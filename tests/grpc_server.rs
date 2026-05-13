@@ -28,12 +28,13 @@
 
 use praxis_extproc::{config, server::PraxisExtProc};
 use praxis_filter::FilterRegistry;
-use praxis_proto::envoy::service::common::v3::HeaderValue;
-use praxis_proto::envoy::service::ext_proc::v3::{
-    HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProcessingResponse,
-    external_processor_server::ExternalProcessorServer,
-    processing_request::Request as ReqVariant,
-    processing_response::Response as RespVariant,
+use praxis_proto::envoy::service::{
+    common::v3::HeaderValue,
+    ext_proc::v3::{
+        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProcessingResponse,
+        external_processor_server::ExternalProcessorServer, processing_request::Request as ReqVariant,
+        processing_response::Response as RespVariant,
+    },
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
@@ -172,6 +173,384 @@ async fn trailers_passthrough() {
     );
 }
 
+#[tokio::test]
+async fn large_body_request_succeeds() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let body = vec![b'x'; 65_536];
+    let responses = send_full_request(&mut client, "POST", "/large", &body).await;
+
+    let has_immediate = responses
+        .iter()
+        .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_))));
+
+    assert!(!has_immediate, "large body should not be rejected");
+    assert!(!responses.is_empty(), "should produce responses for large body");
+}
+
+#[tokio::test]
+async fn response_trailers_passthrough() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.expect("send");
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![make_header(":status", "200")],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response headers");
+
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseTrailers(
+            praxis_proto::envoy::service::ext_proc::v3::HttpTrailers { trailers: None },
+        )),
+        ..Default::default()
+    })
+    .await
+    .expect("send response trailers");
+
+    let trailer_resp = inbound.message().await.expect("receive").expect("response");
+
+    assert!(
+        matches!(&trailer_resp.response, Some(RespVariant::ResponseTrailers(_))),
+        "should echo back response trailers"
+    );
+}
+
+#[tokio::test]
+async fn body_with_headers_deferred_response() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("POST", "/api", false))
+        .await
+        .expect("send headers");
+
+    let header_resp = inbound.message().await.expect("receive").expect("response");
+    assert!(
+        matches!(&header_resp.response, Some(RespVariant::RequestHeaders(_))),
+        "should get immediate headers response before body"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"test payload".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    let body_resp = inbound.message().await.expect("receive").expect("body response");
+    assert!(
+        !matches!(&body_resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "should not reject clean body"
+    );
+}
+
+#[tokio::test]
+async fn response_body_with_header_mutations() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.expect("send");
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![make_header(":status", "200"), make_header("content-type", "text/plain")],
+            }),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response headers");
+
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"response data".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response body");
+
+    let body_resp = inbound.message().await.expect("receive").expect("response body");
+    assert!(
+        !matches!(&body_resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "should not reject response body"
+    );
+}
+
+#[tokio::test]
+async fn multi_chunk_body_accumulation() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("POST", "/chunked", false))
+        .await
+        .expect("send headers");
+
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"chunk1".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send chunk 1");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"chunk2".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send chunk 2");
+
+    let body_resp = inbound.message().await.expect("receive").expect("body response");
+
+    assert!(
+        !matches!(&body_resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "accumulated chunks should not be rejected"
+    );
+}
+
+#[tokio::test]
+async fn multi_chunk_response_body() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.expect("send");
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![make_header(":status", "200")],
+            }),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response headers");
+
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"part1".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response body chunk 1");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"part2".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response body chunk 2");
+
+    let resp = inbound.message().await.expect("receive").expect("response");
+
+    assert!(
+        !matches!(&resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "multi-chunk response body should succeed"
+    );
+}
+
+#[tokio::test]
+async fn raw_value_header_parsing() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    HeaderValue {
+                        key: ":method".to_owned(),
+                        value: String::new(),
+                        raw_value: b"GET".to_vec(),
+                    },
+                    HeaderValue {
+                        key: ":path".to_owned(),
+                        value: String::new(),
+                        raw_value: b"/raw-test".to_vec(),
+                    },
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send headers with raw_value");
+
+    let resp = inbound.message().await.expect("receive").expect("response");
+
+    assert!(
+        matches!(&resp.response, Some(RespVariant::RequestHeaders(_))),
+        "raw_value headers should parse correctly"
+    );
+}
+
+#[tokio::test]
+async fn guardrails_rejects_body_in_buffered_mode() {
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("POST", "/api", false))
+        .await
+        .expect("send headers");
+
+    drop(inbound.message().await);
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"DROP TABLE users".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    let body_resp = inbound.message().await.expect("receive").expect("body response");
+
+    assert!(
+        matches!(&body_resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "guardrails should reject via ImmediateResponse in buffered mode"
+    );
+}
+
+#[tokio::test]
+async fn unconditional_branch_adds_headers_from_branch_chain() {
+    let (mut client, _shutdown) = start_server(UNCONDITIONAL_BRANCH_CONFIG).await;
+
+    let responses = send_headers_only(&mut client, "GET", "/").await;
+
+    let mutations = extract_all_set_headers(&responses);
+    let has_main = mutations.iter().any(|h| h.key == "X-Main");
+    let has_branch = mutations.iter().any(|h| h.key == "X-Branch-Applied");
+
+    assert!(has_main, "main chain header should be present");
+    assert!(has_branch, "branch chain header should be present");
+}
+
+#[tokio::test]
+async fn conditional_terminal_branch_rejects_matching_request() {
+    let (mut client, _shutdown) = start_server(CONDITIONAL_TERMINAL_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":method", "GET"),
+                    make_header(":path", "/"),
+                    make_header("x-danger", "true"),
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send headers");
+
+    let resp = inbound.message().await.expect("receive").expect("response");
+
+    assert!(
+        matches!(&resp.response, Some(RespVariant::ImmediateResponse(_))),
+        "terminal branch should produce ImmediateResponse for flagged request"
+    );
+}
+
+#[tokio::test]
+async fn conditional_terminal_branch_allows_clean_request() {
+    let (mut client, _shutdown) = start_server(CONDITIONAL_TERMINAL_CONFIG).await;
+
+    let responses = send_headers_only(&mut client, "GET", "/").await;
+
+    let has_immediate = responses
+        .iter()
+        .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_))));
+
+    assert!(
+        !has_immediate,
+        "clean request should not be rejected by terminal branch"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -210,6 +589,55 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+const UNCONDITIONAL_BRANCH_CONFIG: &str = r#"
+filter_chains:
+  - name: branch_chain
+    filters:
+      - filter: headers
+        request_add:
+          - name: X-Branch-Applied
+            value: "true"
+  - name: test
+    filters:
+      - filter: headers
+        request_add:
+          - name: X-Main
+            value: "true"
+        branch_chains:
+          - name: always_run
+            rejoin: next
+            chains:
+              - branch_chain
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const CONDITIONAL_TERMINAL_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: guardrails
+        action: flag
+        rules:
+          - target: header
+            name: "x-danger"
+            contains: "true"
+        branch_chains:
+          - name: block_dangerous
+            on_result:
+              filter: guardrails
+              result: blocked
+            rejoin: terminal
+            chains:
+              - name: reject
+                filters:
+                  - filter: static_response
+                    status: 403
+                    body: "blocked by branch"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
 const RESPONSE_HEADER_CONFIG: &str = r#"
 filter_chains:
   - name: test
@@ -243,10 +671,9 @@ async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot
     tokio::spawn(async move {
         Server::builder()
             .add_service(ExternalProcessorServer::new(svc))
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async { drop(shutdown_rx.await) },
-            )
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                drop(shutdown_rx.await);
+            })
             .await
             .expect("server failed");
     });
@@ -366,9 +793,7 @@ fn make_header(key: &str, value: &str) -> HeaderValue {
     }
 }
 
-async fn collect_responses(
-    inbound: &mut tonic::Streaming<ProcessingResponse>,
-) -> Vec<ProcessingResponse> {
+async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -> Vec<ProcessingResponse> {
     let mut responses = Vec::new();
     let timeout = tokio::time::Duration::from_secs(2);
 

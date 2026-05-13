@@ -8,8 +8,7 @@
 //!
 //! Requires:
 //! - A KIND cluster with Istio and praxis-extproc (`make kind-up`)
-//! - An active port-forward to the Gateway:
-//!   `kubectl -n praxis-test port-forward deploy/praxis-test-istio 18080:8080`
+//! - An active port-forward to the Gateway: `kubectl -n praxis-test port-forward deploy/praxis-test-istio 18080:8080`
 
 #![cfg(feature = "integration")]
 #![allow(
