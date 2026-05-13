@@ -1,42 +1,28 @@
-# Praxis ExtProc
-
 [![Tests](https://github.com/praxis-proxy/extproc/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/extproc/actions/workflows/tests.yaml)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+# Praxis ExtProc
 
 [Envoy] [ExtProc] server that runs [Praxis] filter
 pipelines as an external processor. Enables header and
 body inspection, mutation, and rejection over gRPC
 without replacing Envoy.
 
+See [Getting Started](docs/getting-started.md) to
+start deploying alongside Envoy.
+
 [Envoy]: https://github.com/envoyproxy/envoy
 [ExtProc]: https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter
 [Praxis]: https://github.com/praxis-proxy/praxis
 
-## Quick Start
-
-```console
-make build       # build
-make test        # test
-make lint        # clippy + fmt check
-make container   # container image
-```
-
-See [Getting Started](docs/getting-started.md) for
-deploying alongside Envoy.
-
 ## Documentation
 
-- [Getting Started](docs/getting-started.md):
-  deploy and run in minutes
-- [Architecture](docs/architecture.md):
-  how the ExtProc server works
-- [Configuration](docs/configuration.md):
-  YAML reference for filter chains, server, and TLS
-- [Development](docs/development.md):
-  building, testing, contributing
-- [Conventions](docs/conventions.md):
-  coding standards
+- [Getting Started](docs/getting-started.md): deploy and run in minutes
+- [Architecture](docs/architecture.md): how the ExtProc server works
+- [Configuration](docs/configuration.md): YAML reference for filter chains, server, and TLS
+- [Development](docs/development.md): building, testing, contributing
+- [Conventions](docs/conventions.md): coding standards
 
 ## Contributing
 
