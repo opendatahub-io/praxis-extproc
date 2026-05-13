@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+.claude/
+.docs/
+docs/
+deploy/
+hack/
+examples/
+*.md
