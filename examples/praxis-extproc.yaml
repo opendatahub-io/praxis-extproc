@@ -1,0 +1,40 @@
+# Example ExtProc configuration with common Praxis filters.
+#
+# Start:
+#   praxis-extproc -c examples/praxis-extproc.yaml
+
+server:
+  grpc_address: "0.0.0.0:50051"
+  health_address: "0.0.0.0:50052"
+  metrics_address: "0.0.0.0:9090"
+  tls:
+    mode: none
+
+filter_chains:
+  - name: observability
+    filters:
+      - filter: request_id
+      - filter: access_log
+
+  - name: security
+    filters:
+      - filter: guardrails
+        rules:
+          - target: body
+            contains: "DROP TABLE"
+          - target: header
+            name: "User-Agent"
+            pattern: "bad-bot.*"
+
+  - name: transformation
+    filters:
+      - filter: headers
+        request_add:
+          - name: X-Processed-By
+            value: praxis-extproc
+        response_set:
+          - name: X-Proxy
+            value: praxis-extproc
+
+insecure_options:
+  allow_unbounded_body: true

@@ -1,0 +1,42 @@
+# Example ExtProc configuration demonstrating branch chains.
+#
+# This config shows that full Praxis pipeline features work in
+# ExtProc mode, including conditional branching on filter results.
+#
+# Start:
+#   praxis-extproc -c examples/branch-chains.yaml
+
+server:
+  grpc_address: "0.0.0.0:50051"
+  tls:
+    mode: none
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+
+      - filter: guardrails
+        name: content_check
+        rules:
+          - target: body
+            contains: "blocked-content"
+        branches:
+          - chain:
+              filters:
+                - filter: headers
+                  request_add:
+                    - name: X-Content-Blocked
+                      value: "true"
+            on_result:
+              filter: content_check
+              key: rejected
+              value: "true"
+
+      - filter: headers
+        request_add:
+          - name: X-Processed
+            value: "true"
+
+insecure_options:
+  allow_unbounded_body: true
