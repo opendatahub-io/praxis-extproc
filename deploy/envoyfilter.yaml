@@ -1,0 +1,62 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: praxis-extproc
+  namespace: praxis-test
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+    app.kubernetes.io/managed-by: praxis-extproc
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: praxis-test
+  configPatches:
+    - applyTo: CLUSTER
+      match:
+        context: GATEWAY
+      patch:
+        operation: ADD
+        value:
+          name: praxis-extproc-grpc
+          type: STRICT_DNS
+          connect_timeout: 5s
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: praxis-extproc-grpc
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: praxis-extproc.praxis-extproc.svc.cluster.local
+                          port_value: 50051
+    # Insert the ext_proc HTTP filter before the router.
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            grpc_service:
+              envoy_grpc:
+                cluster_name: praxis-extproc-grpc
+              timeout: 10s
+            message_timeout: 10s
+            processing_mode:
+              request_header_mode: SEND
+              response_header_mode: SEND
+              request_body_mode: BUFFERED
+              response_body_mode: BUFFERED
