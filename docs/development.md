@@ -188,6 +188,44 @@ runs on every push and pull request:
 - Doc build (`RUSTDOCFLAGS="-D warnings" cargo doc`)
 - Audit (`cargo audit`, `cargo deny check`)
 
+## Project Management
+
+All repositories in the `praxis-proxy` organization
+use a consistent workflow for planning, prioritizing,
+and tracking work.
+
+### Milestones
+
+Milestones represent a body of work toward a shared
+goal (e.g. a release, a feature area, or a hardening
+pass). Every issue and pull request should belong to
+a milestone. Milestones provide scope boundaries and
+help answer "what ships together?"
+
+### Priority Labels
+
+Priority labels indicate the order in which work
+within a milestone should be addressed. Every issue
+should have exactly one priority label:
+
+| Label | Description |
+| --- | --- |
+| `priority/critical` | Must be worked on immediately before anything else |
+| `priority/high` | Needs to be worked on immediately, defer to criticals |
+| `priority/medium` | Resolve after high and critical |
+| `priority/low` | Resolve after all other priority levels |
+
+When picking up work, address issues in priority
+order: critical first, then high, medium, and low.
+
+### Project Boards
+
+GitHub project boards visualize the state of work
+across milestones. Use boards to track issues through
+their lifecycle (backlog, in progress, in review,
+done). Boards are the primary tool for stand-ups and
+status checks.
+
 ## Coding Conventions
 
 See [conventions.md](conventions.md) for the full
