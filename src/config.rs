@@ -6,7 +6,7 @@
 //! Parses a minimal config containing filter chains and server settings.
 //! Listeners and clusters are omitted because Envoy owns networking.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use serde::Deserialize;
@@ -100,6 +100,8 @@ impl Default for ServerConfig {
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
+    validate_chain_names(&config.filter_chains)?;
+
     let chains: std::collections::HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
@@ -123,6 +125,17 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
 // -----------------------------------------------------------------------------
 // Utilities
 // -----------------------------------------------------------------------------
+
+/// Reject configs with duplicate filter chain names.
+fn validate_chain_names(chains: &[praxis_core::config::FilterChainConfig]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for chain in chains {
+        if !seen.insert(&chain.name) {
+            return Err(Error::Config(format!("duplicate filter chain name: {}", chain.name)));
+        }
+    }
+    Ok(())
+}
 
 /// Concatenate all filter chain entries into a single flat list.
 fn flatten_chains(chains: &[praxis_core::config::FilterChainConfig]) -> Vec<praxis_core::config::FilterEntry> {
@@ -248,5 +261,43 @@ filter_chains:
         let entries = flatten_chains(&cfg.filter_chains);
 
         assert_eq!(entries.len(), 2, "should flatten both chains");
+    }
+
+    #[test]
+    fn duplicate_chain_names_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: dupe
+    filters:
+      - filter: request_id
+  - name: dupe
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = FilterRegistry::with_builtins();
+        let err = build_pipeline(&cfg, &registry)
+            .err()
+            .expect("duplicate chain names should fail");
+
+        assert!(
+            err.to_string().contains("duplicate"),
+            "error should mention duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejects_extra_keys() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+filter_chains: []
+bogus_key: true
+"#,
+        );
+
+        assert!(result.is_err(), "unknown fields should be rejected");
     }
 }

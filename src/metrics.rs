@@ -62,9 +62,9 @@ pub async fn serve(addr: SocketAddr, shutdown: impl Future<Output = ()>) -> crat
 
     register();
 
-    info!(address = %addr, "metrics server listening");
-
     let listener = bind_listener(addr).await?;
+
+    info!(address = %addr, "metrics server listening");
 
     accept_loop(listener, handle, shutdown).await;
 

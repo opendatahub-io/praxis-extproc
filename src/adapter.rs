@@ -141,32 +141,46 @@ pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<H
     })
 }
 
-/// Collect response header mutations by diffing against original headers.
+/// Collect response header mutations by diffing against original state.
 ///
-/// `original_keys` is the set of header names present before filters ran.
-/// Headers present after but not before are mutations to send to Envoy.
+/// Detects three kinds of mutations:
+/// - **Added**: keys present after but not before filters ran.
+/// - **Modified**: keys present in both but with changed values.
+/// - **Removed**: keys present before but absent after filters ran.
 ///
 /// [`HeaderMutation`]: praxis_proto::envoy::service::ext_proc::v3::HeaderMutation
 pub fn collect_response_header_mutations_diff(
     ctx: &HttpFilterContext<'_>,
-    original_keys: &std::collections::HashSet<String>,
+    original_headers: &HashMap<String, String>,
 ) -> Option<HeaderMutation> {
     let resp = ctx.response_header.as_ref()?;
 
     let set_headers: Vec<HeaderValueOption> = resp
         .headers
         .iter()
-        .filter(|(name, _)| !original_keys.contains(name.as_str()))
+        .filter(|(name, value)| {
+            let val_str = value.to_str().unwrap_or_default();
+            match original_headers.get(name.as_str()) {
+                Some(orig) => orig != val_str,
+                None => true,
+            }
+        })
         .map(|(name, value)| header_value_option(name.as_str(), value.to_str().unwrap_or_default()))
         .collect();
 
-    if set_headers.is_empty() {
+    let remove_headers: Vec<String> = original_headers
+        .keys()
+        .filter(|k| !resp.headers.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+
+    if set_headers.is_empty() && remove_headers.is_empty() {
         return None;
     }
 
     Some(HeaderMutation {
         set_headers,
-        remove_headers: Vec::new(),
+        remove_headers,
     })
 }
 
@@ -514,6 +528,129 @@ mod tests {
         let resp = envoy_headers_to_response(&headers);
 
         assert_eq!(resp.status, StatusCode::OK, "should default to 200");
+    }
+
+    #[test]
+    fn response_diff_detects_added_header() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(&req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        let original = HashMap::new();
+
+        resp.headers.insert("x-added", "new".parse().unwrap());
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &original).expect("should have mutations");
+
+        assert_eq!(mutation.set_headers.len(), 1, "should detect one added header");
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-added",
+            "added header key should match"
+        );
+    }
+
+    #[test]
+    fn response_diff_detects_modified_value() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(&req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.insert("x-existing", "changed".parse().unwrap());
+
+        let mut original = HashMap::new();
+        original.insert("x-existing".to_owned(), "original".to_owned());
+
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &original).expect("should have mutations");
+
+        assert_eq!(mutation.set_headers.len(), 1, "should detect value change");
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().value,
+            "changed",
+            "should contain new value"
+        );
+    }
+
+    #[test]
+    fn response_diff_detects_removed_header() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(&req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+
+        let mut original = HashMap::new();
+        original.insert("x-removed".to_owned(), "gone".to_owned());
+
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &original).expect("should have mutations");
+
+        assert!(mutation.set_headers.is_empty(), "no headers to set");
+        assert_eq!(mutation.remove_headers.len(), 1, "should detect one removal");
+        assert_eq!(
+            mutation.remove_headers[0], "x-removed",
+            "removed header name should match"
+        );
+    }
+
+    #[test]
+    fn response_diff_unchanged_returns_none() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(&req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.insert("x-keep", "same".parse().unwrap());
+
+        let mut original = HashMap::new();
+        original.insert("x-keep".to_owned(), "same".to_owned());
+
+        ctx.response_header = Some(&mut resp);
+
+        assert!(
+            collect_response_header_mutations_diff(&ctx, &original).is_none(),
+            "unchanged headers should return None"
+        );
+    }
+
+    #[test]
+    fn header_value_str_prefers_raw_value() {
+        let hv = HeaderValue {
+            key: "x-test".to_owned(),
+            value: "fallback".to_owned(),
+            raw_value: b"raw".to_vec(),
+        };
+
+        assert_eq!(header_value_str(&hv), "raw", "should prefer raw_value");
+    }
+
+    #[test]
+    fn header_value_str_falls_back_to_value() {
+        let hv = HeaderValue {
+            key: "x-test".to_owned(),
+            value: "text".to_owned(),
+            raw_value: Vec::new(),
+        };
+
+        assert_eq!(
+            header_value_str(&hv),
+            "text",
+            "should use value when raw_value is empty"
+        );
     }
 
     // -----------------------------------------------------------------------------

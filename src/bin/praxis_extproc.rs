@@ -110,8 +110,13 @@ async fn start_services(
     serve_grpc(addrs.0, pipeline, tls_cfg).await?;
 
     drop(shutdown_tx);
-    drop(health_handle.await);
-    drop(metrics_handle.await);
+
+    if let Err(e) = health_handle.await {
+        error!(error = %e, "health server task failed");
+    }
+    if let Err(e) = metrics_handle.await {
+        error!(error = %e, "metrics server task failed");
+    }
 
     info!("server shut down");
     Ok(())

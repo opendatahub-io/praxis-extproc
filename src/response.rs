@@ -10,8 +10,8 @@
 //! [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
 
 use praxis_proto::envoy::service::ext_proc::v3::{
-    BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse, ProcessingResponse,
-    TrailersResponse, common_response::ResponseStatus, processing_response::Response,
+    BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse, ProcessingResponse,
+    TrailersResponse, body_mutation, common_response::ResponseStatus, processing_response::Response,
 };
 
 // -----------------------------------------------------------------------------
@@ -163,15 +163,29 @@ pub fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 // Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a single body response with optional header mutation.
-fn body_responses(_body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_request: bool) -> Vec<ProcessingResponse> {
+/// Build body response(s) with optional header mutation and body data.
+///
+/// When body data is present, populates `body_mutation` so Envoy
+/// applies the filter-modified body. Large bodies are split into
+/// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
+fn body_responses(body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_request: bool) -> Vec<ProcessingResponse> {
+    let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
+
     let common = CommonResponse {
         status: ResponseStatus::Continue.into(),
         header_mutation: mutation,
+        body_mutation,
         ..Default::default()
     };
 
     vec![wrap_body_response(common, is_request)]
+}
+
+/// Build a [`BodyMutation`] replacing the body with the given bytes.
+fn make_body_mutation(data: &[u8]) -> BodyMutation {
+    BodyMutation {
+        mutation: Some(body_mutation::Mutation::Body(data.to_vec())),
+    }
 }
 
 /// Wrap a [`CommonResponse`] as either request or response body.
@@ -404,5 +418,68 @@ mod tests {
             1,
             "large body should produce single response with body replacement"
         );
+    }
+
+    #[test]
+    fn request_body_includes_body_mutation() {
+        let data = b"mutated body content";
+        let responses = request_body(Some(data), None);
+
+        assert_eq!(responses.len(), 1, "should produce one response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        assert!(body_mut.is_some(), "body_mutation should be populated");
+
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(bytes, data, "body_mutation should contain the provided body data");
+            },
+            other => panic!("expected Body variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_body_includes_body_mutation() {
+        let data = b"response body data";
+        let responses = response_body(Some(data), None);
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        assert!(body_mut.is_some(), "response body_mutation should be populated");
+    }
+
+    #[test]
+    fn empty_body_has_no_body_mutation() {
+        let responses = request_body(Some(&[]), None);
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        assert!(body_mut.is_none(), "empty body should not produce body_mutation");
+    }
+
+    #[test]
+    fn none_body_has_no_body_mutation() {
+        let responses = request_body(None, None);
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        assert!(body_mut.is_none(), "None body should not produce body_mutation");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn extract_body_mutation(resp: &ProcessingResponse) -> Option<&body_mutation::Mutation> {
+        match &resp.response {
+            Some(Response::RequestBody(b)) => b
+                .response
+                .as_ref()
+                .and_then(|c| c.body_mutation.as_ref())
+                .and_then(|bm| bm.mutation.as_ref()),
+            Some(Response::ResponseBody(b)) => b
+                .response
+                .as_ref()
+                .and_then(|c| c.body_mutation.as_ref())
+                .and_then(|bm| bm.mutation.as_ref()),
+            _ => None,
+        }
     }
 }

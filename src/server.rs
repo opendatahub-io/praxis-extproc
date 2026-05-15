@@ -9,7 +9,7 @@
 //!
 //! [`ExternalProcessor`]: praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessor
 
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
+use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
@@ -85,6 +85,7 @@ impl ExternalProcessor for PraxisExtProc {
         tokio::spawn(async move {
             if let Err(e) = handle_stream(&pipeline, &mut inbound, &tx).await {
                 error!(error = %e, "stream processing failed");
+                drop(tx.send(Err(e)).await);
             }
         });
 
@@ -283,8 +284,6 @@ async fn run_request_filters(
     }
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
-    let executed = ctx.executed_filter_indices.clone();
-    let branches = ctx.branch_iterations.clone();
     let body_data = body_data_if_present(&state.request_body);
 
     let responses = if body_data.is_some() {
@@ -293,8 +292,9 @@ async fn run_request_filters(
         vec![response::request_headers(mutation)]
     };
 
-    state.executed_filter_indices = executed;
-    state.branch_iterations = branches;
+    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
     Ok(responses)
 }
@@ -319,6 +319,10 @@ async fn run_response_pipeline(
 }
 
 /// Execute response-phase filters and body filters, then collect mutations.
+///
+/// Skips response filter re-execution when headers were already
+/// processed by [`run_response_header_filters`]; only body filters
+/// run in that case.
 async fn run_response_filters(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -330,12 +334,14 @@ async fn run_response_filters(
     let mut ctx = adapter::build_filter_context(request);
 
     state.restore_request_ctx(&mut ctx);
-    let original_keys = capture_header_keys(resp);
+    let original_headers = capture_original_headers(resp);
     ctx.response_header = Some(resp);
 
-    let action = execute_response(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
-        return Ok(vec![response::immediate(imm)]);
+    if !state.response_filters_executed {
+        let action = execute_response(pipeline, &mut ctx).await?;
+        if let Some(imm) = check_reject(action) {
+            return Ok(vec![response::immediate(imm)]);
+        }
     }
 
     let body_reject = run_resp_body_filters(pipeline, &mut ctx, &mut state.response_body)?;
@@ -343,7 +349,7 @@ async fn run_response_filters(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_keys);
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
     let body_data = body_data_if_present(&state.response_body);
 
     if body_data.is_some() {
@@ -372,7 +378,7 @@ async fn run_response_header_filters(
         return Ok(None);
     };
 
-    let original_keys = capture_header_keys(resp);
+    let original_headers = capture_original_headers(resp);
     ctx.response_header = Some(resp);
 
     let action = execute_response(pipeline, &mut ctx).await?;
@@ -380,12 +386,17 @@ async fn run_response_header_filters(
         return Err(Status::aborted(imm.body));
     }
 
-    Ok(adapter::collect_response_header_mutations_diff(&ctx, &original_keys))
+    state.response_filters_executed = true;
+
+    Ok(adapter::collect_response_header_mutations_diff(&ctx, &original_headers))
 }
 
-/// Capture response header names before filter execution for diffing.
-fn capture_header_keys(resp: &Response) -> std::collections::HashSet<String> {
-    resp.headers.keys().map(ToString::to_string).collect()
+/// Capture response header names and values before filter execution.
+fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
+    resp.headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
+        .collect()
 }
 
 /// Execute the request-phase pipeline.
@@ -428,7 +439,7 @@ async fn run_body_filters(
         return Ok(None);
     }
 
-    let mut body = Some(Bytes::from(body_buf.split_off(0)));
+    let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
         .execute_http_request_body(ctx, &mut body, true)
         .await
@@ -455,7 +466,7 @@ fn run_resp_body_filters(
         return Ok(None);
     }
 
-    let mut body = Some(Bytes::from(body_buf.split_off(0)));
+    let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
         .execute_http_response_body(ctx, &mut body, true)
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -484,6 +495,9 @@ struct StreamState {
     /// Executed filter indices from request phase.
     executed_filter_indices: Vec<bool>,
 
+    /// Metadata carried from request to response phase.
+    filter_metadata: HashMap<String, String>,
+
     /// Converted request from the headers phase.
     request: Option<Request>,
 
@@ -495,6 +509,9 @@ struct StreamState {
 
     /// Accumulated response body bytes.
     response_body: Vec<u8>,
+
+    /// Whether response-phase filters already ran at header time.
+    response_filters_executed: bool,
 }
 
 impl StreamState {
@@ -507,6 +524,7 @@ impl StreamState {
     fn restore_request_ctx(&self, ctx: &mut HttpFilterContext<'_>) {
         ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
         ctx.branch_iterations.clone_from(&self.branch_iterations);
+        ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
 }
 
