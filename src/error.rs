@@ -8,15 +8,15 @@
 // -----------------------------------------------------------------------------
 
 /// Result alias for ExtProc operations.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = ExtProcError> = std::result::Result<T, E>;
 
 // -----------------------------------------------------------------------------
-// Error
+// ExtProcError
 // -----------------------------------------------------------------------------
 
 /// Errors produced during ExtProc operation.
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum ExtProcError {
     /// Configuration loading or parsing failed.
     #[error("config: {0}")]
     Config(String),

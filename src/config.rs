@@ -11,7 +11,7 @@ use std::{collections::HashSet, sync::Arc};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use serde::Deserialize;
 
-use crate::error::{Error, Result};
+use crate::error::{ExtProcError, Result};
 
 // -----------------------------------------------------------------------------
 // ExtProcConfig
@@ -96,7 +96,7 @@ impl Default for ServerConfig {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Pipeline`] if filter instantiation or validation fails.
+/// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
@@ -111,11 +111,11 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
     let mut entries = flatten_chains(&config.filter_chains);
 
     let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)
-        .map_err(|e| Error::Pipeline(e.to_string()))?;
+        .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline
         .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
-        .map_err(|e| Error::Pipeline(e.to_string()))?;
+        .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
 
@@ -131,7 +131,7 @@ fn validate_chain_names(chains: &[praxis_core::config::FilterChainConfig]) -> Re
     let mut seen = HashSet::new();
     for chain in chains {
         if !seen.insert(&chain.name) {
-            return Err(Error::Config(format!("duplicate filter chain name: {}", chain.name)));
+            return Err(ExtProcError::Config(format!("duplicate filter chain name: {}", chain.name)));
         }
     }
     Ok(())
@@ -147,7 +147,7 @@ fn flatten_chains(chains: &[praxis_core::config::FilterChainConfig]) -> Vec<prax
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

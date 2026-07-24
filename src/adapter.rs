@@ -41,7 +41,7 @@ pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
         let val = header_value_str(hv);
         match hv.key.as_str() {
             ":method" => method = val.parse().unwrap_or(Method::GET),
-            ":path" => path = val.to_owned(),
+            ":path" => val.clone_into(&mut path),
             ":authority" | ":scheme" => {},
             key => {
                 if let (Ok(name), Ok(value)) = (
@@ -308,7 +308,7 @@ fn rejection_headers_to_mutation(headers: &[(String, String)]) -> HeaderMutation
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

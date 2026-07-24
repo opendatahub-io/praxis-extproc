@@ -11,7 +11,7 @@ use std::process;
 use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
-    error::Error,
+    error::ExtProcError,
     server::PraxisExtProc,
     tls,
 };
@@ -208,10 +208,10 @@ async fn wait_broadcast(mut rx: tokio::sync::broadcast::Receiver<()>) {
 }
 
 /// Load and parse the YAML configuration file.
-fn load_config(path: &str) -> Result<ExtProcConfig, Error> {
-    let content = std::fs::read_to_string(path).map_err(|e| Error::Config(format!("{path}: {e}")))?;
+fn load_config(path: &str) -> Result<ExtProcConfig, ExtProcError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ExtProcError::Config(format!("{path}: {e}")))?;
 
-    serde_yaml::from_str(&content).map_err(|e| Error::Config(e.to_string()))
+    serde_yaml::from_str(&content).map_err(|e| ExtProcError::Config(e.to_string()))
 }
 
 /// Parse a socket address from CLI override or config default.

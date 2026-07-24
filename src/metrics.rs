@@ -122,12 +122,12 @@ fn install_recorder() -> crate::error::Result<PrometheusHandle> {
                 .map_err(|e| format!("metrics recorder: {e}"))
         })
         .clone()
-        .map_err(crate::error::Error::Config)
+        .map_err(crate::error::ExtProcError::Config)
 }
 
 /// Bind the TCP listener for the metrics endpoint.
 async fn bind_listener(addr: SocketAddr) -> crate::error::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| crate::error::Error::Config(format!("metrics bind: {e}")))
+        .map_err(|e| crate::error::ExtProcError::Config(format!("metrics bind: {e}")))
 }

@@ -89,7 +89,7 @@ fn build_self_signed() -> crate::error::Result<Option<ServerTlsConfig>> {
     info!("generating self-signed TLS certificate");
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|e| crate::error::Error::Config(format!("self-signed cert: {e}")))?;
+        .map_err(|e| crate::error::ExtProcError::Config(format!("self-signed cert: {e}")))?;
 
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
@@ -110,19 +110,19 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
     let cert_path = cfg
         .cert_path
         .as_deref()
-        .ok_or_else(|| crate::error::Error::Config("tls.cert_path required for provided mode".to_owned()))?;
+        .ok_or_else(|| crate::error::ExtProcError::Config("tls.cert_path required for provided mode".to_owned()))?;
 
     let key_path = cfg
         .key_path
         .as_deref()
-        .ok_or_else(|| crate::error::Error::Config("tls.key_path required for provided mode".to_owned()))?;
+        .ok_or_else(|| crate::error::ExtProcError::Config("tls.key_path required for provided mode".to_owned()))?;
 
     info!(cert = cert_path, key = key_path, "loading TLS certificate");
 
     let cert_pem =
-        std::fs::read(cert_path).map_err(|e| crate::error::Error::Config(format!("read {cert_path}: {e}")))?;
+        std::fs::read(cert_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {cert_path}: {e}")))?;
 
-    let key_pem = std::fs::read(key_path).map_err(|e| crate::error::Error::Config(format!("read {key_path}: {e}")))?;
+    let key_pem = std::fs::read(key_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {key_path}: {e}")))?;
 
     let identity = Identity::from_pem(cert_pem, key_pem);
     let tls_config = ServerTlsConfig::new().identity(identity);
@@ -135,7 +135,7 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

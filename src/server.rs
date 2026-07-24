@@ -20,7 +20,7 @@ use praxis_proto::envoy::service::{
     },
 };
 use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
 use tracing::{debug, error, warn};
 

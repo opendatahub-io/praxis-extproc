@@ -133,7 +133,7 @@ pub fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
 /// ```
 /// use praxis_extproc::response::chunk_body;
 ///
-/// let data = vec![0u8; 130_000];
+/// let data = vec![0_u8; 130_000];
 /// let chunks = chunk_body(&data);
 /// assert_eq!(chunks.len(), 3, "130KB should split into 3 chunks");
 /// assert!(!chunks[0].1, "first chunk is not EOS");
@@ -207,7 +207,7 @@ fn wrap_body_response(common: CommonResponse, is_request: bool) -> ProcessingRes
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn chunk_body_small() {
-        let data = vec![0u8; 100];
+        let data = vec![0_u8; 100];
         let chunks = chunk_body(&data);
 
         assert_eq!(chunks.len(), 1, "small body should produce one chunk");
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn chunk_body_exact_boundary() {
-        let data = vec![0u8; BODY_CHUNK_LIMIT];
+        let data = vec![0_u8; BODY_CHUNK_LIMIT];
         let chunks = chunk_body(&data);
 
         assert_eq!(chunks.len(), 1, "exact boundary should produce one chunk");
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn chunk_body_exceeds_boundary() {
-        let data = vec![0u8; BODY_CHUNK_LIMIT + 1];
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 1];
         let chunks = chunk_body(&data);
 
         assert_eq!(chunks.len(), 2, "should split into two chunks");
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn chunk_body_multiple_chunks() {
         let size = BODY_CHUNK_LIMIT * 3 + 42;
-        let data = vec![0u8; size];
+        let data = vec![0_u8; size];
         let chunks = chunk_body(&data);
 
         assert_eq!(chunks.len(), 4, "should split into four chunks");
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn request_body_with_data() {
-        let data = vec![0u8; 100];
+        let data = vec![0_u8; 100];
         let responses = request_body(Some(&data), None);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn response_body_with_data() {
-        let data = vec![0u8; 200];
+        let data = vec![0_u8; 200];
         let responses = response_body(Some(&data), None);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
@@ -402,7 +402,7 @@ mod tests {
             set_headers: vec![],
             remove_headers: vec!["x-strip".to_owned()],
         };
-        let data = vec![0u8; 50];
+        let data = vec![0_u8; 50];
         let responses = request_body(Some(&data), Some(mutation));
 
         assert_eq!(responses.len(), 1, "should produce single body response with mutation");
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn large_body_single_response() {
-        let data = vec![0u8; BODY_CHUNK_LIMIT * 2 + 100];
+        let data = vec![0_u8; BODY_CHUNK_LIMIT * 2 + 100];
         let responses = request_body(Some(&data), None);
 
         assert_eq!(
