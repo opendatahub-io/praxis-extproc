@@ -274,9 +274,6 @@ Never: `// --- Section Name ---`
   blocks in `.md` files: `console` for shell, `rust` for
   Rust, `yaml` for YAML, `toml` for TOML, etc. Never use
   bare triple backticks.
-- Do not use em-dash or double-hyphen as separators in
-  text. Use other punctuation (periods, colons, semicolons,
-  parentheses) or restructure sentences instead.
 
 ## Code Responsibility
 
