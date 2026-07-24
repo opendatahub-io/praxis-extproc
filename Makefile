@@ -1,26 +1,57 @@
-.PHONY: all build release test lint fmt doc audit clean
-.PHONY: images container kind-up kind-down smoke-test test-integration
-.PHONY: dev-env dev-push dev-integration
+.PHONY: all build release check clean \
+	test test-integration lint fmt doc audit \
+	coverage-check \
+	require-container-engine \
+	container images kind-up kind-down smoke-test \
+	dev-env dev-push dev-integration \
+	setup-hooks \
+	help
 
 # ---------------------------------------------------------------------------
-# Environment
+# Configuration
 # ---------------------------------------------------------------------------
 
+CONTAINER_ENGINE  ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+V                 ?=
 KIND_CLUSTER_NAME ?= praxis-extproc
-EXTPROC_IMAGE    ?= praxis-extproc:dev
-KUBECTL          ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
+EXTPROC_IMAGE     ?= praxis-extproc:dev
+KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
+
+ifneq ($(V),)
+  _NOCAPTURE := -- --nocapture
+endif
+
+# ---------------------------------------------------------------------------
+# All
+# ---------------------------------------------------------------------------
+
+all: build fmt lint test audit
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-
-all: build fmt lint test audit
 
 build:
 	cargo build
 
 release:
 	cargo build --release
+
+check:
+	cargo check
+
+clean:
+	cargo clean
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+test:
+	cargo test $(_NOCAPTURE)
+
+test-integration:
+	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
 
 # ---------------------------------------------------------------------------
 # Quality
@@ -40,29 +71,23 @@ audit:
 	cargo audit
 	cargo deny check
 
-clean:
-	cargo clean
-
-# ---------------------------------------------------------------------------
-# Test
-# ---------------------------------------------------------------------------
-
-test:
-	cargo test
-
-test-integration:
-	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
+coverage-check:
+	cargo llvm-cov --fail-under-lines 80
 
 # ---------------------------------------------------------------------------
 # Container
 # ---------------------------------------------------------------------------
 
-container:
-	podman build -t $(EXTPROC_IMAGE) -f Containerfile . || \
-	docker build -t $(EXTPROC_IMAGE) -f Containerfile .
+require-container-engine:
+ifndef CONTAINER_ENGINE
+	$(error No container engine found. Install podman or docker)
+endif
 
-images:
-	docker build -t $(EXTPROC_IMAGE) -f Containerfile .
+container: | require-container-engine
+	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
+
+images: | require-container-engine
+	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
 
 # ---------------------------------------------------------------------------
 # KIND
@@ -90,8 +115,8 @@ dev-env: images
 	EXTPROC_IMAGE=$(EXTPROC_IMAGE) \
 	bash hack/setup-kind.sh
 
-dev-push:
-	docker build -t $(EXTPROC_IMAGE) -f Containerfile .
+dev-push: | require-container-engine
+	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
 	kind load docker-image $(EXTPROC_IMAGE) --name $(KIND_CLUSTER_NAME)
 	$(KUBECTL) -n praxis-extproc rollout restart deployment/praxis-extproc
 	$(KUBECTL) -n praxis-extproc rollout status deployment/praxis-extproc --timeout=120s
@@ -100,3 +125,59 @@ dev-integration:
 	@kind get kubeconfig --name $(KIND_CLUSTER_NAME) > /tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig
 	KUBECONFIG=/tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig \
 	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
+
+# ---------------------------------------------------------------------------
+# Dev Setup
+# ---------------------------------------------------------------------------
+
+setup-hooks:
+	@ln -sf ../../.hooks/pre-commit .git/hooks/pre-commit
+	@echo "Git hooks installed"
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+help:
+	@echo "Variables:"
+	@echo "  V=1                show test output (--nocapture)"
+	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
+	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
+	@echo "  EXTPROC_IMAGE      container image tag (default: praxis-extproc:dev)"
+	@echo ""
+	@echo "Top-level:"
+	@echo "  all              build + lint + test + audit"
+	@echo ""
+	@echo "Build:"
+	@echo "  build            cargo build"
+	@echo "  release          cargo build --release"
+	@echo "  check            cargo check"
+	@echo "  clean            cargo clean"
+	@echo ""
+	@echo "Test:"
+	@echo "  test             run all tests"
+	@echo "  test-integration run integration tests (ignored tests)"
+	@echo ""
+	@echo "Quality:"
+	@echo "  lint             clippy + rustfmt check"
+	@echo "  fmt              format with nightly rustfmt"
+	@echo "  doc              build docs with warnings denied"
+	@echo "  audit            cargo audit + cargo deny"
+	@echo "  coverage-check   fail if line coverage < 80%%"
+	@echo ""
+	@echo "Container:"
+	@echo "  container        build container image"
+	@echo "  images           build container image"
+	@echo ""
+	@echo "KIND:"
+	@echo "  kind-up          create cluster + deploy"
+	@echo "  kind-down        delete cluster"
+	@echo "  smoke-test       run smoke tests against cluster"
+	@echo ""
+	@echo "Dev Setup:"
+	@echo "  setup-hooks      install git pre-commit hook"
+	@echo ""
+	@echo "Development:"
+	@echo "  dev-env          create/reuse persistent cluster"
+	@echo "  dev-push         build + load + rollout"
+	@echo "  dev-integration  run integration tests against cluster"
