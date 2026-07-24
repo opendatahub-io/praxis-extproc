@@ -1,0 +1,141 @@
+[33mcommit 0123611ae53eb6198f8c9cf380733f7d36011b88[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri Jul 24 08:55:15 2026 -0400
+
+    ci: migrate workflow to conventions shared actions
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit a38fa445d4e4d735a7f67762f323bde147b71a2f[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri Jul 24 08:55:01 2026 -0400
+
+    chore: add community files and update Makefile
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 6c87b8e339928077933f6afcb24957e3a5010bd7[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri Jul 24 08:54:41 2026 -0400
+
+    chore: sync rust tooling configs with conventions baseline
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 54f6b709302adb1541e972deb1f8d378dcdb3ac5[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri May 15 09:59:26 2026 -0400
+
+    chore: general improvements
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit b2a03d7f7659ace0169b65ecc1440ffdcf23dcd6[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri May 15 09:58:09 2026 -0400
+
+    chore: gitignore personal notes
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 55a6220c7d6b0b76511ab9d647a35f694ba36c2a[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Fri May 15 09:54:36 2026 -0400
+
+    docs: add project management process
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 0e786922984f3d1239f050ad2dbdb1dbf5ef49dd[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Wed May 13 05:33:34 2026 -0400
+
+    docs: update README.md
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 469714dd035223306c7a9cc6d3586a7ac7b7a9d8[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Wed May 13 05:32:10 2026 -0400
+
+    fix: update git attr
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit fb47164698fc940f63c031fbd259ade7bfb09edc[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Wed May 13 05:30:06 2026 -0400
+
+    docs: add documentation
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit ca7773ec8d93d056f7c04520719f4781bdf134b7[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:57:20 2026 -0400
+
+    ci: add test workflow
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 97e8901bed22246e7e908c1fa316d0e22e3fdd91[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Wed May 13 03:36:15 2026 -0400
+
+    tests: add integration test suite
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 6fca758f137617a883543a930f483dd0e2b2eb72[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:57:06 2026 -0400
+
+    docs: add example configs
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 7d72e27c5bad034be000bd259ab30267559292f7[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:56:30 2026 -0400
+
+    feat: add deployment manifests
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 091fba46b5cf9d0c9613daed11f23b93dc854b87[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:46:52 2026 -0400
+
+    docs: add readme and conventions
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit e43f5f31e6fb58b1031511430044c1beca4d9d83[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:41:24 2026 -0400
+
+    feat: dev tools
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit efe7b6cb51db7a4b4bf53fa64db369c8ab562f89[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:40:32 2026 -0400
+
+    feat: add dev env scripts
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 939d62428c1d245d258d21705df2befe09ec8fba[m
+Author: Shane Utt <shaneutt@linux.com>
+Date:   Tue May 12 20:40:05 2026 -0400
+
+    feat: add extproc
+    
+    Signed-off-by: Shane Utt <shaneutt@linux.com>
+
+[33mcommit 3c7a29b63913c199cd8303c5fabf2d47562905d4[m
+Author: Shane Utt <shane@shaneutt.com>
+Date:   Tue May 12 13:51:19 2026 -0400
+
+    Initial commit
