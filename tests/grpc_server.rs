@@ -11,6 +11,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::tests_outside_test_module,
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     clippy::missing_assert_message,

@@ -207,16 +207,7 @@ fn wrap_body_response(common: CommonResponse, is_request: bool) -> ProcessingRes
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 

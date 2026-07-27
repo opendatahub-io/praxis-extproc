@@ -131,7 +131,10 @@ fn validate_chain_names(chains: &[praxis_core::config::FilterChainConfig]) -> Re
     let mut seen = HashSet::new();
     for chain in chains {
         if !seen.insert(&chain.name) {
-            return Err(ExtProcError::Config(format!("duplicate filter chain name: {}", chain.name)));
+            return Err(ExtProcError::Config(format!(
+                "duplicate filter chain name: {}",
+                chain.name
+            )));
         }
     }
     Ok(())
@@ -150,13 +153,8 @@ fn flatten_chains(chains: &[praxis_core::config::FilterChainConfig]) -> Vec<prax
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
     clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::missing_assert_message,
     clippy::needless_raw_strings,
-    clippy::needless_raw_string_hashes,
     reason = "tests"
 )]
 mod tests {

@@ -4,6 +4,7 @@
 //! Tests for the health and metrics auxiliary services.
 
 #![allow(
+    clippy::tests_outside_test_module,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

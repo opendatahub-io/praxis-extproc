@@ -308,16 +308,7 @@ fn rejection_headers_to_mutation(headers: &[(String, String)]) -> HeaderMutation
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use bytes::Bytes;
 

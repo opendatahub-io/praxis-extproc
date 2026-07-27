@@ -122,7 +122,8 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
     let cert_pem =
         std::fs::read(cert_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {cert_path}: {e}")))?;
 
-    let key_pem = std::fs::read(key_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {key_path}: {e}")))?;
+    let key_pem =
+        std::fs::read(key_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {key_path}: {e}")))?;
 
     let identity = Identity::from_pem(cert_pem, key_pem);
     let tls_config = ServerTlsConfig::new().identity(identity);
@@ -138,13 +139,7 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::missing_assert_message,
     clippy::needless_raw_strings,
-    clippy::needless_raw_string_hashes,
     reason = "tests"
 )]
 mod tests {

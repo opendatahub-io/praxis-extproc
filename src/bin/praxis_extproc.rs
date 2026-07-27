@@ -92,6 +92,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start gRPC, health, and metrics servers concurrently.
+#[expect(clippy::large_stack_frames, reason = "async state machine for server startup")]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
@@ -204,7 +205,7 @@ fn resolve_addresses(
 
 /// Wait for a broadcast shutdown signal.
 async fn wait_broadcast(mut rx: tokio::sync::broadcast::Receiver<()>) {
-    let _ = rx.recv().await;
+    drop(rx.recv().await);
 }
 
 /// Load and parse the YAML configuration file.
