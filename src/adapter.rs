@@ -13,7 +13,7 @@
 use std::{collections::HashMap, net::IpAddr, time::Instant};
 
 use http::{HeaderMap, Method, StatusCode, Uri};
-use praxis_filter::{BodyMode, HttpFilterContext, Request, Response};
+use praxis_filter::{BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
 use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption, HttpStatus},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
@@ -75,21 +75,32 @@ pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
 ///
 /// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
 /// [`Request`]: praxis_filter::Request
-pub fn build_filter_context<'a>(request: &'a Request) -> HttpFilterContext<'a> {
+pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Request) -> HttpFilterContext<'a> {
     let client_addr = extract_client_addr(request);
 
     HttpFilterContext {
+        buffered_request_body: None,
         body_done_indices: Vec::new(),
         branch_iterations: HashMap::new(),
         client_addr,
         cluster: None,
+        current_filter_id: None,
         downstream_tls: false,
+        peer_identity: None,
+        extensions: RequestExtensions::default(),
         executed_filter_indices: Vec::new(),
         extra_request_headers: Vec::new(),
+        request_headers_to_remove: Vec::new(),
+        request_headers_to_set: Vec::new(),
         filter_metadata: HashMap::new(),
+        pre_read_mutations: Vec::new(),
+        structured_metadata: HashMap::new(),
         filter_results: HashMap::new(),
-        health_registry: None,
-        kv_stores: None,
+        filter_state: HashMap::new(),
+        health_registry: pipeline.health_registry(),
+        id_generator: pipeline.id_generator(),
+        kv_stores: pipeline.kv_stores(),
+        subrequest_connector: pipeline.subrequest_connector(),
         request,
         request_body_bytes: 0,
         request_body_mode: BodyMode::Stream,
@@ -98,8 +109,9 @@ pub fn build_filter_context<'a>(request: &'a Request) -> HttpFilterContext<'a> {
         response_body_mode: BodyMode::Stream,
         response_header: None,
         response_headers_modified: false,
-        rewritten_path: None,
         selected_endpoint_index: None,
+        time_source: pipeline.time_source(),
+        rewritten_path: None,
         upstream: None,
     }
 }
@@ -108,20 +120,24 @@ pub fn build_filter_context<'a>(request: &'a Request) -> HttpFilterContext<'a> {
 // Mutation Collection
 // -----------------------------------------------------------------------------
 
-/// Collect header mutations from `ctx.extra_request_headers` and
-/// `ctx.rewritten_path` into a [`HeaderMutation`].
+/// Collect header mutations from request-phase context into a [`HeaderMutation`].
 ///
-/// When `rewritten_path` is set, emits a `:path` mutation so Envoy
-/// forwards the rewritten URI to the upstream.
+/// Emits ExtProc mutations for:
+/// - `extra_request_headers` (append/inject)
+/// - `request_headers_to_set` (overwrite)
+/// - `request_headers_to_remove`
+/// - `rewritten_path` as a `:path` mutation
 ///
 /// Returns `None` when there are no mutations to apply.
 ///
 /// [`HeaderMutation`]: praxis_proto::envoy::service::ext_proc::v3::HeaderMutation
 pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<HeaderMutation> {
     let has_extras = !ctx.extra_request_headers.is_empty();
+    let has_sets = !ctx.request_headers_to_set.is_empty();
+    let has_removes = !ctx.request_headers_to_remove.is_empty();
     let has_rewrite = ctx.rewritten_path.is_some();
 
-    if !has_extras && !has_rewrite {
+    if !has_extras && !has_sets && !has_removes && !has_rewrite {
         return None;
     }
 
@@ -131,13 +147,23 @@ pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<H
         .map(|(name, value)| header_value_option(name, value))
         .collect();
 
+    set_headers.extend(ctx.request_headers_to_set.iter().map(|(name, value)| {
+        header_value_option(name.as_str(), value.to_str().unwrap_or_default())
+    }));
+
     if let Some(path) = &ctx.rewritten_path {
         set_headers.push(header_value_option(":path", path));
     }
 
+    let remove_headers: Vec<String> = ctx
+        .request_headers_to_remove
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+
     Some(HeaderMutation {
         set_headers,
-        remove_headers: Vec::new(),
+        remove_headers,
     })
 }
 
@@ -310,9 +336,20 @@ fn rejection_headers_to_mutation(headers: &[(String, String)]) -> HeaderMutation
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use std::sync::LazyLock;
+
     use bytes::Bytes;
+    use praxis_filter::FilterRegistry;
 
     use super::*;
+
+    static TEST_PIPELINE: LazyLock<FilterPipeline> = LazyLock::new(|| {
+        FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline")
+    });
+
+    fn test_pipeline() -> &'static FilterPipeline {
+        &TEST_PIPELINE
+    }
 
     #[test]
     fn convert_basic_get_request() {
@@ -384,7 +421,7 @@ mod tests {
     #[test]
     fn build_context_defaults() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(&req);
+        let ctx = build_filter_context(test_pipeline(), &req);
 
         assert!(ctx.client_addr.is_none(), "client_addr should be None without XFF");
         assert!(ctx.cluster.is_none(), "cluster should be None");
@@ -399,7 +436,7 @@ mod tests {
             make_header("x-forwarded-for", "10.0.0.1, 172.16.0.1"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(&req);
+        let ctx = build_filter_context(test_pipeline(), &req);
 
         assert_eq!(
             ctx.client_addr,
@@ -411,7 +448,7 @@ mod tests {
     #[test]
     fn collect_mutations_empty_when_no_extras() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(&req);
+        let ctx = build_filter_context(test_pipeline(), &req);
 
         assert!(
             collect_request_header_mutations(&ctx).is_none(),
@@ -422,7 +459,7 @@ mod tests {
     #[test]
     fn collect_mutations_from_extra_headers() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
         ctx.extra_request_headers.push(("x-added".into(), "value".to_owned()));
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -438,7 +475,7 @@ mod tests {
     #[test]
     fn collect_mutations_includes_rewritten_path() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/old")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
         ctx.rewritten_path = Some("/new/path".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -458,12 +495,34 @@ mod tests {
     #[test]
     fn collect_mutations_rewritten_path_only() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
         ctx.rewritten_path = Some("/rewritten".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
 
         assert_eq!(mutation.set_headers.len(), 1, "only :path mutation");
+    }
+
+    #[test]
+    fn collect_mutations_from_set_and_remove_headers() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
+        ctx.request_headers_to_set.push((
+            http::header::HeaderName::from_static("x-set"),
+            http::header::HeaderValue::from_static("one"),
+        ));
+        ctx.request_headers_to_remove
+            .push(http::header::HeaderName::from_static("x-remove"));
+
+        let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
+
+        assert_eq!(mutation.set_headers.len(), 1, "should have one set header");
+        assert_eq!(
+            mutation.set_headers[0].header.as_ref().unwrap().key,
+            "x-set",
+            "set header key should match"
+        );
+        assert_eq!(mutation.remove_headers, vec!["x-remove".to_owned()], "remove headers");
     }
 
     #[test]
@@ -524,7 +583,7 @@ mod tests {
     #[test]
     fn response_diff_detects_added_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -548,7 +607,7 @@ mod tests {
     #[test]
     fn response_diff_detects_modified_value() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -574,7 +633,7 @@ mod tests {
     #[test]
     fn response_diff_detects_removed_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -599,7 +658,7 @@ mod tests {
     #[test]
     fn response_diff_unchanged_returns_none() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(&req);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
 
         let mut resp = Response {
             status: StatusCode::OK,

@@ -1,0 +1,34 @@
+[package]
+name = "praxis-proxy-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+authors = ["Shane Utt <shaneutt@linux.com>"]
+description = "Protobuf and gRPC definitions for Praxis external processing"
+# Composite: MIT for hand-written code, Apache-2.0 for vendored Envoy
+# protos, BSD-3-Clause for vendored Google well-known types.
+license = "MIT AND Apache-2.0 AND BSD-3-Clause"
+repository = "https://github.com/opendatahub-io/praxis-extproc"
+publish = false
+
+[lib]
+name = "praxis_proto"
+
+# Workspace lints are not inherited: this crate wraps generated protobuf code
+# that cannot satisfy the strict style rules applied to hand-written code.
+# Lint suppression is handled by crate-level `#![allow(...)]` attributes in
+# lib.rs instead.
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+prost = "0.14.3"
+prost-types = "0.14.3"
+prost-wkt-types = { version = "0.7.1", features = ["vendored-protox"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+prost-build = "0.14.3"
+protox = "0.9.1"
+tonic-prost-build = { version = "0.14.6", features = ["transport"] }

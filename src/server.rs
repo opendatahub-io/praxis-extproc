@@ -271,7 +271,7 @@ async fn run_request_filters(
     let Some(request) = state.request.as_ref() else {
         return Err(Status::internal("no request headers"));
     };
-    let mut ctx = adapter::build_filter_context(request);
+    let mut ctx = adapter::build_filter_context(pipeline, request);
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
@@ -331,7 +331,7 @@ async fn run_response_filters(
     let Some(request) = state.request.as_ref() else {
         return Err(Status::internal("no request headers"));
     };
-    let mut ctx = adapter::build_filter_context(request);
+    let mut ctx = adapter::build_filter_context(pipeline, request);
 
     state.restore_request_ctx(&mut ctx);
     let original_headers = capture_original_headers(resp);
@@ -371,7 +371,7 @@ async fn run_response_header_filters(
     let Some(request) = state.request.as_ref() else {
         return Ok(None);
     };
-    let mut ctx = adapter::build_filter_context(request);
+    let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
 
     let Some(resp) = state.response.as_mut() else {

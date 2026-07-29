@@ -65,9 +65,9 @@ async fn headers_filter_adds_response_header() {
     let responses = send_full_request(&mut client, "GET", "/", &[]).await;
 
     let mutations = extract_all_set_headers(&responses);
-    let has_x_test = mutations.iter().any(|h| h.key == "X-Test" && h.value == "extproc");
+    let has_x_test = mutations.iter().any(|h| h.key == "x-test" && h.value == "extproc");
 
-    assert!(has_x_test, "X-Test header should be added by headers filter");
+    assert!(has_x_test, "x-test header should be added by headers filter");
 }
 
 #[tokio::test]
@@ -495,8 +495,8 @@ async fn unconditional_branch_adds_headers_from_branch_chain() {
     let responses = send_headers_only(&mut client, "GET", "/").await;
 
     let mutations = extract_all_set_headers(&responses);
-    let has_main = mutations.iter().any(|h| h.key == "X-Main");
-    let has_branch = mutations.iter().any(|h| h.key == "X-Branch-Applied");
+    let has_main = mutations.iter().any(|h| h.key == "x-main");
+    let has_branch = mutations.iter().any(|h| h.key == "x-branch-applied");
 
     assert!(has_main, "main chain header should be present");
     assert!(has_branch, "branch chain header should be present");
