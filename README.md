@@ -1,5 +1,3 @@
-> **WARNING**: Deprecated. This was a POC we've decided not to pursue. We will archive this soon.
-
 [![Tests](https://github.com/opendatahub-io/praxis-extproc/actions/workflows/tests.yaml/badge.svg)](https://github.com/opendatahub-io/praxis-extproc/actions/workflows/tests.yaml)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
