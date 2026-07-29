@@ -27,7 +27,7 @@ Build consensus with community members.
 > concern that needs to be addressed, regardless of
 > "How?" it is addressed.
 
-[GitHub Discussion]: https://github.com/praxis-proxy/extproc/discussions
+[GitHub Discussion]: https://github.com/opendatahub-io/praxis-extproc/discussions
 
 ### 2. Sign-off
 

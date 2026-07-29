@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/praxis-proxy/extproc"
+repository = "https://github.com/opendatahub-io/praxis-extproc"
 description = "Envoy ExtProc server for Praxis filter pipelines"
 publish = false
 

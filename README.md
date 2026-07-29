@@ -1,6 +1,6 @@
 > **WARNING**: Deprecated. This was a POC we've decided not to pursue. We will archive this soon.
 
-[![Tests](https://github.com/praxis-proxy/extproc/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/extproc/actions/workflows/tests.yaml)
+[![Tests](https://github.com/opendatahub-io/praxis-extproc/actions/workflows/tests.yaml/badge.svg)](https://github.com/opendatahub-io/praxis-extproc/actions/workflows/tests.yaml)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -38,6 +38,6 @@ yourself with the following documentation first:
 For larger changes, open a [discussion] and follow
 the [proposal process](docs/proposals.md).
 
-[Issues]: https://github.com/praxis-proxy/extproc/issues/new
-[pull requests]: https://github.com/praxis-proxy/extproc/compare
-[discussion]: https://github.com/praxis-proxy/extproc/discussions
+[Issues]: https://github.com/opendatahub-io/praxis-extproc/issues/new
+[pull requests]: https://github.com/opendatahub-io/praxis-extproc/compare
+[discussion]: https://github.com/opendatahub-io/praxis-extproc/discussions

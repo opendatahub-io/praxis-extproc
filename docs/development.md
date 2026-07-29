@@ -190,9 +190,8 @@ runs on every push and pull request:
 
 ## Project Management
 
-All repositories in the `praxis-proxy` organization
-use a consistent workflow for planning, prioritizing,
-and tracking work.
+This repository uses a consistent workflow for
+planning, prioritizing, and tracking work.
 
 ### Milestones
 

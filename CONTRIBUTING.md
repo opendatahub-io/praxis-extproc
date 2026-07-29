@@ -115,6 +115,6 @@ are submitting.
 All participants must follow the [CNCF Code of Conduct][coc].
 
 [dco]: https://developercertificate.org/
-[issues]: https://github.com/praxis-proxy/extproc/issues
-[disc]: https://github.com/orgs/praxis-proxy/discussions
+[issues]: https://github.com/opendatahub-io/praxis-extproc/issues
+[disc]: https://github.com/opendatahub-io/praxis-extproc/discussions
 [coc]: https://github.com/cncf/foundation/blob/main/code-of-conduct.md
