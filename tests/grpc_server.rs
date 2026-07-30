@@ -28,7 +28,6 @@
 #![allow(missing_docs, reason = "test module")]
 
 use praxis_extproc::{config, server::PraxisExtProc};
-use praxis_filter::FilterRegistry;
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -660,7 +659,7 @@ type ExtProcClient =
 
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
-    let registry = FilterRegistry::with_builtins();
+    let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

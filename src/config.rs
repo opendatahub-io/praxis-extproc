@@ -118,6 +118,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
     Ok(Arc::new(pipeline))
 }
@@ -214,10 +215,29 @@ filter_chains:
         )
         .unwrap();
 
-        let registry = FilterRegistry::with_builtins();
+        let registry = praxis_ai_filters::build_ai_registry();
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 2, "pipeline should have two filters");
+    }
+
+    #[test]
+    fn build_pipeline_with_ai_filter() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+        header: X-AI-Model
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert_eq!(pipeline.len(), 1, "pipeline should have one AI filter");
     }
 
     #[test]
@@ -232,7 +252,7 @@ filter_chains:
         )
         .unwrap();
 
-        let registry = FilterRegistry::with_builtins();
+        let registry = praxis_ai_filters::build_ai_registry();
         let result = build_pipeline(&cfg, &registry);
 
         assert!(result.is_err(), "unknown filter should fail");
@@ -276,7 +296,7 @@ filter_chains:
         )
         .unwrap();
 
-        let registry = FilterRegistry::with_builtins();
+        let registry = praxis_ai_filters::build_ai_registry();
         let err = build_pipeline(&cfg, &registry)
             .err()
             .expect("duplicate chain names should fail");

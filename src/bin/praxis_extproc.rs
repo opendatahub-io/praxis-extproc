@@ -15,7 +15,6 @@ use praxis_extproc::{
     server::PraxisExtProc,
     tls,
 };
-use praxis_filter::FilterRegistry;
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -72,7 +71,7 @@ async fn main() {
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&cli.config)?;
-    let registry = FilterRegistry::with_builtins();
+    let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry)?;
 
     if cli.validate {
@@ -92,7 +91,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start gRPC, health, and metrics servers concurrently.
-#[expect(clippy::large_stack_frames, reason = "async state machine for server startup")]
+#[expect(
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity,
+    reason = "async state machine for server startup"
+)]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
@@ -150,6 +153,10 @@ async fn serve_grpc(
 // -----------------------------------------------------------------------------
 
 /// Wait for SIGTERM or SIGINT for graceful shutdown.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "platform-specific signal select is intentionally inline"
+)]
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 

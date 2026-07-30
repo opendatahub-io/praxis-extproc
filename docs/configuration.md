@@ -68,7 +68,8 @@ Filters within each chain execute in order.
 ### Available Filters
 
 All built-in Praxis HTTP filters are available in
-ExtProc mode. Commonly used filters:
+ExtProc mode, plus in-tree [Praxis AI] filters from
+`praxis-ai-filters`. Commonly used filters:
 
 | Filter | Description |
 | --- | --- |
@@ -84,11 +85,19 @@ ExtProc mode. Commonly used filters:
 | `json_body_field` | Extract JSON body field to header |
 | `path_rewrite` | Rewrite request path |
 | `url_rewrite` | Regex path + query rewriting |
+| `model_to_header` | Promote JSON `model` field to a request header |
+| `prompt_enrich` | Prepend/append chat messages |
+| `token_count` | Count tokens for a provider |
+| `ai_guardrails` | AI content guardrails |
+| `openai_*` / `anthropic_*` | Provider API format, validate, and stream filters |
 
-See the [Praxis filter documentation] for the full
-list and configuration options.
+See the [Praxis filter documentation] for core filters
+and the [Praxis AI filter documentation] for AI filter
+names and configuration options.
 
+[Praxis AI]: https://github.com/praxis-proxy/ai
 [Praxis filter documentation]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md
+[Praxis AI filter documentation]: https://github.com/praxis-proxy/ai/blob/main/docs/filters/README.md
 
 ### Branch Chains
 
@@ -244,10 +253,12 @@ Working examples in the `examples/` directory:
 | File | Description |
 | --- | --- |
 | [praxis-extproc.yaml] | Common filters: request ID, access log, guardrails, headers |
+| [ai-model-to-header.yaml] | AI `model_to_header` with request ID and headers |
 | [envoy.yaml] | Envoy config wiring up the ExtProc filter |
 | [branch-chains.yaml] | Conditional branching on filter results |
 
 [praxis-extproc.yaml]: ../examples/praxis-extproc.yaml
+[ai-model-to-header.yaml]: ../examples/ai-model-to-header.yaml
 [envoy.yaml]: ../examples/envoy.yaml
 [branch-chains.yaml]: ../examples/branch-chains.yaml
 

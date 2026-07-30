@@ -75,6 +75,10 @@ pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
 ///
 /// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
 /// [`Request`]: praxis_filter::Request
+#[expect(
+    clippy::too_many_lines,
+    reason = "HttpFilterContext field init mirrors the struct; splitting obscures defaults"
+)]
 pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Request) -> HttpFilterContext<'a> {
     let client_addr = extract_client_addr(request);
 
@@ -100,7 +104,7 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         health_registry: pipeline.health_registry(),
         id_generator: pipeline.id_generator(),
         kv_stores: pipeline.kv_stores(),
-        subrequest_connector: pipeline.subrequest_connector(),
+        subrequest_client: pipeline.subrequest_client(),
         request,
         request_body_bytes: 0,
         request_body_mode: BodyMode::Stream,
@@ -147,9 +151,11 @@ pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<H
         .map(|(name, value)| header_value_option(name, value))
         .collect();
 
-    set_headers.extend(ctx.request_headers_to_set.iter().map(|(name, value)| {
-        header_value_option(name.as_str(), value.to_str().unwrap_or_default())
-    }));
+    set_headers.extend(
+        ctx.request_headers_to_set
+            .iter()
+            .map(|(name, value)| header_value_option(name.as_str(), value.to_str().unwrap_or_default())),
+    );
 
     if let Some(path) = &ctx.rewritten_path {
         set_headers.push(header_value_option(":path", path));
@@ -343,9 +349,8 @@ mod tests {
 
     use super::*;
 
-    static TEST_PIPELINE: LazyLock<FilterPipeline> = LazyLock::new(|| {
-        FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline")
-    });
+    static TEST_PIPELINE: LazyLock<FilterPipeline> =
+        LazyLock::new(|| FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline"));
 
     fn test_pipeline() -> &'static FilterPipeline {
         &TEST_PIPELINE

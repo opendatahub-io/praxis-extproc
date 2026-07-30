@@ -119,6 +119,10 @@ async fn handle_stream(
 }
 
 /// Receive and process all messages on the stream.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "stream loop is intentionally flat; splitting obscures channel lifecycle"
+)]
 async fn process_messages(
     pipeline: &FilterPipeline,
     inbound: &mut Streaming<ProcessingRequest>,
@@ -151,6 +155,10 @@ async fn process_messages(
 }
 
 /// Dispatch a single ExtProc request variant to the appropriate handler.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async match over ProcessingRequest variants exceeds stack threshold"
+)]
 async fn dispatch_request(
     pipeline: &FilterPipeline,
     req: processing_request::Request,
