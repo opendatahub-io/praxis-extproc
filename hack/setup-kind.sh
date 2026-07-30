@@ -149,15 +149,33 @@ EOF
 # ---------------------------------------------------------------------------
 
 build_and_load_image() {
-    echo "==> Building release binary..."
-    cargo build --release --bin praxis-extproc --manifest-path "${ROOT_DIR}/Cargo.toml"
-    mkdir -p "${ROOT_DIR}/.container"
-    cp "${ROOT_DIR}/target/release/praxis-extproc" \
-        "${ROOT_DIR}/.container/praxis-extproc"
-    strip "${ROOT_DIR}/.container/praxis-extproc"
+    local engine
+    engine="$(command -v docker 2>/dev/null || command -v podman 2>/dev/null || true)"
+    if [[ -z "${engine}" ]]; then
+        echo "error: docker or podman required to build the image" >&2
+        exit 1
+    fi
 
-    echo "==> Building container image..."
-    docker build -t "${EXTPROC_IMAGE}" -f "${ROOT_DIR}/Containerfile" "${ROOT_DIR}"
+    local platform
+    platform="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+
+    echo "==> Building container image (${platform})..."
+    if [[ "$(basename "${engine}")" == "docker" ]]; then
+        docker buildx build \
+            --platform "${platform}" \
+            --build-arg CARGO_PROFILE=release \
+            -t "${EXTPROC_IMAGE}" \
+            -f "${ROOT_DIR}/Containerfile" \
+            --load \
+            "${ROOT_DIR}"
+    else
+        "${engine}" build \
+            --platform "${platform}" \
+            --build-arg CARGO_PROFILE=release \
+            -t "${EXTPROC_IMAGE}" \
+            -f "${ROOT_DIR}/Containerfile" \
+            "${ROOT_DIR}"
+    fi
 
     echo "==> Loading image into KIND..."
     kind load docker-image "${EXTPROC_IMAGE}" --name "${CLUSTER_NAME}"

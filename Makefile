@@ -17,9 +17,18 @@ KIND_CLUSTER_NAME ?= praxis-extproc
 EXTPROC_IMAGE     ?= praxis-extproc:dev
 KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
 
+# Host OCI platform (linux/amd64 or linux/arm64). Override with PLATFORMS for
+# multi-arch (e.g. PLATFORMS=linux/amd64,linux/arm64).
+PLATFORM  ?= linux/$(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+PLATFORMS ?= $(PLATFORM)
+
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
+
+# True when PLATFORMS lists more than one platform.
+comma := ,
+_MULTI_PLATFORM := $(findstring $(comma),$(PLATFORMS))
 
 # ---------------------------------------------------------------------------
 # All
@@ -42,7 +51,6 @@ check:
 
 clean:
 	cargo clean
-	rm -rf .container
 
 # ---------------------------------------------------------------------------
 # Test
@@ -84,16 +92,42 @@ ifndef CONTAINER_ENGINE
 	$(error No container engine found. Install podman or docker)
 endif
 
-container: build | require-container-engine
-	mkdir -p .container
-	cp target/debug/praxis-extproc .container/praxis-extproc
-	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
+# Build the image for PLATFORMS. Docker multi-platform uses buildx (no --load).
+# Single-platform docker uses buildx --load; podman uses build --platform.
+define build-image
+	@engine_base=$$(basename "$(CONTAINER_ENGINE)"); \
+	if [ "$$engine_base" = "docker" ]; then \
+	  if [ -n "$(_MULTI_PLATFORM)" ]; then \
+	    docker buildx build \
+	      --platform $(PLATFORMS) \
+	      --build-arg CARGO_PROFILE=$(1) \
+	      -t $(EXTPROC_IMAGE) \
+	      -f Containerfile \
+	      .; \
+	  else \
+	    docker buildx build \
+	      --platform $(PLATFORMS) \
+	      --build-arg CARGO_PROFILE=$(1) \
+	      -t $(EXTPROC_IMAGE) \
+	      -f Containerfile \
+	      --load \
+	      .; \
+	  fi; \
+	else \
+	  $(CONTAINER_ENGINE) build \
+	    --platform $(PLATFORMS) \
+	    --build-arg CARGO_PROFILE=$(1) \
+	    -t $(EXTPROC_IMAGE) \
+	    -f Containerfile \
+	    .; \
+	fi
+endef
 
-container-release: release | require-container-engine
-	mkdir -p .container
-	cp target/release/praxis-extproc .container/praxis-extproc
-	strip .container/praxis-extproc
-	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
+container: | require-container-engine
+	$(call build-image,debug)
+
+container-release: | require-container-engine
+	$(call build-image,release)
 
 images: container-release
 
@@ -151,6 +185,9 @@ help:
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
 	@echo "  EXTPROC_IMAGE      container image tag (default: praxis-extproc:dev)"
+	@echo "  PLATFORM           default single platform (host arch)"
+	@echo "  PLATFORMS          build platforms (default: PLATFORM;"
+	@echo "                     e.g. linux/amd64,linux/arm64)"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + lint + test + audit"
@@ -173,8 +210,8 @@ help:
 	@echo "  coverage-check   fail if line coverage < 80%%"
 	@echo ""
 	@echo "Container:"
-	@echo "  container         build debug container image"
-	@echo "  container-release build release container image"
+	@echo "  container         debug image (in-container cargo)"
+	@echo "  container-release release image (in-container cargo)"
 	@echo "  images            alias for container-release"
 	@echo ""
 	@echo "KIND:"

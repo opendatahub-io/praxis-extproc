@@ -170,15 +170,20 @@ make test-integration V=1
 ## Container Build
 
 ```console
-make container          # debug binary
-make container-release  # release binary (stripped)
+make container          # debug binary (in-container)
+make container-release  # release binary (in-container, stripped)
 ```
 
-`make container` packs a debug host build; `make
-container-release` (and `make images`) packs a
-stripped release build. Both stage the binary under
-`.container/` into `ubi10/ubi-minimal`. The runtime
-image runs as a non-root user.
+Multi-stage image: Debian Bookworm builder (rustup,
+cross-compile for `linux/amd64` / `linux/arm64`) and
+`ubi10/ubi-minimal` runtime. Default platform is the
+host arch. Multi-arch example:
+
+```console
+make container-release PLATFORMS=linux/amd64,linux/arm64
+```
+
+The runtime image runs as a non-root user.
 
 ## CI
 
