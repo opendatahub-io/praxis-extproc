@@ -144,7 +144,7 @@ The response should include the `X-Processed-By` and
 Build the container image:
 
 ```console
-make container
+make container-release
 ```
 
 Run directly:

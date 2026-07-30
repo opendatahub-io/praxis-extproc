@@ -149,6 +149,13 @@ EOF
 # ---------------------------------------------------------------------------
 
 build_and_load_image() {
+    echo "==> Building release binary..."
+    cargo build --release --bin praxis-extproc --manifest-path "${ROOT_DIR}/Cargo.toml"
+    mkdir -p "${ROOT_DIR}/.container"
+    cp "${ROOT_DIR}/target/release/praxis-extproc" \
+        "${ROOT_DIR}/.container/praxis-extproc"
+    strip "${ROOT_DIR}/.container/praxis-extproc"
+
     echo "==> Building container image..."
     docker build -t "${EXTPROC_IMAGE}" -f "${ROOT_DIR}/Containerfile" "${ROOT_DIR}"
 

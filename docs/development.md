@@ -23,7 +23,8 @@ make lint        # clippy + nightly fmt check
 make fmt         # cargo +nightly fmt
 make doc         # rustdoc with -D warnings
 make audit       # cargo audit + cargo deny check
-make container   # build container image
+make container          # debug container image
+make container-release  # release container image
 ```
 
 Run a single test:
@@ -169,13 +170,15 @@ make test-integration V=1
 ## Container Build
 
 ```console
-make container
+make container          # debug binary
+make container-release  # release binary (stripped)
 ```
 
-Multi-stage build using `rust:1.94-alpine` for
-compilation and `alpine:3.22` for the runtime image.
-The binary is statically linked against musl and
-stripped. The runtime image runs as a non-root user.
+`make container` packs a debug host build; `make
+container-release` (and `make images`) packs a
+stripped release build. Both stage the binary under
+`.container/` into `ubi10/ubi-minimal`. The runtime
+image runs as a non-root user.
 
 ## CI
 

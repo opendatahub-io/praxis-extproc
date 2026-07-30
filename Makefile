@@ -2,7 +2,7 @@
 	test test-integration lint fmt doc audit \
 	coverage-check \
 	require-container-engine \
-	container images kind-up kind-down smoke-test \
+	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
 	setup-hooks \
 	help
@@ -42,6 +42,7 @@ check:
 
 clean:
 	cargo clean
+	rm -rf .container
 
 # ---------------------------------------------------------------------------
 # Test
@@ -83,11 +84,18 @@ ifndef CONTAINER_ENGINE
 	$(error No container engine found. Install podman or docker)
 endif
 
-container: | require-container-engine
+container: build | require-container-engine
+	mkdir -p .container
+	cp target/debug/praxis-extproc .container/praxis-extproc
 	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
 
-images: | require-container-engine
+container-release: release | require-container-engine
+	mkdir -p .container
+	cp target/release/praxis-extproc .container/praxis-extproc
+	strip .container/praxis-extproc
 	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
+
+images: container-release
 
 # ---------------------------------------------------------------------------
 # KIND
@@ -115,8 +123,7 @@ dev-env: images
 	EXTPROC_IMAGE=$(EXTPROC_IMAGE) \
 	bash hack/setup-kind.sh
 
-dev-push: | require-container-engine
-	$(CONTAINER_ENGINE) build -t $(EXTPROC_IMAGE) -f Containerfile .
+dev-push: container-release
 	kind load docker-image $(EXTPROC_IMAGE) --name $(KIND_CLUSTER_NAME)
 	$(KUBECTL) -n praxis-extproc rollout restart deployment/praxis-extproc
 	$(KUBECTL) -n praxis-extproc rollout status deployment/praxis-extproc --timeout=120s
@@ -166,8 +173,9 @@ help:
 	@echo "  coverage-check   fail if line coverage < 80%%"
 	@echo ""
 	@echo "Container:"
-	@echo "  container        build container image"
-	@echo "  images           build container image"
+	@echo "  container         build debug container image"
+	@echo "  container-release build release container image"
+	@echo "  images            alias for container-release"
 	@echo ""
 	@echo "KIND:"
 	@echo "  kind-up          create cluster + deploy"
