@@ -156,26 +156,12 @@ build_and_load_image() {
         exit 1
     fi
 
-    local platform
-    platform="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-
-    echo "==> Building container image (${platform})..."
-    if [[ "$(basename "${engine}")" == "docker" ]]; then
-        docker buildx build \
-            --platform "${platform}" \
-            --build-arg CARGO_PROFILE=release \
-            -t "${EXTPROC_IMAGE}" \
-            -f "${ROOT_DIR}/Containerfile" \
-            --load \
-            "${ROOT_DIR}"
-    else
-        "${engine}" build \
-            --platform "${platform}" \
-            --build-arg CARGO_PROFILE=release \
-            -t "${EXTPROC_IMAGE}" \
-            -f "${ROOT_DIR}/Containerfile" \
-            "${ROOT_DIR}"
-    fi
+    echo "==> Building container image..."
+    "${engine}" build \
+        --build-arg CARGO_PROFILE=release \
+        -t "${EXTPROC_IMAGE}" \
+        -f "${ROOT_DIR}/Containerfile" \
+        "${ROOT_DIR}"
 
     echo "==> Loading image into KIND..."
     kind load docker-image "${EXTPROC_IMAGE}" --name "${CLUSTER_NAME}"

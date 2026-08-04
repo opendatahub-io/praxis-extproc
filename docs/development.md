@@ -174,16 +174,11 @@ make container          # debug binary (in-container)
 make container-release  # release binary (in-container, stripped)
 ```
 
-Multi-stage image: Debian Bookworm builder (rustup,
-cross-compile for `linux/amd64` / `linux/arm64`) and
-`ubi10/ubi-minimal` runtime. Default platform is the
-host arch. Multi-arch example:
-
-```console
-make container-release PLATFORMS=linux/amd64,linux/arm64
-```
-
-The runtime image runs as a non-root user.
+Multi-stage image: `ubi10/ubi` builder (rustup, native
+`cargo` on the host platform) and `ubi10/ubi-minimal`
+runtime. Builds for the host architecture. The runtime
+image runs as UID 1001 (OpenShift-friendly numeric
+non-root user).
 
 ## CI
 
