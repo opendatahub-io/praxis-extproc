@@ -16,7 +16,8 @@ use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Re
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
-        ProcessingRequest, ProcessingResponse, external_processor_server::ExternalProcessor, processing_request,
+        ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
+        processing_request,
     },
 };
 use tokio::sync::mpsc;
@@ -35,6 +36,78 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
+
+// -----------------------------------------------------------------------------
+// Body Processing Modes
+// -----------------------------------------------------------------------------
+
+/// Body processing mode from Envoy's `BodySendMode` enum.
+///
+/// See: `envoy/service/ext_proc/v3/external_processor.proto`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BodyMode {
+    /// No body sent.
+    None = 0,
+    /// Body sent in streaming mode (incremental processing).
+    Streamed = 1,
+    /// Body buffered until complete, then sent as single chunk.
+    #[default]
+    Buffered = 2,
+    /// Body sent in buffered partial mode.
+    BufferedPartial = 3,
+    /// Body sent in full-duplex streaming mode with chunked responses.
+    FullDuplexStreamed = 4,
+}
+
+
+impl From<i32> for BodyMode {
+    /// Parse from Envoy's `protocol_config` field.
+    ///
+    /// Unknown values default to [`BodyMode::Buffered`] for safety.
+    fn from(value: i32) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::Streamed,
+            2 => Self::Buffered,
+            3 => Self::BufferedPartial,
+            4 => Self::FullDuplexStreamed,
+            _ => {
+                warn!(value, "unknown body mode from Envoy, defaulting to BUFFERED");
+                Self::Buffered
+            },
+        }
+    }
+}
+
+/// Parsed protocol configuration from Envoy.
+///
+/// Extracted from the first `ProcessingRequest` message's `protocol_config` field.
+#[derive(Debug, Clone, Default)]
+struct ProtocolConfig {
+    /// Request body processing mode.
+    request_body_mode: BodyMode,
+    /// Response body processing mode.
+    response_body_mode: BodyMode,
+    /// Whether body is sent immediately without waiting for header response.
+    ///
+    /// When `true`, Envoy sends body chunks immediately after headers without
+    /// waiting for the header response. When `false`, Envoy buffers body data
+    /// until the header response is received.
+    ///
+    /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
+    #[expect(dead_code, reason = "captured for future Header deferral implementation")]
+    send_body_without_waiting: bool,
+}
+
+impl From<ProtocolConfiguration> for ProtocolConfig {
+    fn from(proto_cfg: ProtocolConfiguration) -> Self {
+        Self {
+            request_body_mode: BodyMode::from(proto_cfg.request_body_mode),
+            response_body_mode: BodyMode::from(proto_cfg.response_body_mode),
+            send_body_without_waiting: proto_cfg.send_body_without_waiting_for_header_response,
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Types
@@ -642,12 +715,18 @@ struct StreamState {
 
     /// End-of-stream tracking for protocol safety.
     eos_tracker: EosTracker,
+
+    /// Protocol configuration parsed from Envoy's first message.
+    protocol_config: ProtocolConfig,
 }
 
 impl StreamState {
-    /// Create a new empty stream state.
+    /// Create a new empty stream state with default protocol configuration.
     fn new() -> Self {
-        Self::default()
+        Self {
+            protocol_config: ProtocolConfig::default(),
+            ..Default::default()
+        }
     }
 
     /// Restore filter execution state into a response context.
