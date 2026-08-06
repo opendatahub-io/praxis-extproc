@@ -95,7 +95,6 @@ struct ProtocolConfig {
     /// until the header response is received.
     ///
     /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
-    #[expect(dead_code, reason = "captured for future Header deferral implementation")]
     send_body_without_waiting: bool,
 }
 
@@ -416,7 +415,13 @@ async fn handle_response_headers(
     }
 
     let mutation = run_response_header_filters(pipeline, state).await?;
-    Ok(vec![response::response_headers(mutation)])
+
+    if state.protocol_config.send_body_without_waiting {
+        Ok(vec![response::response_headers(mutation)])
+    } else {
+        state.deferred_response_header_mutation = mutation;
+        Ok(vec![response::response_headers(None)])
+    }
 }
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
@@ -512,6 +517,21 @@ async fn run_response_pipeline(
     Ok(responses)
 }
 
+/// Build response with merged mutations and appropriate wire format.
+fn build_response_with_mutations(
+    state: &mut StreamState,
+    body_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+) -> Vec<ProcessingResponse> {
+    let merged = merge_mutations(state.deferred_response_header_mutation.take(), body_mutation);
+    let body_data = body_data_if_present(&state.response_body);
+
+    if body_data.is_some() {
+        response::response_body(body_data, merged, state.protocol_config.response_body_mode)
+    } else {
+        vec![response::response_headers(merged)]
+    }
+}
+
 /// Execute response-phase filters and body filters, then collect mutations.
 ///
 /// Skips response filter re-execution when headers were already
@@ -543,17 +563,29 @@ async fn run_response_filters(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
-    let body_data = body_data_if_present(&state.response_body);
-
-    if body_data.is_some() {
-        Ok(response::response_body(
-            body_data,
-            mutation,
-            state.protocol_config.response_body_mode,
-        ))
+    // Only collect new mutations if response filters didn't already run at header time
+    let body_mutation = if state.response_filters_executed {
+        None // Filters already ran at header time; no new mutations to collect
     } else {
-        Ok(vec![response::response_headers(mutation)])
+        adapter::collect_response_header_mutations_diff(&ctx, &original_headers)
+    };
+
+    Ok(build_response_with_mutations(state, body_mutation))
+}
+
+/// Merge deferred header mutations with new mutations from body filters.
+fn merge_mutations(
+    deferred: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    current: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+    match (deferred, current) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut d), Some(c)) => {
+            d.set_headers.extend(c.set_headers);
+            d.remove_headers.extend(c.remove_headers);
+            Some(d)
+        },
     }
 }
 
@@ -716,6 +748,9 @@ struct StreamState {
 
     /// Protocol configuration parsed from Envoy's first message.
     protocol_config: ProtocolConfig,
+
+    /// Response header mutations deferred until body phase.
+    deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 }
 
 impl StreamState {

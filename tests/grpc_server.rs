@@ -757,6 +757,80 @@ async fn duplicate_eos_in_response_body_rejected() {
     );
 }
 
+#[tokio::test]
+async fn response_headers_deferred_by_default() {
+    // Default behavior (send_body_without_waiting=false) defers response header mutations
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // Send request
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_resp = response_stream.message().await.unwrap().unwrap();
+
+    // Send response headers with body expected
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![make_header(":status", "200")],
+            }),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp_headers = response_stream.message().await.unwrap().unwrap();
+
+    // Verify X-Resp NOT in headers response (deferred)
+    let has_x_resp_in_headers = match &resp_headers.response {
+        Some(RespVariant::ResponseHeaders(rh)) => rh
+            .response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .is_some_and(|m| {
+                m.set_headers
+                    .iter()
+                    .any(|hvo| hvo.header.as_ref().is_some_and(|h| h.key == "x-resp"))
+            }),
+        _ => false,
+    };
+    assert!(!has_x_resp_in_headers, "X-Resp should be deferred");
+
+    // Send response body
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"body".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp_body = response_stream.message().await.unwrap().unwrap();
+
+    // Verify X-Resp IS in body response
+    let has_x_resp_in_body = match &resp_body.response {
+        Some(RespVariant::ResponseBody(rb)) => rb
+            .response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .is_some_and(|m| {
+                m.set_headers.iter().any(|hvo| {
+                    hvo.header
+                        .as_ref()
+                        .is_some_and(|h| h.key == "x-resp" && h.value == "true")
+                })
+            }),
+        _ => false,
+    };
+    assert!(has_x_resp_in_body, "deferred X-Resp should appear in body response");
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
