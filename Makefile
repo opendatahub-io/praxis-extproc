@@ -4,6 +4,7 @@
 	require-container-engine \
 	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
+	e2e-setup e2e-teardown e2e-test \
 	setup-hooks \
 	help
 
@@ -117,6 +118,24 @@ smoke-test:
 	bash hack/smoke-test.sh
 
 # ---------------------------------------------------------------------------
+# E2E (Forge)
+# ---------------------------------------------------------------------------
+
+FORGE := praxis-forge --config hack/forge.yaml
+
+e2e-setup: images
+	$(FORGE) cluster create e2e
+	$(FORGE) cluster load-image e2e $(EXTPROC_IMAGE)
+	$(FORGE) stack apply e2e
+
+e2e-teardown:
+	$(FORGE) cluster delete e2e
+
+e2e-test:
+	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
+	cargo test --features k8s-e2e $(if $(V),-- --nocapture,)
+
+# ---------------------------------------------------------------------------
 # Iterative Development
 # ---------------------------------------------------------------------------
 
@@ -183,6 +202,11 @@ help:
 	@echo "  kind-up          create cluster + deploy"
 	@echo "  kind-down        delete cluster"
 	@echo "  smoke-test       run smoke tests against cluster"
+	@echo ""
+	@echo "E2E (Forge):"
+	@echo "  e2e-setup        create Kind cluster + install all stacks"
+	@echo "  e2e-teardown     delete Kind e2e cluster"
+	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"

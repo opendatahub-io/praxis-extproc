@@ -1,0 +1,94 @@
+name: K8s E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  ISTIO_VERSION: "1.29.2"
+  PRAXIS_IMAGE: praxis-extproc:e2e
+
+jobs:
+  simulator-check:
+    name: Check simulator connectivity
+    runs-on: ubuntu-24.04
+    outputs:
+      reachable: ${{ steps.check.outputs.reachable }}
+    steps:
+      - name: Check llm-katan reachability
+        id: check
+        run: |
+          if nc -z -w 5 3.147.232.199 443; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+            echo "llm-katan is reachable"
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "llm-katan is NOT reachable — skipping e2e tests"
+          fi
+
+  k8s-e2e:
+    name: K8s E2E
+    needs: simulator-check
+    if: needs.simulator-check.outputs.reachable == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.29.0
+
+      - name: Install istioctl
+        run: |
+          curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=${{ env.ISTIO_VERSION }} sh -
+          echo "$PWD/istio-${{ env.ISTIO_VERSION }}/bin" >> "$GITHUB_PATH"
+
+      - name: Build Praxis image
+        run: docker build -t ${{ env.PRAXIS_IMAGE }} .
+
+      # TODO: Once harness TODOs are filled in, replace the manual
+      # steps below with a single Rust setup binary/test that calls
+      # k8s_harness::setup_cluster() + install_components().
+      #
+      # For now, manual steps (these mirror what the harness will do):
+      - name: Create Kind cluster
+        run: kind create cluster --name praxis-e2e --wait 120s
+
+      - name: Install Gateway API CRDs
+        run: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+
+      - name: Install Istio
+        run: |
+          istioctl install --set profile=minimal \
+            --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true \
+            -y
+          kubectl rollout status deployment/istiod -n istio-system --timeout=120s
+
+      - name: Load Praxis image into Kind
+        run: kind load docker-image ${{ env.PRAXIS_IMAGE }} --name praxis-e2e
+
+      # TODO: Replace kubectl steps below with the harness once
+      # deploy.rs TODOs are implemented. The harness uses kube-rs
+      # to create these resources programmatically.
+      - name: Setup K8s resources via harness
+        run: |
+          echo "TODO: cargo test --features k8s-e2e -- setup --ignored --nocapture"
+          echo "For now, the harness TODOs need to be filled in first."
+
+      - name: Port-forward Gateway
+        run: |
+          # Istio names the gateway service <gateway-name>-istio
+          kubectl port-forward svc/e2e-gateway-istio -n default 28080:80 &
+          sleep 3
+
+      - name: Run K8s e2e tests
+        run: cargo test --features k8s-e2e -- --ignored --nocapture
+
+      - name: Teardown
+        if: always()
+        run: kind delete cluster --name praxis-e2e
