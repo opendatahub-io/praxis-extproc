@@ -231,7 +231,7 @@ impl EosTracker {
     ///
     /// # Errors
     ///
-    /// Returns [`Status::invalid_argument`] if duplicate EOS is detected.
+    /// Returns [`Status::invalid_argument`] if any message is received after EOS.
     fn check_and_mark(&mut self, phase: ProtocolPhase, received_eos: bool) -> Result<(), Status> {
         let marker = match phase {
             ProtocolPhase::RequestHeaders => &mut self.request_headers,
@@ -240,9 +240,9 @@ impl EosTracker {
             ProtocolPhase::ResponseBody => &mut self.response_body,
         };
 
-        if received_eos && marker.is_received() {
+        if marker.is_received() {
             return Err(Status::invalid_argument(format!(
-                "duplicate end_of_stream in {phase:?} phase"
+                "received {phase:?} message after end_of_stream was already marked"
             )));
         }
         if received_eos {
@@ -719,13 +719,13 @@ mod tests {
         // Mark first EOS
         assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
 
-        // Duplicate should fail
+        // Any subsequent message should fail
         let result = tracker.check_and_mark(ProtocolPhase::RequestHeaders, true);
-        assert!(result.is_err(), "duplicate EOS should fail");
+        assert!(result.is_err(), "message after EOS should fail");
 
         if let Err(err) = result {
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains("duplicate end_of_stream"));
+            assert!(err.message().contains("after end_of_stream"));
             assert!(err.message().contains("RequestHeaders"));
         }
     }
@@ -734,7 +734,7 @@ mod tests {
     fn eos_tracker_duplicate_eos_in_each_phase_fails() {
         let mut tracker = EosTracker::default();
 
-        // Test duplicate detection in each phase independently
+        // Test message-after-EOS detection in each phase independently
         let phases = [
             ProtocolPhase::RequestHeaders,
             ProtocolPhase::RequestBody,
@@ -746,13 +746,13 @@ mod tests {
             // First EOS succeeds
             assert!(tracker.check_and_mark(phase, true).is_ok());
 
-            // Duplicate fails
+            // Any subsequent message fails
             let result = tracker.check_and_mark(phase, true);
-            assert!(result.is_err(), "duplicate EOS should fail for {phase:?}");
+            assert!(result.is_err(), "message after EOS should fail for {phase:?}");
 
             if let Err(err) = result {
                 assert_eq!(err.code(), tonic::Code::InvalidArgument);
-                assert!(err.message().contains("duplicate end_of_stream"));
+                assert!(err.message().contains("after end_of_stream"));
             }
         }
     }
@@ -803,13 +803,20 @@ mod tests {
         assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
         assert!(tracker.request_body.is_received());
 
-        // Subsequent false should still be ok (but marker stays Received)
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, false).is_ok());
-        assert!(tracker.request_body.is_received());
+        // Subsequent message (even with false) should fail
+        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, false);
+        assert!(
+            result.is_err(),
+            "message after EOS should fail even with end_of_stream=false"
+        );
 
-        // Subsequent true should fail
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // Subsequent true should also fail
         let result = tracker.check_and_mark(ProtocolPhase::RequestBody, true);
-        assert!(result.is_err(), "duplicate EOS should fail");
+        assert!(result.is_err(), "message after EOS should fail");
 
         if let Err(err) = result {
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -832,7 +839,7 @@ mod tests {
             assert!(tracker.check_and_mark(phase, true).is_ok(), "first EOS should succeed");
 
             let result = tracker.check_and_mark(phase, true);
-            assert!(result.is_err(), "duplicate EOS should fail");
+            assert!(result.is_err(), "message after EOS should fail");
 
             if let Err(err) = result {
                 assert!(
@@ -843,6 +850,30 @@ mod tests {
                     err.message()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn eos_tracker_rejects_message_after_eos_regardless_of_flag() {
+        let mut tracker = EosTracker::default();
+
+        // Mark EOS
+        assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
+
+        // Subsequent message with end_of_stream=false should also fail
+        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, false);
+        assert!(
+            result.is_err(),
+            "message with end_of_stream=false after EOS should fail"
+        );
+
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains("after end_of_stream"),
+                "error should indicate message after EOS, got: {}",
+                err.message()
+            );
         }
     }
 }

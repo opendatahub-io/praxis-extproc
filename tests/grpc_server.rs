@@ -570,8 +570,8 @@ async fn duplicate_eos_in_request_headers_rejected() {
     let err = response_stream.message().await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("duplicate end_of_stream"),
-        "error should mention duplicate EOS: {}",
+        err.message().contains("after end_of_stream"),
+        "error should mention message after EOS: {}",
         err.message()
     );
     assert!(
@@ -621,8 +621,8 @@ async fn duplicate_eos_in_request_body_rejected() {
     let err = response_stream.message().await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("duplicate end_of_stream"),
-        "error should mention duplicate EOS: {}",
+        err.message().contains("after end_of_stream"),
+        "error should mention message after EOS: {}",
         err.message()
     );
     assert!(
@@ -677,8 +677,8 @@ async fn duplicate_eos_in_response_headers_rejected() {
     let err = response_stream.message().await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("duplicate end_of_stream"),
-        "error should mention duplicate EOS: {}",
+        err.message().contains("after end_of_stream"),
+        "error should mention message after EOS: {}",
         err.message()
     );
     assert!(
@@ -746,8 +746,8 @@ async fn duplicate_eos_in_response_body_rejected() {
     let err = response_stream.message().await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("duplicate end_of_stream"),
-        "error should mention duplicate EOS: {}",
+        err.message().contains("after end_of_stream"),
+        "error should mention message after EOS: {}",
         err.message()
     );
     assert!(
@@ -755,6 +755,103 @@ async fn duplicate_eos_in_response_body_rejected() {
         "error should mention phase: {}",
         err.message()
     );
+}
+
+#[tokio::test]
+async fn repro_ap_post_eos_body() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("POST", "/", false)).await.unwrap();
+    assert!(
+        response_stream.message().await.unwrap().is_some(),
+        "headers phase should get a response"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"chunk1".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(
+        response_stream.message().await.unwrap().is_some(),
+        "first body EOS should run the pipeline and respond"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"AFTER_EOS_INJECTED".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+
+    match outcome {
+        Ok(Err(err)) => {
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "ap-post-eos-body: expected InvalidArgument, got {}: {}",
+                err.code(),
+                err.message()
+            );
+        },
+        Ok(Ok(msg)) => panic!(
+            "ap-post-eos-body: expected InvalidArgument after post-EOS body(end_of_stream=false); got success message: {msg:?}"
+        ),
+        Err(_) => panic!(
+            "ap-post-eos-body: timed out waiting for rejection; server accepted body(end_of_stream=false) after EOS and sent no error (bytes still appended to request_body)"
+        ),
+    }
+}
+
+
+#[tokio::test]
+async fn repro_ap_post_eos_headers() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/first", true)).await.unwrap();
+    assert!(
+        response_stream.message().await.unwrap().is_some(),
+        "first headers+EOS should run the pipeline and respond"
+    );
+
+    tx.send(make_request_headers("POST", "/injected-after-eos", false))
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+
+    match outcome {
+        Ok(Err(err)) => {
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "ap-post-eos-headers: expected InvalidArgument, got {}: {}",
+                err.code(),
+                err.message()
+            );
+        },
+        Ok(Ok(msg)) => panic!(
+            "ap-post-eos-headers: expected InvalidArgument after post-EOS headers(end_of_stream=false); got success message instead (state.request was overwritten). response={msg:?}"
+        ),
+        Err(_) => panic!("ap-post-eos-headers: timed out waiting for stream result"),
+    }
 }
 
 // -----------------------------------------------------------------------------
