@@ -567,7 +567,10 @@ async fn duplicate_eos_in_request_headers_rejected() {
 
     tx.send(make_request_headers("GET", "/", true)).await.unwrap();
 
-    let err = response_stream.message().await.unwrap_err();
+    let err = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message())
+        .await
+        .expect("timed out waiting for duplicate EOS rejection")
+        .expect_err("duplicate EOS was accepted");
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("after end_of_stream"),
