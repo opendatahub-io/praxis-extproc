@@ -25,7 +25,10 @@ use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
-use crate::{adapter, metrics, response};
+use crate::{
+    adapter, metrics,
+    response::{self, BodyMode},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -36,48 +39,6 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
-
-// -----------------------------------------------------------------------------
-// Body Processing Modes
-// -----------------------------------------------------------------------------
-
-/// Body processing mode from Envoy's `BodySendMode` enum.
-///
-/// See: `envoy/service/ext_proc/v3/external_processor.proto`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum BodyMode {
-    /// No body sent.
-    None = 0,
-    /// Body sent in streaming mode (incremental processing).
-    Streamed = 1,
-    /// Body buffered until complete, then sent as single chunk.
-    #[default]
-    Buffered = 2,
-    /// Body sent in buffered partial mode.
-    BufferedPartial = 3,
-    /// Body sent in full-duplex streaming mode with chunked responses.
-    FullDuplexStreamed = 4,
-}
-
-
-impl From<i32> for BodyMode {
-    /// Parse from Envoy's `protocol_config` field.
-    ///
-    /// Unknown values default to [`BodyMode::Buffered`] for safety.
-    fn from(value: i32) -> Self {
-        match value {
-            0 => Self::None,
-            1 => Self::Streamed,
-            2 => Self::Buffered,
-            3 => Self::BufferedPartial,
-            4 => Self::FullDuplexStreamed,
-            _ => {
-                warn!(value, "unknown body mode from Envoy, defaulting to BUFFERED");
-                Self::Buffered
-            },
-        }
-    }
-}
 
 /// Parsed protocol configuration from Envoy.
 ///
