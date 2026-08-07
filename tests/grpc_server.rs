@@ -854,6 +854,50 @@ async fn repro_ap_post_eos_headers() {
     }
 }
 
+#[tokio::test]
+async fn wrong_wire_mode_unsupported_streamed_rejected() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED — not implemented
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+
+    match outcome {
+        Ok(Err(err)) => {
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "ap-wrong-wire-mode: expected InvalidArgument for STREAMED mode, got {}: {}",
+                err.code(),
+                err.message()
+            );
+            assert!(
+                err.message().contains("STREAMED") || err.message().contains("not yet implemented"),
+                "error message should mention STREAMED or not implemented, got: {}",
+                err.message()
+            );
+        },
+        Ok(Ok(Some(msg))) => {
+            panic!(
+                "ap-wrong-wire-mode REPRODUCED BUG: expected InvalidArgument for unsupported mode, \
+                 got success response: {msg:?}"
+            );
+        },
+        Ok(Ok(None)) => panic!("ap-wrong-wire-mode: stream closed without error"),
+        Err(_) => panic!("ap-wrong-wire-mode: timed out waiting for rejection"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------

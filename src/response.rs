@@ -14,7 +14,6 @@ use praxis_proto::envoy::service::ext_proc::v3::{
     StreamedBodyResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
     processing_response::Response,
 };
-use tracing::warn;
 
 // -----------------------------------------------------------------------------
 // Body Processing Modes
@@ -24,6 +23,10 @@ use tracing::warn;
 ///
 /// See: `envoy/service/ext_proc/v3/external_processor.proto`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[expect(
+    dead_code,
+    reason = "only Buffered and FullDuplexStreamed are implemented; other variants document the protocol and are referenced in TryFrom error messages"
+)]
 pub(crate) enum BodyMode {
     /// No body sent.
     None = 0,
@@ -38,21 +41,25 @@ pub(crate) enum BodyMode {
     FullDuplexStreamed = 4,
 }
 
-impl From<i32> for BodyMode {
+impl TryFrom<i32> for BodyMode {
+    type Error = String;
+
     /// Parse from Envoy's `protocol_config` field.
     ///
-    /// Unknown values default to [`BodyMode::Buffered`] for safety.
-    fn from(value: i32) -> Self {
+    /// Only `BUFFERED` (2) and `FULL_DUPLEX_STREAMED` (4) are supported at this stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns error message for unsupported modes.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 => Self::None,
-            1 => Self::Streamed,
-            2 => Self::Buffered,
-            3 => Self::BufferedPartial,
-            4 => Self::FullDuplexStreamed,
-            _ => {
-                warn!(value, "unknown body mode from Envoy, defaulting to BUFFERED");
-                Self::Buffered
-            },
+            2 => Ok(Self::Buffered),
+            4 => Ok(Self::FullDuplexStreamed),
+            // Other modes documented but not yet implemented
+            0 => Err("BodySendMode::NONE (0) is not supported".to_owned()),
+            1 => Err("BodySendMode::STREAMED (1) is not yet implemented".to_owned()),
+            3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
+            _ => Err(format!("unknown BodySendMode value {value}")),
         }
     }
 }
