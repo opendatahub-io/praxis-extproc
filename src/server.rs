@@ -227,27 +227,52 @@ struct EosTracker {
 }
 
 impl EosTracker {
+    /// Check if a phase has received EOS.
+    fn phase_is_received(&self, phase: ProtocolPhase) -> bool {
+        match phase {
+            ProtocolPhase::RequestHeaders => self.request_headers.is_received(),
+            ProtocolPhase::RequestBody => self.request_body.is_received(),
+            ProtocolPhase::ResponseHeaders => self.response_headers.is_received(),
+            ProtocolPhase::ResponseBody => self.response_body.is_received(),
+        }
+    }
+
     /// Validate and mark end-of-stream for a protocol phase.
     ///
     /// # Errors
     ///
     /// Returns [`Status::invalid_argument`] if any message is received after EOS.
     fn check_and_mark(&mut self, phase: ProtocolPhase, received_eos: bool) -> Result<(), Status> {
-        let marker = match phase {
-            ProtocolPhase::RequestHeaders => &mut self.request_headers,
-            ProtocolPhase::RequestBody => &mut self.request_body,
-            ProtocolPhase::ResponseHeaders => &mut self.response_headers,
-            ProtocolPhase::ResponseBody => &mut self.response_body,
-        };
-
-        if marker.is_received() {
+        // Check if this phase already received EOS
+        if self.phase_is_received(phase) {
             return Err(Status::invalid_argument(format!(
                 "received {phase:?} message after end_of_stream was already marked"
             )));
         }
-        if received_eos {
-            marker.mark_received();
+
+        // For body phases: check if the corresponding headers phase has ended
+        let headers_ended = match phase {
+            ProtocolPhase::RequestBody => self.phase_is_received(ProtocolPhase::RequestHeaders),
+            ProtocolPhase::ResponseBody => self.phase_is_received(ProtocolPhase::ResponseHeaders),
+            ProtocolPhase::RequestHeaders | ProtocolPhase::ResponseHeaders => false,
+        };
+
+        if headers_ended {
+            return Err(Status::invalid_argument(format!(
+                "received {phase:?} message after headers end_of_stream was already marked"
+            )));
         }
+
+        // Mark received if needed
+        if received_eos {
+            match phase {
+                ProtocolPhase::RequestHeaders => self.request_headers.mark_received(),
+                ProtocolPhase::RequestBody => self.request_body.mark_received(),
+                ProtocolPhase::ResponseHeaders => self.response_headers.mark_received(),
+                ProtocolPhase::ResponseBody => self.response_body.mark_received(),
+            }
+        }
+
         Ok(())
     }
 }
@@ -703,12 +728,17 @@ mod tests {
 
     #[test]
     fn eos_tracker_first_eos_succeeds() {
+        // First EOS in each phase should succeed when tested independently
         let mut tracker = EosTracker::default();
-
-        // First EOS in each phase should succeed
         assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+
+        let mut tracker = EosTracker::default();
         assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
+
+        let mut tracker = EosTracker::default();
         assert!(tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok());
+
+        let mut tracker = EosTracker::default();
         assert!(tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok());
     }
 
@@ -732,9 +762,8 @@ mod tests {
 
     #[test]
     fn eos_tracker_duplicate_eos_in_each_phase_fails() {
-        let mut tracker = EosTracker::default();
-
         // Test message-after-EOS detection in each phase independently
+        // Use separate trackers since body phases are blocked after header EOS
         let phases = [
             ProtocolPhase::RequestHeaders,
             ProtocolPhase::RequestBody,
@@ -743,6 +772,8 @@ mod tests {
         ];
 
         for phase in phases {
+            let mut tracker = EosTracker::default();
+
             // First EOS succeeds
             assert!(tracker.check_and_mark(phase, true).is_ok());
 
@@ -771,22 +802,32 @@ mod tests {
     }
 
     #[test]
-    fn eos_tracker_phases_are_independent() {
+    fn eos_tracker_body_blocked_after_headers() {
         let mut tracker = EosTracker::default();
 
-        // Mark EOS in request headers
         assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
 
-        // Other phases should still allow first EOS
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok());
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok());
+        let result = tracker.check_and_mark(ProtocolPhase::RequestBody, true);
+        assert!(
+            result.is_err(),
+            "RequestBody should be blocked after RequestHeaders EOS"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("after headers end_of_stream"));
+        }
 
-        // All should be marked
-        assert!(tracker.request_headers.is_received());
-        assert!(tracker.request_body.is_received());
-        assert!(tracker.response_headers.is_received());
-        assert!(tracker.response_body.is_received());
+        assert!(tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok());
+
+        let result = tracker.check_and_mark(ProtocolPhase::ResponseBody, true);
+        assert!(
+            result.is_err(),
+            "ResponseBody should be blocked after ResponseHeaders EOS"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("after headers end_of_stream"));
+        }
     }
 
     #[test]
@@ -825,9 +866,8 @@ mod tests {
 
     #[test]
     fn eos_tracker_error_message_includes_phase() {
-        let mut tracker = EosTracker::default();
-
         // Mark each phase and verify error message includes phase name
+        // Use separate trackers since body phases are blocked after header EOS
         let test_cases = [
             (ProtocolPhase::RequestHeaders, "RequestHeaders"),
             (ProtocolPhase::RequestBody, "RequestBody"),
@@ -836,6 +876,7 @@ mod tests {
         ];
 
         for (phase, expected_name) in test_cases {
+            let mut tracker = EosTracker::default();
             assert!(tracker.check_and_mark(phase, true).is_ok(), "first EOS should succeed");
 
             let result = tracker.check_and_mark(phase, true);
