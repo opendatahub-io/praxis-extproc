@@ -587,6 +587,7 @@ async fn run_response_filters_for_headers(
 /// Returns body response with mutations, even if body is empty.
 /// Skips response filter re-execution when headers were already
 /// processed by [`run_response_header_filters`]; only body filters run in that case.
+#[expect(clippy::too_many_lines, reason = "merging deferred mutations adds lines")]
 async fn run_response_filters_for_body(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -613,15 +614,39 @@ async fn run_response_filters_for_body(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    let body_mutation = if state.response_filters_executed {
+        None
+    } else {
+        adapter::collect_response_header_mutations_diff(&ctx, &original_headers)
+    };
+
+    let merged = merge_mutations(state.deferred_response_header_mutation.take(), body_mutation);
     let body_data = body_data_if_present(&state.response_body);
 
     // Always return body response in body phase, even for empty bodies
     Ok(response::response_body(
         body_data,
-        mutation,
+        merged,
         state.protocol_config.response_body_mode,
     ))
+}
+
+/// Merge deferred header mutations with current mutations.
+///
+/// Combines deferred mutations (from headers phase) with new mutations (from body phase).
+fn merge_mutations(
+    deferred: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    current: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+    match (deferred, current) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut d), Some(c)) => {
+            d.set_headers.extend(c.set_headers);
+            d.remove_headers.extend(c.remove_headers);
+            Some(d)
+        },
+    }
 }
 
 /// Run response filters at header time and return header mutations.
@@ -653,7 +678,12 @@ async fn run_response_header_filters(
 
     state.response_filters_executed = true;
 
-    Ok(adapter::collect_response_header_mutations_diff(&ctx, &original_headers))
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+
+    // Defer mutation if body is expected
+    state.deferred_response_header_mutation = mutation;
+
+    Ok(None)
 }
 
 /// Capture response header names and values before filter execution.
@@ -777,6 +807,9 @@ struct StreamState {
 
     /// Whether response-phase filters already ran at header time.
     response_filters_executed: bool,
+
+    /// Deferred response header mutations (when body expected).
+    deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 
     /// End-of-stream tracking for protocol safety.
     eos_tracker: EosTracker,
