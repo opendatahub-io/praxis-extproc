@@ -254,22 +254,17 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
 ///
 /// Chunks the body at 62 KiB boundaries and returns multiple responses,
 /// each with `end_of_stream` set on the final chunk only.
+///
+/// Even for empty bodies, `FULL_DUPLEX_STREAMED` mode requires
+/// `StreamedBodyResponse { body: [], end_of_stream: true }`.
 fn body_responses_streamed(
     body: Option<&[u8]>,
     mut mutation: Option<HeaderMutation>,
     is_request: bool,
 ) -> Vec<ProcessingResponse> {
     let Some(data) = body.filter(|b| !b.is_empty()) else {
-        // No body or empty: single continue with header mutation only
-        return vec![wrap_body_response(
-            CommonResponse {
-                status: ResponseStatus::Continue.into(),
-                header_mutation: mutation,
-                body_mutation: None,
-                ..Default::default()
-            },
-            is_request,
-        )];
+        // Empty body: must still use StreamedBodyResponse with empty chunk and EOS
+        return vec![make_streamed_response(&[], true, mutation, is_request)];
     };
 
     let chunks = chunk_body(data);
@@ -658,7 +653,20 @@ mod tests {
         assert_eq!(responses.len(), 1, "empty body should produce one response");
 
         let body_mut = extract_body_mutation(&responses[0]);
-        assert!(body_mut.is_none(), "empty body should not have body_mutation");
+        let Some(mutation) = body_mut else {
+            panic!("FULL_DUPLEX should use StreamedBodyResponse even for empty body");
+        };
+
+        match mutation {
+            body_mutation::Mutation::StreamedResponse(s) => {
+                assert!(
+                    s.body.is_empty(),
+                    "empty body should have empty StreamedBodyResponse.body"
+                );
+                assert!(s.end_of_stream, "empty body should have end_of_stream=true");
+            },
+            other => panic!("FULL_DUPLEX should use StreamedResponse variant, got {other:?}"),
+        }
     }
 
     #[test]
