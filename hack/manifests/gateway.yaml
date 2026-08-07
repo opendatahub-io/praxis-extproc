@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-katan
+  namespace: default
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: llm-katan
+  namespace: default
+subsets:
+  - addresses:
+      - ip: 3.147.232.199
+    ports:
+      - name: https
+        port: 443
+        protocol: TCP
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: llm-katan
+  namespace: default
+spec:
+  host: llm-katan.default.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      sni: 3-147-232-199.sslip.io
+      insecureSkipVerify: true
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: e2e-gateway
+  namespace: default
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-katan
+  namespace: default
+spec:
+  parentRefs:
+    - name: e2e-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: llm-katan
+          port: 443

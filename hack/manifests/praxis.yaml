@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: praxis-extproc
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-config
+  namespace: praxis-extproc
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      tls:
+        mode: self_signed
+
+    filter_chains:
+      - name: ai-filters
+        filters:
+          - filter: model_to_header
+            header: X-Model-Name
+          - filter: headers
+            request_add:
+              - name: X-Praxis-Processed
+                value: "true"
+            response_set:
+              - name: X-Praxis-Version
+                value: "e2e"
+
+    insecure_options:
+      allow_unbounded_body: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis
+  namespace: praxis-extproc
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: praxis
+  template:
+    metadata:
+      labels:
+        app: praxis
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers:
+        - name: praxis-extproc
+          image: praxis-extproc:dev
+          imagePullPolicy: Never
+          args:
+            - "-c"
+            - "/etc/praxis/extproc.yaml"
+          ports:
+            - name: grpc
+              containerPort: 9004
+              protocol: TCP
+            - name: health
+              containerPort: 50052
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/praxis
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config
+          configMap:
+            name: praxis-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis
+  namespace: praxis-extproc
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+spec:
+  selector:
+    app: praxis
+  ports:
+    - name: grpc
+      port: 9004
+      targetPort: 9004
+      protocol: TCP
