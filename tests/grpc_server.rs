@@ -898,6 +898,83 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
     }
 }
 
+#[tokio::test]
+async fn empty_full_duplex_emits_streamed_eos() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // Send headers with FULL_DUPLEX_STREAMED mode
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4, // FULL_DUPLEX_STREAMED
+        response_body_mode: 4,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    // Consume header response
+    let _unused = response_stream.message().await.unwrap();
+
+    // Send empty body with EOS
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: Vec::new(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+
+    match outcome {
+        Ok(Ok(Some(msg))) => {
+            // Check for StreamedBodyResponse
+            let has_streamed = matches!(
+                &msg.response,
+                Some(RespVariant::RequestBody(b))
+                    if matches!(
+                        b.response.as_ref()
+                            .and_then(|c| c.body_mutation.as_ref())
+                            .and_then(|m| m.mutation.as_ref()),
+                        Some(body_mutation::Mutation::StreamedResponse(_))
+                    )
+            );
+            assert!(
+                has_streamed,
+                "ap-empty-full-duplex REPRODUCED BUG: expected StreamedBodyResponse \
+                for empty FULL_DUPLEX body, got: {msg:?}"
+            );
+
+            // Verify it's empty with EOS
+            if let Some(RespVariant::RequestBody(b)) = &msg.response
+                && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
+                    .response
+                    .as_ref()
+                    .and_then(|c| c.body_mutation.as_ref())
+                    .and_then(|m| m.mutation.as_ref())
+            {
+                assert!(
+                    s.body.is_empty(),
+                    "empty FULL_DUPLEX streamed chunk should have empty body"
+                );
+                assert!(
+                    s.end_of_stream,
+                    "empty FULL_DUPLEX streamed chunk must set end_of_stream"
+                );
+            }
+        },
+        Ok(Ok(None)) => panic!("ap-empty-full-duplex: stream closed without response"),
+        Ok(Err(err)) => panic!("ap-empty-full-duplex: stream error: {err}"),
+        Err(_) => panic!("ap-empty-full-duplex: timed out waiting for response"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
