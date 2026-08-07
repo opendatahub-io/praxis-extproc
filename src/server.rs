@@ -60,13 +60,17 @@ struct ProtocolConfig {
     send_body_without_waiting: bool,
 }
 
-impl From<ProtocolConfiguration> for ProtocolConfig {
-    fn from(proto_cfg: ProtocolConfiguration) -> Self {
-        Self {
-            request_body_mode: BodyMode::from(proto_cfg.request_body_mode),
-            response_body_mode: BodyMode::from(proto_cfg.response_body_mode),
+impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
+    type Error = String;
+
+    fn try_from(proto_cfg: ProtocolConfiguration) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_body_mode: BodyMode::try_from(proto_cfg.request_body_mode)
+                .map_err(|e| format!("request_body_mode: {e}"))?,
+            response_body_mode: BodyMode::try_from(proto_cfg.response_body_mode)
+                .map_err(|e| format!("response_body_mode: {e}"))?,
             send_body_without_waiting: proto_cfg.send_body_without_waiting_for_header_response,
-        }
+        })
     }
 }
 
@@ -169,7 +173,7 @@ async fn process_messages(
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
 
         if !config_parsed {
-            config_from_first_message(stream_state, msg.protocol_config);
+            config_from_first_message(stream_state, msg.protocol_config)?;
             config_parsed = true;
         }
 
@@ -196,15 +200,23 @@ async fn process_messages(
 }
 
 /// Parses `protocol_config` from first message
-fn config_from_first_message(stream_state: &mut StreamState, protocol_config: Option<ProtocolConfiguration>) {
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] if unsupported body modes are requested.
+fn config_from_first_message(
+    stream_state: &mut StreamState,
+    protocol_config: Option<ProtocolConfiguration>,
+) -> Result<(), Status> {
     if let Some(proto_cfg) = protocol_config {
-        stream_state.protocol_config = ProtocolConfig::from(proto_cfg);
+        stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
         info!(
             request_mode = ?stream_state.protocol_config.request_body_mode,
             response_mode = ?stream_state.protocol_config.response_body_mode,
             "ExtProc protocol configuration received from Envoy"
         );
     }
+    Ok(())
 }
 
 /// Dispatch a single ExtProc request variant to the appropriate handler.
