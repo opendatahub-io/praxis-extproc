@@ -18,8 +18,9 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # TODO: re-enable self_signed
       tls:
-        mode: self_signed
+        mode: none
 
     filter_chains:
       - name: ai-filters
