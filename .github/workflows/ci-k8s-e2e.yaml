@@ -9,8 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  ISTIO_VERSION: "1.29.2"
-  PRAXIS_IMAGE: praxis-extproc:e2e
+  EXTPROC_IMAGE: praxis-extproc:dev
 
 jobs:
   simulator-check:
@@ -45,50 +44,21 @@ jobs:
 
       - name: Install istioctl
         run: |
-          curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=${{ env.ISTIO_VERSION }} sh -
-          echo "$PWD/istio-${{ env.ISTIO_VERSION }}/bin" >> "$GITHUB_PATH"
+          curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=1.29.2 sh -
+          echo "$PWD/istio-1.29.2/bin" >> "$GITHUB_PATH"
+
+      - name: Install praxis-forge
+        run: cargo install --git https://github.com/praxis-proxy/grid.git praxis-forge --locked
 
       - name: Build Praxis image
-        run: docker build -t ${{ env.PRAXIS_IMAGE }} .
+        run: make container
 
-      # TODO: Once harness TODOs are filled in, replace the manual
-      # steps below with a single Rust setup binary/test that calls
-      # k8s_harness::setup_cluster() + install_components().
-      #
-      # For now, manual steps (these mirror what the harness will do):
-      - name: Create Kind cluster
-        run: kind create cluster --name praxis-e2e --wait 120s
-
-      - name: Install Gateway API CRDs
-        run: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
-
-      - name: Install Istio
-        run: |
-          istioctl install --set profile=minimal \
-            --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true \
-            -y
-          kubectl rollout status deployment/istiod -n istio-system --timeout=120s
-
-      - name: Load Praxis image into Kind
-        run: kind load docker-image ${{ env.PRAXIS_IMAGE }} --name praxis-e2e
-
-      # TODO: Replace kubectl steps below with the harness once
-      # deploy.rs TODOs are implemented. The harness uses kube-rs
-      # to create these resources programmatically.
-      - name: Setup K8s resources via harness
-        run: |
-          echo "TODO: cargo test --features k8s-e2e -- setup --ignored --nocapture"
-          echo "For now, the harness TODOs need to be filled in first."
-
-      - name: Port-forward Gateway
-        run: |
-          # Istio names the gateway service <gateway-name>-istio
-          kubectl port-forward svc/e2e-gateway-istio -n default 28080:80 &
-          sleep 3
+      - name: Setup e2e environment
+        run: make e2e-setup
 
       - name: Run K8s e2e tests
-        run: cargo test --features k8s-e2e -- --ignored --nocapture
+        run: make e2e-test V=1
 
       - name: Teardown
         if: always()
-        run: kind delete cluster --name praxis-e2e
+        run: make e2e-teardown
