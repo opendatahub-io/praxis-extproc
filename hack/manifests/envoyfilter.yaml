@@ -24,13 +24,7 @@ spec:
               "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
               explicit_http_config:
                 http2_protocol_options: {}
-          transport_socket:
-            name: envoy.transport_sockets.tls
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-              common_tls_context:
-                validation_context:
-                  trust_chain_verification: ACCEPT_UNTRUSTED
+          # TODO: re-enable TLS transport_socket once ext-proc self_signed TLS is restored.
           load_assignment:
             cluster_name: praxis-extproc-grpc
             endpoints:
