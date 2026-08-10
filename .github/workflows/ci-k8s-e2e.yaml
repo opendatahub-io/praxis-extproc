@@ -54,27 +54,28 @@ jobs:
       - name: Setup e2e environment
         run: make e2e-setup
 
-      - name: Debug cluster state
+      - name: Wait for pods
         run: |
-          echo "=== Gateway service ==="
-          kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o wide || echo "service not found"
-          echo "=== Gateway LB IP ==="
-          kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}' && echo || echo "(empty)"
-          echo "=== All services ==="
-          kubectl --context kind-praxis-e2e get svc -A
-          echo "=== Pods ==="
-          kubectl --context kind-praxis-e2e get pods -A
-          echo "=== MetalLB pool ==="
-          kubectl --context kind-praxis-e2e get ipaddresspool -n metallb-system -o yaml || echo "no pool"
-          echo "=== Docker network ==="
-          docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}'
-          echo "=== Curl test ==="
-          GATEWAY_IP=$(kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          echo "GATEWAY_IP=$GATEWAY_IP"
-          curl -sv --max-time 5 "http://${GATEWAY_IP}/v1/chat/completions" -H 'Content-Type: application/json' -H 'Authorization: Bearer llm-katan-openai-key' -d '{"model":"gpt-4","messages":[{"role":"user","content":"ping"}]}' 2>&1 || true
+          echo "Waiting for praxis pod to be ready..."
+          kubectl --context kind-praxis-e2e wait --for=condition=ready pod -n praxis-extproc -l app=praxis --timeout=120s || true
+          echo "Waiting for gateway pod to be ready..."
+          kubectl --context kind-praxis-e2e wait --for=condition=ready pod -l gateway.networking.k8s.io/gateway-name=e2e-gateway --timeout=120s || true
 
       - name: Run K8s e2e tests
         run: make e2e-test V=1
+
+      - name: Debug cluster state
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl --context kind-praxis-e2e get pods -A
+          echo "=== Praxis pod logs ==="
+          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100 --previous 2>/dev/null || true
+          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100 || echo "(no logs)"
+          echo "=== Praxis pod describe ==="
+          kubectl --context kind-praxis-e2e describe pod -n praxis-extproc -l app=praxis | tail -40 || echo "(no pod)"
+          echo "=== Gateway pod logs ==="
+          kubectl --context kind-praxis-e2e logs -l gateway.networking.k8s.io/gateway-name=e2e-gateway --tail=30 || echo "(no logs)"
 
       - name: Teardown
         if: always()
