@@ -1,0 +1,30 @@
+# Example ExtProc configuration using Praxis AI filters.
+#
+# Promotes body "model" to X-Model, then rewrites publisher IDs
+# (publishers/.../models/<name>) in the JSON body to <name> only.
+# The X-Model header is left unchanged for KServe routing.
+#
+# Start:
+#   praxis-extproc -c examples/llmisvc-model-provider-resolver.yaml
+
+server:
+  grpc_address: "0.0.0.0:50051"
+  health_address: "0.0.0.0:50052"
+  metrics_address: "0.0.0.0:9090"
+  tls:
+    mode: none
+
+filter_chains:
+  - name: observability
+    filters:
+      - filter: request_id
+
+  - name: ai
+    filters:
+      - filter: model_to_header
+        header: X-Model
+      - filter: llmisvc_model_provider_resolver
+        header: X-Model
+
+insecure_options:
+  allow_unbounded_body: true

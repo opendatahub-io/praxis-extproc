@@ -55,6 +55,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 requires an explicit process-level CryptoProvider when
+    // multiple providers may be linked transitively (e.g. ring via tonic + aws-lc).
+    drop(rustls::crypto::ring::default_provider().install_default());
     init_tracing();
     let cli = Cli::parse();
 

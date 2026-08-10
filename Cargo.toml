@@ -33,7 +33,7 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = { version = "0.16.2", default-features = false }
 prost = "0.14.3"
 rcgen = "0.13.2"
-rustls = "0.23.40"
+rustls = { version = "0.23.40", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"
