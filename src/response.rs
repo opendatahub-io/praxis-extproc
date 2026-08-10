@@ -9,9 +9,13 @@
 //!
 //! [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
 
-use praxis_proto::envoy::service::ext_proc::v3::{
-    BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse, ProcessingResponse,
-    TrailersResponse, body_mutation, common_response::ResponseStatus, processing_response::Response,
+use praxis_proto::envoy::service::{
+    common::v3::{HeaderValue, HeaderValueOption},
+    ext_proc::v3::{
+        BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse,
+        ProcessingResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
+        processing_response::Response,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -166,14 +170,18 @@ pub fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 /// Build body response(s) with optional header mutation and body data.
 ///
 /// When body data is present, populates `body_mutation` so Envoy
-/// applies the filter-modified body. Large bodies are split into
-/// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
+/// applies the filter-modified body, and sets `content-length` to the
+/// mutated body size. Envoy's ExtProc filter rejects body mutations
+/// that leave a stale `content-length` (`BUFFERED` body mode + `SEND`
+/// headers) with `mismatch_between_content_length_and_the_length_of_the_mutated_body`.
 fn body_responses(body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_request: bool) -> Vec<ProcessingResponse> {
-    let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
+    let body_bytes = body.filter(|b| !b.is_empty());
+    let body_mutation = body_bytes.map(make_body_mutation);
+    let header_mutation = with_content_length_for_body(mutation, body_bytes.map(<[u8]>::len));
 
     let common = CommonResponse {
         status: ResponseStatus::Continue.into(),
-        header_mutation: mutation,
+        header_mutation,
         body_mutation,
         ..Default::default()
     };
@@ -185,6 +193,42 @@ fn body_responses(body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_requ
 fn make_body_mutation(data: &[u8]) -> BodyMutation {
     BodyMutation {
         mutation: Some(body_mutation::Mutation::Body(data.to_vec())),
+    }
+}
+
+/// Ensure a body replacement includes a matching `content-length` header.
+///
+/// When `new_len` is `None` (no body mutation), returns `mutation`
+/// unchanged. Otherwise sets `content-length` to `new_len`, replacing
+/// any prior set/remove for that header in the mutation.
+fn with_content_length_for_body(mutation: Option<HeaderMutation>, new_len: Option<usize>) -> Option<HeaderMutation> {
+    let Some(len) = new_len else {
+        return mutation;
+    };
+
+    let mut mutation = mutation.unwrap_or_default();
+    mutation.set_headers.retain(|hvo| {
+        !hvo.header
+            .as_ref()
+            .is_some_and(|hv| hv.key.eq_ignore_ascii_case("content-length"))
+    });
+    mutation
+        .remove_headers
+        .retain(|name| !name.eq_ignore_ascii_case("content-length"));
+    mutation.set_headers.push(content_length_header_option(len));
+    Some(mutation)
+}
+
+/// Build a `content-length` [`HeaderValueOption`] for `len`.
+fn content_length_header_option(len: usize) -> HeaderValueOption {
+    let value = len.to_string();
+    HeaderValueOption {
+        header: Some(HeaderValue {
+            key: "content-length".to_owned(),
+            value: value.clone(),
+            raw_value: value.into_bytes(),
+        }),
+        ..Default::default()
     }
 }
 
@@ -454,6 +498,86 @@ mod tests {
         assert!(body_mut.is_none(), "None body should not produce body_mutation");
     }
 
+    #[test]
+    fn request_body_sets_content_length_to_mutated_size() {
+        let data = br#"{"model":"sim-stream"}"#;
+        let responses = request_body(Some(data), None);
+
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
+        let cl = content_length_value(mutation).unwrap();
+        assert_eq!(cl, data.len().to_string(), "content-length must match mutated body");
+        assert!(
+            !mutation
+                .remove_headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("content-length")),
+            "content-length should be set, not only removed"
+        );
+    }
+
+    #[test]
+    fn request_body_overrides_stale_content_length_set() {
+        let data = b"shorter";
+        let mutation = HeaderMutation {
+            set_headers: vec![content_length_header_option(9999)],
+            remove_headers: vec!["content-length".to_owned()],
+        };
+        let responses = request_body(Some(data), Some(mutation));
+
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
+        let cl_sets: Vec<_> = mutation
+            .set_headers
+            .iter()
+            .filter(|hvo| {
+                hvo.header
+                    .as_ref()
+                    .is_some_and(|hv| hv.key.eq_ignore_ascii_case("content-length"))
+            })
+            .collect();
+        assert_eq!(cl_sets.len(), 1, "exactly one content-length set");
+        assert_eq!(
+            cl_sets[0].header.as_ref().unwrap().value,
+            data.len().to_string(),
+            "stale content-length must be replaced with mutated length"
+        );
+        assert!(
+            !mutation
+                .remove_headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("content-length")),
+            "content-length remove must not fight the set"
+        );
+    }
+
+    #[test]
+    fn response_body_sets_content_length_to_mutated_size() {
+        let data = b"response-body-bytes";
+        let responses = response_body(Some(data), None);
+
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
+        assert_eq!(
+            content_length_value(mutation),
+            Some(data.len().to_string()),
+            "response body mutation must update content-length"
+        );
+    }
+
+    #[test]
+    fn no_body_does_not_inject_content_length() {
+        let mutation = HeaderMutation {
+            set_headers: vec![],
+            remove_headers: vec!["x-strip".to_owned()],
+        };
+        let responses = request_body(None, Some(mutation));
+
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
+        assert!(
+            content_length_value(mutation).is_none(),
+            "no body mutation means no content-length injection"
+        );
+        assert_eq!(mutation.remove_headers, vec!["x-strip".to_owned()]);
+    }
+
     // -----------------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------------
@@ -472,5 +596,20 @@ mod tests {
                 .and_then(|bm| bm.mutation.as_ref()),
             _ => None,
         }
+    }
+
+    fn extract_header_mutation(resp: &ProcessingResponse) -> Option<&HeaderMutation> {
+        match &resp.response {
+            Some(Response::RequestBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+            Some(Response::ResponseBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn content_length_value(mutation: &HeaderMutation) -> Option<String> {
+        mutation.set_headers.iter().find_map(|hvo| {
+            let hv = hvo.header.as_ref()?;
+            hv.key.eq_ignore_ascii_case("content-length").then(|| hv.value.clone())
+        })
     }
 }
