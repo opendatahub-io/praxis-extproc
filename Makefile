@@ -125,7 +125,7 @@ FORGE := praxis-forge --config hack/forge.yaml
 
 e2e-setup: images
 	$(FORGE) cluster create e2e
-	$(FORGE) cluster load-image e2e $(EXTPROC_IMAGE)
+	$(CONTAINER_ENGINE) save $(EXTPROC_IMAGE) | kind load image-archive /dev/stdin --name praxis-e2e
 	$(FORGE) stack apply e2e
 
 e2e-teardown:

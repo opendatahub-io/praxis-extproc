@@ -10,7 +10,6 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   EXTPROC_IMAGE: praxis-extproc:dev
-  CONTAINER_ENGINE: docker
 
 jobs:
   simulator-check:
