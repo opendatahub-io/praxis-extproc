@@ -133,7 +133,7 @@ e2e-teardown:
 
 e2e-test:
 	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
-	cargo test --features k8s-e2e $(if $(V),-- --nocapture,)
+	cargo test --features k8s-e2e --test k8s_e2e $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
