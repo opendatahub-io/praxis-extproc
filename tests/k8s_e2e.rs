@@ -9,11 +9,11 @@
 //! Run with `cargo test --features k8s-e2e --nocapture`.
 //!
 //! Requires:
-//! - A Kind cluster with `MetalLB`, Istio, Praxis, and Gateway deployed
-//!   (use `praxis-forge stack apply e2e` or equivalent)
+//! - A Kind cluster with `MetalLB`, Istio, Praxis, and Gateway deployed (use `praxis-forge stack apply e2e` or
+//!   equivalent)
 //! - llm-katan reachable at 3.147.232.199:443
-//! - Set `GATEWAY_URL` to the gateway `LoadBalancer` IP:
-//!   `export GATEWAY_URL=http://$(kubectl get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}')`
+//! - Set `GATEWAY_URL` to the gateway `LoadBalancer` IP: `export GATEWAY_URL=http://$(kubectl get svc e2e-gateway-istio
+//!   -o jsonpath='{.status.loadBalancer.ingress[0].ip}')`
 
 #![cfg(feature = "k8s-e2e")]
 #![allow(
@@ -38,7 +38,6 @@
 #![allow(missing_docs, reason = "k8s e2e test module")]
 #![allow(unused_variables, reason = "stubs")]
 
-use std::sync::Once;
 use std::time::Duration;
 
 const DEFAULT_GATEWAY_URL: &str = "http://172.18.0.200";
@@ -46,11 +45,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const GATEWAY_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-static GATEWAY_READY: Once = Once::new();
+static GATEWAY_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-fn ensure_gateway_ready() {
-    GATEWAY_READY.call_once(|| {
-        tokio::runtime::Handle::current().block_on(async {
+async fn ensure_gateway_ready() {
+    GATEWAY_READY
+        .get_or_init(|| async {
             let client = http_client();
             let url = format!("{}/v1/chat/completions", gateway_url());
             let deadline = tokio::time::Instant::now() + GATEWAY_READY_TIMEOUT;
@@ -69,12 +68,12 @@ fn ensure_gateway_ready() {
                     Ok(resp) if resp.status() == 200 => return,
                     _ if tokio::time::Instant::now() >= deadline => {
                         panic!("gateway not ready after {GATEWAY_READY_TIMEOUT:?}");
-                    }
+                    },
                     _ => tokio::time::sleep(GATEWAY_POLL_INTERVAL).await,
                 }
             }
-        });
-    });
+        })
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +83,7 @@ fn ensure_gateway_ready() {
 #[tokio::test]
 
 async fn chat_completion_200() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -108,7 +107,7 @@ async fn chat_completion_200() {
 #[tokio::test]
 
 async fn response_has_openai_structure() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -141,7 +140,7 @@ async fn response_has_openai_structure() {
 #[tokio::test]
 
 async fn tool_call_passthrough() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -181,7 +180,7 @@ async fn tool_call_passthrough() {
 #[tokio::test]
 
 async fn image_content_passthrough() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -211,7 +210,7 @@ async fn image_content_passthrough() {
 #[tokio::test]
 
 async fn json_mode_response() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -242,7 +241,7 @@ async fn json_mode_response() {
 #[tokio::test]
 
 async fn system_prompt_passthrough() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -269,7 +268,7 @@ async fn system_prompt_passthrough() {
 #[tokio::test]
 
 async fn multi_turn_conversation() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -301,7 +300,7 @@ async fn multi_turn_conversation() {
 #[tokio::test]
 
 async fn model_to_header_works() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -328,7 +327,7 @@ async fn model_to_header_works() {
 #[tokio::test]
 
 async fn praxis_headers_applied() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -360,7 +359,7 @@ async fn praxis_headers_applied() {
 #[tokio::test]
 
 async fn streaming_completion() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -399,7 +398,7 @@ async fn streaming_completion() {
 #[tokio::test]
 
 async fn large_body_passthrough() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -425,7 +424,7 @@ async fn large_body_passthrough() {
 #[tokio::test]
 
 async fn invalid_api_key_rejected() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -453,7 +452,7 @@ async fn invalid_api_key_rejected() {
 #[tokio::test]
 
 async fn malformed_json_rejected() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
@@ -479,7 +478,7 @@ async fn malformed_json_rejected() {
 #[tokio::test]
 
 async fn empty_messages_rejected() {
-    ensure_gateway_ready();
+    ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
