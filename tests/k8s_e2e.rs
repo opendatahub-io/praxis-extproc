@@ -36,7 +36,7 @@
     reason = "k8s e2e tests"
 )]
 #![allow(missing_docs, reason = "k8s e2e test module")]
-#![allow(unused_variables, reason = "TODO stubs")]
+#![allow(unused_variables, reason = "stubs")]
 
 use std::time::Duration;
 
@@ -90,11 +90,12 @@ async fn response_has_openai_structure() {
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
 
-    // TODO: Assert the response has proper OpenAI structure:
-    // - body["choices"] is an array
-    // - body["choices"][0]["message"]["content"] is a string
-    // - body["model"] is a string
-    // - body["usage"] exists with prompt_tokens, completion_tokens, total_tokens
+    assert!(body["choices"].is_array());
+    assert!(body["choices"][0]["message"]["content"].is_string());
+    assert!(body["model"].is_string());
+    assert!(body["usage"]["prompt_tokens"].is_number());
+    assert!(body["usage"]["completion_tokens"].is_number());
+    assert!(body["usage"]["total_tokens"].is_number());
 }
 
 // ---------------------------------------------------------------------------
@@ -107,21 +108,33 @@ async fn tool_call_passthrough() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a request with a tools array, e.g.:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [{"role": "user", "content": "What's the weather in NYC?"}],
-    //   "tools": [{
-    //     "type": "function",
-    //     "function": {
-    //       "name": "get_weather",
-    //       "description": "Get weather for a city",
-    //       "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
-    //     }
-    //   }]
-    // }
-    //
-    // Assert: status 200, response has tool_calls in choices[0].message
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "What's the weather in NYC?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
+    assert!(
+        body["choices"][0]["message"]
+            .as_object()
+            .unwrap()
+            .contains_key("tool_calls")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -134,19 +147,23 @@ async fn image_content_passthrough() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a request with image_url content:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [{
-    //     "role": "user",
-    //     "content": [
-    //       {"type": "text", "text": "Describe this image"},
-    //       {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
-    //     ]
-    //   }]
-    // }
-    //
-    // Assert: status 200
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,14 +176,24 @@ async fn json_mode_response() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a request with response_format:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [{"role": "user", "content": "Return a JSON object with key 'greeting'"}],
-    //   "response_format": {"type": "json_object"}
-    // }
-    //
-    // Assert: status 200, the content field is valid JSON
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Return a JSON object with key 'greeting'"}],
+            "response_format": {"type": "json_object"}
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content should be a string");
+    serde_json::from_str::<serde_json::Value>(content).expect("content should be valid JSON");
 }
 
 // ---------------------------------------------------------------------------
@@ -179,16 +206,20 @@ async fn system_prompt_passthrough() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a request with system + user messages:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [
-    //     {"role": "system", "content": "You are a helpful assistant."},
-    //     {"role": "user", "content": "hello"}
-    //   ]
-    // }
-    //
-    // Assert: status 200
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,18 +232,25 @@ async fn multi_turn_conversation() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a request with multi-turn message history:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [
-    //     {"role": "system", "content": "You are a helpful assistant."},
-    //     {"role": "user", "content": "My name is Alex."},
-    //     {"role": "assistant", "content": "Nice to meet you, Alex!"},
-    //     {"role": "user", "content": "What is my name?"}
-    //   ]
-    // }
-    //
-    // Assert: status 200, response body is valid JSON
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "My name is Alex."},
+                {"role": "assistant", "content": "Nice to meet you, Alex!"},
+                {"role": "user", "content": "What is my name?"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
+    assert!(body["choices"].is_array());
 }
 
 // ---------------------------------------------------------------------------
@@ -237,17 +275,8 @@ async fn model_to_header_works() {
 
     assert_eq!(resp.status(), 200);
 
-    // TODO: The model_to_header filter extracts the model from the
-    // request body and sets it as a request header (X-Model-Name).
-    // This header goes to the upstream (llm-katan), not back to the client.
-    //
-    // To verify this, you'd need to check the upstream received the header.
-    // Options:
-    // 1. Check if llm-katan echoes it back in the response
-    // 2. Check Envoy access logs
-    // 3. Use a recording backend instead of llm-katan for this test
-    //
-    // For now, just assert the response is valid.
+    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
+    assert!(body["choices"].is_array());
 }
 
 // ---------------------------------------------------------------------------
@@ -272,9 +301,13 @@ async fn praxis_headers_applied() {
 
     assert_eq!(resp.status(), 200);
 
-    // TODO: The headers filter adds X-Praxis-Version: "e2e" to responses.
-    // Use resp.headers().get("X-Praxis-Version") to check it.
-    // HeaderValue has a .to_str() method to convert to &str.
+    let version = resp
+        .headers()
+        .get("X-Praxis-Version")
+        .expect("missing X-Praxis-Version header")
+        .to_str()
+        .expect("header value not valid UTF-8");
+    assert_eq!(version, "e2e");
 }
 
 // ---------------------------------------------------------------------------
@@ -287,20 +320,32 @@ async fn streaming_completion() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Send a streaming request:
-    // {
-    //   "model": "gpt-4",
-    //   "messages": [{"role": "user", "content": "hello"}],
-    //   "stream": true
-    // }
-    //
-    // Assert: status 200
-    // Assert: content-type contains "text/event-stream"
-    // Assert: body contains "data: " SSE lines
-    //
-    // Hint: use resp.text().await to get the full body as a string,
-    // then check for SSE format. Or use resp.bytes_stream() for
-    // chunk-by-chunk reading.
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .expect("missing content-type")
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected text/event-stream, got {content_type}"
+    );
+
+    let body = resp.text().await.expect("failed to read body");
+    assert!(body.contains("data: "), "body should contain SSE data lines");
 }
 
 // ---------------------------------------------------------------------------
@@ -313,9 +358,98 @@ async fn large_body_passthrough() {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
-    // TODO: Build a large content string (e.g. "x".repeat(100_000)),
-    // send it as a chat completion, assert status 200.
-    // Praxis allows unbounded body via insecure_options in the filter config.
+    let large_content = "x".repeat(100_000);
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": large_content}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+}
+
+// ---------------------------------------------------------------------------
+// Error handling — invalid auth
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+
+async fn invalid_api_key_rejected() {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("failed to build HTTP client");
+    let url = format!("{}/v1/chat/completions", gateway_url());
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", "Bearer wrong-key")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 401);
+}
+
+// ---------------------------------------------------------------------------
+// Error handling — malformed body
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+
+async fn malformed_json_rejected() {
+    let client = http_client();
+    let url = format!("{}/v1/chat/completions", gateway_url());
+
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("this is not json")
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(
+        resp.status().is_client_error(),
+        "malformed JSON should return 4xx, got {}",
+        resp.status()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Error handling — empty messages
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+
+async fn empty_messages_rejected() {
+    let client = http_client();
+    let url = format!("{}/v1/chat/completions", gateway_url());
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": []
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(
+        resp.status().is_client_error(),
+        "empty messages should return 4xx, got {}",
+        resp.status()
+    );
 }
 
 // ---------------------------------------------------------------------------
