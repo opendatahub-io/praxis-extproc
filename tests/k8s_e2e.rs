@@ -45,10 +45,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const GATEWAY_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-static GATEWAY_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static GATEWAY_READY: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 async fn ensure_gateway_ready() {
-    GATEWAY_READY
+    let ready = GATEWAY_READY
         .get_or_init(|| async {
             let client = http_client();
             let url = format!("{}/v1/chat/completions", gateway_url());
@@ -65,15 +65,15 @@ async fn ensure_gateway_ready() {
                     .await;
 
                 match result {
-                    Ok(resp) if resp.status() == 200 => return,
-                    _ if tokio::time::Instant::now() >= deadline => {
-                        panic!("gateway not ready after {GATEWAY_READY_TIMEOUT:?}");
-                    },
+                    Ok(resp) if resp.status() == 200 => return true,
+                    _ if tokio::time::Instant::now() >= deadline => return false,
                     _ => tokio::time::sleep(GATEWAY_POLL_INTERVAL).await,
                 }
             }
         })
         .await;
+
+    assert!(*ready, "gateway not ready after {GATEWAY_READY_TIMEOUT:?}");
 }
 
 // ---------------------------------------------------------------------------
