@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   EXTPROC_IMAGE: praxis-extproc:dev
+  CONTAINER_ENGINE: docker
 
 jobs:
   simulator-check:
@@ -49,9 +50,6 @@ jobs:
 
       - name: Install praxis-forge
         run: cargo install --git https://github.com/praxis-proxy/grid.git forge --locked
-
-      - name: Build Praxis image
-        run: make container
 
       - name: Setup e2e environment
         run: make e2e-setup
