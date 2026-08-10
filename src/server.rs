@@ -889,26 +889,49 @@ mod tests {
     #[test]
     fn eos_tracker_default_all_not_received() {
         let tracker = EosTracker::default();
-        assert!(!tracker.request_headers.is_received());
-        assert!(!tracker.request_body.is_received());
-        assert!(!tracker.response_headers.is_received());
-        assert!(!tracker.response_body.is_received());
+        assert!(
+            !tracker.request_headers.is_received(),
+            "request_headers should not be received"
+        );
+        assert!(
+            !tracker.request_body.is_received(),
+            "request_body should not be received"
+        );
+        assert!(
+            !tracker.response_headers.is_received(),
+            "response_headers should not be received"
+        );
+        assert!(
+            !tracker.response_body.is_received(),
+            "response_body should not be received"
+        );
     }
 
     #[test]
     fn eos_tracker_first_eos_succeeds() {
-        // First EOS in each phase should succeed when tested independently
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok(),
+            "first EOS in RequestHeaders should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok(),
+            "first EOS in RequestBody should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok(),
+            "first EOS in ResponseHeaders should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok(),
+            "first EOS in ResponseBody should succeed"
+        );
     }
 
     #[test]
@@ -943,16 +966,24 @@ mod tests {
         for phase in phases {
             let mut tracker = EosTracker::default();
 
-            // First EOS succeeds
-            assert!(tracker.check_and_mark(phase, true).is_ok());
+            assert!(
+                tracker.check_and_mark(phase, true).is_ok(),
+                "first EOS should succeed for {phase:?}"
+            );
 
-            // Any subsequent message fails
             let result = tracker.check_and_mark(phase, true);
             assert!(result.is_err(), "message after EOS should fail for {phase:?}");
 
             if let Err(err) = result {
-                assert_eq!(err.code(), tonic::Code::InvalidArgument);
-                assert!(err.message().contains("after end_of_stream"));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::InvalidArgument,
+                    "error code should be InvalidArgument for {phase:?}"
+                );
+                assert!(
+                    err.message().contains("after end_of_stream"),
+                    "error message should mention 'after end_of_stream' for {phase:?}"
+                );
             }
         }
     }
