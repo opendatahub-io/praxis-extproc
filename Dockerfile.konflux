@@ -15,7 +15,7 @@
 # Builder
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi10/ubi AS builder
+FROM registry.access.redhat.com/ubi10/ubi:10.2-1786324782@sha256:fda4b66e75edf30cd8a96890c1072b47533425f346f3176f581138d42cd15559 AS builder
 
 ARG CARGO_PROFILE=release
 
@@ -53,7 +53,7 @@ RUN set -eu; \
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi10/ubi-minimal
+FROM registry.access.redhat.com/ubi10/ubi-minimal:10.2-1786323476@sha256:e6c7c01447dc8eadf2a673e65fb6c607f16e168fe29a776fb937004f33c81cc0
 
 COPY --from=builder /praxis-extproc /usr/local/bin/praxis-extproc
 
