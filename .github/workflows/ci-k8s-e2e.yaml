@@ -48,7 +48,7 @@ jobs:
           echo "$PWD/istio-1.29.2/bin" >> "$GITHUB_PATH"
 
       - name: Install praxis-forge
-        run: cargo install --git https://github.com/praxis-proxy/grid.git praxis-forge --locked
+        run: cargo install --git https://github.com/praxis-proxy/grid.git forge --locked
 
       - name: Build Praxis image
         run: make container
