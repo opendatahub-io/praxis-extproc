@@ -177,7 +177,7 @@ pub fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 fn body_responses(body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_request: bool) -> Vec<ProcessingResponse> {
     let body_bytes = body.filter(|b| !b.is_empty());
     let body_mutation = body_bytes.map(make_body_mutation);
-    let header_mutation = with_content_length_for_body(mutation, body_bytes.map(|b| b.len()));
+    let header_mutation = with_content_length_for_body(mutation, body_bytes.map(<[u8]>::len));
 
     let common = CommonResponse {
         status: ResponseStatus::Continue.into(),
@@ -503,8 +503,8 @@ mod tests {
         let data = br#"{"model":"sim-stream"}"#;
         let responses = request_body(Some(data), None);
 
-        let mutation = extract_header_mutation(&responses[0]).expect("header_mutation required");
-        let cl = content_length_value(&mutation).expect("content-length must be set");
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
+        let cl = content_length_value(mutation).unwrap();
         assert_eq!(cl, data.len().to_string(), "content-length must match mutated body");
         assert!(
             !mutation
@@ -524,7 +524,7 @@ mod tests {
         };
         let responses = request_body(Some(data), Some(mutation));
 
-        let mutation = extract_header_mutation(&responses[0]).expect("header_mutation required");
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
         let cl_sets: Vec<_> = mutation
             .set_headers
             .iter()
@@ -554,9 +554,9 @@ mod tests {
         let data = b"response-body-bytes";
         let responses = response_body(Some(data), None);
 
-        let mutation = extract_header_mutation(&responses[0]).expect("header_mutation required");
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
         assert_eq!(
-            content_length_value(&mutation),
+            content_length_value(mutation),
             Some(data.len().to_string()),
             "response body mutation must update content-length"
         );
@@ -570,9 +570,9 @@ mod tests {
         };
         let responses = request_body(None, Some(mutation));
 
-        let mutation = extract_header_mutation(&responses[0]).expect("header_mutation preserved");
+        let mutation = extract_header_mutation(&responses[0]).unwrap();
         assert!(
-            content_length_value(&mutation).is_none(),
+            content_length_value(mutation).is_none(),
             "no body mutation means no content-length injection"
         );
         assert_eq!(mutation.remove_headers, vec!["x-strip".to_owned()]);
