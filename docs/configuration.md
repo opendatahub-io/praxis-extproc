@@ -1,25 +1,37 @@
 # Configuration
 
 The ExtProc server is configured via a YAML file
-passed with the `-c` flag. The config defines filter
-chains and server settings; listeners and clusters
-are omitted because Envoy owns networking.
+passed with the `-c` flag. The config defines
+processing profiles and server settings; listeners
+and clusters are omitted because Envoy owns
+networking.
 
 ## Top-Level Structure
 
 ```yaml
-filter_chains:
-  - name: security
-    filters:
-      - filter: guardrails
-        rules:
-          - target: body
-            contains: "DROP TABLE"
-
+pre_processing:
   - name: observability
     filters:
       - filter: request_id
       - filter: access_log
+
+profiles:
+  - name: default
+    filter_chains:
+      - name: security
+        filters:
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "DROP TABLE"
+
+post_processing:
+  - name: transformation
+    filters:
+      - filter: headers
+        response_set:
+          - name: X-Proxy
+            value: praxis-extproc
 
 server:
   grpc_address: "0.0.0.0:50051"
@@ -32,32 +44,56 @@ insecure_options:
   allow_unbounded_body: true
 ```
 
+## Processing Pipeline
+
+Requests flow through a three-tier pipeline:
+**pre-processing** → **profile** → **post-processing**.
+
+- **`pre_processing`**: filter chains that run before
+  profile selection. Use for authentication,
+  observability, and request identification.
+- **`profiles`**: named processing profiles, each with
+  its own filter chains. Exactly one profile is
+  selected per request.
+- **`post_processing`**: filter chains that run after
+  the selected profile completes. Use for response
+  transformation and logging.
+
+All three sections are optional. Each contains named
+filter chains that are concatenated in order to form
+a pipeline for that tier.
+
+Response processing runs in reverse tier order:
+post → profile → pre.
+
 ## Filter Chains
 
-Named filter chains defined under `filter_chains:`.
-All chains are concatenated in order to form a single
-pipeline. This matches the [Praxis] filter chain model
-and supports the same filters.
+Named filter chains defined within each tier.
+Chains are concatenated in order to form the tier's
+pipeline. This matches the [Praxis] filter chain
+model and supports the same filters.
 
 ```yaml
-filter_chains:
-  - name: security
-    filters:
-      - filter: guardrails
-        rules:
-          - target: header
-            name: "User-Agent"
-            pattern: "bad-bot.*"
+profiles:
+  - name: default
+    filter_chains:
+      - name: security
+        filters:
+          - filter: guardrails
+            rules:
+              - target: header
+                name: "User-Agent"
+                pattern: "bad-bot.*"
 
-  - name: transformation
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Processed-By
-            value: praxis-extproc
-        response_set:
-          - name: X-Proxy
-            value: praxis-extproc
+      - name: transformation
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Processed-By
+                value: praxis-extproc
+            response_set:
+              - name: X-Proxy
+                value: praxis-extproc
 ```
 
 The security chain runs first, then transformation.
@@ -107,25 +143,27 @@ filter results, enabling conditional logic within
 the pipeline.
 
 ```yaml
-filter_chains:
-  - name: main
-    filters:
-      - filter: guardrails
-        name: content_check
-        rules:
-          - target: body
-            contains: "blocked-content"
-        branches:
-          - chain:
-              filters:
-                - filter: headers
-                  request_add:
-                    - name: X-Content-Blocked
-                      value: "true"
-            on_result:
-              filter: content_check
-              key: rejected
-              value: "true"
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: guardrails
+            name: content_check
+            rules:
+              - target: body
+                contains: "blocked-content"
+            branches:
+              - chain:
+                  filters:
+                    - filter: headers
+                      request_add:
+                        - name: X-Content-Blocked
+                          value: "true"
+                on_result:
+                  filter: content_check
+                  key: rejected
+                  value: "true"
 ```
 
 See [branch-chains.yaml] for a working example.

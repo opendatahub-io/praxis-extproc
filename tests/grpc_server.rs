@@ -862,96 +862,108 @@ async fn repro_ap_post_eos_headers() {
 // -----------------------------------------------------------------------------
 
 const HEADERS_ONLY_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: request_id
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const HEADERS_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: request_id
-      - filter: headers
-        request_add:
-          - name: X-Test
-            value: extproc
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: request_id
+          - filter: headers
+            request_add:
+              - name: X-Test
+                value: extproc
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const GUARDRAILS_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: guardrails
-        rules:
-          - target: body
-            contains: "DROP TABLE"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "DROP TABLE"
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const UNCONDITIONAL_BRANCH_CONFIG: &str = r#"
-filter_chains:
-  - name: branch_chain
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Branch-Applied
-            value: "true"
-  - name: test
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Main
-            value: "true"
-        branch_chains:
-          - name: always_run
-            rejoin: next
-            chains:
-              - branch_chain
+profiles:
+  - name: default
+    filter_chains:
+      - name: branch_chain
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Branch-Applied
+                value: "true"
+      - name: test
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Main
+                value: "true"
+            branch_chains:
+              - name: always_run
+                rejoin: next
+                chains:
+                  - branch_chain
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const CONDITIONAL_TERMINAL_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: guardrails
-        action: flag
-        rules:
-          - target: header
-            name: "x-danger"
-            contains: "true"
-        branch_chains:
-          - name: block_dangerous
-            on_result:
-              filter: guardrails
-              result: blocked
-            rejoin: terminal
-            chains:
-              - name: reject
-                filters:
-                  - filter: static_response
-                    status: 403
-                    body: "blocked by branch"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: guardrails
+            action: flag
+            rules:
+              - target: header
+                name: "x-danger"
+                contains: "true"
+            branch_chains:
+              - name: block_dangerous
+                on_result:
+                  filter: guardrails
+                  result: blocked
+                rejoin: terminal
+                chains:
+                  - name: reject
+                    filters:
+                      - filter: static_response
+                        status: 403
+                        body: "blocked by branch"
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const RESPONSE_HEADER_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: headers
-        response_set:
-          - name: X-Resp
-            value: "true"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: headers
+            response_set:
+              - name: X-Resp
+                value: "true"
 insecure_options:
   allow_unbounded_body: true
 "#;
@@ -966,7 +978,7 @@ type ExtProcClient =
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
+    let pipeline = config::build_profile_pipeline(&cfg, &registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");

@@ -7,11 +7,11 @@
 //! Listeners and clusters are omitted because Envoy owns networking.
 
 use std::{collections::HashSet, sync::Arc};
-
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use serde::Deserialize;
 
 use crate::error::{ExtProcError, Result};
+use crate::profile::{ProfilePipeline, NamedProfile};
 
 // -----------------------------------------------------------------------------
 // ExtProcConfig
@@ -24,21 +24,32 @@ use crate::error::{ExtProcError, Result};
 ///
 /// let cfg: ExtProcConfig = serde_yaml::from_str(
 ///     r#"
-/// filter_chains:
-///   - name: main
-///     filters:
-///       - filter: request_id
+/// profiles:
+///   - name: default
+///     filter_chains:
+///       - name: main
+///         filters:
+///           - filter: request_id
 /// "#,
 /// )
 /// .unwrap();
-/// assert_eq!(cfg.filter_chains[0].name, "main");
+/// assert_eq!(cfg.profiles.unwrap()[0].name, "default");
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtProcConfig {
-    /// Named filter chains. Concatenated in order to form the pipeline.
+    /// Filter chains executed before profile selection.
     #[serde(default)]
-    pub filter_chains: Vec<praxis_core::config::FilterChainConfig>,
+    pub pre_processing: Option<Vec<praxis_core::config::FilterChainConfig>>,
+
+    /// Named processing profiles. Exactly one is selected per request.
+    #[serde(default)]
+    
+    pub profiles: Option<Vec<ProfileConfig>>,
+
+    /// Filter chains executed after the selected profile completes.
+    #[serde(default)]
+    pub post_processing: Option<Vec<praxis_core::config::FilterChainConfig>>,
 
     /// Security overrides for development.
     #[serde(default)]
@@ -47,6 +58,16 @@ pub struct ExtProcConfig {
     /// gRPC server settings.
     #[serde(default)]
     pub server: ServerConfig,
+}
+
+/// A named processing profile with its own filter chains.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Profile identifier.
+    pub name: String,
+    /// Filter chains for this profile.
+    pub filter_chains: Vec<praxis_core::config::FilterChainConfig>,
 }
 
 /// gRPC server bind address and options.
@@ -99,25 +120,56 @@ impl Default for ServerConfig {
 /// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
-pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
-    validate_chain_names(&config.filter_chains)?;
+pub fn build_profile_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<ProfilePipeline>> {
+    let pre = config
+        .pre_processing
+        .as_deref()
+        .map(|chains| build_filter_pipeline(chains, registry, &config.insecure_options))
+        .transpose()?;
 
-    let chains: std::collections::HashMap<&str, &[_]> = config
-        .filter_chains
+    let mut profiles = Vec::new();
+    if let Some(profile_configs) = &config.profiles {
+        for pc in profile_configs {
+            let pipeline = build_filter_pipeline(&pc.filter_chains, registry, &config.insecure_options)?;
+            profiles.push(NamedProfile {
+                name: Arc::from(pc.name.as_str()),
+                pipeline,
+            });
+        }
+    }
+
+    let post = config
+        .post_processing
+        .as_deref()
+        .map(|chains| build_filter_pipeline(chains, registry, &config.insecure_options))
+        .transpose()?;
+
+    Ok(Arc::new(ProfilePipeline::new(pre, profiles, post)))
+}
+
+/// Build a single [`FilterPipeline`] from a slice of filter chain configs.
+fn build_filter_pipeline(
+    chains: &[praxis_core::config::FilterChainConfig],
+    registry: &FilterRegistry,
+    insecure_options: &praxis_core::config::InsecureOptions,
+) -> Result<Arc<FilterPipeline>> {
+    validate_chain_names(chains)?;
+
+    let chain_map: std::collections::HashMap<&str, &[_]> = chains
         .iter()
         .map(|c| (c.name.as_str(), c.filters.as_slice()))
         .collect();
 
-    let mut entries = flatten_chains(&config.filter_chains);
+    let mut entries = flatten_chains(chains);
 
-    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)
+    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chain_map)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline
-        .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
+        .apply_body_limits(None, None, insecure_options.allow_unbounded_body)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
-    pipeline.apply_insecure_options(&config.insecure_options);
+    pipeline.apply_insecure_options(insecure_options);
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
     Ok(Arc::new(pipeline))
@@ -165,24 +217,29 @@ mod tests {
     fn parse_minimal_config() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: main
-    filters:
-      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: request_id
 "#,
         )
         .unwrap();
 
-        assert_eq!(cfg.filter_chains.len(), 1, "should have one chain");
-        assert_eq!(cfg.filter_chains[0].name, "main", "chain name should match");
-        assert_eq!(cfg.filter_chains[0].filters.len(), 1, "should have one filter");
+        let profiles = cfg.profiles.unwrap();
+        assert_eq!(profiles.len(), 1, "should have one profile");
+        assert_eq!(profiles[0].name, "default", "profile name should match");
+        assert_eq!(profiles[0].filter_chains.len(), 1, "should have one chain");
     }
 
     #[test]
-    fn parse_empty_chains_defaults() {
+    fn parse_empty_config_defaults() {
         let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
 
-        assert!(cfg.filter_chains.is_empty(), "chains should default to empty");
+        assert!(cfg.profiles.is_none(), "profiles should default to None");
+        assert!(cfg.pre_processing.is_none(), "pre should default to None");
+        assert!(cfg.post_processing.is_none(), "post should default to None");
         assert_eq!(cfg.server.grpc_address, "0.0.0.0:50051", "grpc address should default");
     }
 
@@ -203,20 +260,23 @@ server:
     fn build_pipeline_with_builtins() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: main
-    filters:
-      - filter: request_id
-      - filter: headers
-        request_add:
-          - name: X-Test
-            value: extproc
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: request_id
+          - filter: headers
+            request_add:
+              - name: X-Test
+                value: extproc
 "#,
         )
         .unwrap();
 
         let registry = praxis_ai_filters::build_ai_registry();
-        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+        let profile_pipeline = build_profile_pipeline(&cfg, &registry).unwrap();
+        let pipeline = profile_pipeline.default_pipeline();
 
         assert_eq!(pipeline.len(), 2, "pipeline should have two filters");
     }
@@ -225,17 +285,20 @@ filter_chains:
     fn build_pipeline_with_ai_filter() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: main
-    filters:
-      - filter: model_to_header
-        header: X-AI-Model
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: model_to_header
+            header: X-AI-Model
 "#,
         )
         .unwrap();
 
         let registry = praxis_ai_filters::build_ai_registry();
-        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+        let profile_pipeline = build_profile_pipeline(&cfg, &registry).unwrap();
+        let pipeline = profile_pipeline.default_pipeline();
 
         assert_eq!(pipeline.len(), 1, "pipeline should have one AI filter");
     }
@@ -244,39 +307,40 @@ filter_chains:
     fn build_pipeline_unknown_filter_fails() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: main
-    filters:
-      - filter: nonexistent_filter
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: nonexistent_filter
 "#,
         )
         .unwrap();
 
         let registry = praxis_ai_filters::build_ai_registry();
-        let result = build_pipeline(&cfg, &registry);
+        let result = build_profile_pipeline(&cfg, &registry);
 
         assert!(result.is_err(), "unknown filter should fail");
     }
 
     #[test]
     fn flatten_multiple_chains() {
-        let cfg: ExtProcConfig = serde_yaml::from_str(
+        let chains: Vec<praxis_core::config::FilterChainConfig> = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: security
-    filters:
-      - filter: request_id
-  - name: routing
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-A
-            value: "1"
+- name: security
+  filters:
+    - filter: request_id
+- name: routing
+  filters:
+    - filter: headers
+      request_add:
+        - name: X-A
+          value: "1"
 "#,
         )
         .unwrap();
 
-        let entries = flatten_chains(&cfg.filter_chains);
+        let entries = flatten_chains(&chains);
 
         assert_eq!(entries.len(), 2, "should flatten both chains");
     }
@@ -285,19 +349,21 @@ filter_chains:
     fn duplicate_chain_names_rejected() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
-filter_chains:
-  - name: dupe
-    filters:
-      - filter: request_id
-  - name: dupe
-    filters:
-      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: dupe
+        filters:
+          - filter: request_id
+      - name: dupe
+        filters:
+          - filter: request_id
 "#,
         )
         .unwrap();
 
         let registry = praxis_ai_filters::build_ai_registry();
-        let err = build_pipeline(&cfg, &registry)
+        let err = build_profile_pipeline(&cfg, &registry)
             .err()
             .expect("duplicate chain names should fail");
 
@@ -311,11 +377,72 @@ filter_chains:
     fn deny_unknown_fields_rejects_extra_keys() {
         let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
             r#"
-filter_chains: []
 bogus_key: true
 "#,
         );
 
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn parse_three_tier_config() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Test
+                value: extproc
+post_processing:
+  - name: post
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.pre_processing.is_some(), "pre should be set");
+        assert!(cfg.profiles.is_some(), "profiles should be set");
+        assert!(cfg.post_processing.is_some(), "post should be set");
+    }
+
+    #[test]
+    fn build_three_tier_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Test
+                value: extproc
+post_processing:
+  - name: post
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let profile_pipeline = build_profile_pipeline(&cfg, &registry).unwrap();
+        let pipeline = profile_pipeline.default_pipeline();
+
+        assert_eq!(pipeline.len(), 1, "default profile should have one filter");
     }
 }

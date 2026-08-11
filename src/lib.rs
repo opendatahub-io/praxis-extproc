@@ -20,3 +20,5 @@ pub mod metrics;
 pub mod response;
 pub mod server;
 pub mod tls;
+/// Processing profile pipeline orchestration.
+pub mod profile;

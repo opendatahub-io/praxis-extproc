@@ -12,7 +12,7 @@
 use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
+use praxis_filter::{FilterAction, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -25,6 +25,7 @@ use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streamin
 use tracing::{debug, error, warn};
 
 use crate::{adapter, metrics, response};
+use crate::profile::ProfilePipeline;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -55,12 +56,12 @@ type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingRe
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub struct PraxisExtProc {
     /// Shared filter pipeline.
-    pipeline: Arc<FilterPipeline>,
+    pipeline: Arc<ProfilePipeline>,
 }
 
 impl PraxisExtProc {
     /// Create a new ExtProc service backed by the given pipeline.
-    pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
+    pub fn new(pipeline: Arc<ProfilePipeline>) -> Self {
         Self { pipeline }
     }
 }
@@ -83,7 +84,7 @@ impl ExternalProcessor for PraxisExtProc {
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(&pipeline, &mut inbound, &tx).await {
+            if let Err(e) = handle_stream(pipeline.as_ref(), &mut inbound, &tx).await {
                 error!(error = %e, "stream processing failed");
                 drop(tx.send(Err(e)).await);
             }
@@ -104,7 +105,7 @@ impl ExternalProcessor for PraxisExtProc {
 /// Accumulates request/response body chunks and runs the Praxis filter
 /// pipeline at the appropriate phase boundaries.
 async fn handle_stream(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
 ) -> Result<(), Status> {
@@ -124,7 +125,7 @@ async fn handle_stream(
     reason = "stream loop is intentionally flat; splitting obscures channel lifecycle"
 )]
 async fn process_messages(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     stream_state: &mut StreamState,
@@ -160,7 +161,7 @@ async fn process_messages(
     reason = "async match over ProcessingRequest variants exceeds stack threshold"
 )]
 async fn dispatch_request(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     req: processing_request::Request,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
@@ -289,7 +290,7 @@ impl EosTracker {
 ///
 /// [`Request`]: praxis_filter::Request
 async fn handle_request_headers(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
@@ -309,7 +310,7 @@ async fn handle_request_headers(
 
 /// Handle request body: accumulate chunks, run pipeline on EOS.
 async fn handle_request_body(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
@@ -333,7 +334,7 @@ async fn handle_request_body(
 /// sends headers to the client after receiving our reply. Body-phase
 /// mutations on headers are too late.
 async fn handle_response_headers(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
@@ -354,7 +355,7 @@ async fn handle_response_headers(
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
 async fn handle_response_body(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
@@ -378,7 +379,7 @@ async fn handle_response_body(
 
 /// Run request filters and optional body filters, collecting mutations.
 async fn run_request_pipeline(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     if state.request.is_none() {
@@ -392,20 +393,20 @@ async fn run_request_pipeline(
 
 /// Execute request-phase filters and body filters, then collect mutations.
 async fn run_request_filters(
-    pipeline: &FilterPipeline,
+    profile_pipeline: &ProfilePipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         return Err(Status::internal("no request headers"));
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(profile_pipeline.default_pipeline(), request);
 
-    let action = execute_request(pipeline, &mut ctx).await?;
+    let action = execute_request(profile_pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body).await?;
+    let body_reject = run_body_filters(profile_pipeline, &mut ctx, &mut state.request_body).await?;
     if let Some(imm) = body_reject {
         return Ok(vec![response::immediate(imm)]);
     }
@@ -428,7 +429,7 @@ async fn run_request_filters(
 
 /// Run response filters and optional body filters, collecting mutations.
 async fn run_response_pipeline(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     if state.request.is_none() {
@@ -451,14 +452,14 @@ async fn run_response_pipeline(
 /// processed by [`run_response_header_filters`]; only body filters
 /// run in that case.
 async fn run_response_filters(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     state: &mut StreamState,
     resp: &mut Response,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         return Err(Status::internal("no request headers"));
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(pipeline.default_pipeline(), request);
 
     state.restore_request_ctx(&mut ctx);
     let original_headers = capture_original_headers(resp);
@@ -492,13 +493,13 @@ async fn run_response_filters(
 /// included in the `ResponseHeaders` reply. Body processing runs
 /// separately when the body arrives.
 async fn run_response_header_filters(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     state: &mut StreamState,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>, Status> {
     let Some(request) = state.request.as_ref() else {
         return Ok(None);
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(pipeline.default_pipeline(), request);
     state.restore_request_ctx(&mut ctx);
 
     let Some(resp) = state.response.as_mut() else {
@@ -527,17 +528,17 @@ fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
 }
 
 /// Execute the request-phase pipeline.
-async fn execute_request(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
+async fn execute_request(pipeline: &ProfilePipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
     pipeline
-        .execute_http_request(ctx)
+        .execute_request(ctx)
         .await
         .map_err(|e| Status::internal(e.to_string()))
 }
 
 /// Execute the response-phase pipeline.
-async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
+async fn execute_response(pipeline: &ProfilePipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
     pipeline
-        .execute_http_response(ctx)
+        .execute_response(ctx)
         .await
         .map_err(|e| Status::internal(e.to_string()))
 }
@@ -558,7 +559,7 @@ fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ex
 
 /// Run request body filters if the pipeline has body capabilities.
 async fn run_body_filters(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
@@ -568,7 +569,7 @@ async fn run_body_filters(
 
     let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
-        .execute_http_request_body(ctx, &mut body, true)
+        .execute_request_body(ctx, &mut body, true)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -585,7 +586,7 @@ async fn run_body_filters(
 
 /// Run response body filters (synchronous, per Pingora constraint).
 fn run_resp_body_filters(
-    pipeline: &FilterPipeline,
+    pipeline: &ProfilePipeline,
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
@@ -595,7 +596,7 @@ fn run_resp_body_filters(
 
     let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
-        .execute_http_response_body(ctx, &mut body, true)
+        .execute_response_body(ctx, &mut body, true)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     if let Some(b) = body {

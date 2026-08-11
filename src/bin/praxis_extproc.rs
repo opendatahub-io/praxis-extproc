@@ -14,6 +14,7 @@ use praxis_extproc::{
     error::ExtProcError,
     server::PraxisExtProc,
     tls,
+    profile,
 };
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
@@ -72,7 +73,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry)?;
+    let pipeline = config::build_profile_pipeline(&cfg, &registry)?;
 
     if cli.validate {
         info!("configuration is valid");
@@ -83,7 +84,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         grpc = %addrs.0, health = %addrs.1,
-        metrics = %addrs.2, filters = pipeline.len(),
+        metrics = %addrs.2, filters = pipeline.default_pipeline().len(),
         "starting ExtProc server"
     );
 
@@ -98,7 +99,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 )]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
-    pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
+    pipeline: std::sync::Arc<profile::ProfilePipeline>,
     tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -129,7 +130,7 @@ async fn start_services(
 /// Start the main gRPC ExtProc server.
 async fn serve_grpc(
     addr: std::net::SocketAddr,
-    pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
+    pipeline: std::sync::Arc<profile::ProfilePipeline>,
     tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let svc = PraxisExtProc::new(pipeline);
