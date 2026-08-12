@@ -7,11 +7,14 @@
 //! Listeners and clusters are omitted because Envoy owns networking.
 
 use std::{collections::HashSet, sync::Arc};
+
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use serde::Deserialize;
 
-use crate::error::{ExtProcError, Result};
-use crate::profile::{ProfilePipeline, NamedProfile};
+use crate::{
+    error::{ExtProcError, Result},
+    profile::{NamedProfile, ProfilePipeline},
+};
 
 // -----------------------------------------------------------------------------
 // ExtProcConfig
@@ -44,7 +47,6 @@ pub struct ExtProcConfig {
 
     /// Named processing profiles. Exactly one is selected per request.
     #[serde(default)]
-    
     pub profiles: Option<Vec<ProfileConfig>>,
 
     /// Filter chains executed after the selected profile completes.
@@ -129,6 +131,7 @@ pub fn build_profile_pipeline(config: &ExtProcConfig, registry: &FilterRegistry)
 
     let mut profiles = Vec::new();
     if let Some(profile_configs) = &config.profiles {
+        validate_profile_names(profile_configs)?;
         for pc in profile_configs {
             let pipeline = build_filter_pipeline(&pc.filter_chains, registry, &config.insecure_options)?;
             profiles.push(NamedProfile {
@@ -136,6 +139,10 @@ pub fn build_profile_pipeline(config: &ExtProcConfig, registry: &FilterRegistry)
                 pipeline,
             });
         }
+    }
+
+    if profiles.is_empty() {
+        return Err(ExtProcError::Config("at least one profile is required".to_owned()));
     }
 
     let post = config
@@ -152,13 +159,11 @@ fn build_filter_pipeline(
     chains: &[praxis_core::config::FilterChainConfig],
     registry: &FilterRegistry,
     insecure_options: &praxis_core::config::InsecureOptions,
-) -> Result<Arc<FilterPipeline>> {
+) -> Result<FilterPipeline> {
     validate_chain_names(chains)?;
 
-    let chain_map: std::collections::HashMap<&str, &[_]> = chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    let chain_map: std::collections::HashMap<&str, &[_]> =
+        chains.iter().map(|c| (c.name.as_str(), c.filters.as_slice())).collect();
 
     let mut entries = flatten_chains(chains);
 
@@ -172,7 +177,21 @@ fn build_filter_pipeline(
     pipeline.apply_insecure_options(insecure_options);
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
-    Ok(Arc::new(pipeline))
+    Ok(pipeline)
+}
+
+/// Reject configs with duplicate profile names.
+fn validate_profile_names(profiles: &[ProfileConfig]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for profile in profiles {
+        if !seen.insert(&profile.name) {
+            return Err(ExtProcError::Config(format!(
+                "duplicate profile name: {}",
+                profile.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -412,6 +431,127 @@ post_processing:
         assert!(cfg.pre_processing.is_some(), "pre should be set");
         assert!(cfg.profiles.is_some(), "profiles should be set");
         assert!(cfg.post_processing.is_some(), "post should be set");
+    }
+
+    #[test]
+    fn unknown_filter_in_pre_processing_fails() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: nonexistent_filter
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let result = build_profile_pipeline(&cfg, &registry);
+
+        assert!(result.is_err(), "unknown filter in pre_processing should fail");
+    }
+
+    #[test]
+    fn unknown_filter_in_post_processing_fails() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: request_id
+post_processing:
+  - name: post
+    filters:
+      - filter: nonexistent_filter
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let result = build_profile_pipeline(&cfg, &registry);
+
+        assert!(result.is_err(), "unknown filter in post_processing should fail");
+    }
+
+    #[test]
+    fn duplicate_profile_names_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+profiles:
+  - name: same_name
+    filter_chains:
+      - name: a
+        filters:
+          - filter: request_id
+  - name: same_name
+    filter_chains:
+      - name: b
+        filters:
+          - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let err = build_profile_pipeline(&cfg, &registry)
+            .err()
+            .expect("duplicate profile names should fail");
+
+        assert!(
+            err.to_string().contains("duplicate profile name"),
+            "error should mention duplicate profile: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_profiles_list_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+profiles: []
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let err = build_profile_pipeline(&cfg, &registry)
+            .err()
+            .expect("empty profiles should fail");
+
+        assert!(
+            err.to_string().contains("at least one profile"),
+            "error should mention missing profile: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_profiles_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let err = build_profile_pipeline(&cfg, &registry)
+            .err()
+            .expect("config without profiles should fail");
+
+        assert!(
+            err.to_string().contains("at least one profile"),
+            "error should mention missing profile: {err}"
+        );
     }
 
     #[test]

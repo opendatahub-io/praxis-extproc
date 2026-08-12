@@ -24,8 +24,11 @@ use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
 use tracing::{debug, error, warn};
 
-use crate::{adapter, metrics, response};
-use crate::profile::ProfilePipeline;
+use crate::{
+    adapter, metrics,
+    profile::{ExecutionState, ProfilePipeline},
+    response,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -122,6 +125,7 @@ async fn handle_stream(
 /// Receive and process all messages on the stream.
 #[expect(
     clippy::cognitive_complexity,
+    clippy::large_stack_frames,
     reason = "stream loop is intentionally flat; splitting obscures channel lifecycle"
 )]
 async fn process_messages(
@@ -401,7 +405,7 @@ async fn run_request_filters(
     };
     let mut ctx = adapter::build_filter_context(profile_pipeline.default_pipeline(), request);
 
-    let action = execute_request(profile_pipeline, &mut ctx).await?;
+    let (action, tier_state) = execute_request(profile_pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
         return Ok(vec![response::immediate(imm)]);
     }
@@ -420,8 +424,7 @@ async fn run_request_filters(
         vec![response::request_headers(mutation)]
     };
 
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.tier_state = Some(tier_state);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
     Ok(responses)
@@ -466,7 +469,11 @@ async fn run_response_filters(
     ctx.response_header = Some(resp);
 
     if !state.response_filters_executed {
-        let action = execute_response(pipeline, &mut ctx).await?;
+        let tier_state = state
+            .tier_state
+            .take()
+            .ok_or_else(|| Status::internal("missing tier state"))?;
+        let action = execute_response(pipeline, &mut ctx, tier_state).await?;
         if let Some(imm) = check_reject(action) {
             return Ok(vec![response::immediate(imm)]);
         }
@@ -509,7 +516,11 @@ async fn run_response_header_filters(
     let original_headers = capture_original_headers(resp);
     ctx.response_header = Some(resp);
 
-    let action = execute_response(pipeline, &mut ctx).await?;
+    let tier_state = state
+        .tier_state
+        .take()
+        .ok_or_else(|| Status::internal("missing tier state"))?;
+    let action = execute_response(pipeline, &mut ctx, tier_state).await?;
     if let Some(imm) = check_reject(action) {
         return Err(Status::aborted(imm.body));
     }
@@ -528,7 +539,10 @@ fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
 }
 
 /// Execute the request-phase pipeline.
-async fn execute_request(pipeline: &ProfilePipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
+async fn execute_request(
+    pipeline: &ProfilePipeline,
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<(FilterAction, ExecutionState), Status> {
     pipeline
         .execute_request(ctx)
         .await
@@ -536,9 +550,13 @@ async fn execute_request(pipeline: &ProfilePipeline, ctx: &mut HttpFilterContext
 }
 
 /// Execute the response-phase pipeline.
-async fn execute_response(pipeline: &ProfilePipeline, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, Status> {
+async fn execute_response(
+    pipeline: &ProfilePipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    tier_state: ExecutionState,
+) -> Result<FilterAction, Status> {
     pipeline
-        .execute_response(ctx)
+        .execute_response(ctx, tier_state)
         .await
         .map_err(|e| Status::internal(e.to_string()))
 }
@@ -617,11 +635,8 @@ fn run_resp_body_filters(
 /// Per-stream state accumulated across ExtProc phases.
 #[derive(Debug, Default)]
 struct StreamState {
-    /// Re-entrance counters from request-phase branch chains.
-    branch_iterations: HashMap<Arc<str>, u32>,
-
-    /// Executed filter indices from request phase.
-    executed_filter_indices: Vec<bool>,
+    /// Per-tier filter execution state saved from the request phase.
+    tier_state: Option<ExecutionState>,
 
     /// Metadata carried from request to response phase.
     filter_metadata: HashMap<String, String>,
@@ -651,10 +666,8 @@ impl StreamState {
         Self::default()
     }
 
-    /// Restore filter execution state into a response context.
+    /// Restore filter metadata into a response context.
     fn restore_request_ctx(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
-        ctx.branch_iterations.clone_from(&self.branch_iterations);
         ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
 }

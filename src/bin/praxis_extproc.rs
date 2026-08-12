@@ -12,9 +12,9 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
+    profile,
     server::PraxisExtProc,
     tls,
-    profile,
 };
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
