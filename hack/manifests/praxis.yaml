@@ -36,7 +36,7 @@ data:
                 value: "e2e"
 
     insecure_options:
-      allow_unbounded_body: true
+      allow_unbounded_body: false
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -76,6 +76,16 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
+          readinessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 5
+            periodSeconds: 10
           volumeMounts:
             - name: config
               mountPath: /etc/praxis
