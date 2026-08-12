@@ -34,6 +34,8 @@ spec:
     tls:
       mode: SIMPLE
       sni: 3-147-232-199.sslip.io
+      # llm-katan uses a Let's Encrypt cert we don't control; skip verification in e2e.
+      insecureSkipVerify: true
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
