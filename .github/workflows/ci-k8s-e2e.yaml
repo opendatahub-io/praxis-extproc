@@ -34,6 +34,7 @@ jobs:
 
   k8s-e2e:
     name: K8s E2E
+    timeout-minutes: 30
     permissions:
       contents: read
     needs: simulator-check
@@ -51,17 +52,27 @@ jobs:
 
       - name: Install istioctl
         run: |
-          curl -sL https://istio.io/downloadIstio | ISTIO_VERSION=1.29.2 sh -
+          curl -fsSL -o istio.tar.gz "https://github.com/istio/istio/releases/download/1.29.2/istio-1.29.2-linux-amd64.tar.gz"
+          echo "904bbf1b917dd0135aa55b99cbfa34edd0a188fdeeeef09bb995d8e8e3165112  istio.tar.gz" | sha256sum -c
+          tar -xzf istio.tar.gz
           echo "$PWD/istio-1.29.2/bin" >> "$GITHUB_PATH"
 
       - name: Install praxis-forge
-        run: cargo install --git https://github.com/praxis-proxy/grid.git forge --locked
+        run: cargo install --git https://github.com/praxis-proxy/forge.git --rev 9abe12be9cf51e6384d3e8bc5ba6a0539be466b5 forge --locked
 
       - name: Setup e2e environment
         run: make e2e-setup
 
       - name: Run K8s e2e tests
         run: make e2e-test V=1
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl --context kind-praxis-e2e get pods -A
+          kubectl --context kind-praxis-e2e describe pods -n praxis-extproc
+          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100
+          kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30
 
       - name: Teardown
         if: always()

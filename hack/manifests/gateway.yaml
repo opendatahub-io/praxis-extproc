@@ -34,7 +34,6 @@ spec:
     tls:
       mode: SIMPLE
       sni: 3-147-232-199.sslip.io
-      insecureSkipVerify: true
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

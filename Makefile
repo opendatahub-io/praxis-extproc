@@ -121,15 +121,16 @@ smoke-test:
 # E2E (Forge)
 # ---------------------------------------------------------------------------
 
-FORGE := praxis-forge --config hack/forge.yaml
+FORGE_BIN    ?= praxis-forge
+FORGE_CONFIG := hack/forge.yaml
 
 e2e-setup: images
-	$(FORGE) cluster create e2e
-	$(FORGE) cluster load-image e2e $(EXTPROC_IMAGE)
-	$(FORGE) stack apply e2e
+	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster create e2e
+	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster load-image e2e "$(EXTPROC_IMAGE)"
+	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" stack apply e2e
 
 e2e-teardown:
-	$(FORGE) cluster delete e2e
+	"$(FORGE_BIN)" --config "$(FORGE_CONFIG)" cluster delete e2e
 
 e2e-test:
 	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
