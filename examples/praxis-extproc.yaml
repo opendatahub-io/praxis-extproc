@@ -10,31 +10,33 @@ server:
   tls:
     mode: none
 
-filter_chains:
-  - name: observability
-    filters:
-      - filter: request_id
-      - filter: access_log
+profiles:
+  - name: default
+    filter_chains:
+      - name: observability
+        filters:
+          - filter: request_id
+          - filter: access_log
 
-  - name: security
-    filters:
-      - filter: guardrails
-        rules:
-          - target: body
-            contains: "DROP TABLE"
-          - target: header
-            name: "User-Agent"
-            pattern: "bad-bot.*"
+      - name: security
+        filters:
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "DROP TABLE"
+              - target: header
+                name: "User-Agent"
+                pattern: "bad-bot.*"
 
-  - name: transformation
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Processed-By
-            value: praxis-extproc
-        response_set:
-          - name: X-Proxy
-            value: praxis-extproc
+      - name: transformation
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Processed-By
+                value: praxis-extproc
+            response_set:
+              - name: X-Proxy
+                value: praxis-extproc
 
 insecure_options:
   allow_unbounded_body: true

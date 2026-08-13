@@ -12,22 +12,24 @@ server:
   tls:
     mode: none
 
-filter_chains:
-  - name: observability
-    filters:
-      - filter: request_id
+profiles:
+  - name: default
+    filter_chains:
+      - name: observability
+        filters:
+          - filter: request_id
 
-  - name: ai
-    filters:
-      - filter: model_to_header
-        header: X-AI-Model
+      - name: ai
+        filters:
+          - filter: model_to_header
+            header: X-AI-Model
 
-  - name: transformation
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Processed-By
-            value: praxis-extproc
+      - name: transformation
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Processed-By
+                value: praxis-extproc
 
 insecure_options:
   allow_unbounded_body: true

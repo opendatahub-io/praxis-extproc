@@ -27,7 +27,11 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use praxis_extproc::{config, server::PraxisExtProc};
+use praxis_filter::{FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -858,100 +862,368 @@ async fn repro_ap_post_eos_headers() {
 }
 
 // -----------------------------------------------------------------------------
+// Three-tier pipeline tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn three_tier_request_adds_headers_from_all_tiers() {
+    let (mut client, _shutdown) = start_server(THREE_TIER_CONFIG).await;
+
+    let responses = send_full_request(&mut client, "GET", "/", &[]).await;
+    let mutations = extract_all_set_headers(&responses);
+
+    assert!(
+        mutations.iter().any(|h| h.key == "x-pre" && h.value == "true"),
+        "pre-processing should add X-Pre header, got: {mutations:?}"
+    );
+    assert!(
+        mutations.iter().any(|h| h.key == "x-profile" && h.value == "true"),
+        "profile should add X-Profile header, got: {mutations:?}"
+    );
+    assert!(
+        mutations.iter().any(|h| h.key == "x-post" && h.value == "true"),
+        "post-processing should add X-Post header, got: {mutations:?}"
+    );
+}
+
+#[tokio::test]
+async fn three_tier_response_sets_headers_from_all_tiers() {
+    let (mut client, _shutdown) = start_server(THREE_TIER_CONFIG).await;
+
+    let responses = send_full_roundtrip(&mut client, "GET", "/").await;
+    let mutations = extract_response_set_headers(&responses);
+
+    assert!(
+        mutations.iter().any(|h| h.key == "x-pre-resp" && h.value == "true"),
+        "pre-processing should set X-Pre-Resp on response, got: {mutations:?}"
+    );
+    assert!(
+        mutations.iter().any(|h| h.key == "x-profile-resp" && h.value == "true"),
+        "profile should set X-Profile-Resp on response, got: {mutations:?}"
+    );
+    assert!(
+        mutations.iter().any(|h| h.key == "x-post-resp" && h.value == "true"),
+        "post-processing should set X-Post-Resp on response, got: {mutations:?}"
+    );
+}
+
+#[tokio::test]
+async fn pre_tier_rejection_prevents_later_tiers() {
+    let (mut client, _shutdown) = start_server(PRE_REJECTS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":method", "GET"),
+                    make_header(":path", "/"),
+                    make_header(":authority", "localhost"),
+                    make_header(":scheme", "http"),
+                    make_header("x-block", "true"),
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send headers");
+
+    drop(tx);
+    let responses = collect_responses(&mut inbound).await;
+
+    let has_immediate = responses
+        .iter()
+        .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_))));
+
+    assert!(
+        has_immediate,
+        "pre-processing guardrails should reject with ImmediateResponse"
+    );
+
+    let mutations = extract_all_set_headers(&responses);
+    assert!(
+        !mutations.iter().any(|h| h.key == "x-profile-ran"),
+        "profile tier should not run after pre-processing rejection, got: {mutations:?}"
+    );
+}
+
+#[tokio::test]
+async fn three_tier_body_reaches_post_processing() {
+    let (mut client, _shutdown) = start_server(THREE_TIER_BODY_CONFIG).await;
+
+    let clean = send_full_request(&mut client, "POST", "/", b"hello world").await;
+    let clean_rejected = clean
+        .iter()
+        .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_))));
+    assert!(!clean_rejected, "clean body should pass all tiers");
+
+    let (mut client2, _shutdown2) = start_server(THREE_TIER_BODY_CONFIG).await;
+
+    let blocked = send_full_request(&mut client2, "POST", "/", b"trigger POST_BLOCK here").await;
+    let blocked_rejected = blocked
+        .iter()
+        .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_))));
+    assert!(
+        blocked_rejected,
+        "post-processing should reject body containing POST_BLOCK"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Filter error propagation tests
+// -----------------------------------------------------------------------------
+
+struct AlwaysErrorFilter;
+
+#[async_trait]
+impl HttpFilter for AlwaysErrorFilter {
+    fn name(&self) -> &'static str {
+        "always_error"
+    }
+
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Err("intentional test error".into())
+    }
+}
+
+#[tokio::test]
+async fn filter_error_in_pre_processing_fails_stream() {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "always_error",
+            FilterFactory::Http(Arc::new(|_| Ok(Box::new(AlwaysErrorFilter)))),
+        )
+        .expect("register always_error filter");
+
+    let (mut client, _shutdown) = start_server_with_registry(FILTER_ERROR_CONFIG, &registry).await;
+
+    let responses = send_headers_only(&mut client, "GET", "/").await;
+
+    assert!(
+        responses.is_empty(),
+        "filter error should terminate the stream with no responses"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-const HEADERS_ONLY_CONFIG: &str = r#"
-filter_chains:
-  - name: test
+const FILTER_ERROR_CONFIG: &str = r#"
+pre_processing:
+  - name: pre
     filters:
-      - filter: request_id
+      - filter: always_error
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: request_id
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const HEADERS_ONLY_CONFIG: &str = r#"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: request_id
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const HEADERS_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: request_id
-      - filter: headers
-        request_add:
-          - name: X-Test
-            value: extproc
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: request_id
+          - filter: headers
+            request_add:
+              - name: X-Test
+                value: extproc
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const GUARDRAILS_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: guardrails
-        rules:
-          - target: body
-            contains: "DROP TABLE"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "DROP TABLE"
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const UNCONDITIONAL_BRANCH_CONFIG: &str = r#"
-filter_chains:
-  - name: branch_chain
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Branch-Applied
-            value: "true"
-  - name: test
-    filters:
-      - filter: headers
-        request_add:
-          - name: X-Main
-            value: "true"
-        branch_chains:
-          - name: always_run
-            rejoin: next
-            chains:
-              - branch_chain
+profiles:
+  - name: default
+    filter_chains:
+      - name: branch_chain
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Branch-Applied
+                value: "true"
+      - name: test
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Main
+                value: "true"
+            branch_chains:
+              - name: always_run
+                rejoin: next
+                chains:
+                  - branch_chain
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const CONDITIONAL_TERMINAL_CONFIG: &str = r#"
-filter_chains:
-  - name: test
-    filters:
-      - filter: guardrails
-        action: flag
-        rules:
-          - target: header
-            name: "x-danger"
-            contains: "true"
-        branch_chains:
-          - name: block_dangerous
-            on_result:
-              filter: guardrails
-              result: blocked
-            rejoin: terminal
-            chains:
-              - name: reject
-                filters:
-                  - filter: static_response
-                    status: 403
-                    body: "blocked by branch"
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: guardrails
+            action: flag
+            rules:
+              - target: header
+                name: "x-danger"
+                contains: "true"
+            branch_chains:
+              - name: block_dangerous
+                on_result:
+                  filter: guardrails
+                  result: blocked
+                rejoin: terminal
+                chains:
+                  - name: reject
+                    filters:
+                      - filter: static_response
+                        status: 403
+                        body: "blocked by branch"
 insecure_options:
   allow_unbounded_body: true
 "#;
 
 const RESPONSE_HEADER_CONFIG: &str = r#"
-filter_chains:
-  - name: test
+profiles:
+  - name: default
+    filter_chains:
+      - name: test
+        filters:
+          - filter: headers
+            response_set:
+              - name: X-Resp
+                value: "true"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const THREE_TIER_CONFIG: &str = r#"
+pre_processing:
+  - name: pre
     filters:
+      - filter: request_id
       - filter: headers
-        response_set:
-          - name: X-Resp
+        request_add:
+          - name: X-Pre
             value: "true"
+        response_set:
+          - name: X-Pre-Resp
+            value: "true"
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Profile
+                value: "true"
+            response_set:
+              - name: X-Profile-Resp
+                value: "true"
+post_processing:
+  - name: post
+    filters:
+      - filter: request_id
+      - filter: headers
+        request_add:
+          - name: X-Post
+            value: "true"
+        response_set:
+          - name: X-Post-Resp
+            value: "true"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const PRE_REJECTS_CONFIG: &str = r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: guardrails
+        rules:
+          - target: header
+            name: "x-block"
+            contains: "true"
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: headers
+            request_add:
+              - name: X-Profile-Ran
+                value: "true"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const THREE_TIER_BODY_CONFIG: &str = r#"
+pre_processing:
+  - name: pre
+    filters:
+      - filter: guardrails
+        rules:
+          - target: body
+            contains: "PRE_BLOCK"
+profiles:
+  - name: default
+    filter_chains:
+      - name: main
+        filters:
+          - filter: guardrails
+            rules:
+              - target: body
+                contains: "PROFILE_BLOCK"
+post_processing:
+  - name: post
+    filters:
+      - filter: guardrails
+        rules:
+          - target: body
+            contains: "POST_BLOCK"
 insecure_options:
   allow_unbounded_body: true
 "#;
@@ -964,9 +1236,16 @@ type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
-    let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
+    start_server_with_registry(config_yaml, &registry).await
+}
+
+async fn start_server_with_registry(
+    config_yaml: &str,
+    registry: &FilterRegistry,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
+    let pipeline = config::build_profile_pipeline(&cfg, registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
@@ -1122,6 +1401,25 @@ fn extract_all_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue>
         let mutation = match &r.response {
             Some(RespVariant::RequestHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
             Some(RespVariant::RequestBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+            _ => None,
+        };
+        if let Some(m) = mutation {
+            for hvo in &m.set_headers {
+                if let Some(hv) = &hvo.header {
+                    headers.push(hv.clone());
+                }
+            }
+        }
+    }
+    headers
+}
+
+fn extract_response_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue> {
+    let mut headers = Vec::new();
+    for r in responses {
+        let mutation = match &r.response {
+            Some(RespVariant::ResponseHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+            Some(RespVariant::ResponseBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
             _ => None,
         };
         if let Some(m) = mutation {

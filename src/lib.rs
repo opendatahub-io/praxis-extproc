@@ -17,6 +17,8 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod metrics;
+/// Processing profile pipeline orchestration.
+pub mod profile;
 pub mod response;
 pub mod server;
 pub mod tls;
