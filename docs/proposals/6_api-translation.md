@@ -17,6 +17,13 @@ operates after authorization and route selection have completed, covers
 both buffered and streaming (SSE) responses, and produces a deterministic,
 ordered set of header and body mutations.
 
+The translation stage derives the target provider exclusively from the
+trusted route result written into stream state by the authorization and
+routing stage. Provider identity is never inferred from consumer-controlled
+inputs such as model names, URI paths, or request headers. If the trusted
+route result is absent or names a provider not in the configured allowlist,
+the stage rejects the request and halts the pipeline.
+
 Translation is a **pure protocol concern**. Credential injection is out of
 scope and is addressed as a separate pipeline stage (see issue #6,
 provider-credential sub-task). The two stages are designed to compose —
@@ -41,11 +48,17 @@ translation layer never needs access to secret material.
   the translation pipeline predictable, independently testable, and safe
   to compose with other filter stages.
 
-- **Consumer credential removal.** Any consumer-supplied provider
-  credential present in the request (header or body) must be stripped
-  during this stage, before the credential injection stage runs. This
-  establishes a clean security boundary and ensures the runtime is the
-  sole authority on which credential reaches a provider.
+- **Consumer credential removal.** Consumer-supplied provider credentials
+  must be stripped across every location where a provider can accept them,
+  before the credential injection stage runs. The scope is per-provider
+  and covers: authentication headers (e.g. `Authorization`, `x-api-key`,
+  `X-Goog-Api-Key`), SigV4 query parameters (e.g. `X-Amz-Credential`,
+  `X-Amz-Signature`, `X-Amz-Security-Token`, `X-Amz-Algorithm`), URI
+  path components that embed identity or session tokens, and any nested
+  body fields used by the provider for authentication. Each provider's
+  complete credential-bearing surface must be enumerated in a fixture that
+  asserts the final forwarded request contains only runtime-injected
+  credentials and nothing consumer-supplied.
 
 - **Fixture-backed correctness.** Every provider in scope must have
   golden fixtures covering: normal request/response, error response, and
@@ -58,6 +71,15 @@ translation layer never needs access to secret material.
   unsupported model parameter, schema mismatch), it must reject the
   request with a stable error response rather than forwarding a malformed
   request to the provider.
+
+- **Trusted provider context, explicit allowlist.** The translation stage
+  must operate from an explicit, operator-configured allowlist of known
+  providers. Provider identity is read exclusively from the trusted route
+  result in stream state — it must never be inferred or overridden from
+  consumer-controlled inputs (model names, URI paths, headers, or body
+  fields). A missing route result, an unrecognized provider identifier,
+  or a conflict between route-state values must cause an immediate
+  rejection before any translation or mutation is applied.
 
 - **Authorization ordering enforced.** Translation must not execute
   before the authorization stage has completed. The pipeline stage
@@ -138,10 +160,17 @@ heterogeneity an infrastructure concern:
   regardless of which provider served the request.
 
 - As a **security engineer**, I want consumer-supplied provider
-  credentials stripped during the translation stage before any authorized
-  credential is injected, so that the runtime is the sole authority on
-  which credential reaches a provider and consumers cannot influence
-  provider authentication.
+  credentials stripped across every credential-bearing location —
+  headers, SigV4 query parameters, URI path tokens, and body fields —
+  before any authorized credential is injected, so that the runtime is
+  the sole authority on which credential reaches a provider regardless
+  of which transport mechanism the consumer used to supply it.
+
+- As a **security engineer**, I want provider identity derived
+  exclusively from the trusted route result stored in stream state, and
+  never inferred from consumer-controlled model names, URI paths, or
+  headers, so that a consumer cannot steer the translation stage toward
+  a provider they are not authorized to reach.
 
 - As a **security engineer**, I want translation to fail closed when
   input cannot be translated to a valid provider request, so that
