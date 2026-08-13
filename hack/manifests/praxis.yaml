@@ -59,6 +59,7 @@ spec:
       annotations:
         sidecar.istio.io/inject: "false"
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: praxis-extproc
           image: praxis-extproc:dev
@@ -102,6 +103,10 @@ spec:
             runAsUser: 65534
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
       volumes:
         - name: config
           configMap:

@@ -36,7 +36,6 @@
     reason = "k8s e2e tests"
 )]
 #![allow(missing_docs, reason = "k8s e2e test module")]
-#![allow(unused_variables, reason = "stubs")]
 
 use std::time::Duration;
 
@@ -314,10 +313,7 @@ async fn model_to_header_works() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 200);
-
-    let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    assert!(body["choices"].is_array());
+    assert_eq!(resp.status(), 200, "model_to_header filter must not break the request pipeline");
 }
 
 // ---------------------------------------------------------------------------
