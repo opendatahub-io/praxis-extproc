@@ -21,10 +21,12 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", rev = "1dc6aebe086ab5bd324234541c11ce6b1b456ae3" }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "1dc6aebe086ab5bd324234541c11ce6b1b456ae3" }
-praxis-core = { version = "=0.5.1", package = "praxis-proxy-core" }
-praxis-filter = { version = "=0.5.1", package = "praxis-proxy-filter" }
+# praxis-ai v0.2.0
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", rev = "e9fb5211eb97752a1bbffe0fd42d3c6beeaec4aa" }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "e9fb5211eb97752a1bbffe0fd42d3c6beeaec4aa" }
+# v0.5.2 (af54edcd24de01e4dac7da59a809bf88bd246fe5) — tag must match praxis-ai's pin to unify
+praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-filter" }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
