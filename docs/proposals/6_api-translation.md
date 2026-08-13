@@ -35,8 +35,14 @@ translation layer never needs access to secret material.
 - **Bidirectional format translation.** Rewrite consumer inference
   requests to the wire format required by the selected provider, and
   rewrite provider responses back to the canonical consumer-facing schema.
-  Providers in scope for the first release: OpenAI, Anthropic, Vertex AI,
-  Bedrock, and any other provider included in the pinned release fixtures.
+  Supported providers are defined by a versioned, operator-configured
+  allowlist. Each allowlist entry must declare: the provider identifier,
+  transport protocol, credential-bearing locations (headers, query
+  parameters, body fields), request and response schemas, and a fixture
+  manifest. Providers for the first release: OpenAI, Anthropic, Vertex
+  AI, and Bedrock. Adding a provider requires an explicit allowlist entry
+  with all required fields — fixture inclusion alone does not grant
+  support scope.
 
 - **Streaming / SSE correctness.** Handle streaming and SSE responses
   across arbitrary chunk boundaries. Event framing, ordering, and the
