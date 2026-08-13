@@ -4,13 +4,14 @@
 set -euo pipefail
 
 CTX="${1:?usage: install-metallb-pool.sh <kube-context>}"
+ENGINE="${CONTAINER_ENGINE:-docker}"
 
 if kubectl --context "$CTX" get ipaddresspool e2e-pool -n metallb-system &>/dev/null; then
   echo "MetalLB pool already configured"
   exit 0
 fi
 
-KIND_SUBNET=$(docker network inspect kind \
+KIND_SUBNET=$("$ENGINE" network inspect kind \
   -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' \
   | tr ' ' '\n' | grep '\.' | head -1)
 [[ -n "$KIND_SUBNET" ]] || { echo "cannot determine Kind subnet" >&2; exit 1; }
