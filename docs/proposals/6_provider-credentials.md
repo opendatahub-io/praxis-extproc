@@ -1,6 +1,11 @@
 ---
 issue: https://github.com/opendatahub-io/praxis-extproc/issues/6
-discussion: # add a link here
+discussion: >-
+  Sub-task of epic issue #6, which was opened from the project discussion
+  phase and serves as the approved discussion artifact for all child
+  proposals. No separate GitHub Discussion was opened for this sub-task;
+  the epic issue is considered sufficient per maintainer agreement.
+  See https://github.com/opendatahub-io/praxis-extproc/issues/6
 status: proposed
 authors:
   - mkoushni
@@ -40,12 +45,19 @@ validity window.
   not require changes to the credential-stage interface, only to the
   provider-specific resolver.
 
-- **Consumer credential removal.** Any provider credential present in
-  the consumer request — header, query parameter, or body field — must
-  be stripped unconditionally before the authorized credential is
-  injected. Removal must happen regardless of whether a valid authorized
-  credential exists. A missing authorized credential is a rejection, not
-  a fallback to the consumer-supplied one.
+- **No-consumer-credential precondition.** Primary removal of consumer-
+  supplied provider credentials (headers, query parameters, body fields)
+  is owned by the API translation stage (see `6_api-translation.md`).
+  The credential stage treats a clean request as a precondition: it must
+  verify that no consumer-supplied credential remains in any
+  credential-bearing location before injecting the authorized credential.
+  If a consumer credential is still present when this stage executes —
+  indicating the translation stage did not run or was bypassed — the
+  request must be rejected. The credential stage must not overwrite or
+  shadow a consumer credential with an authorized one; it must refuse to
+  inject until the consumer credential is absent. This defense-in-depth
+  check ensures that a misconfigured or bypassed translation stage cannot
+  cause consumer credentials to reach a provider.
 
 - **Bounded token lifecycle management.** Cloud-generated credentials
   (OAuth2 access tokens, STS session tokens) have finite validity
