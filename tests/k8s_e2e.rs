@@ -313,7 +313,11 @@ async fn model_to_header_works() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 200, "model_to_header filter must not break the request pipeline");
+    assert_eq!(
+        resp.status(),
+        200,
+        "model_to_header filter must not break the request pipeline"
+    );
 }
 
 // ---------------------------------------------------------------------------
