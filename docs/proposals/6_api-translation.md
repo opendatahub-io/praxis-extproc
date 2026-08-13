@@ -1,6 +1,6 @@
 ---
 issue: https://github.com/opendatahub-io/praxis-extproc/issues/6
-discussion: # add a link here
+discussion:
 status: proposed
 authors:
   - mkoushni
