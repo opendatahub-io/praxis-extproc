@@ -80,7 +80,6 @@ async fn ensure_gateway_ready() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn chat_completion_200() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -104,7 +103,6 @@ async fn chat_completion_200() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn response_has_openai_structure() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -137,7 +135,6 @@ async fn response_has_openai_structure() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn tool_call_passthrough() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -177,7 +174,6 @@ async fn tool_call_passthrough() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn image_content_passthrough() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -207,7 +203,6 @@ async fn image_content_passthrough() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn json_mode_response() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -238,7 +233,6 @@ async fn json_mode_response() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn system_prompt_passthrough() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -265,7 +259,6 @@ async fn system_prompt_passthrough() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn multi_turn_conversation() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -297,7 +290,6 @@ async fn multi_turn_conversation() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn model_to_header_works() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -325,7 +317,6 @@ async fn model_to_header_works() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn praxis_headers_applied() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -357,7 +348,6 @@ async fn praxis_headers_applied() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn streaming_completion() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -396,7 +386,6 @@ async fn streaming_completion() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn large_body_passthrough() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -422,7 +411,6 @@ async fn large_body_passthrough() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn invalid_api_key_rejected() {
     ensure_gateway_ready().await;
     let client = reqwest::Client::builder()
@@ -450,7 +438,6 @@ async fn invalid_api_key_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn malformed_json_rejected() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -476,7 +463,6 @@ async fn malformed_json_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-
 async fn empty_messages_rejected() {
     ensure_gateway_ready().await;
     let client = http_client();
