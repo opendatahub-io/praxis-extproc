@@ -1,7 +1,7 @@
 # Multi-stage build for praxis-extproc.
 #
-# Builder: ubi10/ubi with rustup (native cargo on the host platform).
-# Runtime: ubi10/ubi-minimal.
+# Builder: ubi9/ubi with rustup (native cargo on the host platform).
+# Runtime: ubi9/ubi-minimal.
 #
 # Build:
 #   make container-release
@@ -15,7 +15,7 @@
 # Builder
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi10/ubi AS builder
+FROM registry.access.redhat.com/ubi9/ubi AS builder
 
 ARG CARGO_PROFILE=release
 
@@ -53,7 +53,7 @@ RUN set -eu; \
 # Runtime
 # ---------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi10/ubi-minimal
+FROM registry.access.redhat.com/ubi9/ubi-minimal
 
 RUN microdnf install -y openssl-libs \
     && microdnf clean all
