@@ -946,6 +946,12 @@ async fn pre_tier_rejection_prevents_later_tiers() {
         has_immediate,
         "pre-processing guardrails should reject with ImmediateResponse"
     );
+
+    let mutations = extract_all_set_headers(&responses);
+    assert!(
+        !mutations.iter().any(|h| h.key == "x-profile-ran"),
+        "profile tier should not run after pre-processing rejection, got: {mutations:?}"
+    );
 }
 
 #[tokio::test]
