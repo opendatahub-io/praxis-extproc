@@ -1,6 +1,11 @@
 ---
 issue: https://github.com/opendatahub-io/praxis-extproc/issues/6
-discussion:
+discussion: >-
+  Sub-task of epic issue #6, which was opened from the project discussion
+  phase and serves as the approved discussion artifact for all child
+  proposals. No separate GitHub Discussion was opened for this sub-task;
+  the epic issue is considered sufficient per maintainer agreement.
+  See https://github.com/opendatahub-io/praxis-extproc/issues/6
 status: proposed
 authors:
   - mkoushni
@@ -44,10 +49,31 @@ translation layer never needs access to secret material.
   with all required fields — fixture inclusion alone does not grant
   support scope.
 
-- **Streaming / SSE correctness.** Handle streaming and SSE responses
-  across arbitrary chunk boundaries. Event framing, ordering, and the
-  `data:` / `[DONE]` envelope must be preserved through translation
-  without buffering the full stream.
+- **Streaming correctness with transport-specific framing.** Provider
+  streaming transports are not uniform and must be handled with
+  transport-specific decoders rather than a single SSE path:
+
+  - **OpenAI / Anthropic** use Server-Sent Events (`text/event-stream`):
+    `data:` lines, blank-line delimiters, and `data: [DONE]` termination.
+  - **Amazon Bedrock** (`InvokeModelWithResponseStream`) uses
+    `application/vnd.amazon.eventstream` binary framing: length-prefixed
+    messages with headers, payload, and CRC32 checksums. This is not SSE
+    and must not be processed through the SSE decoder. In-stream exception
+    events and normal stream completion must both be mapped to the
+    consumer contract.
+  - **Vertex AI** uses its own event-stream framing and must be handled
+    separately.
+
+  Each transport requires its own decoder with fixtures covering: normal
+  chunk events, stream completion, and in-stream exception or error events.
+
+  All decoders must operate **incrementally**: maintain only a bounded
+  incomplete-frame buffer, emit complete events as soon as they are
+  recognised, and never buffer the full stream. The current ExtProc server
+  accumulates the full response body (up to 10 MiB) before running
+  filters; the streaming translation path must define explicit parser state
+  that avoids this full-buffer model and handles valid end-of-stream
+  termination correctly regardless of chunk boundaries.
 
 - **Deterministic mutation ordering.** Header and body mutations produced
   by translation must be applied in a fixed, documented order. This makes
@@ -66,11 +92,30 @@ translation layer never needs access to secret material.
   asserts the final forwarded request contains only runtime-injected
   credentials and nothing consumer-supplied.
 
-- **Fixture-backed correctness.** Every provider in scope must have
-  golden fixtures covering: normal request/response, error response, and
-  streaming/SSE. Fixtures are the acceptance gate — a translation is
-  correct when its output matches the fixture, not when it passes a
-  unit test written from the same assumptions as the implementation.
+- **Fixture-backed correctness with provenance and negative coverage.**
+  Fixtures are the acceptance gate — a translation is correct when its
+  output matches the fixture, not when it passes a unit test written from
+  the same assumptions as the implementation. To prevent a stale or
+  incomplete contract from passing the gate, fixtures must satisfy the
+  following requirements:
+
+  - **Provenance.** Each fixture records the provider API version, model
+    schema version, and the source of truth it was derived from (e.g.
+    provider SDK test suite, live endpoint capture, specification). Fixture
+    updates require a corresponding provenance update.
+  - **Secret scan.** Fixtures must be scanned for credential material
+    before merge. Any fixture containing a real key, token, or signature
+    must be rejected.
+  - **Positive coverage.** Normal request/response, error response, all
+    supported streaming transports (SSE, Bedrock event-stream), and normal
+    end-of-stream termination.
+  - **Negative coverage.** Unsupported or unknown request fields,
+    malformed stream frames, arbitrary chunk splits across frame boundaries,
+    consumer-supplied credentials in every credential-bearing location
+    (asserting they are absent from the forwarded request), in-stream
+    exception and error events, and mid-stream provider failures. A
+    negative fixture that does not assert a rejection is not a negative
+    fixture.
 
 - **Fail closed on untranslatable input.** If the translation stage
   cannot produce a valid provider request (missing required field,
@@ -88,8 +133,8 @@ translation layer never needs access to secret material.
   rejection before any translation or mutation is applied.
 
 - **Authorization ordering enforced.** Translation must not execute
-  before the authorization stage has completed. The pipeline stage
-  ordering must be statically enforced, not a runtime assumption.
+  before the authorization stage has completed. The enforcement strategy
+  will be detailed in the How? section.
 
 ### Non-Goals
 
