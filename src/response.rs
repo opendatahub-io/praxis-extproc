@@ -11,8 +11,57 @@
 
 use praxis_proto::envoy::service::ext_proc::v3::{
     BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse, ProcessingResponse,
-    TrailersResponse, body_mutation, common_response::ResponseStatus, processing_response::Response,
+    StreamedBodyResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
+    processing_response::Response,
 };
+
+// -----------------------------------------------------------------------------
+// Body Processing Modes
+// -----------------------------------------------------------------------------
+
+/// Body processing mode from Envoy's `BodySendMode` enum.
+///
+/// See: `envoy/service/ext_proc/v3/external_processor.proto`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BodyMode {
+    /// No body sent.
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
+    None = 0,
+    /// Body sent in streaming mode (incremental processing).
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
+    Streamed = 1,
+    /// Body buffered until complete, then sent as single chunk.
+    #[default]
+    Buffered = 2,
+    /// Body sent in buffered partial mode.
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
+    BufferedPartial = 3,
+    /// Body sent in full-duplex streaming mode with chunked responses.
+    FullDuplexStreamed = 4,
+}
+
+impl TryFrom<i32> for BodyMode {
+    type Error = String;
+
+    /// Parse from Envoy's `protocol_config` field.
+    ///
+    /// Only `BUFFERED` (2) and `FULL_DUPLEX_STREAMED` (4) are supported at this stage.
+    /// `NONE` (0) maps to `BUFFERED` (2)
+    ///
+    /// # Errors
+    ///
+    /// Returns error message for unsupported modes.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 | 2 => Ok(Self::Buffered),
+            4 => Ok(Self::FullDuplexStreamed),
+            // Other modes documented but not yet implemented
+            1 => Err("BodySendMode::STREAMED (1) is not yet implemented".to_owned()),
+            3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
+            _ => Err(format!("unknown BodySendMode value {value}")),
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -31,7 +80,7 @@ const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
 /// Build a [`ProcessingResponse`] for the request headers phase.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
+pub(crate) fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::RequestHeaders(HeadersResponse {
             response: Some(CommonResponse {
@@ -47,7 +96,7 @@ pub fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
 /// Build a [`ProcessingResponse`] for the response headers phase.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn response_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
+pub(crate) fn response_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::ResponseHeaders(HeadersResponse {
             response: Some(CommonResponse {
@@ -70,8 +119,12 @@ pub fn response_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse 
 /// 62 KiB boundary. Otherwise sends a single continue.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn request_body(body: Option<&[u8]>, mutation: Option<HeaderMutation>) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, true)
+pub(crate) fn request_body(
+    body: Option<&[u8]>,
+    mutation: Option<HeaderMutation>,
+    body_mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    body_responses(body, mutation, true, body_mode)
 }
 
 /// Build [`ProcessingResponse`] messages for the response body phase.
@@ -79,8 +132,12 @@ pub fn request_body(body: Option<&[u8]>, mutation: Option<HeaderMutation>) -> Ve
 /// Same chunking logic as [`request_body`] but wraps in `ResponseBody`.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn response_body(body: Option<&[u8]>, mutation: Option<HeaderMutation>) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, false)
+pub(crate) fn response_body(
+    body: Option<&[u8]>,
+    mutation: Option<HeaderMutation>,
+    body_mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    body_responses(body, mutation, false, body_mode)
 }
 
 // -----------------------------------------------------------------------------
@@ -90,7 +147,7 @@ pub fn response_body(body: Option<&[u8]>, mutation: Option<HeaderMutation>) -> V
 /// Build a passthrough [`ProcessingResponse`] for request trailers.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn request_trailers() -> ProcessingResponse {
+pub(crate) fn request_trailers() -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::RequestTrailers(TrailersResponse { header_mutation: None })),
         ..Default::default()
@@ -100,7 +157,7 @@ pub fn request_trailers() -> ProcessingResponse {
 /// Build a passthrough [`ProcessingResponse`] for response trailers.
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn response_trailers() -> ProcessingResponse {
+pub(crate) fn response_trailers() -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::ResponseTrailers(TrailersResponse { header_mutation: None })),
         ..Default::default()
@@ -114,7 +171,7 @@ pub fn response_trailers() -> ProcessingResponse {
 /// Wrap an `ImmediateResponse` in a [`ProcessingResponse`].
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
-pub fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
+pub(crate) fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::ImmediateResponse(imm)),
         ..Default::default()
@@ -129,17 +186,8 @@ pub fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
 ///
 /// Returns a `Vec` of `(chunk, end_of_stream)` pairs. The last chunk
 /// has `end_of_stream` set to `true`.
-///
-/// ```
-/// use praxis_extproc::response::chunk_body;
-///
-/// let data = vec![0_u8; 130_000];
-/// let chunks = chunk_body(&data);
-/// assert_eq!(chunks.len(), 3, "130KB should split into 3 chunks");
-/// assert!(!chunks[0].1, "first chunk is not EOS");
-/// assert!(chunks[chunks.len() - 1].1, "last chunk is EOS");
-/// ```
-pub fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
+#[cfg(test)]
+fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
     if data.is_empty() {
         return vec![(data, true)];
     }
@@ -168,17 +216,28 @@ pub fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 /// When body data is present, populates `body_mutation` so Envoy
 /// applies the filter-modified body. Large bodies are split into
 /// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
-fn body_responses(body: Option<&[u8]>, mutation: Option<HeaderMutation>, is_request: bool) -> Vec<ProcessingResponse> {
-    let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
+fn body_responses(
+    body: Option<&[u8]>,
+    mutation: Option<HeaderMutation>,
+    is_request: bool,
+    body_mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    match body_mode {
+        BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request),
+        BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
+            // BUFFERED mode (and others): use BodyMutation::Body for full replacement
+            let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
 
-    let common = CommonResponse {
-        status: ResponseStatus::Continue.into(),
-        header_mutation: mutation,
-        body_mutation,
-        ..Default::default()
-    };
+            let common = CommonResponse {
+                status: ResponseStatus::Continue.into(),
+                header_mutation: mutation,
+                body_mutation,
+                ..Default::default()
+            };
 
-    vec![wrap_body_response(common, is_request)]
+            vec![wrap_body_response(common, is_request)]
+        },
+    }
 }
 
 /// Build a [`BodyMutation`] replacing the body with the given bytes.
@@ -186,6 +245,65 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
     BodyMutation {
         mutation: Some(body_mutation::Mutation::Body(data.to_vec())),
     }
+}
+
+/// Build streamed body responses using `StreamedBodyResponse` wire format.
+///
+/// Chunks the body at 62 KiB boundaries and returns responses.
+/// Each chunk is copied exactly once into its `ProcessingResponse`.
+///
+/// Even for empty bodies, `FULL_DUPLEX_STREAMED` mode requires
+/// `StreamedBodyResponse { body: [], end_of_stream: true }`.
+fn body_responses_streamed(
+    body: Option<&[u8]>,
+    mut mutation: Option<HeaderMutation>,
+    is_request: bool,
+) -> Vec<ProcessingResponse> {
+    let Some(data) = body.filter(|b| !b.is_empty()) else {
+        return vec![make_streamed_response(&[], true, mutation, is_request)];
+    };
+
+    let mut responses = Vec::new();
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let end = (offset + BODY_CHUNK_LIMIT).min(data.len());
+        let eos = end == data.len();
+        let chunk = data.get(offset..end).unwrap_or(&[]);
+        let header_mut = if offset == 0 { mutation.take() } else { None };
+
+        responses.push(make_streamed_response(chunk, eos, header_mut, is_request));
+        offset = end;
+    }
+
+    responses
+}
+
+/// Build a single streamed body response with chunk data.
+fn make_streamed_response(
+    chunk: &[u8],
+    end_of_stream: bool,
+    header_mutation: Option<HeaderMutation>,
+    is_request: bool,
+) -> ProcessingResponse {
+    let streamed = StreamedBodyResponse {
+        body: chunk.to_vec(),
+        end_of_stream,
+    };
+
+    let body_mutation = Some(BodyMutation {
+        mutation: Some(body_mutation::Mutation::StreamedResponse(streamed)),
+    });
+
+    wrap_body_response(
+        CommonResponse {
+            status: ResponseStatus::Continue.into(),
+            header_mutation,
+            body_mutation,
+            ..Default::default()
+        },
+        is_request,
+    )
 }
 
 /// Wrap a [`CommonResponse`] as either request or response body.
@@ -307,7 +425,7 @@ mod tests {
 
     #[test]
     fn request_body_no_mutation() {
-        let responses = request_body(None, None);
+        let responses = request_body(None, None, BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "no body should produce one response");
     }
@@ -315,14 +433,14 @@ mod tests {
     #[test]
     fn request_body_with_data() {
         let data = vec![0_u8; 100];
-        let responses = request_body(Some(&data), None);
+        let responses = request_body(Some(&data), None, BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
     }
 
     #[test]
     fn response_body_no_mutation() {
-        let responses = response_body(None, None);
+        let responses = response_body(None, None, BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "no body should produce one response");
         assert!(
@@ -334,7 +452,7 @@ mod tests {
     #[test]
     fn response_body_with_data() {
         let data = vec![0_u8; 200];
-        let responses = response_body(Some(&data), None);
+        let responses = response_body(Some(&data), None, BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
         assert!(
@@ -394,7 +512,7 @@ mod tests {
             remove_headers: vec!["x-strip".to_owned()],
         };
         let data = vec![0_u8; 50];
-        let responses = request_body(Some(&data), Some(mutation));
+        let responses = request_body(Some(&data), Some(mutation), BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "should produce single body response with mutation");
     }
@@ -402,7 +520,7 @@ mod tests {
     #[test]
     fn large_body_single_response() {
         let data = vec![0_u8; BODY_CHUNK_LIMIT * 2 + 100];
-        let responses = request_body(Some(&data), None);
+        let responses = request_body(Some(&data), None, BodyMode::Buffered);
 
         assert_eq!(
             responses.len(),
@@ -414,7 +532,7 @@ mod tests {
     #[test]
     fn request_body_includes_body_mutation() {
         let data = b"mutated body content";
-        let responses = request_body(Some(data), None);
+        let responses = request_body(Some(data), None, BodyMode::Buffered);
 
         assert_eq!(responses.len(), 1, "should produce one response");
 
@@ -432,7 +550,7 @@ mod tests {
     #[test]
     fn response_body_includes_body_mutation() {
         let data = b"response body data";
-        let responses = response_body(Some(data), None);
+        let responses = response_body(Some(data), None, BodyMode::Buffered);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_some(), "response body_mutation should be populated");
@@ -440,7 +558,7 @@ mod tests {
 
     #[test]
     fn empty_body_has_no_body_mutation() {
-        let responses = request_body(Some(&[]), None);
+        let responses = request_body(Some(&[]), None, BodyMode::Buffered);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_none(), "empty body should not produce body_mutation");
@@ -448,10 +566,139 @@ mod tests {
 
     #[test]
     fn none_body_has_no_body_mutation() {
-        let responses = request_body(None, None);
+        let responses = request_body(None, None, BodyMode::Buffered);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_none(), "None body should not produce body_mutation");
+    }
+
+    #[test]
+    fn streamed_mode_single_chunk() {
+        let data = vec![0_u8; 100];
+        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed);
+
+        assert_eq!(responses.len(), 1, "small body should produce one streamed response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        assert!(body_mut.is_some(), "streamed response should have body_mutation");
+
+        match body_mut.unwrap() {
+            body_mutation::Mutation::StreamedResponse(s) => {
+                assert_eq!(s.body.len(), 100, "chunk should contain all data");
+                assert!(s.end_of_stream, "single chunk should be EOS");
+            },
+            other => panic!("expected StreamedResponse variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_mode_multiple_chunks() {
+        let size = BODY_CHUNK_LIMIT * 2 + 50;
+        let data = vec![0_u8; size];
+        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed);
+
+        assert_eq!(responses.len(), 3, "large body should produce three streamed responses");
+
+        for (i, resp) in responses.iter().enumerate() {
+            let body_mut = extract_body_mutation(resp);
+            assert!(body_mut.is_some(), "chunk {i} should have body_mutation");
+
+            match body_mut.unwrap() {
+                body_mutation::Mutation::StreamedResponse(s) => {
+                    if i < 2 {
+                        assert_eq!(s.body.len(), BODY_CHUNK_LIMIT, "chunk {i} should be full size");
+                        assert!(!s.end_of_stream, "chunk {i} should not be EOS");
+                    } else {
+                        assert_eq!(s.body.len(), 50, "last chunk should have remainder");
+                        assert!(s.end_of_stream, "last chunk should be EOS");
+                    }
+                },
+                other => panic!("expected StreamedResponse variant, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_mode_with_header_mutation() {
+        let mutation = HeaderMutation {
+            set_headers: vec![],
+            remove_headers: vec!["x-internal".to_owned()],
+        };
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
+        let responses = request_body(Some(&data), Some(mutation), BodyMode::FullDuplexStreamed);
+
+        assert_eq!(responses.len(), 2, "should produce two streamed responses");
+
+        // First chunk should have header mutation
+        let first = &responses[0];
+        assert!(
+            matches!(&first.response, Some(Response::RequestBody(b)) if b.response.as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some()),
+            "first chunk should include header mutation"
+        );
+
+        // Second chunk should not
+        let second = &responses[1];
+        assert!(
+            matches!(&second.response, Some(Response::RequestBody(b)) if b.response.as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_none()),
+            "second chunk should not have header mutation"
+        );
+    }
+
+    #[test]
+    fn streamed_mode_empty_body() {
+        let responses = request_body(Some(&[]), None, BodyMode::FullDuplexStreamed);
+
+        assert_eq!(responses.len(), 1, "empty body should produce one response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        let Some(mutation) = body_mut else {
+            panic!("FULL_DUPLEX should use StreamedBodyResponse even for empty body");
+        };
+
+        match mutation {
+            body_mutation::Mutation::StreamedResponse(s) => {
+                assert!(
+                    s.body.is_empty(),
+                    "empty body should have empty StreamedBodyResponse.body"
+                );
+                assert!(s.end_of_stream, "empty body should have end_of_stream=true");
+            },
+            other => panic!("FULL_DUPLEX should use StreamedResponse variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffered_mode_preserves_behavior() {
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
+        let responses = request_body(Some(&data), None, BodyMode::Buffered);
+
+        assert_eq!(responses.len(), 1, "BUFFERED mode should produce single response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(bytes.len(), data.len(), "BUFFERED should send full body");
+            },
+            other => panic!("BUFFERED should use Body variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_mode_from_i32_valid_modes() {
+        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(2).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(4).unwrap(), BodyMode::FullDuplexStreamed);
+    }
+
+    #[test]
+    fn body_mode_from_i32_invalid_modes() {
+        assert!(BodyMode::try_from(1).is_err());
+        assert!(BodyMode::try_from(3).is_err());
+        assert!(BodyMode::try_from(999).is_err());
     }
 
     // -----------------------------------------------------------------------------
