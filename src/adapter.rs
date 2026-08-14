@@ -90,6 +90,7 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         cluster: None,
         current_filter_id: None,
         downstream_tls: false,
+        metrics_route: None,
         peer_identity: None,
         extensions: RequestExtensions::default(),
         executed_filter_indices: Vec::new(),

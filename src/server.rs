@@ -16,7 +16,8 @@ use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Re
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
-        ProcessingRequest, ProcessingResponse, external_processor_server::ExternalProcessor, processing_request,
+        ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
+        processing_request,
     },
 };
 use tokio::sync::mpsc;
@@ -24,7 +25,10 @@ use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
 use tracing::{debug, error, warn};
 
-use crate::{adapter, metrics, response};
+use crate::{
+    adapter, metrics,
+    response::{self, BodyMode},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -35,6 +39,40 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
+
+/// Parsed protocol configuration from Envoy.
+///
+/// Extracted from the first `ProcessingRequest` message's `protocol_config` field.
+#[derive(Debug, Clone, Default)]
+struct ProtocolConfig {
+    /// Request body processing mode.
+    request_body_mode: BodyMode,
+    /// Response body processing mode.
+    response_body_mode: BodyMode,
+    /// Whether body is sent immediately without waiting for header response.
+    ///
+    /// When `true`, Envoy sends body chunks immediately after headers without
+    /// waiting for the header response. When `false`, Envoy buffers body data
+    /// until the header response is received.
+    ///
+    /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
+    #[expect(dead_code, reason = "captured for future Header deferral implementation")]
+    send_body_without_waiting: bool,
+}
+
+impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
+    type Error = String;
+
+    fn try_from(proto_cfg: ProtocolConfiguration) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_body_mode: BodyMode::try_from(proto_cfg.request_body_mode)
+                .map_err(|e| format!("request_body_mode: {e}"))?,
+            response_body_mode: BodyMode::try_from(proto_cfg.response_body_mode)
+                .map_err(|e| format!("response_body_mode: {e}"))?,
+            send_body_without_waiting: proto_cfg.send_body_without_waiting_for_header_response,
+        })
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Types
@@ -129,8 +167,20 @@ async fn process_messages(
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     stream_state: &mut StreamState,
 ) -> Result<(), Status> {
+    let mut first_message_processed = false;
+
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
+
+        if let Some(proto_cfg) = msg.protocol_config {
+            if first_message_processed {
+                return Err(Status::invalid_argument(
+                    "protocol_config may only be sent on the first stream message",
+                ));
+            }
+            config_from_first_message(stream_state, proto_cfg)?;
+        }
+        first_message_processed = true;
 
         let Some(req) = msg.request else {
             warn!("received ProcessingRequest with no request field");
@@ -151,6 +201,21 @@ async fn process_messages(
         }
     }
 
+    Ok(())
+}
+
+/// Parses `protocol_config` from first message.
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] if unsupported body modes are requested.
+fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: ProtocolConfiguration) -> Result<(), Status> {
+    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
+    debug!(
+        request_mode = ?stream_state.protocol_config.request_body_mode,
+        response_mode = ?stream_state.protocol_config.response_body_mode,
+        "ExtProc protocol configuration received from Envoy"
+    );
     Ok(())
 }
 
@@ -301,7 +366,7 @@ async fn handle_request_headers(
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_pipeline(pipeline, state).await;
+        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
     Ok(vec![response::request_headers(None)])
@@ -324,7 +389,7 @@ async fn handle_request_body(
         return Ok(Vec::new());
     }
 
-    run_request_pipeline(pipeline, state).await
+    run_request_pipeline(RequestPhase::Body, pipeline, state).await
 }
 
 /// Handle response headers: run response filters and respond with mutations.
@@ -345,11 +410,10 @@ async fn handle_response_headers(
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_response_pipeline(pipeline, state).await;
+        return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
     }
 
-    let mutation = run_response_header_filters(pipeline, state).await?;
-    Ok(vec![response::response_headers(mutation)])
+    run_response_header_filters_early(pipeline, state).await
 }
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
@@ -369,34 +433,32 @@ async fn handle_response_body(
         return Ok(Vec::new());
     }
 
-    run_response_pipeline(pipeline, state).await
+    run_response_pipeline(ResponsePhase::Body, pipeline, state).await
 }
 
 // -----------------------------------------------------------------------------
 // Pipeline Execution
 // -----------------------------------------------------------------------------
 
-/// Run request filters and optional body filters, collecting mutations.
-async fn run_request_pipeline(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
-
-    let responses = run_request_filters(pipeline, state).await?;
-
-    Ok(responses)
+/// Request filter execution phase.
+#[derive(Debug, Clone, Copy)]
+enum RequestPhase {
+    /// Headers phase (headers EOS=true).
+    Headers,
+    /// Body phase (body EOS=true).
+    Body,
 }
 
-/// Execute request-phase filters and body filters, then collect mutations.
-async fn run_request_filters(
+/// Execute request pipeline for the given phase.
+///
+/// Returns headers or body response with mutations.
+async fn run_request_pipeline(
+    phase: RequestPhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
+        return Err(Status::invalid_argument("request headers not received"));
     };
     let mut ctx = adapter::build_filter_context(pipeline, request);
 
@@ -411,78 +473,117 @@ async fn run_request_filters(
     }
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
-    let body_data = body_data_if_present(&state.request_body);
-
-    let responses = if body_data.is_some() {
-        response::request_body(body_data, mutation)
-    } else {
-        vec![response::request_headers(mutation)]
-    };
 
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
-    Ok(responses)
+    match phase {
+        RequestPhase::Headers => Ok(vec![response::request_headers(mutation)]),
+        RequestPhase::Body => {
+            let body_data = body_data_if_present(&state.request_body);
+            Ok(response::request_body(
+                body_data,
+                mutation,
+                state.protocol_config.request_body_mode,
+            ))
+        },
+    }
 }
 
-/// Run response filters and optional body filters, collecting mutations.
+/// Response filter execution phase.
+#[derive(Debug, Clone, Copy)]
+enum ResponsePhase {
+    /// Headers phase (response headers EOS=true).
+    Headers,
+    /// Body phase (response body EOS=true).
+    Body,
+}
+
+/// Execute response pipeline for the given phase.
+///
+/// Returns headers or body response with mutations.
+#[expect(clippy::too_many_lines, reason = "context borrowing prevents extraction")]
 async fn run_response_pipeline(
+    phase: ResponsePhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
+    let Some(request) = state.request.as_ref() else {
+        return Err(Status::invalid_argument("request headers not received"));
+    };
 
     let mut resp = state
         .response
         .take()
-        .ok_or_else(|| Status::internal("no response headers"))?;
+        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
 
-    let responses = run_response_filters(pipeline, state, &mut resp).await?;
-
-    Ok(responses)
-}
-
-/// Execute response-phase filters and body filters, then collect mutations.
-///
-/// Skips response filter re-execution when headers were already
-/// processed by [`run_response_header_filters`]; only body filters
-/// run in that case.
-async fn run_response_filters(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-    resp: &mut Response,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
-    };
     let mut ctx = adapter::build_filter_context(pipeline, request);
-
     state.restore_request_ctx(&mut ctx);
-    let original_headers = capture_original_headers(resp);
-    ctx.response_header = Some(resp);
+    let original_headers = capture_original_headers(&resp);
+    ctx.response_header = Some(&mut resp);
 
-    if !state.response_filters_executed {
-        let action = execute_response(pipeline, &mut ctx).await?;
-        if let Some(imm) = check_reject(action) {
-            return Ok(vec![response::immediate(imm)]);
-        }
-    }
-
-    let body_reject = run_resp_body_filters(pipeline, &mut ctx, &mut state.response_body)?;
-    if let Some(imm) = body_reject {
-        return Ok(vec![response::immediate(imm)]);
+    if let Some(rejection) = execute_response_pipeline_and_body_filters(
+        phase,
+        pipeline,
+        &mut ctx,
+        &mut state.response_body,
+        state.response_filters_executed,
+    )
+    .await?
+    {
+        return Ok(vec![response::immediate(rejection)]);
     }
 
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
-    let body_data = body_data_if_present(&state.response_body);
 
-    if body_data.is_some() {
-        Ok(response::response_body(body_data, mutation))
-    } else {
-        Ok(vec![response::response_headers(mutation)])
+    Ok(build_response_for_phase(
+        phase,
+        mutation,
+        &state.response_body,
+        state.protocol_config.response_body_mode,
+    ))
+}
+
+/// Execute response pipeline and body filters, checking for rejections.
+///
+/// Returns `Some(ImmediateResponse)` if filters reject the request.
+async fn execute_response_pipeline_and_body_filters(
+    phase: ResponsePhase,
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    response_body: &mut Vec<u8>,
+    filters_executed: bool,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    let should_execute = match phase {
+        ResponsePhase::Headers => true,
+        ResponsePhase::Body => !filters_executed,
+    };
+
+    if should_execute {
+        let action = execute_response(pipeline, ctx).await?;
+        if let Some(imm) = check_reject(action) {
+            return Ok(Some(imm));
+        }
+    }
+
+    let body_reject = run_resp_body_filters(pipeline, ctx, response_body)?;
+    Ok(body_reject)
+}
+
+/// Build appropriate response based on phase.
+fn build_response_for_phase(
+    phase: ResponsePhase,
+    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    response_body: &[u8],
+    body_mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    match phase {
+        ResponsePhase::Headers => vec![response::response_headers(mutation)],
+        ResponsePhase::Body => {
+            let body_data = body_data_if_present(response_body);
+            response::response_body(body_data, mutation, body_mode)
+        },
     }
 }
 
@@ -491,18 +592,19 @@ async fn run_response_filters(
 /// This executes the response pipeline early so mutations can be
 /// included in the `ResponseHeaders` reply. Body processing runs
 /// separately when the body arrives.
-async fn run_response_header_filters(
+async fn run_response_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>, Status> {
+) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Ok(None);
+        return Ok(vec![response::response_headers(None)]);
     };
+
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
 
     let Some(resp) = state.response.as_mut() else {
-        return Ok(None);
+        return Ok(vec![response::response_headers(None)]);
     };
 
     let original_headers = capture_original_headers(resp);
@@ -514,8 +616,9 @@ async fn run_response_header_filters(
     }
 
     state.response_filters_executed = true;
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
-    Ok(adapter::collect_response_header_mutations_diff(&ctx, &original_headers))
+    Ok(vec![response::response_headers(mutation)])
 }
 
 /// Capture response header names and values before filter execution.
@@ -642,12 +745,18 @@ struct StreamState {
 
     /// End-of-stream tracking for protocol safety.
     eos_tracker: EosTracker,
+
+    /// Protocol configuration parsed from Envoy's first message.
+    protocol_config: ProtocolConfig,
 }
 
 impl StreamState {
-    /// Create a new empty stream state.
+    /// Create a new empty stream state with default protocol configuration.
     fn new() -> Self {
-        Self::default()
+        Self {
+            protocol_config: ProtocolConfig::default(),
+            ..Default::default()
+        }
     }
 
     /// Restore filter execution state into a response context.
@@ -720,26 +829,49 @@ mod tests {
     #[test]
     fn eos_tracker_default_all_not_received() {
         let tracker = EosTracker::default();
-        assert!(!tracker.request_headers.is_received());
-        assert!(!tracker.request_body.is_received());
-        assert!(!tracker.response_headers.is_received());
-        assert!(!tracker.response_body.is_received());
+        assert!(
+            !tracker.request_headers.is_received(),
+            "request_headers should not be received"
+        );
+        assert!(
+            !tracker.request_body.is_received(),
+            "request_body should not be received"
+        );
+        assert!(
+            !tracker.response_headers.is_received(),
+            "response_headers should not be received"
+        );
+        assert!(
+            !tracker.response_body.is_received(),
+            "response_body should not be received"
+        );
     }
 
     #[test]
     fn eos_tracker_first_eos_succeeds() {
-        // First EOS in each phase should succeed when tested independently
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok(),
+            "first EOS in RequestHeaders should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_ok(),
+            "first EOS in RequestBody should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::ResponseHeaders, true).is_ok(),
+            "first EOS in ResponseHeaders should succeed"
+        );
 
         let mut tracker = EosTracker::default();
-        assert!(tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok());
+        assert!(
+            tracker.check_and_mark(ProtocolPhase::ResponseBody, true).is_ok(),
+            "first EOS in ResponseBody should succeed"
+        );
     }
 
     #[test]
@@ -774,16 +906,24 @@ mod tests {
         for phase in phases {
             let mut tracker = EosTracker::default();
 
-            // First EOS succeeds
-            assert!(tracker.check_and_mark(phase, true).is_ok());
+            assert!(
+                tracker.check_and_mark(phase, true).is_ok(),
+                "first EOS should succeed for {phase:?}"
+            );
 
-            // Any subsequent message fails
             let result = tracker.check_and_mark(phase, true);
             assert!(result.is_err(), "message after EOS should fail for {phase:?}");
 
             if let Err(err) = result {
-                assert_eq!(err.code(), tonic::Code::InvalidArgument);
-                assert!(err.message().contains("after end_of_stream"));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::InvalidArgument,
+                    "error code should be InvalidArgument for {phase:?}"
+                );
+                assert!(
+                    err.message().contains("after end_of_stream"),
+                    "error message should mention 'after end_of_stream' for {phase:?}"
+                );
             }
         }
     }
