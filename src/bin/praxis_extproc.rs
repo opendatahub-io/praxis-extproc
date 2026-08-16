@@ -81,9 +81,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
+    let bbr_enabled = cfg.maas.as_ref().is_some_and(|m| m.bbr.enabled);
     info!(
         grpc = %addrs.0, health = %addrs.1,
         metrics = %addrs.2, filters = pipeline.len(),
+        bbr = bbr_enabled,
         "starting ExtProc server"
     );
 
@@ -128,7 +130,8 @@ async fn serve_grpc(
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let extproc = PraxisExtProc::new(pipeline);
+    let svc = ExternalProcessorServer::new(extproc);
     match tls::build_tls_config(tls_cfg)? {
         None => Box::pin(serve_plaintext(addr, svc)).await,
         Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,

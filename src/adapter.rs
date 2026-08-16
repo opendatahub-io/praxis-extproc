@@ -81,6 +81,8 @@ pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
 )]
 pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Request) -> HttpFilterContext<'a> {
     let client_addr = extract_client_addr(request);
+    let mut extensions = RequestExtensions::default();
+    pipeline.prepare_extensions(&mut extensions);
 
     HttpFilterContext {
         buffered_request_body: None,
@@ -92,7 +94,7 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         downstream_tls: false,
         metrics_route: None,
         peer_identity: None,
-        extensions: RequestExtensions::default(),
+        extensions,
         executed_filter_indices: Vec::new(),
         extra_request_headers: Vec::new(),
         request_headers_to_remove: Vec::new(),
@@ -316,7 +318,7 @@ fn extract_client_addr(request: &Request) -> Option<IpAddr> {
 /// would append the new value alongside an original the client already sent,
 /// producing an invalid multi-valued header. Sets both `value` and `raw_value`
 /// for maximum compatibility across Envoy versions.
-fn header_value_option(key: &str, value: &str) -> HeaderValueOption {
+pub(crate) fn header_value_option(key: &str, value: &str) -> HeaderValueOption {
     HeaderValueOption {
         header: Some(HeaderValue {
             key: key.to_owned(),

@@ -6,12 +6,18 @@
 //! Parses a minimal config containing filter chains and server settings.
 //! Listeners and clusters are omitted because Envoy owns networking.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use serde::Deserialize;
 
-use crate::error::{ExtProcError, Result};
+use crate::{
+    error::{ExtProcError, Result},
+    maas::{BbrProcessor, ModelEntry, RoutingState, TrustBoundary, TrustBoundaryConfig},
+};
 
 // -----------------------------------------------------------------------------
 // ExtProcConfig
@@ -47,7 +53,100 @@ pub struct ExtProcConfig {
     /// gRPC server settings.
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// `MaaS` (Models as a Service) configuration.
+    #[serde(default)]
+    pub maas: Option<MaasConfig>,
 }
+
+// -----------------------------------------------------------------------------
+// MaaS Configuration
+// -----------------------------------------------------------------------------
+
+/// `MaaS` (Models as a Service) configuration.
+///
+/// ```
+/// use praxis_extproc::config::{ExtProcConfig, MaasConfig};
+///
+/// let cfg: ExtProcConfig = serde_yaml::from_str(
+///     r#"
+/// maas:
+///   bbr:
+///     enabled: true
+///     models:
+///       - model: gpt-4
+///         provider:
+///           authority: api.openai.com
+///           path_prefix: /v1
+/// "#,
+/// )
+/// .unwrap();
+/// assert!(cfg.maas.is_some());
+/// assert!(cfg.maas.unwrap().bbr.enabled);
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MaasConfig {
+    /// Body-based routing configuration.
+    #[serde(default)]
+    pub bbr: BbrConfig,
+}
+
+/// Body-Based Routing (BBR) configuration.
+///
+/// Controls how requests are routed based on the model name extracted
+/// from the request body.
+///
+/// # Prerequisites
+///
+/// BBR requires the `model_to_header` filter from `praxis-ai-filters` to be
+/// configured in the pipeline. This filter extracts the model name from the
+/// JSON request body and places it in the `X-AI-Model` header, which BBR
+/// then reads to determine routing.
+///
+/// # Example Configuration
+///
+/// ```yaml
+/// filter_chains:
+///   - name: main
+///     filters:
+///       - filter: model_to_header
+///         header: X-AI-Model
+///
+/// maas:
+///   bbr:
+///     enabled: true
+///     models:
+///       - model: gpt-4
+///         provider:
+///           authority: api.openai.com
+///           path_prefix: /v1
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BbrConfig {
+    /// Whether BBR is enabled.
+    ///
+    /// When `false`, all BBR processing is skipped.
+    /// When `true`, requires `model_to_header` filter in the pipeline.
+    pub enabled: bool,
+
+    /// Model-to-provider mappings.
+    ///
+    /// Each entry maps a model name to its authorized provider.
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
+
+    /// Trust boundary configuration.
+    ///
+    /// Controls which headers are stripped from requests.
+    #[serde(default)]
+    pub trust_boundary: TrustBoundaryConfig,
+}
+
+// -----------------------------------------------------------------------------
+// Server Configuration
+// -----------------------------------------------------------------------------
 
 /// gRPC server bind address and options.
 ///
@@ -91,18 +190,19 @@ impl Default for ServerConfig {
 
 /// Build a [`FilterPipeline`] from the config's filter chains.
 ///
-/// Concatenates all chains in order, builds via the registry, and
-/// applies body limits and insecure options.
+/// Concatenates all chains in order, builds via the registry, applies
+/// body limits, and registers pipeline extensions (`MaaS` BBR when enabled).
 ///
 /// # Errors
 ///
 /// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails.
+/// Returns [`ExtProcError::Config`] if BBR is enabled with invalid models.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
     validate_chain_names(&config.filter_chains)?;
 
-    let chains: std::collections::HashMap<&str, &[_]> = config
+    let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
         .map(|c| (c.name.as_str(), c.filters.as_slice()))
@@ -118,9 +218,125 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    register_pipeline_extensions(&mut pipeline, config)?;
 
     Ok(Arc::new(pipeline))
+}
+
+/// Register pipeline-scoped resources copied onto each request.
+fn register_pipeline_extensions(pipeline: &mut FilterPipeline, config: &ExtProcConfig) -> Result<()> {
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    if let Some(bbr) = build_bbr_processor(config)? {
+        pipeline.add_pipeline_extension(Box::new(bbr));
+    }
+    Ok(())
+}
+
+/// Build a [`BbrProcessor`] from the `MaaS` configuration.
+///
+/// Returns `Ok(None)` if BBR is not enabled or not configured.
+/// Returns an error if BBR is enabled but `models` is empty.
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Config`] when `maas.bbr.enabled` is `true` and
+/// `maas.bbr.models` is empty, a model name is duplicated, or a provider
+/// `authority` is empty.
+///
+/// # Example
+///
+/// ```
+/// use praxis_extproc::config::{ExtProcConfig, build_bbr_processor};
+///
+/// let cfg: ExtProcConfig = serde_yaml::from_str(
+///     r#"
+/// maas:
+///   bbr:
+///     enabled: true
+///     models:
+///       - model: gpt-4
+///         provider:
+///           authority: api.openai.com
+///           path_prefix: /v1
+/// "#,
+/// )
+/// .unwrap();
+///
+/// let bbr = build_bbr_processor(&cfg).unwrap();
+/// assert!(bbr.is_some());
+/// ```
+pub fn build_bbr_processor(config: &ExtProcConfig) -> Result<Option<BbrProcessor>> {
+    let Some(maas) = config.maas.as_ref() else {
+        return Ok(None);
+    };
+
+    if !maas.bbr.enabled {
+        return Ok(None);
+    }
+
+    if maas.bbr.models.is_empty() {
+        return Err(ExtProcError::Config(
+            "maas.bbr.enabled is true but maas.bbr.models is empty".to_owned(),
+        ));
+    }
+
+    let mut routing_state = RoutingState::new();
+    add_configured_models(&mut routing_state, &maas.bbr.models)?;
+
+    let trust_boundary = TrustBoundary::from_config(&maas.bbr.trust_boundary);
+
+    Ok(Some(
+        BbrProcessor::new(routing_state).with_trust_boundary(trust_boundary),
+    ))
+}
+
+/// Insert model entries into routing state, rejecting empty authority, pseudo-header extras, and duplicates.
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Config`] when a model has an empty authority, a
+/// duplicate name, or an `extra_headers` key that starts with `:`.
+fn add_configured_models(routing_state: &mut RoutingState, models: &[ModelEntry]) -> Result<()> {
+    let mut seen_models = HashSet::new();
+
+    for entry in models {
+        if entry.provider.authority.trim().is_empty() {
+            return Err(ExtProcError::Config(format!(
+                "model '{}' has an empty provider authority",
+                entry.model
+            )));
+        }
+        reject_pseudo_extra_headers(&entry.model, &entry.provider.extra_headers)?;
+        let key = entry.model.to_lowercase();
+        if !seen_models.insert(key) {
+            return Err(ExtProcError::Config(format!(
+                "duplicate model name (case-insensitive): {}",
+                entry.model
+            )));
+        }
+        routing_state.add_model(&entry.model, entry.provider.clone());
+    }
+
+    Ok(())
+}
+
+/// Reject `:authority` / `:path` (and other pseudo-headers) in provider `extra_headers`.
+///
+/// Those names already have dedicated YAML fields. If they also appear in
+/// `extra_headers`, Envoy would apply the extra value last and overwrite routing.
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Config`] when any key starts with `:`.
+fn reject_pseudo_extra_headers(model: &str, extra_headers: &HashMap<String, String>) -> Result<()> {
+    for key in extra_headers.keys() {
+        if key.trim().starts_with(':') {
+            return Err(ExtProcError::Config(format!(
+                "model '{model}': extra_headers must not contain pseudo-header '{key}'; use 'authority' and 'path_prefix' instead"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -317,5 +533,308 @@ bogus_key: true
         );
 
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejects_trust_boundary_typo() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+    trust_boundary:
+      strip_prefies: ["x-maas-"]
+"#,
+        );
+
+        assert!(result.is_err(), "typo in trust_boundary field should be rejected");
+    }
+
+    #[test]
+    fn deny_unknown_fields_rejects_provider_extra_key() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          cluster: openai-pool
+"#,
+        );
+
+        assert!(result.is_err(), "unknown provider field should be rejected");
+    }
+
+    #[test]
+    fn parse_bbr_config() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+      - model: claude-3-opus
+        provider:
+          authority: api.anthropic.com
+          path_prefix: /v1/messages
+"#,
+        )
+        .unwrap();
+
+        let maas = cfg.maas.expect("maas should be present");
+        assert!(maas.bbr.enabled, "bbr should be enabled");
+        assert_eq!(maas.bbr.models.len(), 2, "should have two models");
+        assert_eq!(maas.bbr.models[0].model, "gpt-4");
+        assert_eq!(maas.bbr.models[0].provider.authority, "api.openai.com");
+    }
+
+    #[test]
+    fn bbr_disabled_returns_none() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: false
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+"#,
+        )
+        .unwrap();
+
+        let bbr = build_bbr_processor(&cfg).unwrap();
+        assert!(bbr.is_none(), "disabled bbr should return None");
+    }
+
+    #[test]
+    fn bbr_enabled_returns_processor() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+"#,
+        )
+        .unwrap();
+
+        let bbr = build_bbr_processor(&cfg).unwrap();
+        assert!(bbr.is_some(), "enabled bbr should return Some");
+    }
+
+    #[test]
+    fn bbr_enabled_with_empty_models_errors() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models: []
+"#,
+        )
+        .unwrap();
+
+        let err = build_bbr_processor(&cfg).expect_err("empty models should error");
+        assert!(
+            err.to_string().contains("models is empty"),
+            "error should mention empty models: {err}"
+        );
+    }
+
+    #[test]
+    fn bbr_duplicate_model_names_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: GPT-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+      - model: gpt-4
+        provider:
+          authority: api.anthropic.com
+          path_prefix: /v1
+"#,
+        )
+        .unwrap();
+
+        let err = build_bbr_processor(&cfg).expect_err("duplicate model names should fail");
+        assert!(
+            err.to_string().contains("duplicate model name"),
+            "error should mention duplicate model: {err}"
+        );
+    }
+
+    #[test]
+    fn bbr_empty_provider_authority_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          path_prefix: /v1
+"#,
+        )
+        .unwrap();
+
+        let err = build_bbr_processor(&cfg).expect_err("empty authority should fail");
+        assert!(
+            err.to_string().contains("empty provider authority"),
+            "error should mention empty authority: {err}"
+        );
+    }
+
+    #[test]
+    fn bbr_whitespace_provider_authority_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: "   "
+          path_prefix: /v1
+"#,
+        )
+        .unwrap();
+
+        let err = build_bbr_processor(&cfg).expect_err("whitespace authority should fail");
+        assert!(
+            err.to_string().contains("empty provider authority"),
+            "error should mention empty authority: {err}"
+        );
+    }
+
+    #[test]
+    fn bbr_extra_headers_pseudo_header_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+          extra_headers:
+            ":authority": evil.com
+"#,
+        )
+        .unwrap();
+
+        let err = build_bbr_processor(&cfg).expect_err("pseudo-header extra_headers should fail");
+        assert!(
+            err.to_string().contains("pseudo-header"),
+            "error should mention pseudo-header: {err}"
+        );
+        assert!(
+            err.to_string().contains(":authority"),
+            "error should name the forbidden header: {err}"
+        );
+    }
+
+    #[test]
+    fn bbr_extra_headers_custom_header_allowed() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+          extra_headers:
+            x-provider-region: us-east
+"#,
+        )
+        .unwrap();
+
+        let bbr = build_bbr_processor(&cfg).unwrap();
+        assert!(bbr.is_some(), "non-pseudo extra_headers should be accepted");
+    }
+
+    #[test]
+    fn no_maas_config_returns_none() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
+
+        let bbr = build_bbr_processor(&cfg).unwrap();
+        assert!(bbr.is_none(), "no maas config should return None");
+    }
+
+    #[test]
+    fn build_pipeline_registers_bbr_processor() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains: []
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+insecure_options:
+  allow_unbounded_body: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+        let mut extensions = praxis_filter::RequestExtensions::new();
+        pipeline.prepare_extensions(&mut extensions);
+        assert!(
+            extensions.get::<BbrProcessor>().is_some(),
+            "enabled BBR should be injected into request extensions"
+        );
+    }
+
+    #[test]
+    fn build_pipeline_omits_bbr_when_disabled() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains: []
+insecure_options:
+  allow_unbounded_body: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+        let mut extensions = praxis_filter::RequestExtensions::new();
+        pipeline.prepare_extensions(&mut extensions);
+        assert!(
+            extensions.get::<BbrProcessor>().is_none(),
+            "disabled BBR should not be present in request extensions"
+        );
     }
 }

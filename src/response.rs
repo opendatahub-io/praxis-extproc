@@ -79,12 +79,27 @@ const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
 ///
 /// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
 pub(crate) fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingResponse {
+    let clear_route_cache = mutation.is_some();
+    request_headers_with_options(mutation, clear_route_cache)
+}
+
+/// Build a [`ProcessingResponse`] for request headers with routing options.
+///
+/// When `clear_route_cache` is true, Envoy will re-evaluate its routing
+/// decision after applying header mutations. Use this when mutations
+/// affect routing inputs (`:authority`, `:path`, or route-matching headers).
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn request_headers_with_options(
+    mutation: Option<HeaderMutation>,
+    clear_route_cache: bool,
+) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(Response::RequestHeaders(HeadersResponse {
             response: Some(CommonResponse {
                 status: ResponseStatus::Continue.into(),
-                clear_route_cache: mutation.is_some(),
                 header_mutation: mutation,
+                clear_route_cache,
                 ..Default::default()
             }),
         })),
@@ -124,7 +139,33 @@ pub(crate) fn request_body(
     body_mode: BodyMode,
     end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, true, body_mode, end_of_stream)
+    request_body_with_options(body, mutation, body_mode, end_of_stream, false)
+}
+
+/// Build [`ProcessingResponse`] messages for request body with routing options.
+///
+/// When `clear_route_cache` is true, Envoy will re-evaluate its routing
+/// decision after applying mutations. Use this when body-derived data
+/// (like a model name) affects routing decisions.
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn request_body_with_options(
+    body: Option<&[u8]>,
+    mutation: Option<HeaderMutation>,
+    body_mode: BodyMode,
+    end_of_stream: bool,
+    clear_route_cache: bool,
+) -> Vec<ProcessingResponse> {
+    body_responses(
+        body,
+        mutation,
+        body_mode,
+        BodyResponseOptions {
+            direction: BodyDirection::Request,
+            end_of_stream,
+            clear_route_cache,
+        },
+    )
 }
 
 /// Build [`ProcessingResponse`] messages for the response body phase.
@@ -138,8 +179,18 @@ pub(crate) fn response_body(
     body_mode: BodyMode,
     end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, false, body_mode, end_of_stream)
+    body_responses(
+        body,
+        mutation,
+        body_mode,
+        BodyResponseOptions {
+            direction: BodyDirection::Response,
+            end_of_stream,
+            clear_route_cache: false,
+        },
+    )
 }
+
 // -----------------------------------------------------------------------------
 // Trailer Responses
 // -----------------------------------------------------------------------------
@@ -211,6 +262,33 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 // Utilities
 // -----------------------------------------------------------------------------
 
+/// Whether a body response belongs to the request or response phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyDirection {
+    /// Wrap as `RequestBody`.
+    Request,
+    /// Wrap as `ResponseBody`.
+    Response,
+}
+
+impl BodyDirection {
+    /// Returns `true` when wrapping a request-body response.
+    fn is_request(self) -> bool {
+        matches!(self, Self::Request)
+    }
+}
+
+/// Options for building body-phase ExtProc responses.
+#[derive(Debug, Clone, Copy)]
+struct BodyResponseOptions {
+    /// Request-body vs response-body message wrapping.
+    direction: BodyDirection,
+    /// Propagate EOS into streamed body framing.
+    end_of_stream: bool,
+    /// Ask Envoy to rematch routes after mutations (BUFFERED modes only).
+    clear_route_cache: bool,
+}
+
 /// Build body response(s) with optional header mutation and body data.
 ///
 /// When body data is present, populates `body_mutation` so Envoy
@@ -219,25 +297,29 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 fn body_responses(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
-    is_request: bool,
     body_mode: BodyMode,
-    end_of_stream: bool,
+    options: BodyResponseOptions,
 ) -> Vec<ProcessingResponse> {
     match body_mode {
-        BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request, end_of_stream),
+        BodyMode::FullDuplexStreamed => {
+            body_responses_streamed(body, mutation, options.direction.is_request(), options.end_of_stream)
+        },
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
             // BUFFERED mode (and others): use BodyMutation::Body for full replacement.
             // `Some(&[])` is an explicit clear (emit empty body); `None` = leave as-is.
             let body_mutation = body.map(make_body_mutation);
+            let clear_route_cache =
+                options.clear_route_cache && matches!(body_mode, BodyMode::Buffered | BodyMode::BufferedPartial);
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
                 header_mutation: mutation,
                 body_mutation,
+                clear_route_cache,
                 ..Default::default()
             };
 
-            vec![wrap_body_response(common, is_request)]
+            vec![wrap_body_response(common, options.direction.is_request())]
         },
     }
 }
@@ -329,7 +411,13 @@ fn wrap_body_response(common: CommonResponse, is_request: bool) -> ProcessingRes
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic, reason = "tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::match_same_arms,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
 
@@ -408,6 +496,27 @@ mod tests {
         let resp = request_headers(None);
 
         assert!(resp.response.is_some(), "response should be present");
+    }
+
+    #[test]
+    fn request_headers_with_clear_route_cache() {
+        let resp = request_headers_with_options(None, true);
+
+        let common = extract_common_response(&resp);
+        assert!(common.is_some(), "CommonResponse should be present");
+        assert!(common.unwrap().clear_route_cache, "clear_route_cache should be true");
+    }
+
+    #[test]
+    fn request_body_with_clear_route_cache() {
+        let data = b"test body";
+        let responses = request_body_with_options(Some(data), None, BodyMode::Buffered, true, true);
+
+        assert_eq!(responses.len(), 1, "should produce one response");
+
+        let common = extract_body_common_response(&responses[0]);
+        assert!(common.is_some(), "CommonResponse should be present");
+        assert!(common.unwrap().clear_route_cache, "clear_route_cache should be true");
     }
 
     #[test]
@@ -746,6 +855,22 @@ mod tests {
                 .as_ref()
                 .and_then(|c| c.body_mutation.as_ref())
                 .and_then(|bm| bm.mutation.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn extract_common_response(resp: &ProcessingResponse) -> Option<&CommonResponse> {
+        match &resp.response {
+            Some(Response::RequestHeaders(h)) => h.response.as_ref(),
+            Some(Response::ResponseHeaders(h)) => h.response.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn extract_body_common_response(resp: &ProcessingResponse) -> Option<&CommonResponse> {
+        match &resp.response {
+            Some(Response::RequestBody(b)) => b.response.as_ref(),
+            Some(Response::ResponseBody(b)) => b.response.as_ref(),
             _ => None,
         }
     }
