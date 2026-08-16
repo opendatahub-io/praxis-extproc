@@ -16,6 +16,7 @@ pub mod adapter;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod maas;
 pub mod metrics;
 pub mod response;
 pub mod server;

@@ -12,6 +12,7 @@
 use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -26,7 +27,9 @@ use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streamin
 use tracing::{debug, error, warn};
 
 use crate::{
-    adapter, metrics,
+    adapter,
+    maas::BbrProcessor,
+    metrics,
     response::{self, BodyMode},
 };
 
@@ -39,6 +42,9 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
+
+/// Header name where `model_to_header` filter places the extracted model.
+const MODEL_HEADER_NAME: &str = "x-ai-model";
 
 /// Parsed protocol configuration from Envoy.
 ///
@@ -87,7 +93,8 @@ type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingRe
 /// Praxis ExtProc gRPC service.
 ///
 /// Holds a shared [`FilterPipeline`] and executes it for each
-/// incoming gRPC stream.
+/// incoming gRPC stream. `MaaS` BBR is read from pipeline extensions
+/// when registered at config load.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub struct PraxisExtProc {
@@ -566,6 +573,7 @@ enum RequestPhase {
 /// Execute request pipeline for the given phase.
 ///
 /// Returns headers or body response with mutations.
+#[expect(clippy::too_many_lines, reason = "BBR integration adds necessary complexity")]
 async fn run_request_pipeline(
     phase: RequestPhase,
     pipeline: &FilterPipeline,
@@ -587,7 +595,21 @@ async fn run_request_pipeline(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_request_header_mutations(&ctx);
+    let mut mutation = adapter::collect_request_header_mutations(&ctx);
+    let mut clear_route_cache = false;
+
+    // When BBR is enabled: always enforce the trust boundary (strip untrusted
+    // headers). Routing mutations run only when the model header is present.
+    if let Some(processor) = ctx.extensions.get::<BbrProcessor>() {
+        let applied = apply_bbr(
+            processor,
+            find_model_header(&ctx.extra_request_headers),
+            request.uri.path(),
+            &request.headers,
+        )?;
+        clear_route_cache = applied.clear_route_cache;
+        merge_header_mutations(&mut mutation, &applied.set_headers, applied.remove_headers);
+    }
 
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
@@ -602,6 +624,7 @@ async fn run_request_pipeline(
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.request_body_mode,
+        clear_route_cache,
     ))
 }
 
@@ -722,16 +745,19 @@ fn build_request_for_phase(
     mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
+    clear_route_cache: bool,
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
-        (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
+        (RequestPhase::Headers, _) => {
+            vec![response::request_headers_with_options(mutation, clear_route_cache)]
+        },
         (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
-            let mut r = vec![response::request_headers(mutation)];
+            let mut r = vec![response::request_headers_with_options(mutation, clear_route_cache)];
             // Assembled body emitted at EOS.
             r.extend(response::request_body(body, None, mode, true));
             r
         },
-        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, true),
+        (RequestPhase::Body, _) => response::request_body_with_options(body, mutation, mode, true, clear_route_cache),
     }
 }
 
@@ -911,6 +937,12 @@ impl MutationDelivery {
 }
 
 /// Run request header filters early and deliver mutations per strategy.
+///
+/// Used for `STREAMED` / `FDS` header timing. Mutations may be sent immediately
+/// or deferred per [`MutationDelivery`].
+///
+/// When BBR is enabled, trust-boundary stripping is merged into the same
+/// header mutation (routing still requires a buffered body).
 async fn run_request_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -926,10 +958,23 @@ async fn run_request_header_filters_early(
         return Ok(vec![response::immediate(imm)]);
     }
 
+    let mut mutation = adapter::collect_request_header_mutations(&ctx);
+
+    // STREAMED cannot do body-based routing, but trust boundary is header-only.
+    if let Some(processor) = ctx.extensions.get::<BbrProcessor>() {
+        let remove = processor.trust_boundary().headers_to_remove(&request.headers);
+        if !remove.is_empty() {
+            debug!(
+                remove_count = remove.len(),
+                "BBR trust boundary applied in STREAMED header phase"
+            );
+            merge_header_mutations(&mut mutation, &[], remove);
+        }
+    }
+
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    let mutation = adapter::collect_request_header_mutations(&ctx);
 
     Ok(delivery.deliver_request(mutation, state))
 }
@@ -1203,6 +1248,88 @@ fn merge_mutations(
             d.remove_headers.extend(c.remove_headers);
             Some(d)
         },
+    }
+}
+
+/// Merge BBR set/remove header lists into an existing filter mutation.
+fn merge_header_mutations(
+    mutation: &mut Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    set_headers: &[(String, String)],
+    remove_headers: Vec<String>,
+) {
+    let bbr_set_headers: Vec<_> = set_headers
+        .iter()
+        .map(|(k, v)| adapter::header_value_option(k, v))
+        .collect();
+
+    if let Some(m) = mutation.as_mut() {
+        m.set_headers.extend(bbr_set_headers);
+        m.remove_headers.extend(remove_headers);
+    } else if !bbr_set_headers.is_empty() || !remove_headers.is_empty() {
+        *mutation = Some(praxis_proto::envoy::service::ext_proc::v3::HeaderMutation {
+            set_headers: bbr_set_headers,
+            remove_headers,
+        });
+    }
+}
+
+/// Find the model name from filter-injected request headers.
+fn find_model_header(extra_headers: &[(impl AsRef<str>, impl AsRef<str>)]) -> Option<&str> {
+    extra_headers
+        .iter()
+        .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(MODEL_HEADER_NAME))
+        .map(|(_, value)| value.as_ref())
+}
+
+/// Result of applying BBR routing and/or trust-boundary stripping.
+struct AppliedBbr {
+    /// Headers to set on the request (routing mutations).
+    set_headers: Vec<(String, String)>,
+    /// Header names to remove (trust boundary).
+    remove_headers: Vec<String>,
+    /// Whether Envoy should clear its route cache after mutations.
+    clear_route_cache: bool,
+}
+
+/// Apply BBR routing and/or trust-boundary stripping.
+///
+/// - If `model` is present: full routing + trust boundary.
+/// - If `model` is absent: trust boundary only.
+fn apply_bbr(
+    processor: &BbrProcessor,
+    model: Option<&str>,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<AppliedBbr, Status> {
+    if let Some(model) = model {
+        match processor.process_request(model, path, headers) {
+            Ok(result) => {
+                debug!(
+                    authority = %result.decision.authority,
+                    model = %result.decision.effective_model,
+                    "BBR routing resolved"
+                );
+                Ok(AppliedBbr {
+                    set_headers: result.headers_to_set,
+                    remove_headers: result.headers_to_remove,
+                    clear_route_cache: result.clear_route_cache,
+                })
+            },
+            Err(e) => {
+                warn!(error = %e, "BBR routing failed");
+                Err(Status::invalid_argument(e.to_string()))
+            },
+        }
+    } else {
+        debug!(
+            "BBR enabled but no model header found; applying trust boundary only \
+             (model_to_header filter may not be configured)"
+        );
+        Ok(AppliedBbr {
+            set_headers: Vec::new(),
+            remove_headers: processor.trust_boundary().headers_to_remove(headers),
+            clear_route_cache: false,
+        })
     }
 }
 
@@ -1508,5 +1635,35 @@ mod tests {
             Some("0"),
             "clearing the body must declare content-length: 0"
         );
+    }
+
+    #[test]
+    fn merge_header_mutations_overwrites_authority_and_path() {
+        use praxis_proto::envoy::service::common::v3::header_value_option::HeaderAppendAction;
+
+        let mut mutation = None;
+        merge_header_mutations(
+            &mut mutation,
+            &[
+                (":authority".to_owned(), "api.openai.com".to_owned()),
+                (":path".to_owned(), "/v1/chat/completions".to_owned()),
+            ],
+            vec![],
+        );
+
+        assert!(mutation.is_some(), "BBR routing should produce a header mutation");
+        let mutation = mutation.unwrap();
+        for key in [":authority", ":path"] {
+            let option = mutation
+                .set_headers
+                .iter()
+                .find(|hvo| hvo.header.as_ref().is_some_and(|h| h.key == key));
+            assert!(option.is_some(), "{key} mutation should be present");
+            assert_eq!(
+                option.unwrap().append_action,
+                i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd),
+                "{key} must overwrite the existing request header, not append a second value"
+            );
+        }
     }
 }
