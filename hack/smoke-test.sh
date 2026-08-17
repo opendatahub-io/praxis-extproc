@@ -93,7 +93,7 @@ if [ "${PASS}" != "true" ]; then
     echo "--- Response Headers ---"
     cat "${RESPONSE_HEADERS}"
     echo "--- praxis-extproc logs ---"
-    ${KUBECTL} -n praxis-extproc logs deployment/praxis-extproc \
+    ${KUBECTL} -n praxis-extproc logs deployment/payload-processing \
         --tail=50 2>/dev/null || true
     echo "--- Gateway Envoy logs ---"
     ${KUBECTL} -n "${NAMESPACE}" logs "deploy/${GW_DEPLOY}" \

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-extproc
+
+resources:
+  - ../../../base
+  - namespace.yaml
+
+images:
+  - name: praxis-extproc
+    newName: praxis-extproc
+    newTag: dev
+
+patches:
+  - path: configmap-patch.yaml
+    target:
+      kind: ConfigMap
+      name: payload-processing-plugins

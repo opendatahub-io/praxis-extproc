@@ -172,15 +172,12 @@ build_and_load_image() {
 # ---------------------------------------------------------------------------
 
 deploy_extproc() {
-    echo "==> Deploying praxis-extproc..."
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/namespace.yaml"
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/configmap.yaml"
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/deployment.yaml"
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/service.yaml"
+    echo "==> Deploying praxis-extproc (Kustomize demo overlay)..."
+    ${KUBECTL} apply -k "${ROOT_DIR}/deploy/overlays/demo/workload/"
 
     echo "==> Waiting for praxis-extproc rollout..."
     ${KUBECTL} -n praxis-extproc rollout status \
-        deployment/praxis-extproc --timeout=120s
+        deployment/payload-processing --timeout=120s
 }
 
 # ---------------------------------------------------------------------------
@@ -189,13 +186,10 @@ deploy_extproc() {
 
 deploy_test_resources() {
     echo "==> Deploying test resources..."
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/echo.yaml"
+    ${KUBECTL} apply -k "${ROOT_DIR}/deploy/overlays/demo/test/"
 
     ${KUBECTL} -n praxis-test rollout status \
         deployment/echo --timeout=60s
-
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/gateway.yaml"
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/httproute.yaml"
 
     echo "==> Waiting for Gateway to be programmed..."
     for i in $(seq 1 120); do
@@ -213,9 +207,6 @@ deploy_test_resources() {
         fi
         sleep 1
     done
-
-    echo "==> Applying EnvoyFilter..."
-    ${KUBECTL} apply -f "${ROOT_DIR}/deploy/envoyfilter.yaml"
 
     echo "==> Waiting for Envoy config propagation..."
     sleep 5

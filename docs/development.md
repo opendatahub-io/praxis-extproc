@@ -57,14 +57,18 @@ examples/
   envoy.yaml           # Example Envoy configuration
   branch-chains.yaml   # Branch chain example
 deploy/
-  namespace.yaml       # Kubernetes namespace
-  configmap.yaml       # ConfigMap with ExtProc config
-  deployment.yaml      # Deployment manifest
-  service.yaml         # Service manifest
-  envoyfilter.yaml     # Istio EnvoyFilter for ExtProc
-  echo.yaml            # Echo backend for testing
-  gateway.yaml         # Istio Gateway for testing
-  httproute.yaml       # HTTPRoute for testing
+  base/                # Shared Kustomize base
+    instance/          # Deployment + Service (hardened, non-root)
+    config/            # ConfigMap with BBR + IPP filter chains
+  overlays/
+    demo/              # Local KIND development overlay
+      workload/        # Namespace, TLS-disabled config patch
+      test/            # Echo backend, Gateway, HTTPRoute, EnvoyFilter
+    odh/               # OpenDataHub production overlay
+      rbac/            # ServiceAccount, ClusterRole, ClusterRoleBinding
+      networking/      # NetworkPolicy (ingress/egress restrictions)
+      pre-processing/  # Second Deployment for pre-auth model extraction
+      after/           # Post-auth Deployment + DestinationRule (TLS)
 hack/
   kind-config.yaml     # KIND cluster configuration
   setup-kind.sh        # KIND cluster setup script
@@ -175,7 +179,7 @@ make container-release  # release binary (in-container, stripped)
 ```
 
 Multi-stage image: `ubi10/ubi` builder (rustup, native
-`cargo` on the host platform) and `ubi10/ubi-minimal`
+cargo on the host platform) and `ubi10/ubi-minimal`
 runtime. Builds for the host architecture. The runtime
 image runs as UID 1001 (OpenShift-friendly numeric
 non-root user).

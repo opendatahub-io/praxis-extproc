@@ -4,6 +4,7 @@
 	require-container-engine \
 	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
+	manifests-demo manifests-odh \
 	setup-hooks \
 	help
 
@@ -127,13 +128,19 @@ dev-env: images
 
 dev-push: container-release
 	kind load docker-image $(EXTPROC_IMAGE) --name $(KIND_CLUSTER_NAME)
-	$(KUBECTL) -n praxis-extproc rollout restart deployment/praxis-extproc
-	$(KUBECTL) -n praxis-extproc rollout status deployment/praxis-extproc --timeout=120s
+	$(KUBECTL) -n praxis-extproc rollout restart deployment/payload-processing
+	$(KUBECTL) -n praxis-extproc rollout status deployment/payload-processing --timeout=120s
 
 dev-integration:
 	@kind get kubeconfig --name $(KIND_CLUSTER_NAME) > /tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig
 	KUBECONFIG=/tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig \
 	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
+
+manifests-demo:
+	@kubectl kustomize deploy/overlays/demo
+
+manifests-odh:
+	@kubectl kustomize deploy/overlays/odh
 
 # ---------------------------------------------------------------------------
 # Dev Setup
@@ -183,6 +190,10 @@ help:
 	@echo "  kind-up          create cluster + deploy"
 	@echo "  kind-down        delete cluster"
 	@echo "  smoke-test       run smoke tests against cluster"
+	@echo ""
+	@echo "Manifests:"
+	@echo "  manifests-demo   kubectl kustomize deploy/overlays/demo"
+	@echo "  manifests-odh    kubectl kustomize deploy/overlays/odh"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"

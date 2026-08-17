@@ -75,56 +75,78 @@ Check a config file without starting the server:
 
 ### Apply Manifests
 
+Deployment manifests use [Kustomize] with a shared
+base and environment-specific overlays.
+
+Deploy the workload to a local cluster:
+
 ```console
-kubectl apply -f deploy/namespace.yaml
-kubectl apply -f deploy/configmap.yaml
-kubectl apply -f deploy/deployment.yaml
-kubectl apply -f deploy/service.yaml
+kubectl apply -k deploy/overlays/demo/workload
 ```
 
 This creates:
 
 - A `praxis-extproc` namespace
-- A ConfigMap with the ExtProc filter configuration
-- A Deployment running the ExtProc server
-- A Service exposing gRPC (50051), health (50052),
-  and metrics (9090)
+- A ConfigMap with BBR (pre-auth) and IPP (post-auth)
+  filter chain configurations
+- A `payload-processing` Deployment running the
+  ExtProc server (hardened: non-root, read-only
+  filesystem, resource limits)
+- A ClusterIP Service on port 9004 (gRPC)
+
+Deploy test resources (echo backend + Istio gateway):
+
+```console
+kubectl apply -k deploy/overlays/demo/test
+```
+
+Or deploy everything in one step:
+
+```console
+kubectl apply -k deploy/overlays/demo
+```
+
+This additionally creates an echo backend, an Istio
+Gateway, an HTTPRoute, and an [EnvoyFilter] that
+wires Envoy's ext_proc HTTP filter to the ExtProc
+server with `BUFFERED` mode for request and response
+bodies.
+
+Preview rendered manifests without applying:
+
+```console
+make manifests-demo
+make manifests-odh
+```
 
 Verify the deployment:
 
 ```console
 kubectl -n praxis-extproc rollout status \
-    deployment/praxis-extproc
+    deployment/payload-processing
 ```
 
-### Istio Integration
+[Kustomize]: https://kustomize.io/
+[EnvoyFilter]: https://istio.io/latest/docs/reference/config/networking/envoy-filter/
 
-For Istio service meshes, an [EnvoyFilter] resource
-wires Envoy's ext_proc HTTP filter to the ExtProc
-server.
+### Production Deployment (OpenDataHub)
 
-Deploy the test resources:
+For production MaaS environments, use the `odh`
+overlay which adds:
+
+- Dual ExtProc instances (pre-auth BBR +
+  post-auth IPP)
+- RBAC with least-privilege read-only access to
+  CRDs and secrets
+- NetworkPolicy restricting ingress to gateway
+  pods and monitoring
+- DestinationRules with SIMPLE TLS and explicit SNI
+- EnvoyFilter anchored around Kuadrant auth
+  (supports Istio <=1.25 through >=1.30 and RHCL)
 
 ```console
-kubectl apply -f deploy/echo.yaml
-kubectl apply -f deploy/gateway.yaml
-kubectl apply -f deploy/httproute.yaml
-kubectl apply -f deploy/envoyfilter.yaml
+kubectl apply -k deploy/overlays/odh
 ```
-
-This configures:
-
-- An echo backend in the `praxis-test` namespace
-- An Istio Gateway listening on port 8080
-- An HTTPRoute routing traffic to the echo backend
-- An EnvoyFilter injecting the ext_proc filter before
-  the router, pointing to the ExtProc gRPC service
-
-The EnvoyFilter configures `BUFFERED` mode for both
-request and response bodies, enabling body-inspecting
-filters like `guardrails` and `json_body_field`.
-
-[EnvoyFilter]: https://istio.io/latest/docs/reference/config/networking/envoy-filter/
 
 ### Test
 

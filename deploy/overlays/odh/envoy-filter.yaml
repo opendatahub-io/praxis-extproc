@@ -1,0 +1,407 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: payload-processing
+spec:
+  # Must run AFTER Kuadrant's EnvoyFilter (default priority 0). Without a positive
+  # priority, istiod applies this resource first and RHCL wasm anchors miss.
+  # Auth-relative INSERT uses multiple subFilter name variants so exactly one
+  # pair matches per Istio release (<=1.25 typo wasmplugin, 1.26-1.29 fixed
+  # wasmplugin, >=1.30 trafficextension, plus RHCL envoy.filters.http.wasm).
+  priority: 10
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: maas-default-gateway
+  configPatches:
+    # ---------------------------------------------------------------
+    # Istio <=1.25 Kuadrant WasmPlugin (intentional Istio typo: extenstions).
+    # ---------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extenstions.istio.io/wasmplugin/openshift-ingress.kuadrant-maas-default-gateway
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp-pre
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: true
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SKIP"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "NONE"
+              request_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-pre-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extenstions.istio.io/wasmplugin/openshift-ingress.kuadrant-maas-default-gateway
+      patch:
+        operation: INSERT_AFTER
+        value:
+          name: envoy.filters.http.ext_proc.ipp
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: false
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SEND"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "BUFFERED"
+              request_trailer_mode: "SKIP"
+              response_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+
+    # ---------------------------------------------------------------
+    # Istio 1.26-1.29 Kuadrant WasmPlugin (typo fixed).
+    # ---------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extensions.istio.io/wasmplugin/openshift-ingress.kuadrant-maas-default-gateway
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp-pre
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: true
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SKIP"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "NONE"
+              request_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-pre-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extensions.istio.io/wasmplugin/openshift-ingress.kuadrant-maas-default-gateway
+      patch:
+        operation: INSERT_AFTER
+        value:
+          name: envoy.filters.http.ext_proc.ipp
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: false
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SEND"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "BUFFERED"
+              request_trailer_mode: "SKIP"
+              response_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+
+    # ---------------------------------------------------------------
+    # Istio >=1.30 Kuadrant auth via TrafficExtension-translated WasmPlugin.
+    # ---------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extensions.istio.io/trafficextension/openshift-ingress.kuadrant-maas-default-gateway~istio-translated-wasmplugin
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp-pre
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: true
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SKIP"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "NONE"
+              request_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-pre-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: extensions.istio.io/trafficextension/openshift-ingress.kuadrant-maas-default-gateway~istio-translated-wasmplugin
+      patch:
+        operation: INSERT_AFTER
+        value:
+          name: envoy.filters.http.ext_proc.ipp
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: false
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SEND"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "BUFFERED"
+              request_trailer_mode: "SKIP"
+              response_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+
+    # ---------------------------------------------------------------
+    # RHCL 1.4 injects auth via envoy.filters.http.wasm (no WasmPlugin CR).
+    # Only one of the auth-anchor pairs matches per mesh; unused INSERT
+    # patches are no-ops.
+    # ---------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: envoy.filters.http.wasm
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp-pre
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: true
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SKIP"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "NONE"
+              request_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-pre-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: envoy.filters.http.wasm
+      patch:
+        operation: INSERT_AFTER
+        value:
+          name: envoy.filters.http.ext_proc.ipp
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: false
+            allow_mode_override: true
+            processing_mode:
+              request_header_mode: "SEND"
+              response_header_mode: "SEND"
+              request_body_mode: "BUFFERED"
+              response_body_mode: "BUFFERED"
+              request_trailer_mode: "SKIP"
+              response_trailer_mode: "SKIP"
+            grpc_service:
+              envoy_grpc:
+                cluster_name: payload-processing-extproc
+              timeout: 300s
+            message_timeout: 300s
+
+    # ---------------------------------------------------------------
+    # Disable ext_proc on non-inference maas-api routes.
+    # Route name follows Istio's Gateway API naming convention.
+    # Rule indices: 0=/v1/models, 1=/v1/subscriptions,
+    #               2=/v1/api-keys, 3=/maas-api/*
+    # ---------------------------------------------------------------
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "PLACEHOLDER.maas-api-route.0"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "PLACEHOLDER.maas-api-route.1"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "PLACEHOLDER.maas-api-route.2"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: "PLACEHOLDER.maas-api-route.3"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_proc.ipp-pre:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+            envoy.filters.http.ext_proc.ipp:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+              disabled: true
+
+    # ---------------------------------------------------------------
+    # Dedicated ExtProc upstream clusters (no istio.metadata_exchange).
+    # Istio's outbound|* clusters inject MX, which non-mesh Praxis
+    # rejects as HTTP/2 protocol_error.
+    # ---------------------------------------------------------------
+    - applyTo: CLUSTER
+      match:
+        context: GATEWAY
+      patch:
+        operation: ADD
+        value:
+          name: payload-pre-processing-extproc
+          type: STRICT_DNS
+          connect_timeout: 10s
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: payload-pre-processing.openshift-ingress.svc.cluster.local
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                validation_context:
+                  trust_chain_verification: ACCEPT_UNTRUSTED
+          load_assignment:
+            cluster_name: payload-pre-processing-extproc
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: payload-pre-processing.openshift-ingress.svc.cluster.local
+                          port_value: 9004
+    - applyTo: CLUSTER
+      match:
+        context: GATEWAY
+      patch:
+        operation: ADD
+        value:
+          name: payload-processing-extproc
+          type: STRICT_DNS
+          connect_timeout: 10s
+          lb_policy: ROUND_ROBIN
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: payload-processing.openshift-ingress.svc.cluster.local
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                validation_context:
+                  trust_chain_verification: ACCEPT_UNTRUSTED
+          load_assignment:
+            cluster_name: payload-processing-extproc
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: payload-processing.openshift-ingress.svc.cluster.local
+                          port_value: 9004

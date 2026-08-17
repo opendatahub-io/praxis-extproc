@@ -32,9 +32,8 @@ spec:
                   - endpoint:
                       address:
                         socket_address:
-                          address: praxis-extproc.praxis-extproc.svc.cluster.local
-                          port_value: 50051
-    # Insert the ext_proc HTTP filter before the router.
+                          address: payload-processing.praxis-extproc.svc.cluster.local
+                          port_value: 9004
     - applyTo: HTTP_FILTER
       match:
         context: GATEWAY

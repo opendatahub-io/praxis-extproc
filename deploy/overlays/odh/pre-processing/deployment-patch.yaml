@@ -1,0 +1,29 @@
+- op: replace
+  path: /metadata/name
+  value: payload-pre-processing
+- op: replace
+  path: /spec/selector/matchLabels/app
+  value: payload-pre-processing
+- op: replace
+  path: /spec/template/metadata/labels/app
+  value: payload-pre-processing
+- op: replace
+  path: /spec/template/spec/containers/0/name
+  value: payload-pre-processing
+- op: replace
+  path: /spec/template/spec/containers/0/args
+  value:
+    - -c
+    - /etc/praxis/pre-extproc.yaml
+- op: replace
+  path: /spec/template/spec/containers/0/resources
+  value:
+    requests:
+      memory: "32Mi"
+      cpu: "25m"
+    limits:
+      memory: "128Mi"
+      cpu: "200m"
+- op: add
+  path: /spec/template/spec/serviceAccountName
+  value: payload-processing

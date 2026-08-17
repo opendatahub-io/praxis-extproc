@@ -1,0 +1,13 @@
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: payload-processing
+spec:
+  host: payload-processing.openshift-ingress.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      insecureSkipVerify: true
+      # Explicit SNI required: without it Envoy uses the Istio cluster name
+      # (outbound|9004||...), which rustls rejects as an illegal hostname.
+      sni: payload-processing.openshift-ingress.svc.cluster.local
