@@ -1,0 +1,79 @@
+name: K8s E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  EXTPROC_IMAGE: praxis-extproc:dev
+  CONTAINER_ENGINE: docker
+
+permissions: {}
+
+jobs:
+  simulator-check:
+    name: Check simulator connectivity
+    runs-on: ubuntu-24.04
+    outputs:
+      reachable: ${{ steps.check.outputs.reachable }}
+    steps:
+      - name: Check llm-katan reachability
+        id: check
+        run: |
+          if nc -z -w 5 3.147.232.199 443; then
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+            echo "llm-katan is reachable"
+          else
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "llm-katan is NOT reachable — skipping e2e tests"
+          fi
+
+  k8s-e2e:
+    name: K8s E2E
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    needs: simulator-check
+    if: needs.simulator-check.outputs.reachable == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.29.0
+
+      - name: Install istioctl
+        run: |
+          curl -fsSL -o istio.tar.gz "https://github.com/istio/istio/releases/download/1.29.2/istio-1.29.2-linux-amd64.tar.gz"
+          echo "904bbf1b917dd0135aa55b99cbfa34edd0a188fdeeeef09bb995d8e8e3165112  istio.tar.gz" | sha256sum -c
+          tar -xzf istio.tar.gz
+          echo "$PWD/istio-1.29.2/bin" >> "$GITHUB_PATH"
+
+      - name: Install praxis-forge
+        run: cargo install --git https://github.com/praxis-proxy/forge.git --rev 9abe12be9cf51e6384d3e8bc5ba6a0539be466b5 forge --locked
+
+      - name: Setup e2e environment
+        run: make e2e-setup
+
+      - name: Run K8s e2e tests
+        run: make e2e-test V=1
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl --context kind-praxis-e2e get pods -A
+          kubectl --context kind-praxis-e2e describe pods -n praxis-extproc
+          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100
+          kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30
+
+      - name: Teardown
+        if: always()
+        run: make e2e-teardown

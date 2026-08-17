@@ -1,0 +1,93 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: praxis-e2e
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: praxis
+
+  clusters:
+    - name: e2e
+      stacks:
+        - metallb
+        - gateway-api
+        - istio
+        - praxis
+        - gateway
+      properties:
+        metallbVersion: "v0.14.9"
+        metallbSha256: "951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4"
+        gatewayApiVersion: "1.4.0"
+        gatewayApiSha256: "6a4029e661446d64add866a00ecdc40c14219b68777ab614c5cdaac0adb481f1"
+        istioVersion: "1.29.2"
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with Kind docker-network IP pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/{{ cluster.properties.metallbVersion }}/config/manifests/metallb-native.yaml
+          sha256: "{{ cluster.properties.metallbSha256 }}"
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "180s"
+        - type: exec
+          command:
+            - bash
+            - scripts/install-metallb-pool.sh
+            - kind-praxis-{{ cluster.name }}
+
+    gateway-api:
+      description: Gateway API CRDs from upstream release
+      steps:
+        - type: url
+          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ cluster.properties.gatewayApiVersion }}/standard-install.yaml
+          sha256: "{{ cluster.properties.gatewayApiSha256 }}"
+
+    istio:
+      description: Istio minimal with Gateway API Inference Extension
+      steps:
+        - type: exec
+          command:
+            - istioctl
+            - install
+            - --set
+            - profile=minimal
+            - --set
+            - values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true
+            - -y
+            - --context
+            - kind-praxis-{{ cluster.name }}
+        - type: wait
+          resource: deployment/istiod
+          namespace: istio-system
+          condition: available
+          timeout: "120s"
+
+    praxis:
+      description: Praxis ext-proc namespace, config, deployment, and service
+      steps:
+        - type: manifest
+          path: manifests/praxis.yaml
+        - type: wait
+          resource: deployment/praxis
+          namespace: praxis-extproc
+          condition: available
+          timeout: "120s"
+
+    gateway:
+      description: llm-katan backend, Gateway, HTTPRoute, and EnvoyFilter
+      steps:
+        - type: manifest
+          path: manifests/gateway.yaml
+        - type: manifest
+          path: manifests/envoyfilter.yaml
+        - type: wait
+          resource: gateway/e2e-gateway
+          condition: Programmed
+          timeout: "120s"

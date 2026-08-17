@@ -35,6 +35,7 @@ RUN rustup show
 
 COPY . .
 
+
 RUN set -eu; \
     if [ "${CARGO_PROFILE}" = "release" ]; then \
       cargo build --release --bin praxis-extproc; \
