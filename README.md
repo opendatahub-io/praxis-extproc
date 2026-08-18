@@ -21,6 +21,7 @@ start deploying alongside Envoy.
 - [Getting Started](docs/getting-started.md): deploy and run in minutes
 - [Architecture](docs/architecture.md): how the ExtProc server works
 - [Configuration](docs/configuration.md): YAML reference for filter chains, server, and TLS
+- [IPP → Praxis Migration](docs/migration-ipp-to-praxis.md): moving from the Go Inference Payload Processor
 - [Development](docs/development.md): building, testing, contributing
 - [Conventions](docs/conventions.md): coding standards
 

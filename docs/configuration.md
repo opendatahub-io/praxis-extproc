@@ -63,6 +63,10 @@ filter_chains:
 The security chain runs first, then transformation.
 Filters within each chain execute in order.
 
+Migrating an existing Go IPP plugin config? See the
+[IPP → Praxis migration guide](migration-ipp-to-praxis.md)
+for a before/after translation.
+
 [Praxis]: https://github.com/praxis-proxy/praxis
 
 ### Available Filters
