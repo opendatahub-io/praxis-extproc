@@ -34,7 +34,7 @@ metadata:
 spec:
   endpoint: "${LLM_KATAN_FQDN}"
   provider: openai
-  targetModel: llm-katan-openai
+  targetModel: llm-katan-echo
   credentialRef:
     name: llm-katan-creds
 ---

@@ -468,6 +468,7 @@ print('\n---\n'.join(out))
   warn "Gateway-namespace pre-apply failed (controller will retry)"
 
 kc set env deployment/maas-controller -n "$MAAS_NAMESPACE" \
+  "MAAS_IPP_PROFILE=praxis" \
   "MAAS_PLATFORM_MANIFESTS=${platform_manifests}"
 kc patch deployment/maas-controller -n "$MAAS_NAMESPACE" --type=json \
   -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
