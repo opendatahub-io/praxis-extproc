@@ -84,5 +84,79 @@ Without these, MaaS cannot safely route inference requests.
 
 ## How?
 
-> **Note:** This section will be added in a follow-up PR
-> after the proposal direction is accepted.
+### Requirements
+
+- Use the existing `model_to_header` filter from `praxis-ai-filters`
+  to extract the model name from JSON request bodies.
+- Store model-to-provider mappings in an in-memory routing table
+  loaded from configuration.
+- Perform case-insensitive model lookups to handle variations like
+  "GPT-4" vs "gpt-4".
+- Normalize path construction to prevent double/missing slashes when
+  joining path prefixes.
+- Strip headers matching configurable prefixes (e.g., `x-maas-`,
+  `x-provider-`) and optionally the `Authorization` header.
+- Set `clear_route_cache: true` when authority or path mutations
+  would change Envoy's route selection.
+- Return deterministic errors for missing models and unknown providers.
+
+### Design
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      server.rs                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              run_request_filters()                   │   │
+│  │  1. Run filter pipeline (includes model_to_header)   │   │
+│  │  2. Extract model from X-AI-Model header             │   │
+│  │  3. Call BbrProcessor.process_request()              │   │
+│  │  4. Merge BBR mutations with filter mutations        │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     src/maas/                               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │   bbr.rs    │  │ routing.rs  │  │ trust_boundary.rs   │ │
+│  │             │  │             │  │                     │ │
+│  │ BbrProcessor│─▶│RoutingState │  │ TrustBoundary       │ │
+│  │ BbrResult   │  │ProviderCfg  │  │ TrustBoundaryConfig │ │
+│  │             │  │ ModelEntry  │  │                     │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Components
+
+| Component | Responsibility |
+|-----------|----------------|
+| `BbrProcessor` | Orchestrates model resolution, trust boundary, and mutation generation |
+| `RoutingState` | In-memory model-to-provider lookup table |
+| `ProviderConfig` | Provider details: authority, path_prefix, cluster, effective_model |
+| `TrustBoundary` | Identifies headers to strip based on configurable prefixes |
+| `BbrResult` | Output: headers_to_set, headers_to_remove, clear_route_cache |
+
+#### Error Handling
+
+| Condition | Behavior |
+|-----------|----------|
+| Model not in X-AI-Model header | Skip BBR processing (filter not configured) |
+| Empty model string in header | Return `RoutingError::ModelMissing` |
+| Model not found in routing table | Return `RoutingError::ModelMissing` |
+| Provider resolution fails | Return `RoutingError::ProviderNotFound` |
+| Conflicting mutations (filter vs BBR) | BBR mutations take precedence; BBR runs after filters |
+
+#### Effective Model
+
+The issue requires returning an "effective model" in mutations. This handles
+cases where the provider uses a different model name internally:
+
+- User requests `gpt-4` → provider expects `gpt-4-turbo-preview`
+- The `effective_model` field in `ProviderConfig` specifies the mapping
+- If set, BBR adds an `X-Effective-Model` header with the mapped name
+- The original model name in the request body is NOT modified (body mutation
+  is out of scope; only header mutations are returned)
+
