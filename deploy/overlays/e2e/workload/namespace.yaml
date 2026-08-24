@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: praxis-extproc
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+    app.kubernetes.io/managed-by: praxis-extproc

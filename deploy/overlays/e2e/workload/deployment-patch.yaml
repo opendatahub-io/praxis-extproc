@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-processing
+spec:
+  template:
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: payload-processing
+          imagePullPolicy: Never

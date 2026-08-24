@@ -86,6 +86,7 @@ endif
 
 container: | require-container-engine
 	$(CONTAINER_ENGINE) build \
+		--no-cache \
 		--build-arg CARGO_PROFILE=debug \
 		-t $(EXTPROC_IMAGE) \
 		-f Containerfile \
