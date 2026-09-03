@@ -4,7 +4,7 @@
 	require-container-engine \
 	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
-	manifests-demo manifests-odh \
+	manifests-demo manifests-odh manifests-openshift \
 	e2e-setup e2e-teardown e2e-test \
 	setup-hooks \
 	help
@@ -166,6 +166,9 @@ manifests-demo:
 manifests-odh:
 	@kubectl kustomize deploy/overlays/odh
 
+manifests-openshift:
+	@kubectl kustomize deploy/overlays/openshift
+
 # ---------------------------------------------------------------------------
 # Dev Setup
 # ---------------------------------------------------------------------------
@@ -216,8 +219,9 @@ help:
 	@echo "  smoke-test       run smoke tests against cluster"
 	@echo ""
 	@echo "Manifests:"
-	@echo "  manifests-demo   kubectl kustomize deploy/overlays/demo"
-	@echo "  manifests-odh    kubectl kustomize deploy/overlays/odh"
+	@echo "  manifests-demo      kubectl kustomize deploy/overlays/demo"
+	@echo "  manifests-odh       kubectl kustomize deploy/overlays/odh"
+	@echo "  manifests-openshift kubectl kustomize deploy/overlays/openshift"
 	@echo ""
 	@echo "E2E (Forge):"
 	@echo "  e2e-setup        create Kind cluster + install all stacks"

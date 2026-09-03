@@ -193,6 +193,17 @@ spec:
 YAML
 ```
 
+The Subscription installs the operator asynchronously. Wait for its
+CSV to reach `Succeeded` before continuing — the `Istio` and
+`IstioCNI` CRDs do not exist until the operator has finished
+installing:
+
+```console
+oc wait --for=condition=InstallSucceeded csv \
+    -l operators.coreos.com/servicemeshoperator3.openshift-operators \
+    -n openshift-operators --timeout=300s
+```
+
 Create the control plane and CNI (CNI is required on OpenShift):
 
 ```console
@@ -223,6 +234,13 @@ oc wait --for=jsonpath='{.status.state}'=Healthy \
 ```
 
 This creates the `istio` GatewayClass and the `EnvoyFilter` CRD.
+
+The `Istio` CR omits `spec.version`, so the operator installs its own
+default Istio version. To see which version was selected, check the
+resulting revision (`oc get istiorevisions` — the name encodes the
+version, e.g. `default-v1-24-3`). To pin a version for
+reproducibility, set `spec.version` on the `Istio` CR (e.g.
+`version: v1.24.3`).
 
 #### 3. Deploy and verify
 
