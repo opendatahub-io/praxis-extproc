@@ -1486,14 +1486,15 @@ async fn full_duplex_headers_prepended_only_to_first_chunk() {
     }
 }
 
-/// Extract `end_of_stream` from a streamed request-body response, if present.
+/// Extract `end_of_stream` from a streamed body response, if present.
 fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
     use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
-    match msg.response.as_ref()? {
-        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
-            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
-            _ => None,
-        },
+    let common = match msg.response.as_ref()? {
+        RespVariant::RequestBody(b) | RespVariant::ResponseBody(b) => b.response.as_ref()?,
+        _ => return None,
+    };
+    match common.body_mutation.as_ref()?.mutation.as_ref()? {
+        body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
         _ => None,
     }
 }
@@ -2238,6 +2239,153 @@ async fn buffered_second_body_message_rejected() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
 }
 
+#[tokio::test]
+async fn full_duplex_body_filters_complete_on_trailers() {
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_body_msg(b"SELECT 1", false)).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "trailers must release the deferred HeadersResponse, got: {hdr_msg:?}"
+    );
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&body_msg),
+        Some(false),
+        "a body closed by trailers must not claim end_of_stream, got: {body_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged after the body, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_body_filters_reject_on_trailers() {
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_body_msg(b"DROP TABLE users", false)).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+    drop(tx);
+
+    let responses = collect_responses(&mut response_stream).await;
+    assert!(
+        matches!(
+            responses.first().and_then(|r| r.response.as_ref()),
+            Some(RespVariant::ImmediateResponse(_))
+        ),
+        "the reassembled body must be rejected when trailers close it, got: {responses:?}"
+    );
+    assert_eq!(
+        responses.len(),
+        1,
+        "nothing follows an ImmediateResponse, got: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_passthrough_flushes_headers_on_trailers() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    let mutations = extract_all_set_headers(std::slice::from_ref(&hdr_msg));
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))) && mutations.iter().any(|h| h.key == "x-test"),
+        "a HeadersResponse deferred to the first chunk must be flushed when trailers arrive instead, got: {hdr_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged after the headers, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_response_body_filters_complete_on_trailers() {
+    let (mut client, _shutdown) = start_server(RESPONSE_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(2, 4));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    tx.send(response_body_msg(b"data", false)).await.unwrap();
+    tx.send(response_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::ResponseHeaders(_))),
+        "trailers must release the deferred ResponseHeaders, got: {hdr_msg:?}"
+    );
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&body_msg),
+        Some(false),
+        "a response body closed by trailers must not claim end_of_stream, got: {body_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::ResponseTrailers(_))),
+        "response trailers are acknowledged after the body, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_empty_body_with_trailers_can_still_reject() {
+    let (mut client, _shutdown) = start_server(CONDITIONAL_TERMINAL_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":method", "POST"),
+                    make_header(":path", "/"),
+                    make_header("x-danger", "true"),
+                ],
+            }),
+            end_of_stream: false,
+        })),
+        protocol_config: Some(protocol_config(2, 2)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_trailers_msg()).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(msg.response, Some(RespVariant::ImmediateResponse(_))),
+        "a BUFFERED body Envoy never sent must still let the pipeline reject at trailers, got: {msg:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2496,6 +2644,40 @@ fn make_response_headers(status: u32, end_of_stream: bool) -> ProcessingRequest 
             }),
             end_of_stream,
         })),
+        ..Default::default()
+    }
+}
+
+fn request_body_msg(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })),
+        ..Default::default()
+    }
+}
+
+fn response_body_msg(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })),
+        ..Default::default()
+    }
+}
+
+fn request_trailers_msg() -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    }
+}
+
+fn response_trailers_msg() -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::ResponseTrailers(HttpTrailers { trailers: None })),
         ..Default::default()
     }
 }

@@ -178,6 +178,16 @@ pub(crate) fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
     }
 }
 
+/// Whether a [`ProcessingResponse`] is an `ImmediateResponse`.
+///
+/// Envoy ignores every message after an immediate response, so callers use
+/// this to stop emitting follow-up messages.
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn is_immediate(resp: &ProcessingResponse) -> bool {
+    matches!(resp.response, Some(Response::ImmediateResponse(_)))
+}
+
 // -----------------------------------------------------------------------------
 // Body Chunking
 // -----------------------------------------------------------------------------
@@ -216,7 +226,7 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 /// When body data is present, populates `body_mutation` so Envoy
 /// applies the filter-modified body. Large bodies are split into
 /// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
-fn body_responses(
+pub(crate) fn body_responses(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
     is_request: bool,

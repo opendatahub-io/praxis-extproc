@@ -389,8 +389,8 @@ async fn dispatch_request(
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,
-        processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
-        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestTrailers(_) => handle_trailers(pipeline, state, true).await,
+        processing_request::Request::ResponseTrailers(_) => handle_trailers(pipeline, state, false).await,
     }
 }
 
@@ -489,15 +489,23 @@ impl EosTracker {
         }
 
         if received_eos {
-            match phase {
-                ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
-                ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
-                ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
-                ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
-            }
+            self.mark_complete(phase);
         }
 
         Ok(PhaseState::Active)
+    }
+
+    /// Mark a phase complete.
+    ///
+    /// Used for the end-of-stream flag and for trailers, which close a body
+    /// phase without any body message carrying the flag.
+    fn mark_complete(&mut self, phase: ProtocolPhase) {
+        match phase {
+            ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
+            ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
+            ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
+            ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
+        }
     }
 }
 
@@ -659,7 +667,7 @@ async fn accumulate_request_body(
         return Ok(Vec::new());
     }
 
-    run_request_pipeline(RequestPhase::Body, pipeline, state).await
+    run_request_pipeline(RequestPhase::Body(BodyEnd::EndOfStream), pipeline, state).await
 }
 
 /// Handle response headers: run response filters and respond with mutations.
@@ -754,20 +762,142 @@ async fn accumulate_response_body(
         return Ok(Vec::new());
     }
 
-    run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+    run_response_pipeline(ResponsePhase::Body(BodyEnd::EndOfStream), pipeline, state).await
+}
+
+// -----------------------------------------------------------------------------
+// Trailers
+// -----------------------------------------------------------------------------
+
+/// Handle trailers for one direction: release anything held for the body, then acknowledge.
+async fn handle_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = finalize_body_on_trailers(pipeline, state, is_request).await?;
+    if !responses.last().is_some_and(response::is_immediate) {
+        responses.push(if is_request {
+            response::request_trailers()
+        } else {
+            response::response_trailers()
+        });
+    }
+    Ok(responses)
+}
+
+/// Complete a body phase when trailers, not `end_of_stream`, close it.
+///
+/// Envoy signals the end of a body that carries trailers with the trailers
+/// message itself. Everything held back for end-of-stream — the deferred
+/// headers response, the accumulated body, the pipeline run — must be
+/// released now or the stream stalls until Envoy's message timeout.
+async fn finalize_body_on_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if !state.body_open(is_request) {
+        return Ok(Vec::new());
+    }
+
+    let caps = pipeline.body_capabilities();
+    let (phase, mode, needs_body) = if is_request {
+        (
+            ProtocolPhase::RequestBody,
+            state.protocol_config.request_body_mode,
+            caps.needs_request_body,
+        )
+    } else {
+        (
+            ProtocolPhase::ResponseBody,
+            state.protocol_config.response_body_mode,
+            caps.needs_response_body,
+        )
+    };
+    state.eos_tracker.mark_complete(phase);
+
+    match (mode, needs_body) {
+        (BodyMode::FullDuplexStreamed, true) => run_body_pipeline(BodyEnd::Trailers, pipeline, state, is_request).await,
+        (BodyMode::FullDuplexStreamed, false) => Ok(deferred_headers_response(state, is_request).into_iter().collect()),
+        (BodyMode::Buffered, _) => Ok(rejection_only(
+            run_body_pipeline(BodyEnd::Trailers, pipeline, state, is_request).await?,
+            is_request,
+        )),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Run the body-phase pipeline for one direction.
+async fn run_body_pipeline(
+    end: BodyEnd,
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if is_request {
+        run_request_pipeline(RequestPhase::Body(end), pipeline, state).await
+    } else {
+        run_response_pipeline(ResponsePhase::Body(end), pipeline, state).await
+    }
+}
+
+/// The headers response deferred to a direction's first body chunk, if not yet sent.
+///
+/// Carries the header mutations collected when the filters ran early; the
+/// first caller per direction gets it, later callers get `None`.
+fn deferred_headers_response(state: &mut StreamState, is_request: bool) -> Option<ProcessingResponse> {
+    if !state.header_state.take_first_chunk(is_request) {
+        return None;
+    }
+    Some(if is_request {
+        response::request_headers(state.deferred_request_header_mutation.take())
+    } else {
+        response::response_headers(state.deferred_response_header_mutation.take())
+    })
+}
+
+/// Keep only an `ImmediateResponse` from a pipeline run that had no body message to answer.
+///
+/// A BUFFERED body that turns out to be empty never produces a body message,
+/// so header and body mutations have nothing to ride on; a rejection still
+/// applies at any point in the stream.
+fn rejection_only(responses: Vec<ProcessingResponse>, is_request: bool) -> Vec<ProcessingResponse> {
+    let immediate: Vec<ProcessingResponse> = responses.into_iter().filter(response::is_immediate).collect();
+    if immediate.is_empty() {
+        warn!(
+            direction = direction_label(is_request),
+            "trailers closed an empty BUFFERED body; pipeline header mutations have no message to apply to and are dropped"
+        );
+    }
+    immediate
+}
+
+/// Log label for a stream direction.
+fn direction_label(is_request: bool) -> &'static str {
+    if is_request { "request" } else { "response" }
 }
 
 // -----------------------------------------------------------------------------
 // Pipeline Execution
 // -----------------------------------------------------------------------------
 
+/// How a body phase was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyEnd {
+    /// The final body message carried `end_of_stream`.
+    EndOfStream,
+    /// A trailers message closed the body.
+    Trailers,
+}
+
 /// Request filter execution phase.
 #[derive(Debug, Clone, Copy)]
 enum RequestPhase {
     /// Headers phase (headers EOS=true).
     Headers,
-    /// Body phase (body EOS=true).
-    Body,
+    /// Body phase, once the body is complete.
+    Body(BodyEnd),
 }
 
 /// Execute request pipeline for the given phase.
@@ -817,8 +947,8 @@ async fn run_request_pipeline(
 enum ResponsePhase {
     /// Headers phase (response headers EOS=true).
     Headers,
-    /// Body phase (response body EOS=true).
-    Body,
+    /// Body phase, once the body is complete.
+    Body(BodyEnd),
 }
 
 /// Execute response pipeline for the given phase.
@@ -861,7 +991,7 @@ async fn run_response_pipeline(
 
     let mutation = match phase {
         ResponsePhase::Headers => current_mutation,
-        ResponsePhase::Body => {
+        ResponsePhase::Body(_) => {
             let deferred = state.deferred_response_header_mutation.take();
             merge_mutations(deferred, current_mutation)
         },
@@ -891,7 +1021,7 @@ async fn execute_response_pipeline_and_body_filters(
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     let should_execute = match phase {
         ResponsePhase::Headers => true,
-        ResponsePhase::Body => !filters_executed,
+        ResponsePhase::Body(_) => !filters_executed,
     };
 
     if should_execute {
@@ -932,13 +1062,33 @@ fn build_request_for_phase(
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
-        (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
+        (RequestPhase::Body(end), BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::request_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::request_body(body, None, mode, true));
+            r.extend(assembled_body_responses(end, body, mode, true));
             r
         },
-        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, true),
+        (RequestPhase::Body(_), _) => response::request_body(body, mutation, mode, true),
+    }
+}
+
+/// Streamed responses for a body the server assembled from FDS chunks.
+///
+/// At end-of-stream the body is always emitted, even when empty, so the
+/// final chunk carries the flag. When trailers closed the body the chunks
+/// must not claim end-of-stream — Envoy applies that flag to the HTTP stream
+/// ahead of the trailers — and an empty body has nothing to forward.
+fn assembled_body_responses(
+    end: BodyEnd,
+    body: Option<&[u8]>,
+    mode: BodyMode,
+    is_request: bool,
+) -> Vec<ProcessingResponse> {
+    match end {
+        BodyEnd::EndOfStream => response::body_responses(body, None, is_request, mode, true),
+        BodyEnd::Trailers => body
+            .filter(|b| !b.is_empty())
+            .map(|b| response::body_responses(Some(b), None, is_request, mode, false))
+            .unwrap_or_default(),
     }
 }
 
@@ -951,13 +1101,12 @@ fn build_response_for_phase(
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (ResponsePhase::Headers, _) => vec![response::response_headers(mutation)],
-        (ResponsePhase::Body, BodyMode::FullDuplexStreamed) => {
+        (ResponsePhase::Body(end), BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::response_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::response_body(body, None, mode, true));
+            r.extend(assembled_body_responses(end, body, mode, false));
             r
         },
-        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, true),
+        (ResponsePhase::Body(_), _) => response::response_body(body, mutation, mode, true),
     }
 }
 
@@ -986,19 +1135,8 @@ fn passthrough_chunk(
         response::response_body(body_data, None, mode, body.end_of_stream)
     };
 
-    if !state.header_state.take_first_chunk(is_request) {
+    let Some(hdr) = deferred_headers_response(state, is_request) else {
         return body_responses;
-    }
-
-    let mutation = if is_request {
-        state.deferred_request_header_mutation.take()
-    } else {
-        state.deferred_response_header_mutation.take()
-    };
-    let hdr = if is_request {
-        response::request_headers(mutation)
-    } else {
-        response::response_headers(mutation)
     };
     let mut responses = vec![hdr];
     responses.extend(body_responses);
@@ -1350,6 +1488,34 @@ impl StreamState {
             protocol_config: ProtocolConfig::default(),
             ..Default::default()
         }
+    }
+
+    /// Whether the request body phase is still waiting to be closed.
+    ///
+    /// False before any headers arrived, once the headers said there is no
+    /// body, or once the body completed.
+    fn request_body_open(&self) -> bool {
+        self.request.is_some()
+            && !self.eos_tracker.request_headers.is_complete()
+            && !self.eos_tracker.request_body.is_complete()
+    }
+
+    /// Whether the body phase of a direction is still waiting to be closed.
+    fn body_open(&self, is_request: bool) -> bool {
+        if is_request {
+            self.request_body_open()
+        } else {
+            self.response_body_open()
+        }
+    }
+
+    /// Whether the response body phase is still waiting to be closed.
+    ///
+    /// See [`request_body_open`](Self::request_body_open).
+    fn response_body_open(&self) -> bool {
+        self.response.is_some()
+            && !self.eos_tracker.response_headers.is_complete()
+            && !self.eos_tracker.response_body.is_complete()
     }
 
     /// Restore filter execution state into a response context.
