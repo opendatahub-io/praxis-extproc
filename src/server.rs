@@ -521,6 +521,17 @@ fn headers_complete_message(end_of_stream: bool, mode: BodyMode) -> bool {
     end_of_stream || mode == BodyMode::None
 }
 
+/// Whether a body message carries the complete body for its direction.
+///
+/// In `BUFFERED` mode Envoy delivers the entire body in a single message and
+/// waits for the `BodyResponse` before it sends anything else. Its
+/// `end_of_stream` is false only when trailers follow, so waiting for a
+/// later end-of-stream message would deadlock the stream. Streamed modes
+/// really do deliver the body in several messages.
+fn body_complete_message(end_of_stream: bool, mode: BodyMode) -> bool {
+    end_of_stream || mode == BodyMode::Buffered
+}
+
 /// Warn (once per process) when body filters are configured but Envoy will never send the body.
 fn warn_body_never_sent(direction: &str, needs_body: bool) {
     if !needs_body {
@@ -614,11 +625,10 @@ async fn handle_request_body(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let mode = state.protocol_config.request_body_mode;
+    let complete = body_complete_message(body.end_of_stream, mode);
 
     if let Some(response) = handle_body_redelivery(
-        state
-            .eos_tracker
-            .check_and_mark(ProtocolPhase::RequestBody, body.end_of_stream)?,
+        state.eos_tracker.check_and_mark(ProtocolPhase::RequestBody, complete)?,
         mode,
         ProtocolPhase::RequestBody,
         body.body.len(),
@@ -631,20 +641,21 @@ async fn handle_request_body(
     match (mode, needs_body) {
         (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => Ok(passthrough_chunk(&body, state, mode, true)),
         (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, true).await,
-        _ => accumulate_request_body(pipeline, body, state).await,
+        _ => accumulate_request_body(pipeline, body, complete, state).await,
     }
 }
 
-/// Accumulate request body chunks, run full pipeline on EOS.
+/// Accumulate request body chunks, run full pipeline once the body is complete.
 async fn accumulate_request_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
+    complete: bool,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     check_body_limit(state.request_body.len(), body.body.len())?;
     state.request_body.extend_from_slice(&body.body);
 
-    if !body.end_of_stream {
+    if !complete {
         return Ok(Vec::new());
     }
 
@@ -707,11 +718,12 @@ async fn handle_response_body(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let mode = state.protocol_config.response_body_mode;
+    let complete = body_complete_message(body.end_of_stream, mode);
 
     if let Some(response) = handle_body_redelivery(
         state
             .eos_tracker
-            .check_and_mark(ProtocolPhase::ResponseBody, body.end_of_stream)?,
+            .check_and_mark(ProtocolPhase::ResponseBody, complete)?,
         mode,
         ProtocolPhase::ResponseBody,
         body.body.len(),
@@ -724,20 +736,21 @@ async fn handle_response_body(
     match (mode, needs_body) {
         (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => Ok(passthrough_chunk(&body, state, mode, false)),
         (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, false).await,
-        _ => accumulate_response_body(pipeline, body, state).await,
+        _ => accumulate_response_body(pipeline, body, complete, state).await,
     }
 }
 
-/// Accumulate response body chunks, run full pipeline on EOS.
+/// Accumulate response body chunks, run full pipeline once the body is complete.
 async fn accumulate_response_body(
     pipeline: &FilterPipeline,
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
+    complete: bool,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     check_body_limit(state.response_body.len(), body.body.len())?;
     state.response_body.extend_from_slice(&body.body);
 
-    if !body.end_of_stream {
+    if !complete {
         return Ok(Vec::new());
     }
 
@@ -1771,6 +1784,20 @@ mod tests {
                 !headers_complete_message(false, mode),
                 "{mode:?} must wait for the body when end_of_stream is false"
             );
+        }
+    }
+
+    #[test]
+    fn buffered_body_is_complete_without_eos() {
+        assert!(body_complete_message(false, BodyMode::Buffered));
+        assert!(body_complete_message(true, BodyMode::Buffered));
+
+        for mode in [BodyMode::Streamed, BodyMode::FullDuplexStreamed] {
+            assert!(
+                !body_complete_message(false, mode),
+                "{mode:?} delivers the body in several messages"
+            );
+            assert!(body_complete_message(true, mode), "{mode:?} completes on end_of_stream");
         }
     }
 
