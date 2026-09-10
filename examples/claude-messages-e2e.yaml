@@ -1,0 +1,15 @@
+# Example ExtProc configuration for Claude Code Anthropic Messages translation.
+server:
+  grpc_address: "0.0.0.0:50051"
+  health_address: "0.0.0.0:50052"
+  metrics_address: "0.0.0.0:9090"
+  tls:
+    mode: none
+
+filter_chains:
+  - name: claude_code_translation
+    filters:
+      - filter: anthropic_messages_to_chat_completions
+
+insecure_options:
+  allow_unbounded_body: true

@@ -118,6 +118,15 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         time_source: pipeline.time_source(),
         rewritten_path: None,
         upstream: None,
+        session_stores: None,
+        subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
+        attempted_endpoints: Vec::new(),
+        retry_policy: None,
+        route_retry_policy: None,
+        cluster_retry_state: None,
+        cluster_retry_state_released: false,
+        endpoint_reselector: None,
+        pinned_endpoint_address: None,
     }
 }
 
