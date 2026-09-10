@@ -2088,6 +2088,92 @@ async fn response_headers_deferred_by_default() {
     }
 }
 
+#[tokio::test]
+async fn none_request_mode_runs_header_filters_at_headers() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(&msg.response, Some(RespVariant::RequestHeaders(_))),
+        "NONE mode must answer headers with a HeadersResponse, got: {msg:?}"
+    );
+    let mutations = extract_all_set_headers(std::slice::from_ref(&msg));
+    assert!(
+        mutations.iter().any(|h| h.key == "x-test" && h.value == "extproc"),
+        "header filters must run at header time when no body will ever arrive, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn none_response_mode_sends_header_mutations_immediately() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let has_x_resp = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .is_some_and(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .any(|hv| hv.key == "x-resp" && hv.value == "true")
+        });
+    assert!(
+        has_x_resp,
+        "response header mutations must not be deferred to a body that never arrives, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn none_mode_rejects_unexpected_body_message() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"unexpected".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for rejection")
+    .expect_err("a body message in NONE mode must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2339,6 +2425,21 @@ fn make_header(key: &str, value: &str) -> HeaderValue {
         key: key.to_owned(),
         value: value.to_owned(),
         raw_value: Vec::new(),
+    }
+}
+
+/// Build the `protocol_config` Envoy attaches to the first stream message.
+///
+/// Body modes use the `BodySendMode` wire values: 0 `NONE`, 1 `STREAMED`,
+/// 2 `BUFFERED`, 4 `FULL_DUPLEX_STREAMED`.
+fn protocol_config(
+    request_body_mode: i32,
+    response_body_mode: i32,
+) -> praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+    praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        request_body_mode,
+        response_body_mode,
+        send_body_without_waiting_for_header_response: false,
     }
 }
 

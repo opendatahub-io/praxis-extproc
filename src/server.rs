@@ -40,6 +40,32 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
 
+/// Once-per-process warning: body filters configured under NONE body mode.
+static NONE_MODE_BODY_FILTERS: OnceWarning = OnceWarning::new();
+
+// -----------------------------------------------------------------------------
+// OnceWarning
+// -----------------------------------------------------------------------------
+
+/// A configuration-mismatch warning that fires once per process.
+///
+/// The conditions these guard depend on the pipeline and on Envoy's
+/// processing mode, not on the request, so repeating them for every stream
+/// would only flood the log; later occurrences are logged at debug.
+struct OnceWarning(std::sync::atomic::AtomicBool);
+
+impl OnceWarning {
+    /// A warning that has not fired yet.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Whether this call is the first; every later call returns `false`.
+    fn first(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Parsed protocol configuration from Envoy.
 ///
 /// Extracted from the first `ProcessingRequest` message's `protocol_config` field.
@@ -457,6 +483,30 @@ fn duplicate_after_eos(phase: ProtocolPhase) -> Status {
     ))
 }
 
+/// Whether a headers message is the complete message for its direction.
+///
+/// In `NONE` body mode Envoy never sends a body, so the headers message is
+/// complete even when `end_of_stream` is false; the pipeline must run now or
+/// it never runs at all.
+fn headers_complete_message(end_of_stream: bool, mode: BodyMode) -> bool {
+    end_of_stream || mode == BodyMode::None
+}
+
+/// Warn (once per process) when body filters are configured but Envoy will never send the body.
+fn warn_body_never_sent(direction: &str, needs_body: bool) {
+    if !needs_body {
+        return;
+    }
+    if NONE_MODE_BODY_FILTERS.first() {
+        warn!(
+            direction,
+            "pipeline declares body filters but Envoy body mode is NONE; body filters will not run"
+        );
+    } else {
+        debug!(direction, "body filters skipped: Envoy body mode is NONE");
+    }
+}
+
 /// Apply body-phase policy to the phase state observed by [`EosTracker::check_and_mark`].
 ///
 /// Returns `Ok(None)` to keep processing. For a re-delivery ([`PhaseState::Completed`]),
@@ -481,6 +531,7 @@ fn handle_body_redelivery(
 
 /// Handle request headers: parse into [`Request`] and route by body mode.
 ///
+/// For `NONE`, the headers are the complete request — pipeline runs now.
 /// For `BUFFERED`, sends an empty `HeadersResponse` — pipeline runs at body EOS.
 /// For `STREAMED`, runs filters early and sends mutations in `HeadersResponse`.
 /// For `FDS` with body filters, returns no response — full pipeline at body EOS.
@@ -492,9 +543,12 @@ async fn handle_request_headers(
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    let mode = state.protocol_config.request_body_mode;
+    let complete = headers_complete_message(headers.end_of_stream, mode);
+
     if state
         .eos_tracker
-        .check_and_mark(ProtocolPhase::RequestHeaders, headers.end_of_stream)?
+        .check_and_mark(ProtocolPhase::RequestHeaders, complete)?
         == PhaseState::Completed
     {
         // Envoy does not re-deliver headers; a duplicate is a protocol violation.
@@ -504,11 +558,14 @@ async fn handle_request_headers(
     let envoy_headers = extract_header_list(&headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
-    if headers.end_of_stream {
+    if complete {
+        if !headers.end_of_stream {
+            warn_body_never_sent("request", pipeline.body_capabilities().needs_request_body);
+        }
         return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
-    match state.protocol_config.request_body_mode {
+    match mode {
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
             run_request_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
@@ -567,6 +624,7 @@ async fn accumulate_request_body(
 
 /// Handle response headers: run response filters and respond with mutations.
 ///
+/// For `NONE`, the headers are the complete response — pipeline runs now.
 /// For `BUFFERED`, runs filters early and defers mutations to body phase
 /// (Envoy honours `CommonResponse.header_mutation` on body responses).
 /// For `STREAMED`, runs filters early and sends mutations immediately
@@ -578,9 +636,12 @@ async fn handle_response_headers(
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    let mode = state.protocol_config.response_body_mode;
+    let complete = headers_complete_message(headers.end_of_stream, mode);
+
     if state
         .eos_tracker
-        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?
+        .check_and_mark(ProtocolPhase::ResponseHeaders, complete)?
         == PhaseState::Completed
     {
         // Envoy does not re-deliver headers; a duplicate is a protocol violation.
@@ -590,11 +651,14 @@ async fn handle_response_headers(
     let envoy_headers = extract_header_list(&headers);
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
-    if headers.end_of_stream {
+    if complete {
+        if !headers.end_of_stream {
+            warn_body_never_sent("response", pipeline.body_capabilities().needs_response_body);
+        }
         return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
     }
 
-    match state.protocol_config.response_body_mode {
+    match mode {
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_response_body => {
             run_response_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
@@ -1665,6 +1729,20 @@ mod tests {
             tracker.check_and_mark(ProtocolPhase::RequestBody, true).unwrap(),
             PhaseState::Completed
         );
+    }
+
+    #[test]
+    fn headers_complete_in_none_mode_regardless_of_eos() {
+        assert!(headers_complete_message(false, BodyMode::None));
+        assert!(headers_complete_message(true, BodyMode::None));
+        assert!(headers_complete_message(true, BodyMode::Buffered));
+
+        for mode in [BodyMode::Buffered, BodyMode::Streamed, BodyMode::FullDuplexStreamed] {
+            assert!(
+                !headers_complete_message(false, mode),
+                "{mode:?} must wait for the body when end_of_stream is false"
+            );
+        }
     }
 
     #[test]
