@@ -16,6 +16,3 @@ data:
         filters:
           - filter: model_to_header
             header: X-Gateway-Model-Name
-
-    insecure_options:
-      allow_unbounded_body: true

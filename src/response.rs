@@ -24,8 +24,7 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 /// See: `envoy/service/ext_proc/v3/external_processor.proto`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum BodyMode {
-    /// No body sent.
-    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
+    /// No body sent: the headers message is the complete message.
     None = 0,
     /// Body sent in streaming mode (incremental processing).
     Streamed = 1,
@@ -44,16 +43,17 @@ impl TryFrom<i32> for BodyMode {
 
     /// Parse from Envoy's `protocol_config` field.
     ///
-    /// Supported: `STREAMED` (1), `BUFFERED` (2), `FULL_DUPLEX_STREAMED` (4).
-    /// `NONE` (0) maps to `BUFFERED` (2).
+    /// Supported: `NONE` (0), `STREAMED` (1), `BUFFERED` (2),
+    /// `FULL_DUPLEX_STREAMED` (4).
     ///
     /// # Errors
     ///
     /// Returns error message for unsupported modes.
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 | 2 => Ok(Self::Buffered),
+            0 => Ok(Self::None),
             1 => Ok(Self::Streamed),
+            2 => Ok(Self::Buffered),
             4 => Ok(Self::FullDuplexStreamed),
             3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
             _ => Err(format!("unknown BodySendMode value {value}")),
@@ -178,6 +178,16 @@ pub(crate) fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
     }
 }
 
+/// Whether a [`ProcessingResponse`] is an `ImmediateResponse`.
+///
+/// Envoy ignores every message after an immediate response, so callers use
+/// this to stop emitting follow-up messages.
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn is_immediate(resp: &ProcessingResponse) -> bool {
+    matches!(resp.response, Some(Response::ImmediateResponse(_)))
+}
+
 // -----------------------------------------------------------------------------
 // Body Chunking
 // -----------------------------------------------------------------------------
@@ -216,7 +226,7 @@ fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
 /// When body data is present, populates `body_mutation` so Envoy
 /// applies the filter-modified body. Large bodies are split into
 /// chunks at the [`BODY_CHUNK_LIMIT`] boundary.
-fn body_responses(
+pub(crate) fn body_responses(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
     is_request: bool,
@@ -718,7 +728,7 @@ mod tests {
 
     #[test]
     fn body_mode_from_i32_valid_modes() {
-        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::None);
         assert_eq!(BodyMode::try_from(1).unwrap(), BodyMode::Streamed);
         assert_eq!(BodyMode::try_from(2).unwrap(), BodyMode::Buffered);
         assert_eq!(BodyMode::try_from(4).unwrap(), BodyMode::FullDuplexStreamed);

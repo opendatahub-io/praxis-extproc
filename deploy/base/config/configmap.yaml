@@ -18,9 +18,6 @@ data:
           - filter: model_to_header
             header: X-Gateway-Model-Name
 
-    insecure_options:
-      allow_unbounded_body: true
-
   # Post-auth (IPP) Praxis chain: full processing pipeline.
   extproc.yaml: |
     server:
@@ -34,6 +31,3 @@ data:
       - name: ipp
         filters:
           - filter: request_id
-
-    insecure_options:
-      allow_unbounded_body: true

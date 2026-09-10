@@ -28,6 +28,3 @@ filter_chains:
         request_add:
           - name: X-Processed-By
             value: praxis-extproc
-
-insecure_options:
-  allow_unbounded_body: true

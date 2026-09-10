@@ -27,7 +27,12 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
+use std::sync::Arc;
+
 use praxis_extproc::{config, server::PraxisExtProc};
+use praxis_filter::{
+    BodyAccess, FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext,
+};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -317,101 +322,82 @@ async fn response_body_with_header_mutations() {
 
 #[tokio::test]
 async fn multi_chunk_body_accumulation() {
-    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
-
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
 
-    let response = client.process(stream).await.expect("process call failed");
-    let mut inbound = response.into_inner();
+    let mut headers = make_request_headers("POST", "/chunked", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
 
-    tx.send(make_request_headers("POST", "/chunked", false))
+    for (chunk, eos) in [(&b"DROP "[..], false), (&b"TABLE users"[..], true)] {
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: chunk.to_vec(),
+                end_of_stream: eos,
+            })),
+            ..Default::default()
+        })
         .await
-        .expect("send headers");
+        .unwrap();
+    }
 
-    drop(inbound.message().await);
-
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::RequestBody(HttpBody {
-            body: b"chunk1".to_vec(),
-            end_of_stream: false,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send chunk 1");
-
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::RequestBody(HttpBody {
-            body: b"chunk2".to_vec(),
-            end_of_stream: true,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send chunk 2");
-
-    let body_resp = inbound.message().await.expect("receive").expect("body response");
-
+    let msg = next_full_duplex_msg(&mut response_stream).await;
     assert!(
-        !matches!(&body_resp.response, Some(RespVariant::ImmediateResponse(_))),
-        "accumulated chunks should not be rejected"
+        matches!(&msg.response, Some(RespVariant::ImmediateResponse(_))),
+        "the rule only matches the reassembled body, so chunks must be accumulated before filters run, got: {msg:?}"
     );
 }
 
 #[tokio::test]
 async fn multi_chunk_response_body() {
-    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
+    let (mut client, _shutdown) = start_server(RESPONSE_BODY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
 
-    let response = client.process(stream).await.expect("process call failed");
-    let mut inbound = response.into_inner();
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(2, 4));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
 
-    tx.send(make_request_headers("GET", "/", true)).await.expect("send");
-    drop(inbound.message().await);
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    for (chunk, eos) in [(&b"part1"[..], false), (&b"part2"[..], true)] {
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::ResponseBody(HttpBody {
+                body: chunk.to_vec(),
+                end_of_stream: eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
 
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![make_header(":status", "200")],
-            }),
-            end_of_stream: false,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send response headers");
-
-    drop(inbound.message().await);
-
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseBody(HttpBody {
-            body: b"part1".to_vec(),
-            end_of_stream: false,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send response body chunk 1");
-
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseBody(HttpBody {
-            body: b"part2".to_vec(),
-            end_of_stream: true,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send response body chunk 2");
-
-    let resp = inbound.message().await.expect("receive").expect("response");
-
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
     assert!(
-        !matches!(&resp.response, Some(RespVariant::ImmediateResponse(_))),
-        "multi-chunk response body should succeed"
+        matches!(hdr_msg.response, Some(RespVariant::ResponseHeaders(_))),
+        "deferred ResponseHeaders must precede the body, got: {hdr_msg:?}"
     );
+
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    let Some(RespVariant::ResponseBody(b)) = &body_msg.response else {
+        panic!("expected ResponseBody, got: {body_msg:?}");
+    };
+    let Some(body_mutation::Mutation::StreamedResponse(s)) = b
+        .response
+        .as_ref()
+        .and_then(|c| c.body_mutation.as_ref())
+        .and_then(|m| m.mutation.as_ref())
+    else {
+        panic!("expected StreamedResponse, got: {body_msg:?}");
+    };
+    assert_eq!(
+        s.body, b"part1part2",
+        "accumulated chunks are emitted once the body is complete"
+    );
+    assert!(s.end_of_stream, "final chunk must set end_of_stream");
 }
 
 #[tokio::test]
@@ -1505,14 +1491,15 @@ async fn full_duplex_headers_prepended_only_to_first_chunk() {
     }
 }
 
-/// Extract `end_of_stream` from a streamed request-body response, if present.
+/// Extract `end_of_stream` from a streamed body response, if present.
 fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
     use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
-    match msg.response.as_ref()? {
-        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
-            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
-            _ => None,
-        },
+    let common = match msg.response.as_ref()? {
+        RespVariant::RequestBody(b) | RespVariant::ResponseBody(b) => b.response.as_ref()?,
+        _ => return None,
+    };
+    match common.body_mutation.as_ref()?.mutation.as_ref()? {
+        body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
         _ => None,
     }
 }
@@ -2088,6 +2075,550 @@ async fn response_headers_deferred_by_default() {
     }
 }
 
+#[tokio::test]
+async fn none_request_mode_runs_header_filters_at_headers() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(&msg.response, Some(RespVariant::RequestHeaders(_))),
+        "NONE mode must answer headers with a HeadersResponse, got: {msg:?}"
+    );
+    let mutations = extract_all_set_headers(std::slice::from_ref(&msg));
+    assert!(
+        mutations.iter().any(|h| h.key == "x-test" && h.value == "extproc"),
+        "header filters must run at header time when no body will ever arrive, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn none_response_mode_sends_header_mutations_immediately() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let has_x_resp = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .is_some_and(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .any(|hv| hv.key == "x-resp" && hv.value == "true")
+        });
+    assert!(
+        has_x_resp,
+        "response header mutations must not be deferred to a body that never arrives, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn none_mode_rejects_unexpected_body_message() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(0, 0));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"unexpected".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for rejection")
+    .expect_err("a body message in NONE mode must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
+}
+
+#[tokio::test]
+async fn buffered_body_with_trailers_gets_body_response() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"payload".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(&body_msg.response, Some(RespVariant::RequestBody(_))),
+        "BUFFERED delivers the whole body in one message, so it must be answered even when trailers follow, got: {body_msg:?}"
+    );
+    let mutations = extract_all_set_headers(std::slice::from_ref(&body_msg));
+    assert!(
+        mutations.iter().any(|h| h.key == "x-test"),
+        "the pipeline must run on the single BUFFERED body message, got: {body_msg:?}"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(&trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers after a processed body are answered normally, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_second_body_message_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    for (chunk, eos) in [(&b"one"[..], false), (&b"two"[..], true)] {
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: chunk.to_vec(),
+                end_of_stream: eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    let first = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(&first.response, Some(RespVariant::RequestBody(_))),
+        "first BUFFERED body message is the complete body, got: {first:?}"
+    );
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for rejection")
+    .expect_err("a second BUFFERED body message is a protocol violation");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
+}
+
+#[tokio::test]
+async fn full_duplex_body_filters_complete_on_trailers() {
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_body_msg(b"SELECT 1", false)).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "trailers must release the deferred HeadersResponse, got: {hdr_msg:?}"
+    );
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&body_msg),
+        Some(false),
+        "a body closed by trailers must not claim end_of_stream, got: {body_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged after the body, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_body_filters_reject_on_trailers() {
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_body_msg(b"DROP TABLE users", false)).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+    drop(tx);
+
+    let responses = collect_responses(&mut response_stream).await;
+    assert!(
+        matches!(
+            responses.first().and_then(|r| r.response.as_ref()),
+            Some(RespVariant::ImmediateResponse(_))
+        ),
+        "the reassembled body must be rejected when trailers close it, got: {responses:?}"
+    );
+    assert_eq!(
+        responses.len(),
+        1,
+        "nothing follows an ImmediateResponse, got: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_passthrough_flushes_headers_on_trailers() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(4, 2));
+    tx.send(headers).await.unwrap();
+    tx.send(request_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    let mutations = extract_all_set_headers(std::slice::from_ref(&hdr_msg));
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))) && mutations.iter().any(|h| h.key == "x-test"),
+        "a HeadersResponse deferred to the first chunk must be flushed when trailers arrive instead, got: {hdr_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged after the headers, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_response_body_filters_complete_on_trailers() {
+    let (mut client, _shutdown) = start_server(RESPONSE_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(2, 4));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    tx.send(response_body_msg(b"data", false)).await.unwrap();
+    tx.send(response_trailers_msg()).await.unwrap();
+
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::ResponseHeaders(_))),
+        "trailers must release the deferred ResponseHeaders, got: {hdr_msg:?}"
+    );
+    let body_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&body_msg),
+        Some(false),
+        "a response body closed by trailers must not claim end_of_stream, got: {body_msg:?}"
+    );
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::ResponseTrailers(_))),
+        "response trailers are acknowledged after the body, got: {trailer_msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_empty_body_with_trailers_can_still_reject() {
+    let (mut client, _shutdown) = start_server(CONDITIONAL_TERMINAL_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":method", "POST"),
+                    make_header(":path", "/"),
+                    make_header("x-danger", "true"),
+                ],
+            }),
+            end_of_stream: false,
+        })),
+        protocol_config: Some(protocol_config(2, 2)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_trailers_msg()).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(msg.response, Some(RespVariant::ImmediateResponse(_))),
+        "a BUFFERED body Envoy never sent must still let the pipeline reject at trailers, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn multi_valued_response_header_passes_through_untouched() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":status", "200"),
+                    make_header("set-cookie", "a=1"),
+                    make_header("set-cookie", "b=2"),
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let mutation = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .expect("x-resp is set, so a mutation is present");
+    let keys: Vec<&str> = mutation
+        .set_headers
+        .iter()
+        .filter_map(|h| h.header.as_ref())
+        .map(|hv| hv.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["x-resp"],
+        "only the filter's own change may be emitted, got: {mutation:?}"
+    );
+    assert!(
+        mutation.remove_headers.is_empty(),
+        "untouched headers must not be removed, got: {mutation:?}"
+    );
+}
+
+#[tokio::test]
+async fn filter_state_and_request_start_survive_across_phases() {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "state_probe",
+            FilterFactory::Http(Arc::new(|_cfg| Ok(Box::new(StateProbeFilter)))),
+        )
+        .expect("register probe filter");
+    let (mut client, _shutdown) = start_server_with_registry(STATE_PROBE_CONFIG, &registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let probes: Vec<(String, String)> = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .map(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .filter(|hv| hv.key.starts_with("x-probe-"))
+                .map(|hv| (hv.key.clone(), hv.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        probes.contains(&("x-probe-state".to_owned(), "from-request".to_owned())),
+        "filter_state written during the request phase must be visible on the response, got: {probes:?}"
+    );
+    assert!(
+        probes.contains(&("x-probe-extension".to_owned(), "from-request".to_owned())),
+        "request extensions written during the request phase must be visible on the response, got: {probes:?}"
+    );
+    assert!(
+        probes.contains(&("x-probe-start-stable".to_owned(), "true".to_owned())),
+        "request_start must not be re-stamped per phase, got: {probes:?}"
+    );
+}
+
+#[tokio::test]
+async fn streamed_body_derived_header_mutations_are_not_emitted() {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+
+    let (mut client, _shutdown) = start_server(MODEL_TO_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/v1/chat/completions", false);
+    headers.protocol_config = Some(protocol_config(1, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    let payload = br#"{"model":"gpt-4","messages":[]}"#;
+    tx.send(request_body_msg(payload, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::RequestBody(b)) = &msg.response else {
+        panic!("expected RequestBody, got: {msg:?}");
+    };
+    let common = b.response.as_ref().expect("common response");
+    assert!(
+        common.header_mutation.is_none(),
+        "Envoy ignores header mutations on STREAMED body responses, so none must be emitted, got: {msg:?}"
+    );
+    assert!(
+        matches!(
+            common.body_mutation.as_ref().and_then(|m| m.mutation.as_ref()),
+            Some(body_mutation::Mutation::Body(bytes)) if bytes == payload
+        ),
+        "the chunk itself must still be forwarded, got: {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn request_body_over_limit_gets_local_413() {
+    let (mut client, _shutdown) = start_server(LIMITED_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_body_msg(b"123456789", true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ImmediateResponse(imm)) = &msg.response else {
+        panic!("an oversized body must be answered with a local reply, got: {msg:?}");
+    };
+    assert_eq!(imm.status.as_ref().map(|s| s.code), Some(413), "status is 413");
+}
+
+#[tokio::test]
+async fn response_body_over_limit_gets_local_413() {
+    let (mut client, _shutdown) = start_server(LIMITED_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let _resp_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(response_body_msg(b"123456789", true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ImmediateResponse(imm)) = &msg.response else {
+        panic!("an oversized response body must be answered with a local reply, got: {msg:?}");
+    };
+    assert_eq!(imm.status.as_ref().map(|s| s.code), Some(413), "status is 413");
+}
+
+#[tokio::test]
+async fn streamed_body_filters_see_end_of_stream_at_trailers() {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "state_probe",
+            FilterFactory::Http(Arc::new(|_cfg| Ok(Box::new(StateProbeFilter)))),
+        )
+        .expect("register probe filter");
+    let (mut client, _shutdown) = start_server_with_registry(STATE_PROBE_CONFIG, &registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(1, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_body_msg(b"chunk", false)).await.unwrap();
+    let _chunk_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_trailers_msg()).await.unwrap();
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged, got: {trailer_msg:?}"
+    );
+
+    tx.send(make_response_headers(200, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let body_eos = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .and_then(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .find(|hv| hv.key == "x-probe-body-eos")
+                .map(|hv| hv.value.clone())
+        });
+    assert_eq!(
+        body_eos.as_deref(),
+        Some("true"),
+        "STREAMED body filters must get their end-of-stream call when trailers close the body, got: {msg:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2097,8 +2628,6 @@ filter_chains:
   - name: test
     filters:
       - filter: request_id
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const HEADERS_CONFIG: &str = r#"
@@ -2110,8 +2639,6 @@ filter_chains:
         request_add:
           - name: X-Test
             value: extproc
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const GUARDRAILS_CONFIG: &str = r#"
@@ -2122,8 +2649,6 @@ filter_chains:
         rules:
           - target: body
             contains: "DROP TABLE"
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const UNCONDITIONAL_BRANCH_CONFIG: &str = r#"
@@ -2145,8 +2670,6 @@ filter_chains:
             rejoin: next
             chains:
               - branch_chain
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const CONDITIONAL_TERMINAL_CONFIG: &str = r#"
@@ -2171,8 +2694,45 @@ filter_chains:
                   - filter: static_response
                     status: 403
                     body: "blocked by branch"
-insecure_options:
-  allow_unbounded_body: true
+"#;
+
+const LIMITED_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+limits:
+  max_request_bytes: 8
+  max_response_bytes: 8
+"#;
+
+const MODEL_TO_HEADER_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: model_to_header
+        header: X-Gateway-Model-Name
+"#;
+
+const STATE_PROBE_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: state_probe
+"#;
+
+/// `access_log` declares read-only response body access, which is what makes
+/// the pipeline accumulate `FULL_DUPLEX_STREAMED` response chunks instead of
+/// passing them through.
+const RESPONSE_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: access_log
+      - filter: headers
+        response_set:
+          - name: X-Resp
+            value: "true"
 "#;
 
 const RESPONSE_HEADER_CONFIG: &str = r#"
@@ -2183,8 +2743,6 @@ filter_chains:
         response_set:
           - name: X-Resp
             value: "true"
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 // -----------------------------------------------------------------------------
@@ -2194,15 +2752,77 @@ insecure_options:
 type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
+/// Records a value in every cross-phase slot during the request and reports
+/// what survived as response headers.
+struct StateProbeFilter;
+
+struct ProbeExtension(String);
+
+#[async_trait::async_trait]
+impl HttpFilter for StateProbeFilter {
+    fn name(&self) -> &'static str {
+        "state_probe"
+    }
+
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.insert_filter_state(String::from("from-request"));
+        ctx.extensions.insert(ProbeExtension("from-request".to_owned()));
+        ctx.set_metadata("probe.start", format!("{:?}", ctx.request_start));
+        Ok(FilterAction::Continue)
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            ctx.set_metadata("probe.body_eos", "true");
+        }
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        let state = ctx
+            .get_filter_state::<String>()
+            .cloned()
+            .unwrap_or_else(|| "missing".to_owned());
+        let extension = ctx
+            .extensions
+            .get::<ProbeExtension>()
+            .map_or_else(|| "missing".to_owned(), |e| e.0.clone());
+        let start_stable = ctx.get_metadata("probe.start") == Some(format!("{:?}", ctx.request_start).as_str());
+        let body_eos = ctx.get_metadata("probe.body_eos").unwrap_or("false").to_owned();
+        let resp = ctx.response_header.as_mut().expect("response phase has headers");
+        resp.headers.insert("x-probe-state", state.parse().unwrap());
+        resp.headers.insert("x-probe-extension", extension.parse().unwrap());
+        resp.headers
+            .insert("x-probe-start-stable", start_stable.to_string().parse().unwrap());
+        resp.headers.insert("x-probe-body-eos", body_eos.parse().unwrap());
+        Ok(FilterAction::Continue)
+    }
+}
+
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry(config_yaml, &praxis_ai_filters::build_ai_registry()).await
+}
+
+async fn start_server_with_registry(
+    config_yaml: &str,
+    registry: &FilterRegistry,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
-    let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
+    let pipeline = config::build_pipeline(&cfg, registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = PraxisExtProc::new(pipeline);
+    let svc = PraxisExtProc::with_limits(pipeline, cfg.limits.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -2334,11 +2954,60 @@ fn make_response_headers(status: u32, end_of_stream: bool) -> ProcessingRequest 
     }
 }
 
+fn request_body_msg(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })),
+        ..Default::default()
+    }
+}
+
+fn response_body_msg(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })),
+        ..Default::default()
+    }
+}
+
+fn request_trailers_msg() -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    }
+}
+
+fn response_trailers_msg() -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::ResponseTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    }
+}
+
 fn make_header(key: &str, value: &str) -> HeaderValue {
     HeaderValue {
         key: key.to_owned(),
         value: value.to_owned(),
         raw_value: Vec::new(),
+    }
+}
+
+/// Build the `protocol_config` Envoy attaches to the first stream message.
+///
+/// Body modes use the `BodySendMode` wire values: 0 `NONE`, 1 `STREAMED`,
+/// 2 `BUFFERED`, 4 `FULL_DUPLEX_STREAMED`.
+fn protocol_config(
+    request_body_mode: i32,
+    response_body_mode: i32,
+) -> praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+    praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        request_body_mode,
+        response_body_mode,
+        send_body_without_waiting_for_header_response: false,
     }
 }
 
