@@ -202,6 +202,7 @@ fn flatten_chains(chains: &[praxis_core::config::FilterChainConfig]) -> Vec<prax
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::needless_raw_strings,
+    clippy::panic,
     reason = "tests"
 )]
 mod tests {
@@ -422,6 +423,25 @@ insecure_options:
         let registry = praxis_ai_filters::build_ai_registry();
 
         assert!(build_pipeline(&cfg, &registry).is_ok(), "opt-in lifts the limit");
+    }
+
+    #[test]
+    fn shipped_examples_build_pipelines() {
+        let examples = [
+            ("praxis-extproc.yaml", include_str!("../examples/praxis-extproc.yaml")),
+            (
+                "ai-model-to-header.yaml",
+                include_str!("../examples/ai-model-to-header.yaml"),
+            ),
+            ("branch-chains.yaml", include_str!("../examples/branch-chains.yaml")),
+        ];
+        let registry = praxis_ai_filters::build_ai_registry();
+
+        for (name, yaml) in examples {
+            let cfg: ExtProcConfig = serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let err = build_pipeline(&cfg, &registry).err().map(|e| e.to_string());
+            assert!(err.is_none(), "{name} must build a pipeline: {err:?}");
+        }
     }
 
     #[test]

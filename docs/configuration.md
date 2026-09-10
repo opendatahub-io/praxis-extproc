@@ -107,31 +107,41 @@ names and configuration options.
 ### Branch Chains
 
 Filter chains support conditional branching via the
-`branches` field. Branch chains execute based on
-filter results, enabling conditional logic within
-the pipeline.
+`branch_chains` field. A branch names the chains to
+run, an optional `on_result` condition on the parent
+filter's result, and where to `rejoin` the parent
+pipeline afterwards (`next`, `terminal`, or a named
+filter).
 
 ```yaml
 filter_chains:
   - name: main
     filters:
       - filter: guardrails
-        name: content_check
+        action: flag
         rules:
-          - target: body
-            contains: "blocked-content"
-        branches:
-          - chain:
-              filters:
-                - filter: headers
-                  request_add:
-                    - name: X-Content-Blocked
-                      value: "true"
+          - target: header
+            name: "x-content-class"
+            contains: "blocked"
+        branch_chains:
+          - name: tag_blocked_content
             on_result:
-              filter: content_check
-              key: rejected
-              value: "true"
+              filter: guardrails
+              result: blocked
+            rejoin: next
+            chains:
+              - name: tag
+                filters:
+                  - filter: headers
+                    request_add:
+                      - name: X-Content-Blocked
+                        value: "true"
 ```
+
+Branch conditions are evaluated when the parent
+filter's request phase completes, so they can only
+react to results produced from headers. Body rules
+run once the body arrives, after branch evaluation.
 
 See [branch-chains.yaml] for a working example.
 
