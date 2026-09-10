@@ -20,6 +20,7 @@ use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption, HttpStatus, header_value_option::HeaderAppendAction},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
 };
+use tracing::debug;
 
 // -----------------------------------------------------------------------------
 // Header Conversion
@@ -27,9 +28,12 @@ use praxis_proto::envoy::service::{
 
 /// Convert ExtProc [`HeaderValue`] list into a Praxis [`Request`].
 ///
-/// Pseudo-headers (`:method`, `:path`, `:authority`, `:scheme`) are
-/// extracted into their respective fields. Remaining headers populate
-/// the [`HeaderMap`].
+/// Pseudo-headers are extracted: `:method` and `:path` into their fields,
+/// `:scheme` and `:authority` into an absolute-form URI. Envoy carries the
+/// host only as `:authority`, so a `host` header is synthesized from it
+/// when the request did not send one; filters then find the host where
+/// they would under either HTTP/1.1 (the header) or HTTP/2 (the URI).
+/// Remaining headers populate the [`HeaderMap`] with their raw bytes.
 ///
 /// [`HeaderValue`]: praxis_proto::envoy::service::common::v3::HeaderValue
 /// [`Request`]: praxis_filter::Request
@@ -37,31 +41,66 @@ use praxis_proto::envoy::service::{
 pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
     let mut method = Method::GET;
     let mut path = "/".to_owned();
+    let mut scheme = None;
+    let mut authority = None;
     let mut header_map = HeaderMap::new();
 
     for hv in headers {
-        let val = header_value_str(hv);
         match hv.key.as_str() {
-            ":method" => method = val.parse().unwrap_or(Method::GET),
-            ":path" => val.clone_into(&mut path),
-            ":authority" | ":scheme" => {},
-            key => {
-                if let (Ok(name), Ok(value)) = (
-                    key.parse::<http::header::HeaderName>(),
-                    val.parse::<http::header::HeaderValue>(),
-                ) {
-                    header_map.append(name, value);
-                }
-            },
+            ":method" => method = header_value_str(hv).parse().unwrap_or(Method::GET),
+            ":path" => header_value_str(hv).clone_into(&mut path),
+            ":scheme" => scheme = Some(header_value_str(hv).to_owned()),
+            ":authority" => authority = Some(header_value_str(hv).to_owned()),
+            _ => append_header(&mut header_map, hv),
         }
     }
 
-    let uri = path.parse().unwrap_or_else(|_| Uri::from_static("/"));
+    if let Some(host) = authority.as_deref()
+        && !header_map.contains_key(http::header::HOST)
+        && let Ok(value) = http::header::HeaderValue::from_str(host)
+    {
+        header_map.insert(http::header::HOST, value);
+    }
 
     Request {
         headers: header_map,
         method,
-        uri,
+        uri: build_uri(scheme.as_deref(), authority.as_deref(), &path),
+    }
+}
+
+/// Assemble the request URI: absolute-form when Envoy supplied both scheme
+/// and authority and the path is origin-form, otherwise the path alone.
+fn build_uri(scheme: Option<&str>, authority: Option<&str>, path: &str) -> Uri {
+    let absolute = match (scheme, authority) {
+        (Some(scheme), Some(authority)) if path.starts_with('/') => {
+            format!("{scheme}://{authority}{path}").parse().ok()
+        },
+        _ => None,
+    };
+
+    absolute
+        .or_else(|| path.parse().ok())
+        .unwrap_or_else(|| Uri::from_static("/"))
+}
+
+/// Append a regular header to `map`, keeping opaque value bytes.
+///
+/// Envoy sends non-UTF-8 values in `raw_value`; they are kept byte for byte
+/// rather than replaced by an empty value. A name or value that is not a
+/// valid HTTP field is dropped and logged, so it never silently vanishes
+/// from what filters inspect.
+fn append_header(map: &mut HeaderMap, hv: &HeaderValue) {
+    let value = if hv.raw_value.is_empty() {
+        http::header::HeaderValue::from_str(&hv.value)
+    } else {
+        http::header::HeaderValue::from_bytes(&hv.raw_value)
+    };
+
+    if let (Ok(name), Ok(value)) = (hv.key.parse::<http::header::HeaderName>(), value) {
+        map.append(name, value);
+    } else {
+        debug!(key = %hv.key, "dropping header that is not a valid HTTP field");
     }
 }
 
@@ -463,7 +502,7 @@ fn header_map_pairs(map: &HeaderMap) -> impl Iterator<Item = (&str, &[u8])> {
 /// Build a [`Response`] from ExtProc response headers.
 ///
 /// Extracts `:status` pseudo-header for the status code; remaining
-/// headers populate the [`HeaderMap`].
+/// headers populate the [`HeaderMap`] with their raw bytes.
 ///
 /// [`Response`]: praxis_filter::Response
 /// [`HeaderMap`]: http::HeaderMap
@@ -472,18 +511,14 @@ pub fn envoy_headers_to_response(headers: &[HeaderValue]) -> Response {
     let mut header_map = HeaderMap::new();
 
     for hv in headers {
-        let val = header_value_str(hv);
         if hv.key == ":status" {
-            status = val
+            status = header_value_str(hv)
                 .parse::<u16>()
                 .ok()
                 .and_then(|c| StatusCode::from_u16(c).ok())
                 .unwrap_or(StatusCode::OK);
-        } else if let (Ok(name), Ok(value)) = (
-            hv.key.parse::<http::header::HeaderName>(),
-            val.parse::<http::header::HeaderValue>(),
-        ) {
-            header_map.append(name, value);
+        } else {
+            append_header(&mut header_map, hv);
         }
     }
 
@@ -656,6 +691,104 @@ mod tests {
             req.headers.get("x-custom").is_some(),
             "regular headers should be preserved"
         );
+    }
+
+    #[test]
+    fn authority_and_scheme_populate_host_and_uri() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/api?x=1"),
+            make_header(":authority", "example.com:8443"),
+            make_header(":scheme", "https"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert_eq!(
+            req.headers.get("host").and_then(|v| v.to_str().ok()),
+            Some("example.com:8443"),
+            "host header is synthesized from :authority"
+        );
+        assert_eq!(req.uri.scheme_str(), Some("https"), "scheme carried into the URI");
+        assert_eq!(
+            req.uri.authority().map(http::uri::Authority::as_str),
+            Some("example.com:8443"),
+            "authority carried into the URI"
+        );
+        assert_eq!(req.uri.path(), "/api", "path unchanged");
+        assert_eq!(req.uri.query(), Some("x=1"), "query unchanged");
+    }
+
+    #[test]
+    fn explicit_host_header_wins_over_authority() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header(":authority", "proxy.internal"),
+            make_header("host", "client-sent.example"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert_eq!(
+            req.headers.get("host").and_then(|v| v.to_str().ok()),
+            Some("client-sent.example"),
+            "a host header the client sent is not overwritten"
+        );
+        assert_eq!(req.headers.get_all("host").iter().count(), 1, "host is not duplicated");
+    }
+
+    #[test]
+    fn asterisk_form_path_stays_parseable() {
+        let headers = vec![
+            make_header(":method", "OPTIONS"),
+            make_header(":path", "*"),
+            make_header(":authority", "example.com"),
+            make_header(":scheme", "http"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert_eq!(req.uri.path(), "*", "asterisk-form request target is kept");
+    }
+
+    #[test]
+    fn opaque_header_bytes_are_preserved() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            HeaderValue {
+                key: "x-raw".to_owned(),
+                value: String::new(),
+                raw_value: b"caf\xe9".to_vec(),
+            },
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert_eq!(
+            req.headers.get("x-raw").map(http::header::HeaderValue::as_bytes),
+            Some(&b"caf\xe9"[..]),
+            "non-UTF-8 bytes must reach filters unchanged, not as an empty value"
+        );
+    }
+
+    #[test]
+    fn invalid_header_field_is_dropped() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-bad", "line\nbreak"),
+            make_header("x-good", "ok"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert!(
+            req.headers.get("x-bad").is_none(),
+            "control characters are not a valid field"
+        );
+        assert!(req.headers.get("x-good").is_some(), "valid headers are unaffected");
     }
 
     #[test]
