@@ -27,7 +27,10 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
+use std::sync::Arc;
+
 use praxis_extproc::{config, server::PraxisExtProc};
+use praxis_filter::{FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -2437,6 +2440,55 @@ async fn multi_valued_response_header_passes_through_untouched() {
     );
 }
 
+#[tokio::test]
+async fn filter_state_and_request_start_survive_across_phases() {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "state_probe",
+            FilterFactory::Http(Arc::new(|_cfg| Ok(Box::new(StateProbeFilter)))),
+        )
+        .expect("register probe filter");
+    let (mut client, _shutdown) = start_server_with_registry(STATE_PROBE_CONFIG, &registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let probes: Vec<(String, String)> = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .map(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .filter(|hv| hv.key.starts_with("x-probe-"))
+                .map(|hv| (hv.key.clone(), hv.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        probes.contains(&("x-probe-state".to_owned(), "from-request".to_owned())),
+        "filter_state written during the request phase must be visible on the response, got: {probes:?}"
+    );
+    assert!(
+        probes.contains(&("x-probe-extension".to_owned(), "from-request".to_owned())),
+        "request extensions written during the request phase must be visible on the response, got: {probes:?}"
+    );
+    assert!(
+        probes.contains(&("x-probe-start-stable".to_owned(), "true".to_owned())),
+        "request_start must not be re-stamped per phase, got: {probes:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2524,6 +2576,13 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+const STATE_PROBE_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: state_probe
+"#;
+
 /// `access_log` declares read-only response body access, which is what makes
 /// the pipeline accumulate `FULL_DUPLEX_STREAMED` response chunks instead of
 /// passing them through.
@@ -2559,10 +2618,54 @@ insecure_options:
 type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
+/// Records a value in every cross-phase slot during the request and reports
+/// what survived as response headers.
+struct StateProbeFilter;
+
+struct ProbeExtension(String);
+
+#[async_trait::async_trait]
+impl HttpFilter for StateProbeFilter {
+    fn name(&self) -> &'static str {
+        "state_probe"
+    }
+
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.insert_filter_state(String::from("from-request"));
+        ctx.extensions.insert(ProbeExtension("from-request".to_owned()));
+        ctx.set_metadata("probe.start", format!("{:?}", ctx.request_start));
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        let state = ctx
+            .get_filter_state::<String>()
+            .cloned()
+            .unwrap_or_else(|| "missing".to_owned());
+        let extension = ctx
+            .extensions
+            .get::<ProbeExtension>()
+            .map_or_else(|| "missing".to_owned(), |e| e.0.clone());
+        let start_stable = ctx.get_metadata("probe.start") == Some(format!("{:?}", ctx.request_start).as_str());
+        let resp = ctx.response_header.as_mut().expect("response phase has headers");
+        resp.headers.insert("x-probe-state", state.parse().unwrap());
+        resp.headers.insert("x-probe-extension", extension.parse().unwrap());
+        resp.headers
+            .insert("x-probe-start-stable", start_stable.to_string().parse().unwrap());
+        Ok(FilterAction::Continue)
+    }
+}
+
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry(config_yaml, &praxis_ai_filters::build_ai_registry()).await
+}
+
+async fn start_server_with_registry(
+    config_yaml: &str,
+    registry: &FilterRegistry,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
-    let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
+    let pipeline = config::build_pipeline(&cfg, registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");

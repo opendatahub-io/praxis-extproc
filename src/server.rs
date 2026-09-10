@@ -9,7 +9,7 @@
 //!
 //! [`ExternalProcessor`]: praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessor
 
-use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
+use std::{mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
@@ -175,7 +175,7 @@ async fn handle_stream(
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
 ) -> Result<(), Status> {
     let start = Instant::now();
-    let mut stream_state = StreamState::new();
+    let mut stream_state = StreamState::new(pipeline);
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -911,7 +911,7 @@ async fn run_request_pipeline(
     let Some(request) = state.request.as_ref() else {
         return Err(Status::invalid_argument("request headers not received"));
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
@@ -925,10 +925,6 @@ async fn run_request_pipeline(
     }
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
-
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
@@ -969,8 +965,7 @@ async fn run_response_pipeline(
         .take()
         .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
 
-    let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
     let original_headers = resp.headers.clone();
     ctx.response_header = Some(&mut resp);
 
@@ -1162,8 +1157,7 @@ async fn process_streamed_body_chunk(
         .request
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
-    let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
     if !is_request {
         let resp = state
             .response
@@ -1181,9 +1175,7 @@ async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    drop(ctx);
     let (mutation, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
@@ -1264,17 +1256,15 @@ async fn run_request_header_filters_early(
     let Some(request) = state.request.as_ref() else {
         return Ok(delivery.deliver_request(None, state));
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
     let mutation = adapter::collect_request_header_mutations(&ctx);
+    drop(ctx);
 
     Ok(delivery.deliver_request(mutation, state))
 }
@@ -1289,14 +1279,12 @@ async fn run_response_header_filters_early(
         return Ok(delivery.deliver_response(None, state));
     };
 
-    let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
-
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
     };
 
     let original_headers = resp.headers.clone();
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
     ctx.response_header = Some(resp);
 
     let action = execute_response(pipeline, &mut ctx).await?;
@@ -1306,6 +1294,7 @@ async fn run_response_header_filters_early(
 
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    drop(ctx);
 
     Ok(delivery.deliver_response(mutation, state))
 }
@@ -1431,16 +1420,10 @@ impl HeaderDeliveryState {
 }
 
 /// Per-stream state accumulated across ExtProc phases.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StreamState {
-    /// Re-entrance counters from request-phase branch chains.
-    branch_iterations: HashMap<Arc<str>, u32>,
-
-    /// Executed filter indices from request phase.
-    executed_filter_indices: Vec<bool>,
-
-    /// Metadata carried from request to response phase.
-    filter_metadata: HashMap<String, String>,
+    /// Filter context state threaded through every phase of the stream.
+    context: adapter::CarriedContext,
 
     /// Converted request from the headers phase.
     request: Option<Request>,
@@ -1475,10 +1458,19 @@ struct StreamState {
 
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
-    fn new() -> Self {
+    fn new(pipeline: &FilterPipeline) -> Self {
         Self {
+            context: adapter::CarriedContext::new(pipeline),
+            request: None,
+            request_body: Vec::new(),
+            response: None,
+            response_body: Vec::new(),
+            header_state: HeaderDeliveryState::default(),
+            eos_tracker: EosTracker::default(),
             protocol_config: ProtocolConfig::default(),
-            ..Default::default()
+            deferred_request_header_mutation: None,
+            deferred_response_header_mutation: None,
+            phase_order: PhaseOrderTracker::default(),
         }
     }
 
@@ -1508,13 +1500,6 @@ impl StreamState {
         self.response.is_some()
             && !self.eos_tracker.response_headers.is_complete()
             && !self.eos_tracker.response_body.is_complete()
-    }
-
-    /// Restore filter execution state into a response context.
-    fn restore_request_ctx(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
-        ctx.branch_iterations.clone_from(&self.branch_iterations);
-        ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
 }
 

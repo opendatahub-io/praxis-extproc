@@ -10,10 +10,12 @@
 //! [`Request`]: praxis_filter::Request
 //! [`HttpFilterContext`]: praxis_filter::HttpFilterContext
 
-use std::{collections::HashMap, net::IpAddr, time::Instant};
+use std::{any::Any, collections::HashMap, fmt, mem, net::IpAddr, sync::Arc, time::Instant};
 
 use http::{HeaderMap, Method, StatusCode, Uri};
-use praxis_filter::{BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
+use praxis_filter::{
+    BodyMode, FilterPipeline, FilterResultSet, HttpFilterContext, Request, RequestExtensions, Response,
+};
 use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption, HttpStatus, header_value_option::HeaderAppendAction},
     ext_proc::v3::{HeaderMutation, ImmediateResponse},
@@ -64,53 +66,203 @@ pub fn envoy_headers_to_request(headers: &[HeaderValue]) -> Request {
 }
 
 // -----------------------------------------------------------------------------
+// Carried Context
+// -----------------------------------------------------------------------------
+
+/// Filter context state that outlives a single ExtProc phase.
+///
+/// [`HttpFilterContext`] owns these fields by value and is rebuilt for every
+/// phase of a stream. The server keeps one `CarriedContext` per stream, moves
+/// its contents into each context it builds and takes them back afterwards,
+/// so filters see the same state across request headers, body, response
+/// headers and response body — the same threading the Pingora protocol
+/// layer does for a proxied request.
+///
+/// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
+pub struct CarriedContext {
+    /// Per-filter body-done flags (`FilterAction::BodyDone`).
+    pub body_done_indices: Vec<bool>,
+
+    /// Re-entrance counters from request-phase branch chains.
+    pub branch_iterations: HashMap<Arc<str>, u32>,
+
+    /// Filter indices that ran during the request phase.
+    pub executed_filter_indices: Vec<bool>,
+
+    /// Typed request-scoped values, pre-populated by pipeline extensions.
+    pub extensions: RequestExtensions,
+
+    /// Durable string metadata written by filters.
+    pub filter_metadata: HashMap<String, String>,
+
+    /// Branch-condition results keyed by filter name.
+    pub filter_results: HashMap<&'static str, FilterResultSet>,
+
+    /// Typed per-filter state keyed by filter invocation ID.
+    pub filter_state: HashMap<usize, Box<dyn Any + Send + Sync>>,
+
+    /// Request body bytes seen so far.
+    pub request_body_bytes: u64,
+
+    /// When the stream opened; the request's start for duration metrics.
+    pub request_start: Instant,
+
+    /// Response body bytes seen so far.
+    pub response_body_bytes: u64,
+
+    /// Structured metadata keyed by namespace.
+    pub structured_metadata: HashMap<String, serde_json::Value>,
+}
+
+impl CarriedContext {
+    /// Fresh state for a new stream, with pipeline extensions prepared.
+    pub fn new(pipeline: &FilterPipeline) -> Self {
+        let mut extensions = RequestExtensions::new();
+        pipeline.prepare_extensions(&mut extensions);
+
+        Self {
+            body_done_indices: Vec::new(),
+            branch_iterations: HashMap::new(),
+            executed_filter_indices: Vec::new(),
+            extensions,
+            filter_metadata: HashMap::new(),
+            filter_results: HashMap::new(),
+            filter_state: HashMap::new(),
+            request_body_bytes: 0,
+            request_start: Instant::now(),
+            response_body_bytes: 0,
+            structured_metadata: HashMap::new(),
+        }
+    }
+
+    /// Take the carried state back out of a context once its phase is done.
+    pub fn reclaim(&mut self, ctx: &mut HttpFilterContext<'_>) {
+        self.body_done_indices = mem::take(&mut ctx.body_done_indices);
+        self.branch_iterations = mem::take(&mut ctx.branch_iterations);
+        self.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+        self.extensions = mem::take(&mut ctx.extensions);
+        self.filter_metadata = mem::take(&mut ctx.filter_metadata);
+        self.filter_results = mem::take(&mut ctx.filter_results);
+        self.filter_state = mem::take(&mut ctx.filter_state);
+        self.request_body_bytes = ctx.request_body_bytes;
+        self.response_body_bytes = ctx.response_body_bytes;
+        self.structured_metadata = mem::take(&mut ctx.structured_metadata);
+    }
+}
+
+impl fmt::Debug for CarriedContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CarriedContext")
+            .field("executed_filter_indices", &self.executed_filter_indices)
+            .field("filter_metadata", &self.filter_metadata)
+            .field("filter_state_entries", &self.filter_state.len())
+            .field("request_body_bytes", &self.request_body_bytes)
+            .field("response_body_bytes", &self.response_body_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phase Context
+// -----------------------------------------------------------------------------
+
+/// A phase's [`HttpFilterContext`] bound to the stream's [`CarriedContext`].
+///
+/// The carried state is moved into the context on construction and handed
+/// back when this guard drops, so every exit from a phase — a rejection, an
+/// error, an early return — leaves the stream's state intact for messages
+/// that may still follow. Dereferences to the inner context.
+///
+/// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
+pub struct PhaseContext<'a> {
+    /// Stream state to hand back on drop.
+    carried: &'a mut CarriedContext,
+
+    /// The context filters run against during this phase.
+    ctx: HttpFilterContext<'a>,
+}
+
+impl<'a> PhaseContext<'a> {
+    /// Build the context for one phase from the stream's carried state.
+    pub fn new(pipeline: &'a FilterPipeline, request: &'a Request, carried: &'a mut CarriedContext) -> Self {
+        let ctx = build_filter_context(pipeline, request, carried);
+        Self { carried, ctx }
+    }
+}
+
+impl<'a> std::ops::Deref for PhaseContext<'a> {
+    type Target = HttpFilterContext<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+impl std::ops::DerefMut for PhaseContext<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ctx
+    }
+}
+
+impl Drop for PhaseContext<'_> {
+    fn drop(&mut self) {
+        self.carried.reclaim(&mut self.ctx);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Context Construction
 // -----------------------------------------------------------------------------
 
-/// Build a minimal [`HttpFilterContext`] from a converted [`Request`].
+/// Build an [`HttpFilterContext`] for one phase of a stream.
 ///
+/// Moves the stream's [`CarriedContext`] into the new context; the caller
+/// hands it back with [`CarriedContext::reclaim`] when the phase is done.
 /// Populates `client_addr` from the `x-forwarded-for` header if present.
 /// All routing fields (`cluster`, `upstream`) default to `None`; they are
 /// advisory in ExtProc mode since Envoy owns routing.
 ///
 /// [`HttpFilterContext`]: praxis_filter::HttpFilterContext
-/// [`Request`]: praxis_filter::Request
 #[expect(
     clippy::too_many_lines,
     reason = "HttpFilterContext field init mirrors the struct; splitting obscures defaults"
 )]
-pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Request) -> HttpFilterContext<'a> {
+pub fn build_filter_context<'a>(
+    pipeline: &'a FilterPipeline,
+    request: &'a Request,
+    carried: &mut CarriedContext,
+) -> HttpFilterContext<'a> {
     let client_addr = extract_client_addr(request);
 
     HttpFilterContext {
         buffered_request_body: None,
-        body_done_indices: Vec::new(),
-        branch_iterations: HashMap::new(),
+        body_done_indices: mem::take(&mut carried.body_done_indices),
+        branch_iterations: mem::take(&mut carried.branch_iterations),
         client_addr,
         cluster: None,
         current_filter_id: None,
         downstream_tls: false,
         metrics_route: None,
         peer_identity: None,
-        extensions: RequestExtensions::default(),
-        executed_filter_indices: Vec::new(),
+        extensions: mem::take(&mut carried.extensions),
+        executed_filter_indices: mem::take(&mut carried.executed_filter_indices),
         extra_request_headers: Vec::new(),
         request_headers_to_remove: Vec::new(),
         request_headers_to_set: Vec::new(),
-        filter_metadata: HashMap::new(),
+        filter_metadata: mem::take(&mut carried.filter_metadata),
         pre_read_mutations: Vec::new(),
-        structured_metadata: HashMap::new(),
-        filter_results: HashMap::new(),
-        filter_state: HashMap::new(),
+        structured_metadata: mem::take(&mut carried.structured_metadata),
+        filter_results: mem::take(&mut carried.filter_results),
+        filter_state: mem::take(&mut carried.filter_state),
         health_registry: pipeline.health_registry(),
         id_generator: pipeline.id_generator(),
         kv_stores: pipeline.kv_stores(),
         subrequest_client: pipeline.subrequest_client(),
         request,
-        request_body_bytes: 0,
+        request_body_bytes: carried.request_body_bytes,
         request_body_mode: BodyMode::Stream,
-        request_start: Instant::now(),
-        response_body_bytes: 0,
+        request_start: carried.request_start,
+        response_body_bytes: carried.response_body_bytes,
         response_body_mode: BodyMode::Stream,
         response_header: None,
         response_headers_modified: false,
@@ -483,7 +635,7 @@ mod tests {
     #[test]
     fn build_context_defaults() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         assert!(ctx.client_addr.is_none(), "client_addr should be None without XFF");
         assert!(ctx.cluster.is_none(), "cluster should be None");
@@ -498,7 +650,7 @@ mod tests {
             make_header("x-forwarded-for", "10.0.0.1, 172.16.0.1"),
         ];
         let req = envoy_headers_to_request(&headers);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         assert_eq!(
             ctx.client_addr,
@@ -508,9 +660,91 @@ mod tests {
     }
 
     #[test]
+    fn carried_context_prepares_pipeline_extensions() {
+        struct Marker(u8);
+
+        struct MarkerExtension;
+
+        impl praxis_filter::PipelineExtension for MarkerExtension {
+            fn prepare(&self, extensions: &mut RequestExtensions) {
+                extensions.insert(Marker(7));
+            }
+        }
+
+        let mut pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline");
+        pipeline.add_pipeline_extension(Box::new(MarkerExtension));
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+
+        let mut carried = CarriedContext::new(&pipeline);
+        let ctx = build_filter_context(&pipeline, &req, &mut carried);
+
+        assert_eq!(
+            ctx.extensions.get::<Marker>().map(|m| m.0),
+            Some(7),
+            "pipeline extensions must reach the request context"
+        );
+    }
+
+    #[test]
+    fn carried_context_round_trips_filter_state_and_metadata() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut carried = CarriedContext::new(test_pipeline());
+
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut carried);
+        ctx.current_filter_id = Some(3);
+        ctx.insert_filter_state(String::from("seen"));
+        ctx.set_metadata("probe.key", "value");
+        ctx.body_done_indices = vec![true];
+        ctx.request_body_bytes = 42;
+        carried.reclaim(&mut ctx);
+
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut carried);
+        ctx.current_filter_id = Some(3);
+        assert_eq!(
+            ctx.get_filter_state::<String>().map(String::as_str),
+            Some("seen"),
+            "filter_state must survive into the next phase"
+        );
+        assert_eq!(ctx.get_metadata("probe.key"), Some("value"), "metadata must survive");
+        assert_eq!(ctx.body_done_indices, vec![true], "body-done flags must survive");
+        assert_eq!(ctx.request_body_bytes, 42, "byte counters must survive");
+    }
+
+    #[test]
+    fn phase_context_reclaims_state_on_drop() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut carried = CarriedContext::new(test_pipeline());
+
+        {
+            let mut ctx = PhaseContext::new(test_pipeline(), &req, &mut carried);
+            ctx.current_filter_id = Some(1);
+            ctx.insert_filter_state(String::from("kept"));
+            ctx.request_body_bytes = 9;
+        }
+
+        assert!(
+            carried.filter_state.contains_key(&1),
+            "dropping the guard must hand filter state back to the stream"
+        );
+        assert_eq!(carried.request_body_bytes, 9, "counters are handed back too");
+    }
+
+    #[test]
+    fn carried_context_keeps_request_start_stable() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut carried = CarriedContext::new(test_pipeline());
+
+        let first = build_filter_context(test_pipeline(), &req, &mut carried).request_start;
+        let second = build_filter_context(test_pipeline(), &req, &mut carried).request_start;
+
+        assert_eq!(first, second, "every phase must measure from the same request start");
+        assert_eq!(first, carried.request_start, "the start is owned by the stream");
+    }
+
+    #[test]
     fn collect_mutations_empty_when_no_extras() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let ctx = build_filter_context(test_pipeline(), &req);
+        let ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         assert!(
             collect_request_header_mutations(&ctx).is_none(),
@@ -521,7 +755,7 @@ mod tests {
     #[test]
     fn collect_mutations_from_extra_headers() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
         ctx.extra_request_headers.push(("x-added".into(), "value".to_owned()));
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -542,7 +776,7 @@ mod tests {
     #[test]
     fn collect_mutations_includes_rewritten_path() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/old")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
         ctx.rewritten_path = Some("/new/path".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -567,7 +801,7 @@ mod tests {
     #[test]
     fn collect_mutations_rewritten_path_only() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
         ctx.rewritten_path = Some("/rewritten".to_owned());
 
         let mutation = collect_request_header_mutations(&ctx).expect("should have mutations");
@@ -578,7 +812,7 @@ mod tests {
     #[test]
     fn collect_mutations_from_set_and_remove_headers() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
         ctx.request_headers_to_set.push((
             http::header::HeaderName::from_static("x-set"),
             http::header::HeaderValue::from_static("one"),
@@ -655,7 +889,7 @@ mod tests {
     #[test]
     fn response_diff_detects_added_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -679,7 +913,7 @@ mod tests {
     #[test]
     fn response_diff_detects_modified_value() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -705,7 +939,7 @@ mod tests {
     #[test]
     fn response_diff_detects_removed_header() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -730,7 +964,7 @@ mod tests {
     #[test]
     fn response_diff_unchanged_returns_none() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -752,7 +986,7 @@ mod tests {
     #[test]
     fn response_diff_leaves_unchanged_multi_valued_header_alone() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
@@ -773,7 +1007,7 @@ mod tests {
     #[test]
     fn response_diff_reemits_changed_multi_valued_header_in_order() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut original = HeaderMap::new();
         original.append("set-cookie", "a=1".parse().unwrap());
@@ -807,7 +1041,7 @@ mod tests {
     #[test]
     fn response_diff_dropping_one_of_several_values_overwrites_with_the_rest() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut original = HeaderMap::new();
         original.append("vary", "accept".parse().unwrap());
@@ -836,7 +1070,7 @@ mod tests {
     #[test]
     fn response_diff_keeps_opaque_value_bytes() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
-        let mut ctx = build_filter_context(test_pipeline(), &req);
+        let mut ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
 
         let mut resp = Response {
             status: StatusCode::OK,
