@@ -257,7 +257,8 @@ impl Drop for PhaseContext<'_> {
 ///
 /// Moves the stream's [`CarriedContext`] into the new context; the caller
 /// hands it back with [`CarriedContext::reclaim`] when the phase is done.
-/// Populates `client_addr` from the `x-forwarded-for` header if present.
+/// Populates `client_addr` from `x-envoy-external-address`, falling back to
+/// `x-forwarded-for`.
 /// All routing fields (`cluster`, `upstream`) default to `None`; they are
 /// advisory in ExtProc mode since Envoy owns routing.
 ///
@@ -541,14 +542,28 @@ fn header_value_str(hv: &HeaderValue) -> &str {
     }
 }
 
-/// Extract client IP from the `x-forwarded-for` header.
+/// Extract the client IP for `HttpFilterContext::client_addr`.
+///
+/// Prefers `x-envoy-external-address`, which Envoy derives from its own
+/// trusted-hop configuration and sanitizes on external requests, over the
+/// first `x-forwarded-for` entry, which any client can set. The latter
+/// remains the fallback for deployments that do not use `use_remote_address`.
 fn extract_client_addr(request: &Request) -> Option<IpAddr> {
+    first_ip_in_header(request, "x-envoy-external-address").or_else(|| first_ip_in_header(request, "x-forwarded-for"))
+}
+
+/// Parse the first comma-separated IP address in a header.
+fn first_ip_in_header(request: &Request, name: &str) -> Option<IpAddr> {
     request
         .headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Build a [`HeaderValueOption`] from raw value bytes with the given action.
@@ -898,6 +913,42 @@ mod tests {
 
         assert_eq!(first, second, "every phase must measure from the same request start");
         assert_eq!(first, carried.request_start, "the start is owned by the stream");
+    }
+
+    #[test]
+    fn build_context_prefers_envoy_external_address() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-forwarded-for", "10.0.0.1, 172.16.0.1"),
+            make_header("x-envoy-external-address", "203.0.113.9"),
+        ];
+        let req = envoy_headers_to_request(&headers);
+        let ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
+
+        assert_eq!(
+            ctx.client_addr,
+            Some("203.0.113.9".parse().unwrap()),
+            "Envoy's trusted client address must win over the client-controlled XFF entry"
+        );
+    }
+
+    #[test]
+    fn build_context_ignores_unparseable_external_address() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-forwarded-for", "10.0.0.1"),
+            make_header("x-envoy-external-address", "not-an-ip"),
+        ];
+        let req = envoy_headers_to_request(&headers);
+        let ctx = build_filter_context(test_pipeline(), &req, &mut CarriedContext::new(test_pipeline()));
+
+        assert_eq!(
+            ctx.client_addr,
+            Some("10.0.0.1".parse().unwrap()),
+            "falls back to XFF when the external address is unusable"
+        );
     }
 
     #[test]
