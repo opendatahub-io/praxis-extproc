@@ -851,12 +851,52 @@ async fn finalize_body_on_trailers(
     match (mode, needs_body) {
         (BodyMode::FullDuplexStreamed, true) => run_body_pipeline(BodyEnd::Trailers, pipeline, state, is_request).await,
         (BodyMode::FullDuplexStreamed, false) => Ok(deferred_headers_response(state, is_request).into_iter().collect()),
+        (BodyMode::Streamed, true) => flush_streamed_body_filters(pipeline, state, is_request).await,
         (BodyMode::Buffered, _) => Ok(rejection_only(
             run_body_pipeline(BodyEnd::Trailers, pipeline, state, is_request).await?,
             is_request,
         )),
         _ => Ok(Vec::new()),
     }
+}
+
+/// Give STREAMED body filters their end-of-stream call when trailers close the body.
+///
+/// Every chunk was answered as it arrived, but none carried `end_of_stream`,
+/// so filters that finish their work at end of stream (access logging, token
+/// accounting) would otherwise never run it. Run the body filters once more
+/// with no data and the flag set. Their output has no body message to ride
+/// on: a rejection still applies, body bytes produced here are dropped.
+async fn flush_streamed_body_filters(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state
+        .request
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
+    let mut body = None;
+
+    let action = if is_request {
+        pipeline.execute_http_request_body(&mut ctx, &mut body, true).await
+    } else {
+        ctx.response_header = state.response.as_mut();
+        pipeline.execute_http_response_body(&mut ctx, &mut body, true)
+    }
+    .map_err(|e| Status::internal(e.to_string()))?;
+
+    if body.as_ref().is_some_and(|b| !b.is_empty()) {
+        warn!(
+            direction = direction_label(is_request),
+            "body filters produced bytes at end of stream after trailers; no message can carry them"
+        );
+    }
+    Ok(immediate_from_action(action)
+        .map(response::immediate)
+        .into_iter()
+        .collect())
 }
 
 /// Run the body-phase pipeline for one direction.

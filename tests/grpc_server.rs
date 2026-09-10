@@ -30,7 +30,9 @@
 use std::sync::Arc;
 
 use praxis_extproc::{config, server::PraxisExtProc};
-use praxis_filter::{FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext};
+use praxis_filter::{
+    BodyAccess, FilterAction, FilterError, FilterFactory, FilterRegistry, HttpFilter, HttpFilterContext,
+};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -2566,6 +2568,57 @@ async fn response_body_over_limit_gets_local_413() {
     assert_eq!(imm.status.as_ref().map(|s| s.code), Some(413), "status is 413");
 }
 
+#[tokio::test]
+async fn streamed_body_filters_see_end_of_stream_at_trailers() {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "state_probe",
+            FilterFactory::Http(Arc::new(|_cfg| Ok(Box::new(StateProbeFilter)))),
+        )
+        .expect("register probe filter");
+    let (mut client, _shutdown) = start_server_with_registry(STATE_PROBE_CONFIG, &registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/grpc.Service/Call", false);
+    headers.protocol_config = Some(protocol_config(1, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_body_msg(b"chunk", false)).await.unwrap();
+    let _chunk_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_trailers_msg()).await.unwrap();
+    let trailer_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(trailer_msg.response, Some(RespVariant::RequestTrailers(_))),
+        "trailers are acknowledged, got: {trailer_msg:?}"
+    );
+
+    tx.send(make_response_headers(200, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let body_eos = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .and_then(|m| {
+            m.set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .find(|hv| hv.key == "x-probe-body-eos")
+                .map(|hv| hv.value.clone())
+        });
+    assert_eq!(
+        body_eos.as_deref(),
+        Some("true"),
+        "STREAMED body filters must get their end-of-stream call when trailers close the body, got: {msg:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2718,6 +2771,22 @@ impl HttpFilter for StateProbeFilter {
         Ok(FilterAction::Continue)
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            ctx.set_metadata("probe.body_eos", "true");
+        }
+        Ok(FilterAction::Continue)
+    }
+
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let state = ctx
             .get_filter_state::<String>()
@@ -2728,11 +2797,13 @@ impl HttpFilter for StateProbeFilter {
             .get::<ProbeExtension>()
             .map_or_else(|| "missing".to_owned(), |e| e.0.clone());
         let start_stable = ctx.get_metadata("probe.start") == Some(format!("{:?}", ctx.request_start).as_str());
+        let body_eos = ctx.get_metadata("probe.body_eos").unwrap_or("false").to_owned();
         let resp = ctx.response_header.as_mut().expect("response phase has headers");
         resp.headers.insert("x-probe-state", state.parse().unwrap());
         resp.headers.insert("x-probe-extension", extension.parse().unwrap());
         resp.headers
             .insert("x-probe-start-stable", start_stable.to_string().parse().unwrap());
+        resp.headers.insert("x-probe-body-eos", body_eos.parse().unwrap());
         Ok(FilterAction::Continue)
     }
 }
