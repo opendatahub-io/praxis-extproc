@@ -176,35 +176,33 @@ pub fn collect_request_header_mutations(ctx: &HttpFilterContext<'_>) -> Option<H
 
 /// Collect response header mutations by diffing against original state.
 ///
-/// Detects three kinds of mutations:
-/// - **Added**: keys present after but not before filters ran.
-/// - **Modified**: keys present in both but with changed values.
-/// - **Removed**: keys present before but absent after filters ran.
+/// Compares each header name's complete value list, so multi-valued headers
+/// such as `set-cookie` are only touched when a filter actually changed
+/// them. Detects three kinds of mutations:
+/// - **Added**: names present after but not before filters ran.
+/// - **Modified**: names whose value list changed.
+/// - **Removed**: names present before but absent after filters ran.
+///
+/// A changed value list is re-emitted in full: the first value overwrites
+/// whatever Envoy holds, the remaining values append to it.
 ///
 /// [`HeaderMutation`]: praxis_proto::envoy::service::ext_proc::v3::HeaderMutation
 pub fn collect_response_header_mutations_diff(
     ctx: &HttpFilterContext<'_>,
-    original_headers: &HashMap<String, String>,
+    original_headers: &HeaderMap,
 ) -> Option<HeaderMutation> {
-    let resp = ctx.response_header.as_ref()?;
+    let current = &ctx.response_header.as_ref()?.headers;
 
-    let set_headers: Vec<HeaderValueOption> = resp
-        .headers
-        .iter()
-        .filter(|(name, value)| {
-            let val_str = value.to_str().unwrap_or_default();
-            match original_headers.get(name.as_str()) {
-                Some(orig) => orig != val_str,
-                None => true,
-            }
-        })
-        .map(|(name, value)| header_value_option(name.as_str(), value.to_str().unwrap_or_default()))
+    let set_headers: Vec<HeaderValueOption> = current
+        .keys()
+        .filter(|name| !current.get_all(*name).iter().eq(original_headers.get_all(*name).iter()))
+        .flat_map(|name| replace_header_values(name.as_str(), current.get_all(name).iter()))
         .collect();
 
     let remove_headers: Vec<String> = original_headers
         .keys()
-        .filter(|k| !resp.headers.contains_key(k.as_str()))
-        .cloned()
+        .filter(|name| !current.contains_key(*name))
+        .map(|name| name.as_str().to_owned())
         .collect();
 
     if set_headers.is_empty() && remove_headers.is_empty() {
@@ -214,6 +212,25 @@ pub fn collect_response_header_mutations_diff(
     Some(HeaderMutation {
         set_headers,
         remove_headers,
+    })
+}
+
+/// Mutations that make `name` carry exactly `values`, in order.
+///
+/// The first value overwrites any existing header of that name; the rest
+/// append, which is the only way ExtProc can express a multi-valued header.
+/// Values travel as raw bytes so opaque (non-UTF-8) header values survive.
+fn replace_header_values<'a>(
+    name: &'a str,
+    values: impl Iterator<Item = &'a http::header::HeaderValue> + 'a,
+) -> impl Iterator<Item = HeaderValueOption> + 'a {
+    values.enumerate().map(move |(index, value)| {
+        let action = if index == 0 {
+            HeaderAppendAction::OverwriteIfExistsOrAdd
+        } else {
+            HeaderAppendAction::AppendIfExistsOrAdd
+        };
+        header_option(name, value.as_bytes(), action)
     })
 }
 
@@ -308,41 +325,41 @@ fn extract_client_addr(request: &Request) -> Option<IpAddr> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Build a [`HeaderValueOption`] from raw value bytes with the given action.
+///
+/// Valid UTF-8 is sent in both `value` and `raw_value` for compatibility
+/// across Envoy versions; any other bytes go in `raw_value` alone, since
+/// `value` is a protobuf string and must not carry them.
+fn header_option(key: &str, value: &[u8], append_action: HeaderAppendAction) -> HeaderValueOption {
+    HeaderValueOption {
+        header: Some(HeaderValue {
+            key: key.to_owned(),
+            value: std::str::from_utf8(value).map(str::to_owned).unwrap_or_default(),
+            raw_value: value.to_vec(),
+        }),
+        append_action: append_action.into(),
+        append: None,
+    }
+}
+
 /// Build a [`HeaderValueOption`] that overwrites any existing header of the
 /// same key (or adds it if absent).
 ///
 /// Correct for single-valued headers (`content-length`, `:path`, `:authority`)
 /// and explicit set/replace mutations: without `OverwriteIfExistsOrAdd`, Envoy
 /// would append the new value alongside an original the client already sent,
-/// producing an invalid multi-valued header. Sets both `value` and `raw_value`
-/// for maximum compatibility across Envoy versions.
+/// producing an invalid multi-valued header.
 fn header_value_option(key: &str, value: &str) -> HeaderValueOption {
-    HeaderValueOption {
-        header: Some(HeaderValue {
-            key: key.to_owned(),
-            value: value.to_owned(),
-            raw_value: value.as_bytes().to_vec(),
-        }),
-        append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
-        append: None,
-    }
+    header_option(key, value.as_bytes(), HeaderAppendAction::OverwriteIfExistsOrAdd)
 }
 
 /// Build a [`HeaderValueOption`] that appends to any existing header of the
 /// same key (protobuf default `APPEND_IF_EXISTS_OR_ADD`).
 ///
 /// Used for injected extra headers, where a filter may legitimately add a
-/// value alongside one the client already sent. Sets both `value` and
-/// `raw_value` for maximum compatibility across Envoy versions.
+/// value alongside one the client already sent.
 fn header_value_option_append(key: &str, value: &str) -> HeaderValueOption {
-    HeaderValueOption {
-        header: Some(HeaderValue {
-            key: key.to_owned(),
-            value: value.to_owned(),
-            raw_value: value.as_bytes().to_vec(),
-        }),
-        ..Default::default()
-    }
+    header_option(key, value.as_bytes(), HeaderAppendAction::AppendIfExistsOrAdd)
 }
 
 /// Overwrite `content-length` on a header mutation to `len` bytes.
@@ -644,7 +661,7 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
         };
-        let original = HashMap::new();
+        let original = HeaderMap::new();
 
         resp.headers.insert("x-added", "new".parse().unwrap());
         ctx.response_header = Some(&mut resp);
@@ -670,8 +687,8 @@ mod tests {
         };
         resp.headers.insert("x-existing", "changed".parse().unwrap());
 
-        let mut original = HashMap::new();
-        original.insert("x-existing".to_owned(), "original".to_owned());
+        let mut original = HeaderMap::new();
+        original.insert("x-existing", "original".parse().unwrap());
 
         ctx.response_header = Some(&mut resp);
 
@@ -695,8 +712,8 @@ mod tests {
             headers: HeaderMap::new(),
         };
 
-        let mut original = HashMap::new();
-        original.insert("x-removed".to_owned(), "gone".to_owned());
+        let mut original = HeaderMap::new();
+        original.insert("x-removed", "gone".parse().unwrap());
 
         ctx.response_header = Some(&mut resp);
 
@@ -721,8 +738,8 @@ mod tests {
         };
         resp.headers.insert("x-keep", "same".parse().unwrap());
 
-        let mut original = HashMap::new();
-        original.insert("x-keep".to_owned(), "same".to_owned());
+        let mut original = HeaderMap::new();
+        original.insert("x-keep", "same".parse().unwrap());
 
         ctx.response_header = Some(&mut resp);
 
@@ -730,6 +747,116 @@ mod tests {
             collect_response_header_mutations_diff(&ctx, &original).is_none(),
             "unchanged headers should return None"
         );
+    }
+
+    #[test]
+    fn response_diff_leaves_unchanged_multi_valued_header_alone() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.append("set-cookie", "a=1".parse().unwrap());
+        resp.headers.append("set-cookie", "b=2".parse().unwrap());
+        let original = resp.headers.clone();
+
+        ctx.response_header = Some(&mut resp);
+
+        assert!(
+            collect_response_header_mutations_diff(&ctx, &original).is_none(),
+            "an untouched multi-valued header must not be rewritten (that would collapse it)"
+        );
+    }
+
+    #[test]
+    fn response_diff_reemits_changed_multi_valued_header_in_order() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
+
+        let mut original = HeaderMap::new();
+        original.append("set-cookie", "a=1".parse().unwrap());
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.append("set-cookie", "a=1".parse().unwrap());
+        resp.headers.append("set-cookie", "b=2".parse().unwrap());
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &original).expect("should have mutations");
+
+        let entries: Vec<(String, i32)> = mutation
+            .set_headers
+            .iter()
+            .map(|h| (h.header.as_ref().unwrap().value.clone(), h.append_action))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("a=1".to_owned(), i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd)),
+                ("b=2".to_owned(), i32::from(HeaderAppendAction::AppendIfExistsOrAdd)),
+            ],
+            "first value overwrites, later values append, preserving order"
+        );
+        assert!(mutation.remove_headers.is_empty(), "nothing to remove");
+    }
+
+    #[test]
+    fn response_diff_dropping_one_of_several_values_overwrites_with_the_rest() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
+
+        let mut original = HeaderMap::new();
+        original.append("vary", "accept".parse().unwrap());
+        original.append("vary", "origin".parse().unwrap());
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.append("vary", "origin".parse().unwrap());
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &original).expect("should have mutations");
+
+        assert_eq!(mutation.set_headers.len(), 1, "single remaining value");
+        let only = &mutation.set_headers[0];
+        assert_eq!(only.header.as_ref().unwrap().value, "origin");
+        assert_eq!(
+            only.append_action,
+            i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd),
+            "the surviving value must replace the whole list"
+        );
+        assert!(mutation.remove_headers.is_empty(), "the name still exists");
+    }
+
+    #[test]
+    fn response_diff_keeps_opaque_value_bytes() {
+        let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
+        let mut ctx = build_filter_context(test_pipeline(), &req);
+
+        let mut resp = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.insert(
+            "content-disposition",
+            http::header::HeaderValue::from_bytes(b"attachment; filename=\"caf\xe9\"").unwrap(),
+        );
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = collect_response_header_mutations_diff(&ctx, &HeaderMap::new()).expect("added header");
+
+        let hv = mutation.set_headers[0].header.as_ref().unwrap();
+        assert_eq!(
+            hv.raw_value,
+            b"attachment; filename=\"caf\xe9\"".to_vec(),
+            "opaque bytes are sent in raw_value instead of being blanked"
+        );
+        assert!(hv.value.is_empty(), "a protobuf string cannot carry non-UTF-8 bytes");
     }
 
     #[test]

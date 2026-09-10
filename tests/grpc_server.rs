@@ -2386,6 +2386,57 @@ async fn buffered_empty_body_with_trailers_can_still_reject() {
     );
 }
 
+#[tokio::test]
+async fn multi_valued_response_header_passes_through_untouched() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap {
+                headers: vec![
+                    make_header(":status", "200"),
+                    make_header("set-cookie", "a=1"),
+                    make_header("set-cookie", "b=2"),
+                ],
+            }),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+    let Some(RespVariant::ResponseHeaders(h)) = &msg.response else {
+        panic!("expected ResponseHeaders, got: {msg:?}");
+    };
+    let mutation = h
+        .response
+        .as_ref()
+        .and_then(|c| c.header_mutation.as_ref())
+        .expect("x-resp is set, so a mutation is present");
+    let keys: Vec<&str> = mutation
+        .set_headers
+        .iter()
+        .filter_map(|h| h.header.as_ref())
+        .map(|hv| hv.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["x-resp"],
+        "only the filter's own change may be emitted, got: {mutation:?}"
+    );
+    assert!(
+        mutation.remove_headers.is_empty(),
+        "untouched headers must not be removed, got: {mutation:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------

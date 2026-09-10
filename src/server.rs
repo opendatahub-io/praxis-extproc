@@ -971,7 +971,7 @@ async fn run_response_pipeline(
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
-    let original_headers = capture_original_headers(&resp);
+    let original_headers = resp.headers.clone();
     ctx.response_header = Some(&mut resp);
 
     let original_len = state.response_body.len();
@@ -1296,7 +1296,7 @@ async fn run_response_header_filters_early(
         return Ok(delivery.deliver_response(None, state));
     };
 
-    let original_headers = capture_original_headers(resp);
+    let original_headers = resp.headers.clone();
     ctx.response_header = Some(resp);
 
     let action = execute_response(pipeline, &mut ctx).await?;
@@ -1308,14 +1308,6 @@ async fn run_response_header_filters_early(
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
     Ok(delivery.deliver_response(mutation, state))
-}
-
-/// Capture response header names and values before filter execution.
-fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
-    resp.headers
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
-        .collect()
 }
 
 /// Execute the request-phase pipeline.
