@@ -392,33 +392,72 @@ fn replace_header_values<'a>(
 
 /// Convert a [`Rejection`] into an ExtProc [`ImmediateResponse`].
 ///
-/// Maps status code, headers, and body from the Praxis rejection
-/// to the ExtProc immediate response format.
+/// Maps status code, headers (both the string pairs and the
+/// byte-preserving header map), and body from the Praxis rejection to
+/// the ExtProc immediate response format.
 ///
 /// [`Rejection`]: praxis_filter::Rejection
 /// [`ImmediateResponse`]: praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse
 pub fn rejection_to_immediate(rejection: &praxis_filter::Rejection) -> ImmediateResponse {
-    let headers = if rejection.headers.is_empty() {
-        None
-    } else {
-        Some(rejection_headers_to_mutation(&rejection.headers))
-    };
+    let headers = rejection
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .chain(rejection.header_map.iter().flat_map(|map| header_map_pairs(map)));
 
-    let body = rejection
-        .body
-        .as_ref()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
+    immediate_response(rejection.status, headers, rejection.body.as_deref())
+}
+
+/// Convert a [`TerminalResponse`] into an ExtProc [`ImmediateResponse`].
+///
+/// A terminal response is a complete reply produced by a request-phase
+/// filter. Envoy can only deliver it as a local reply, which ends the
+/// stream, so unlike in the Pingora runtime the response-phase filters do
+/// not observe it.
+///
+/// [`TerminalResponse`]: praxis_filter::TerminalResponse
+/// [`ImmediateResponse`]: praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse
+pub fn terminal_response_to_immediate(terminal: &praxis_filter::TerminalResponse) -> ImmediateResponse {
+    immediate_response(
+        terminal.status,
+        header_map_pairs(&terminal.headers),
+        terminal.body.as_deref(),
+    )
+}
+
+/// Build an [`ImmediateResponse`] from its parts.
+///
+/// [`ImmediateResponse`]: praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse
+fn immediate_response<'a>(
+    status: u16,
+    headers: impl Iterator<Item = (&'a str, &'a [u8])>,
+    body: Option<&[u8]>,
+) -> ImmediateResponse {
+    let set_headers: Vec<HeaderValueOption> = headers
+        .map(|(name, value)| header_option(name, value, HeaderAppendAction::OverwriteIfExistsOrAdd))
+        .collect();
 
     ImmediateResponse {
         status: Some(HttpStatus {
-            code: i32::from(rejection.status),
+            code: i32::from(status),
         }),
-        headers,
-        body,
+        headers: (!set_headers.is_empty()).then(|| HeaderMutation {
+            set_headers,
+            remove_headers: Vec::new(),
+        }),
+        body: body
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default(),
         grpc_status: None,
         details: String::new(),
     }
+}
+
+/// Name and raw value bytes of every entry in a [`HeaderMap`].
+///
+/// [`HeaderMap`]: http::HeaderMap
+fn header_map_pairs(map: &HeaderMap) -> impl Iterator<Item = (&str, &[u8])> {
+    map.iter().map(|(name, value)| (name.as_str(), value.as_bytes()))
 }
 
 /// Build a [`Response`] from ExtProc response headers.
@@ -529,19 +568,6 @@ pub(crate) fn set_content_length(mutation: Option<HeaderMutation>, len: usize) -
         .set_headers
         .push(header_value_option("content-length", &len.to_string()));
     mutation
-}
-
-/// Convert rejection header pairs to a [`HeaderMutation`].
-fn rejection_headers_to_mutation(headers: &[(String, String)]) -> HeaderMutation {
-    let set_headers = headers
-        .iter()
-        .map(|(name, value)| header_value_option(name, value))
-        .collect();
-
-    HeaderMutation {
-        set_headers,
-        remove_headers: Vec::new(),
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -856,6 +882,78 @@ mod tests {
         assert_eq!(
             hdrs.set_headers[0].header.as_ref().unwrap().key,
             "Retry-After",
+            "header key should match"
+        );
+    }
+
+    #[test]
+    fn rejection_to_immediate_includes_byte_preserving_headers() {
+        let mut map = HeaderMap::new();
+        map.insert("x-upstream", "kept".parse().unwrap());
+        let rejection = praxis_filter::Rejection {
+            header_map: Some(Box::new(map)),
+            ..praxis_filter::Rejection::status(502).with_header("x-plain", "also")
+        };
+
+        let imm = rejection_to_immediate(&rejection);
+
+        let mut keys: Vec<String> = imm
+            .headers
+            .expect("headers present")
+            .set_headers
+            .iter()
+            .map(|h| h.header.as_ref().unwrap().key.clone())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["x-plain".to_owned(), "x-upstream".to_owned()],
+            "headers from both the pair list and the header map must be emitted"
+        );
+    }
+
+    #[test]
+    fn rejection_to_immediate_keeps_opaque_header_bytes() {
+        let mut map = HeaderMap::new();
+        map.insert(
+            "content-disposition",
+            http::header::HeaderValue::from_bytes(b"attachment; filename=\"caf\xe9\"").unwrap(),
+        );
+        let rejection = praxis_filter::Rejection {
+            header_map: Some(Box::new(map)),
+            ..praxis_filter::Rejection::status(502)
+        };
+
+        let imm = rejection_to_immediate(&rejection);
+
+        let hv = imm.headers.expect("headers present").set_headers[0]
+            .header
+            .clone()
+            .expect("header value");
+        assert_eq!(
+            hv.raw_value,
+            b"attachment; filename=\"caf\xe9\"".to_vec(),
+            "byte-preserving headers must be carried byte for byte, not blanked"
+        );
+    }
+
+    #[test]
+    fn terminal_response_to_immediate_maps_status_headers_and_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let terminal = praxis_filter::TerminalResponse::new(201)
+            .with_headers(headers)
+            .with_body(Bytes::from_static(b"{\"ok\":true}"));
+
+        let imm = terminal_response_to_immediate(&terminal);
+
+        assert_eq!(imm.status.unwrap().code, 201, "status should be carried");
+        assert_eq!(imm.body, "{\"ok\":true}", "body should be carried");
+        let hdrs = imm.headers.expect("headers present");
+        assert_eq!(hdrs.set_headers.len(), 1, "one header");
+        assert_eq!(
+            hdrs.set_headers[0].header.as_ref().unwrap().key,
+            "content-type",
             "header key should match"
         );
     }

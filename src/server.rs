@@ -914,7 +914,7 @@ async fn run_request_pipeline(
     let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -1021,7 +1021,7 @@ async fn execute_response_pipeline_and_body_filters(
 
     if should_execute {
         let action = execute_response(pipeline, ctx).await?;
-        if let Some(imm) = check_reject(action) {
+        if let Some(imm) = immediate_from_action(action) {
             return Ok(Some(imm));
         }
     }
@@ -1259,7 +1259,7 @@ async fn run_request_header_filters_early(
     let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -1288,7 +1288,7 @@ async fn run_response_header_filters_early(
     ctx.response_header = Some(resp);
 
     let action = execute_response(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -1315,14 +1315,21 @@ async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext
         .map_err(|e| Status::internal(e.to_string()))
 }
 
-/// Convert a [`FilterAction::Reject`] into an `ImmediateResponse`.
-fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
-    if let FilterAction::Reject(rejection) = action {
-        metrics::record_immediate_response();
-        Some(adapter::rejection_to_immediate(&rejection))
-    } else {
-        None
-    }
+/// Convert a short-circuiting [`FilterAction`] into an `ImmediateResponse`.
+///
+/// Both `Reject` and `TerminalResponse` end the request with a local reply
+/// at Envoy. `Release` and `BodyDone` mean `Continue` outside their body
+/// contexts by contract.
+fn immediate_from_action(
+    action: FilterAction,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+    let immediate = match action {
+        FilterAction::Reject(rejection) => adapter::rejection_to_immediate(&rejection),
+        FilterAction::TerminalResponse(terminal) => adapter::terminal_response_to_immediate(&terminal),
+        FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone => return None,
+    };
+    metrics::record_immediate_response();
+    Some(immediate)
 }
 
 // -----------------------------------------------------------------------------
@@ -1350,11 +1357,7 @@ async fn run_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
-
-    Ok(None)
+    Ok(immediate_from_action(action))
 }
 
 /// Run response body filters (synchronous, per Pingora constraint).
@@ -1377,11 +1380,7 @@ fn run_resp_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
-
-    Ok(None)
+    Ok(immediate_from_action(action))
 }
 
 // -----------------------------------------------------------------------------
@@ -1941,6 +1940,29 @@ mod tests {
                 "{mode:?} delivers the body in several messages"
             );
             assert!(body_complete_message(true, mode), "{mode:?} completes on end_of_stream");
+        }
+    }
+
+    #[test]
+    fn immediate_from_action_short_circuits_reject_and_terminal() {
+        let reject = immediate_from_action(FilterAction::Reject(praxis_filter::Rejection::status(403)));
+        assert_eq!(
+            reject.and_then(|i| i.status).map(|s| s.code),
+            Some(403),
+            "a rejection becomes an immediate response"
+        );
+
+        let terminal = immediate_from_action(FilterAction::TerminalResponse(Box::new(
+            praxis_filter::TerminalResponse::new(200),
+        )));
+        assert_eq!(
+            terminal.and_then(|i| i.status).map(|s| s.code),
+            Some(200),
+            "a terminal response must end the request at Envoy rather than fall through upstream"
+        );
+
+        for action in [FilterAction::Continue, FilterAction::Release, FilterAction::BodyDone] {
+            assert!(immediate_from_action(action).is_none(), "non-terminal actions continue");
         }
     }
 
