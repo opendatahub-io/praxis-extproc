@@ -1104,7 +1104,6 @@ async fn repro_ap_post_eos_body() {
     }
 }
 
-
 #[tokio::test]
 async fn repro_ap_post_eos_headers() {
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;

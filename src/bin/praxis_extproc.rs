@@ -87,7 +87,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "starting ExtProc server"
     );
 
-    Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+    Box::pin(start_services(addrs, pipeline, &cfg.server)).await
 }
 
 /// Start gRPC, health, and metrics servers concurrently.
@@ -95,7 +95,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
@@ -103,11 +103,22 @@ async fn start_services(
     let health_handle =
         tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, wait_broadcast(health_rx)).await });
 
+    let metrics_auth = server_cfg.metrics_auth.clone();
     let metrics_rx = shutdown_tx.subscribe();
-    let metrics_handle =
-        tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
+    let (metrics_ready_tx, metrics_ready_rx) = tokio::sync::oneshot::channel();
+    let metrics_handle = tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addrs.2, &metrics_auth, metrics_ready_tx, wait_broadcast(metrics_rx)).await
+    });
 
-    serve_grpc(addrs.0, pipeline, tls_cfg).await?;
+    if metrics_ready_rx.await.is_err() {
+        match metrics_handle.await {
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(())) => return Err("metrics server exited unexpectedly".into()),
+            Err(e) => return Err(format!("metrics task panicked: {e}").into()),
+        }
+    }
+
+    serve_grpc(addrs.0, pipeline, &server_cfg.tls).await?;
 
     drop(shutdown_tx);
 

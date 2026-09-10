@@ -162,6 +162,7 @@ server:
 | `grpc_address` | string | `0.0.0.0:50051` | gRPC ExtProc listen address |
 | `health_address` | string | `0.0.0.0:50052` | gRPC health check address |
 | `metrics_address` | string | `0.0.0.0:9090` | Prometheus metrics address |
+| `metrics_auth` | object | `enabled: true` | Metrics endpoint authentication |
 | `tls` | object | `mode: none` | TLS configuration |
 
 ### TLS
@@ -207,6 +208,76 @@ server:
     ca_cert_path: /etc/tls/ca.pem   # optional: enables mTLS
     handshake_concurrency: 64        # optional: default shown
     handshake_timeout_secs: 10       # optional: default shown
+```
+
+### Metrics Authentication
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Enable Kubernetes TokenReview + SubjectAccessReview on `/metrics` |
+
+When enabled, the `/metrics` endpoint requires an
+`Authorization: Bearer <token>` header carrying a
+valid Kubernetes ServiceAccount token. The server
+validates the token via the Kubernetes `TokenReview`
+API, then checks that the caller has `GET /metrics`
+permission via `SubjectAccessReview`.
+
+Health probes at `/healthz` remain unauthenticated
+regardless of this setting.
+
+```yaml
+server:
+  metrics_auth:
+    enabled: true   # default — disable for local dev
+```
+
+#### How it works
+
+1. The scraper (Prometheus / OTel Collector) sends
+   its ServiceAccount token in the `Authorization`
+   header.
+2. The metrics server calls the Kubernetes
+   `TokenReview` API to verify the token.
+3. The server calls `SubjectAccessReview` to confirm
+   the caller may `GET /metrics`.
+4. On success, the Prometheus render is returned.
+
+Responses:
+
+- **200** — authenticated and authorized.
+- **401** — missing, malformed, or invalid token.
+- **403** — valid token but not authorized.
+
+#### RBAC requirements
+
+Two `ClusterRole` resources ship in
+`deploy/overlays/odh/rbac/`:
+
+| Resource | Purpose |
+| --- | --- |
+| `metrics-auth-clusterrole.yaml` | Allows the `payload-processing` ServiceAccount to call `TokenReview` and `SubjectAccessReview` |
+| `metrics-reader-clusterrole.yaml` | Grants `GET /metrics` to the monitoring ServiceAccount |
+
+A default `ClusterRoleBinding` binds
+`payload-processing-metrics-reader` to
+`prometheus-k8s` in `redhat-ods-monitoring`. Adjust
+the subject if your monitoring ServiceAccount differs.
+
+#### Local development
+
+Disable authentication when running outside
+Kubernetes:
+
+```yaml
+server:
+  metrics_auth:
+    enabled: false
+```
+
+```console
+curl http://localhost:9090/metrics   # returns 200
+curl http://localhost:9090/healthz   # returns 200
 ```
 
 ## Insecure Options
@@ -300,6 +371,10 @@ problems:
 - **Invalid TLS values**: `handshake_concurrency`
   or `handshake_timeout_secs` set to zero cause an
   immediate startup error.
+- **Metrics auth kube client failure**: `enabled: true`
+  but the Kubernetes API client cannot be created
+  (e.g. running outside a cluster) causes a startup
+  error.
 - **Address bind failure**: the server fails to start
   if any listen address is already in use.
 

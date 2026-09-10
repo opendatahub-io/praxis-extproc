@@ -9,6 +9,8 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      metrics_auth:
+        enabled: true
       tls:
         mode: self_signed
 
@@ -27,6 +29,8 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      metrics_auth:
+        enabled: true
       tls:
         mode: self_signed
 
