@@ -37,6 +37,3 @@ filter_chains:
         request_add:
           - name: X-Processed
             value: "true"
-
-insecure_options:
-  allow_unbounded_body: true

@@ -22,6 +22,3 @@ data:
             response_set:
               - name: X-Praxis
                 value: "true"
-
-    insecure_options:
-      allow_unbounded_body: true

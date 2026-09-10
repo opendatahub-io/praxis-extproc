@@ -2523,6 +2523,49 @@ async fn streamed_body_derived_header_mutations_are_not_emitted() {
     );
 }
 
+#[tokio::test]
+async fn request_body_over_limit_gets_local_413() {
+    let (mut client, _shutdown) = start_server(LIMITED_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/submit", false);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(request_body_msg(b"123456789", true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ImmediateResponse(imm)) = &msg.response else {
+        panic!("an oversized body must be answered with a local reply, got: {msg:?}");
+    };
+    assert_eq!(imm.status.as_ref().map(|s| s.code), Some(413), "status is 413");
+}
+
+#[tokio::test]
+async fn response_body_over_limit_gets_local_413() {
+    let (mut client, _shutdown) = start_server(LIMITED_BODY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/", true);
+    headers.protocol_config = Some(protocol_config(2, 2));
+    tx.send(headers).await.unwrap();
+    let _req_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let _resp_headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    tx.send(response_body_msg(b"123456789", true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::ImmediateResponse(imm)) = &msg.response else {
+        panic!("an oversized response body must be answered with a local reply, got: {msg:?}");
+    };
+    assert_eq!(imm.status.as_ref().map(|s| s.code), Some(413), "status is 413");
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2532,8 +2575,6 @@ filter_chains:
   - name: test
     filters:
       - filter: request_id
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const HEADERS_CONFIG: &str = r#"
@@ -2545,8 +2586,6 @@ filter_chains:
         request_add:
           - name: X-Test
             value: extproc
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const GUARDRAILS_CONFIG: &str = r#"
@@ -2557,8 +2596,6 @@ filter_chains:
         rules:
           - target: body
             contains: "DROP TABLE"
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const UNCONDITIONAL_BRANCH_CONFIG: &str = r#"
@@ -2580,8 +2617,6 @@ filter_chains:
             rejoin: next
             chains:
               - branch_chain
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const CONDITIONAL_TERMINAL_CONFIG: &str = r#"
@@ -2606,8 +2641,16 @@ filter_chains:
                   - filter: static_response
                     status: 403
                     body: "blocked by branch"
-insecure_options:
-  allow_unbounded_body: true
+"#;
+
+const LIMITED_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+limits:
+  max_request_bytes: 8
+  max_response_bytes: 8
 "#;
 
 const MODEL_TO_HEADER_CONFIG: &str = r#"
@@ -2616,8 +2659,6 @@ filter_chains:
     filters:
       - filter: model_to_header
         header: X-Gateway-Model-Name
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const STATE_PROBE_CONFIG: &str = r#"
@@ -2639,8 +2680,6 @@ filter_chains:
         response_set:
           - name: X-Resp
             value: "true"
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 const RESPONSE_HEADER_CONFIG: &str = r#"
@@ -2651,8 +2690,6 @@ filter_chains:
         response_set:
           - name: X-Resp
             value: "true"
-insecure_options:
-  allow_unbounded_body: true
 "#;
 
 // -----------------------------------------------------------------------------
@@ -2714,7 +2751,7 @@ async fn start_server_with_registry(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = PraxisExtProc::new(pipeline);
+    let svc = PraxisExtProc::with_limits(pipeline, cfg.limits.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {

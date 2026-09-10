@@ -13,6 +13,7 @@ use std::{mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_core::config::BodyLimitsConfig;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -34,9 +35,6 @@ use crate::{
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Maximum accumulated body size before rejecting.
-const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
@@ -129,14 +127,22 @@ type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingRe
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub struct PraxisExtProc {
+    /// Ceilings on the body bytes assembled per stream and direction.
+    limits: BodyLimitsConfig,
+
     /// Shared filter pipeline.
     pipeline: Arc<FilterPipeline>,
 }
 
 impl PraxisExtProc {
-    /// Create a new ExtProc service backed by the given pipeline.
+    /// Create a new ExtProc service backed by the given pipeline with default body limits.
     pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
-        Self { pipeline }
+        Self::with_limits(pipeline, BodyLimitsConfig::default())
+    }
+
+    /// Create a new ExtProc service with explicit body limits.
+    pub fn with_limits(pipeline: Arc<FilterPipeline>, limits: BodyLimitsConfig) -> Self {
+        Self { limits, pipeline }
     }
 }
 
@@ -154,11 +160,12 @@ impl ExternalProcessor for PraxisExtProc {
         request: TonicRequest<Streaming<ProcessingRequest>>,
     ) -> Result<TonicResponse<Self::ProcessStream>, Status> {
         let pipeline = Arc::clone(&self.pipeline);
+        let limits = self.limits.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(&pipeline, &mut inbound, &tx).await {
+            if let Err(e) = handle_stream(&pipeline, limits, &mut inbound, &tx).await {
                 error!(error = %e, "stream processing failed");
                 drop(tx.send(Err(e)).await);
             }
@@ -180,11 +187,12 @@ impl ExternalProcessor for PraxisExtProc {
 /// pipeline at the appropriate phase boundaries.
 async fn handle_stream(
     pipeline: &FilterPipeline,
+    limits: BodyLimitsConfig,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
 ) -> Result<(), Status> {
     let start = Instant::now();
-    let mut stream_state = StreamState::new(pipeline);
+    let mut stream_state = StreamState::new(pipeline, limits);
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -669,7 +677,14 @@ async fn accumulate_request_body(
     complete: bool,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len())?;
+    if let Some(imm) = body_limit_exceeded(
+        state.request_body.len(),
+        body.body.len(),
+        state.limits.max_request_bytes,
+        "request",
+    ) {
+        return Ok(vec![response::immediate(imm)]);
+    }
     state.request_body.extend_from_slice(&body.body);
 
     if !complete {
@@ -764,7 +779,14 @@ async fn accumulate_response_body(
     complete: bool,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.response_body.len(), body.body.len())?;
+    if let Some(imm) = body_limit_exceeded(
+        state.response_body.len(),
+        body.body.len(),
+        state.limits.max_response_bytes,
+        "response",
+    ) {
+        return Ok(vec![response::immediate(imm)]);
+    }
     state.response_body.extend_from_slice(&body.body);
 
     if !complete {
@@ -1471,6 +1493,9 @@ struct StreamState {
     /// Filter context state threaded through every phase of the stream.
     context: adapter::CarriedContext,
 
+    /// Ceilings on the body bytes assembled per direction.
+    limits: BodyLimitsConfig,
+
     /// Converted request from the headers phase.
     request: Option<Request>,
 
@@ -1504,9 +1529,10 @@ struct StreamState {
 
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
-    fn new(pipeline: &FilterPipeline) -> Self {
+    fn new(pipeline: &FilterPipeline, limits: BodyLimitsConfig) -> Self {
         Self {
             context: adapter::CarriedContext::new(pipeline),
+            limits,
             request: None,
             request_body: Vec::new(),
             response: None,
@@ -1562,12 +1588,25 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
         .unwrap_or_default()
 }
 
-/// Reject body accumulation exceeding [`MAX_BODY_ACCUMULATION`].
-fn check_body_limit(current: usize, incoming: usize) -> Result<(), Status> {
-    if current + incoming > MAX_BODY_ACCUMULATION {
-        return Err(Status::resource_exhausted("body exceeds maximum size"));
+/// Reject a body that would exceed `limit` once `incoming` bytes are added.
+///
+/// Answers with a local `413` rather than a stream error: a stream error
+/// lets a fail-open Envoy forward the oversized body unfiltered, whereas an
+/// `ImmediateResponse` is enforced in every failure mode.
+fn body_limit_exceeded(
+    current: usize,
+    incoming: usize,
+    limit: Option<usize>,
+    direction: &str,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+    let max = limit?;
+    if current.saturating_add(incoming) <= max {
+        return None;
     }
-    Ok(())
+    warn!(direction, max, "body exceeds the configured limit; rejecting with 413");
+    immediate_from_action(FilterAction::Reject(
+        praxis_filter::Rejection::status(413).with_body(format!("{direction} body exceeds {max} bytes")),
+    ))
 }
 
 /// Return a body slice reference if the buffer is non-empty.
@@ -2011,6 +2050,26 @@ mod tests {
         for action in [FilterAction::Continue, FilterAction::Release, FilterAction::BodyDone] {
             assert!(immediate_from_action(action).is_none(), "non-terminal actions continue");
         }
+    }
+
+    #[test]
+    fn body_limit_exceeded_only_past_the_ceiling() {
+        assert!(
+            body_limit_exceeded(4, 4, Some(8), "request").is_none(),
+            "exactly at the ceiling is allowed"
+        );
+        assert!(
+            body_limit_exceeded(4, 4, None, "request").is_none(),
+            "no ceiling means no rejection"
+        );
+
+        let imm = body_limit_exceeded(4, 5, Some(8), "response").unwrap();
+        assert_eq!(
+            imm.status.map(|s| s.code),
+            Some(413),
+            "oversized bodies get a local 413"
+        );
+        assert!(imm.body.contains("response"), "reply names the direction: {}", imm.body);
     }
 
     #[test]

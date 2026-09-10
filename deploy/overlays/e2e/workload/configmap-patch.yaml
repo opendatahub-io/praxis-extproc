@@ -21,6 +21,3 @@ data:
             response_set:
               - name: X-Praxis-Version
                 value: "e2e"
-
-    insecure_options:
-      allow_unbounded_body: true

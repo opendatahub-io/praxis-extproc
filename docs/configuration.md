@@ -28,8 +28,9 @@ server:
   tls:
     mode: none
 
-insecure_options:
-  allow_unbounded_body: true
+limits:
+  max_request_bytes: 10485760
+  max_response_bytes: 10485760
 ```
 
 ## Filter Chains
@@ -209,6 +210,31 @@ server:
     handshake_timeout_secs: 10       # optional: default shown
 ```
 
+## Limits
+
+Ceilings on the body bytes the server assembles per
+direction, under `limits:`. Bodies are assembled for
+`BUFFERED` processing and, when the pipeline contains
+body filters, for `FULL_DUPLEX_STREAMED` processing.
+A body over its ceiling is answered with a local
+`413 Payload Too Large` reply, which Envoy enforces in
+every failure mode.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_request_bytes` | integer | `10485760` (10 MiB) | Request body ceiling |
+| `max_response_bytes` | integer | `10485760` (10 MiB) | Response body ceiling |
+
+```yaml
+limits:
+  max_request_bytes: 5242880
+  max_response_bytes: 2097152
+```
+
+Setting a field to `null` removes that ceiling. The
+server then refuses to start unless
+`insecure_options.allow_unbounded_body` is also set.
+
 ## Insecure Options
 
 Development overrides under `insecure_options:`.
@@ -217,9 +243,12 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation |
+| `allow_unbounded_body` | bool | `false` | Permit `null` body limits (unbounded accumulation) |
 
 ```yaml
+limits:
+  max_request_bytes: null
+
 insecure_options:
   allow_unbounded_body: true
 ```

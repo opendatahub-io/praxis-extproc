@@ -87,7 +87,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         "starting ExtProc server"
     );
 
-    Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+    Box::pin(start_services(addrs, pipeline, &cfg)).await
 }
 
 /// Start gRPC, health, and metrics servers concurrently.
@@ -95,7 +95,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    cfg: &ExtProcConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
@@ -107,7 +107,7 @@ async fn start_services(
     let metrics_handle =
         tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
 
-    serve_grpc(addrs.0, pipeline, tls_cfg).await?;
+    serve_grpc(addrs.0, pipeline, cfg).await?;
 
     drop(shutdown_tx);
 
@@ -126,9 +126,10 @@ async fn start_services(
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    cfg: &ExtProcConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let tls_cfg = &cfg.server.tls;
+    let svc = ExternalProcessorServer::new(PraxisExtProc::with_limits(pipeline, cfg.limits.clone()));
     match tls::build_tls_config(tls_cfg)? {
         None => Box::pin(serve_plaintext(addr, svc)).await,
         Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,

@@ -35,6 +35,3 @@ filter_chains:
         response_set:
           - name: X-Proxy
             value: praxis-extproc
-
-insecure_options:
-  allow_unbounded_body: true

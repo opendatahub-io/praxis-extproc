@@ -44,6 +44,16 @@ pub struct ExtProcConfig {
     #[serde(default)]
     pub insecure_options: praxis_core::config::InsecureOptions,
 
+    /// Ceilings on the body bytes the server assembles per direction.
+    ///
+    /// Bodies are assembled for `BUFFERED` and, when body filters are
+    /// configured, `FULL_DUPLEX_STREAMED` processing. A body over the
+    /// ceiling is answered with a local `413` reply. Both default to 10 MiB;
+    /// `null` removes a ceiling and requires
+    /// `insecure_options.allow_unbounded_body`.
+    #[serde(default)]
+    pub limits: praxis_core::config::BodyLimitsConfig,
+
     /// gRPC server settings.
     #[serde(default)]
     pub server: ServerConfig,
@@ -96,11 +106,14 @@ impl Default for ServerConfig {
 ///
 /// # Errors
 ///
-/// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails.
+/// Returns [`ExtProcError::Config`] if a body limit is removed without
+/// `insecure_options.allow_unbounded_body`, and [`ExtProcError::Pipeline`]
+/// if filter instantiation or validation fails.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
     validate_chain_names(&config.filter_chains)?;
+    validate_body_limits(&config.limits, config.insecure_options.allow_unbounded_body)?;
 
     let chains: std::collections::HashMap<&str, &[_]> = config
         .filter_chains
@@ -113,8 +126,25 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
     let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
+    // The server assembles bodies itself and enforces `limits` while doing
+    // so. The pipeline only needs the ceiling where a filter already buffers,
+    // because `apply_body_limits` also marks a direction as needing the body,
+    // which would switch every stream out of passthrough.
+    let caps = pipeline.body_capabilities();
+    let request_ceiling = caps
+        .needs_request_body
+        .then_some(config.limits.max_request_bytes)
+        .flatten();
+    let response_ceiling = caps
+        .needs_response_body
+        .then_some(config.limits.max_response_bytes)
+        .flatten();
     pipeline
-        .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
+        .apply_body_limits(
+            request_ceiling,
+            response_ceiling,
+            config.insecure_options.allow_unbounded_body,
+        )
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
@@ -139,6 +169,22 @@ fn validate_chain_names(chains: &[praxis_core::config::FilterChainConfig]) -> Re
         }
     }
     Ok(())
+}
+
+/// Reject removed body limits unless unbounded accumulation was opted into.
+fn validate_body_limits(limits: &praxis_core::config::BodyLimitsConfig, allow_unbounded: bool) -> Result<()> {
+    let removed = match (limits.max_request_bytes, limits.max_response_bytes) {
+        (None, _) => Some("max_request_bytes"),
+        (_, None) => Some("max_response_bytes"),
+        (Some(_), Some(_)) => None,
+    };
+    match removed {
+        Some(field) if !allow_unbounded => Err(ExtProcError::Config(format!(
+            "limits.{field} is null; unbounded body accumulation requires \
+             insecure_options.allow_unbounded_body: true"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Concatenate all filter chain entries into a single flat list.
@@ -305,6 +351,77 @@ filter_chains:
             err.to_string().contains("duplicate"),
             "error should mention duplicate: {err}"
         );
+    }
+
+    #[test]
+    fn body_limits_default_to_ten_mib() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(cfg.limits.max_request_bytes, Some(10_485_760), "request limit");
+        assert_eq!(cfg.limits.max_response_bytes, Some(10_485_760), "response limit");
+    }
+
+    #[test]
+    fn body_filter_pipeline_builds_without_insecure_flag() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: guardrails
+        rules:
+          - target: body
+            contains: "DROP TABLE"
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let err = build_pipeline(&cfg, &registry).err().map(|e| e.to_string());
+
+        assert!(
+            err.is_none(),
+            "the default limits bound body buffering, so no insecure opt-in is needed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn null_limit_requires_allow_unbounded_body() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+limits:
+  max_request_bytes: null
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let err = build_pipeline(&cfg, &registry)
+            .err()
+            .expect("removing a limit without opting in must fail");
+
+        assert!(
+            err.to_string().contains("allow_unbounded_body"),
+            "error should name the opt-in: {err}"
+        );
+    }
+
+    #[test]
+    fn null_limit_allowed_with_insecure_opt_in() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+limits:
+  max_request_bytes: null
+  max_response_bytes: null
+insecure_options:
+  allow_unbounded_body: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+
+        assert!(build_pipeline(&cfg, &registry).is_ok(), "opt-in lifts the limit");
     }
 
     #[test]
