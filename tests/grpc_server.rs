@@ -2489,6 +2489,40 @@ async fn filter_state_and_request_start_survive_across_phases() {
     );
 }
 
+#[tokio::test]
+async fn streamed_body_derived_header_mutations_are_not_emitted() {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+
+    let (mut client, _shutdown) = start_server(MODEL_TO_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut response_stream = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/v1/chat/completions", false);
+    headers.protocol_config = Some(protocol_config(1, 2));
+    tx.send(headers).await.unwrap();
+    let _headers_resp = next_full_duplex_msg(&mut response_stream).await;
+
+    let payload = br#"{"model":"gpt-4","messages":[]}"#;
+    tx.send(request_body_msg(payload, true)).await.unwrap();
+    let msg = next_full_duplex_msg(&mut response_stream).await;
+
+    let Some(RespVariant::RequestBody(b)) = &msg.response else {
+        panic!("expected RequestBody, got: {msg:?}");
+    };
+    let common = b.response.as_ref().expect("common response");
+    assert!(
+        common.header_mutation.is_none(),
+        "Envoy ignores header mutations on STREAMED body responses, so none must be emitted, got: {msg:?}"
+    );
+    assert!(
+        matches!(
+            common.body_mutation.as_ref().and_then(|m| m.mutation.as_ref()),
+            Some(body_mutation::Mutation::Body(bytes)) if bytes == payload
+        ),
+        "the chunk itself must still be forwarded, got: {msg:?}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -2572,6 +2606,16 @@ filter_chains:
                   - filter: static_response
                     status: 403
                     body: "blocked by branch"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const MODEL_TO_HEADER_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: model_to_header
+        header: X-Gateway-Model-Name
 insecure_options:
   allow_unbounded_body: true
 "#;

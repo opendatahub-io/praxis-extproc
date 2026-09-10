@@ -12,6 +12,7 @@
 use std::{mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -46,6 +47,9 @@ static NONE_MODE_BODY_FILTERS: OnceWarning = OnceWarning::new();
 /// Once-per-process warning: a stream opened without `protocol_config`.
 static MISSING_PROTOCOL_CONFIG: OnceWarning = OnceWarning::new();
 
+/// Once-per-process warning: STREAMED body filters produced header mutations.
+static STREAMED_HEADER_MUTATIONS: OnceWarning = OnceWarning::new();
+
 // -----------------------------------------------------------------------------
 // OnceWarning
 // -----------------------------------------------------------------------------
@@ -66,6 +70,11 @@ impl OnceWarning {
     /// Whether this call is the first; every later call returns `false`.
     fn first(&self) -> bool {
         !self.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the warning has not fired yet, without firing it.
+    fn pending(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1157,6 +1166,11 @@ async fn process_streamed_body_chunk(
         .request
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    // The response-side check needs a header snapshot; take it only on the
+    // final chunk and only until the once-per-process warning has fired.
+    let original_response_headers = (!is_request && body.end_of_stream && STREAMED_HEADER_MUTATIONS.pending())
+        .then(|| state.response.as_ref().map(|r| r.headers.clone()))
+        .flatten();
     let mut ctx = adapter::PhaseContext::new(pipeline, request, &mut state.context);
     if !is_request {
         let resp = state
@@ -1175,6 +1189,7 @@ async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
+    warn_unapplied_header_mutations(&ctx, is_request, original_response_headers.as_ref());
     drop(ctx);
     let (mutation, body_mode) = if is_request {
         (
@@ -1195,6 +1210,38 @@ async fn process_streamed_body_chunk(
         response::response_body(body_data, mutation, body_mode, eos)
     };
     Ok(responses)
+}
+
+/// Warn (once per process) when body filters changed headers that Envoy will not apply.
+///
+/// Header mutations on a body response only take effect in `BUFFERED` mode.
+/// In `STREAMED` mode the headers were forwarded when the `HeadersResponse`
+/// went out, so a filter that derives headers from the body (for example
+/// `model_to_header`) is silently ineffective. Surface that so operators
+/// can switch the direction to `BUFFERED` or `FULL_DUPLEX_STREAMED`.
+fn warn_unapplied_header_mutations(
+    ctx: &HttpFilterContext<'_>,
+    is_request: bool,
+    original_response_headers: Option<&HeaderMap>,
+) {
+    if !STREAMED_HEADER_MUTATIONS.pending() {
+        return;
+    }
+    let mutation = if is_request {
+        adapter::collect_request_header_mutations(ctx)
+    } else {
+        original_response_headers.and_then(|original| adapter::collect_response_header_mutations_diff(ctx, original))
+    };
+    if let Some(mutation) = mutation
+        && STREAMED_HEADER_MUTATIONS.first()
+    {
+        warn!(
+            direction = if is_request { "request" } else { "response" },
+            set_headers = mutation.set_headers.len(),
+            remove_headers = mutation.remove_headers.len(),
+            "STREAMED body filters produced header mutations, which Envoy applies only in BUFFERED mode; dropped"
+        );
+    }
 }
 
 /// How header mutations are delivered after early filter execution.
