@@ -43,6 +43,9 @@ const RESPONSE_CHANNEL_SIZE: usize = 16;
 /// Once-per-process warning: body filters configured under NONE body mode.
 static NONE_MODE_BODY_FILTERS: OnceWarning = OnceWarning::new();
 
+/// Once-per-process warning: a stream opened without `protocol_config`.
+static MISSING_PROTOCOL_CONFIG: OnceWarning = OnceWarning::new();
+
 // -----------------------------------------------------------------------------
 // OnceWarning
 // -----------------------------------------------------------------------------
@@ -197,14 +200,7 @@ async fn process_messages(
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
 
-        if let Some(proto_cfg) = msg.protocol_config {
-            if first_message_processed {
-                return Err(Status::invalid_argument(
-                    "protocol_config may only be sent on the first stream message",
-                ));
-            }
-            config_from_first_message(stream_state, proto_cfg)?;
-        }
+        apply_protocol_config(stream_state, msg.protocol_config, first_message_processed)?;
         first_message_processed = true;
 
         let Some(req) = msg.request else {
@@ -227,6 +223,39 @@ async fn process_messages(
     }
 
     Ok(())
+}
+
+/// Apply the `protocol_config` carried on a stream message, if any.
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] if the configuration arrives on a
+/// later message or requests unsupported body modes.
+fn apply_protocol_config(
+    stream_state: &mut StreamState,
+    proto_cfg: Option<ProtocolConfiguration>,
+    first_message_processed: bool,
+) -> Result<(), Status> {
+    match proto_cfg {
+        Some(_) if first_message_processed => Err(Status::invalid_argument(
+            "protocol_config may only be sent on the first stream message",
+        )),
+        Some(cfg) => config_from_first_message(stream_state, cfg),
+        // Envoy releases before 1.33 never send protocol_config, so the body
+        // modes are unknown and BUFFERED is assumed. Such an Envoy must be
+        // configured with BUFFERED body modes for its streams to work.
+        None if !first_message_processed => {
+            if MISSING_PROTOCOL_CONFIG.first() {
+                warn!(
+                    "first message carries no protocol_config; assuming BUFFERED body modes (Envoy < 1.33 must be configured with BUFFERED)"
+                );
+            } else {
+                debug!("no protocol_config on first message; assuming BUFFERED body modes");
+            }
+            Ok(())
+        },
+        None => Ok(()),
+    }
 }
 
 /// Parses `protocol_config` from first message.
