@@ -129,6 +129,151 @@ kubectl -n praxis-extproc rollout status \
 [Kustomize]: https://kustomize.io/
 [EnvoyFilter]: https://istio.io/latest/docs/reference/config/networking/envoy-filter/
 
+### OpenShift Deployment
+
+The `demo` overlay above targets a local KIND cluster, so two
+things need adjusting for a remote OpenShift cluster:
+
+1. **Image.** The overlay's `praxis-extproc:dev` tag is a local
+   image KIND side-loads; a remote cluster cannot pull it. Publish
+   the image to the cluster's internal registry instead.
+2. **Service Mesh.** The `test` overlay creates an Istio `Gateway`
+   (`gatewayClassName: istio`) and an `EnvoyFilter`. These require
+   an Istio-based mesh that provides the `istio` GatewayClass and
+   the `EnvoyFilter` CRD (e.g. [OpenShift Service Mesh]).
+
+The `openshift` overlay handles the image; the mesh is a one-time
+cluster install.
+
+#### 1. Publish the image to the internal registry
+
+Expose the internal registry route (one-time, cluster-admin):
+
+```console
+oc patch configs.imageregistry.operator.openshift.io/cluster \
+    --type=merge -p '{"spec":{"defaultRoute":true}}'
+REGISTRY=$(oc get route default-route \
+    -n openshift-image-registry -o jsonpath='{.spec.host}')
+```
+
+Build, log in, and push. Pushing creates the `praxis-extproc`
+namespace's ImageStream automatically:
+
+```console
+make container-release
+
+oc new-project praxis-extproc
+podman login -u "$(oc whoami)" -p "$(oc whoami -t)" "$REGISTRY"
+podman tag docker.io/library/praxis-extproc:dev \
+    "$REGISTRY/praxis-extproc/praxis-extproc:dev"
+podman push "$REGISTRY/praxis-extproc/praxis-extproc:dev"
+```
+
+If your cluster's ingress uses a self-signed certificate, add its
+CA to the local trust store rather than disabling TLS
+verification.
+
+#### 2. Install OpenShift Service Mesh 3
+
+Install the operator:
+
+```console
+oc apply -f - <<'YAML'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: servicemeshoperator3
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: servicemeshoperator3
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+YAML
+```
+
+The Subscription installs the operator asynchronously. Wait for its
+CSV to reach `Succeeded` before continuing — the `Istio` and
+`IstioCNI` CRDs do not exist until the operator has finished
+installing:
+
+```console
+oc wait --for=condition=InstallSucceeded csv \
+    -l operators.coreos.com/servicemeshoperator3.openshift-operators \
+    -n openshift-operators --timeout=300s
+```
+
+Create the control plane and CNI (CNI is required on OpenShift):
+
+```console
+oc apply -f - <<'YAML'
+apiVersion: v1
+kind: Namespace
+metadata: { name: istio-system }
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: istio-cni }
+---
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata: { name: default }
+spec:
+  namespace: istio-system
+---
+apiVersion: sailoperator.io/v1
+kind: IstioCNI
+metadata: { name: default }
+spec:
+  namespace: istio-cni
+YAML
+
+oc wait --for=jsonpath='{.status.state}'=Healthy \
+    istio/default istiocni/default --timeout=300s
+```
+
+This creates the `istio` GatewayClass and the `EnvoyFilter` CRD.
+
+The `Istio` CR omits `spec.version`, so the operator installs its own
+default Istio version. To see which version was selected, check the
+resulting revision (`oc get istiorevisions` — the name encodes the
+version, e.g. `default-v1-24-3`). To pin a version for
+reproducibility, set `spec.version` on the `Istio` CR (e.g.
+`version: v1.24.3`).
+
+#### 3. Deploy and verify
+
+The `openshift` overlay is the `demo` overlay with the image
+pointed at the in-cluster registry
+(`image-registry.openshift-image-registry.svc:5000`, identical on
+every OpenShift cluster). The namespace's default service account
+already has a pull secret for it, so no imagePullSecret is needed.
+
+```console
+oc apply -k deploy/overlays/openshift
+oc -n praxis-extproc rollout status \
+    deployment/payload-processing
+```
+
+The Gateway auto-provisions an Envoy behind a `LoadBalancer`
+Service (an ELB on cloud OpenShift). Wait for it, then test:
+
+```console
+oc -n praxis-test wait --for=condition=Programmed \
+    gateway/praxis-test --timeout=180s
+
+GW=$(oc -n praxis-test get gateway praxis-test \
+    -o jsonpath='{.status.addresses[0].value}')
+curl -v "http://${GW}:8080/"
+```
+
+The load balancer may take a minute to become reachable after the
+Gateway reports `Programmed`. The response should be `200 OK` with
+the ExtProc-injected `x-praxis` and `x-request-id` headers.
+
+[OpenShift Service Mesh]: https://docs.openshift.com/container-platform/latest/service_mesh/v3x/ossm-about.html
+
 ### Production Deployment (OpenDataHub)
 
 For production MaaS environments, use the `odh`
