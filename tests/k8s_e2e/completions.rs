@@ -192,10 +192,7 @@ async fn multi_turn_conversation() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    assert!(
-        body.get("choices").is_some_and(|c| c.is_array())
-            || body.get("content").is_some_and(|c| c.is_array())
-    );
+    assert!(body.get("choices").is_some_and(|c| c.is_array()) || body.get("content").is_some_and(|c| c.is_array()));
 }
 
 #[tokio::test]
