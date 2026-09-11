@@ -10,7 +10,7 @@ async fn smoke_200() {
 }
 
 #[tokio::test]
-async fn response_has_openai_structure() {
+async fn response_has_valid_structure() {
     ensure_gateway_ready().await;
     let resp = chat_completion("gpt-4", "hello").await;
 
@@ -99,7 +99,24 @@ async fn tool_call_passthrough() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    assert!(body.get("choices").is_some() || body.get("content").is_some());
+    if body.get("content").is_some() {
+        assert!(
+            body["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "tool_use"),
+            "Anthropic response should contain a tool_use content block"
+        );
+    } else {
+        assert!(
+            body["choices"][0]["message"]
+                .as_object()
+                .unwrap()
+                .contains_key("tool_calls"),
+            "OpenAI response should contain tool_calls"
+        );
+    }
 }
 
 #[tokio::test]
@@ -175,7 +192,10 @@ async fn multi_turn_conversation() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    assert!(body.get("choices").is_some_and(|c| c.is_array()) || body.get("content").is_some_and(|c| c.is_array()));
+    assert!(
+        body.get("choices").is_some_and(|c| c.is_array())
+            || body.get("content").is_some_and(|c| c.is_array())
+    );
 }
 
 #[tokio::test]
