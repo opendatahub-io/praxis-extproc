@@ -573,6 +573,10 @@ async fn accumulate_request_body(
 /// (Envoy ignores header mutations on body responses for non-`BUFFERED`).
 /// For `FDS` with body filters, returns no response — full pipeline at body EOS.
 /// For `FDS` passthrough, runs filters early, defers mutations to first chunk.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "ExtProc filter pipeline response header processing future is inherently large"
+)]
 async fn handle_response_headers(
     pipeline: &FilterPipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,

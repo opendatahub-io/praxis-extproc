@@ -12,8 +12,11 @@ data:
         mode: self_signed
 
     filter_chains:
-      - name: ipp
+      - name: ai-filters
         filters:
+          - filter: anthropic_messages_to_chat_completions
+          - filter: model_to_header
+            header: X-Model-Name
           - filter: headers
             request_add:
               - name: X-Praxis-Processed
