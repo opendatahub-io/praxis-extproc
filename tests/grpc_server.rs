@@ -29,7 +29,7 @@
 
 use praxis_extproc::{config, server::PraxisExtProc};
 use praxis_proto::envoy::service::{
-    common::v3::HeaderValue,
+    common::v3::{HeaderValue, HeaderValueOption, header_value_option::HeaderAppendAction},
     ext_proc::v3::{
         HeaderMap, HttpBody, HttpHeaders, HttpTrailers, ProcessingRequest, ProcessingResponse,
         external_processor_server::ExternalProcessorServer, processing_request::Request as ReqVariant,
@@ -2089,6 +2089,246 @@ async fn response_headers_deferred_by_default() {
 }
 
 // -----------------------------------------------------------------------------
+// BBR (body-based routing + trust boundary)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bbr_routes_known_model_and_clears_route_cache() {
+    let (mut client, _shutdown) = start_server(BBR_CONFIG).await;
+
+    let body = br#"{"model":"gpt-4","messages":[]}"#;
+    let responses = send_full_request(&mut client, "POST", "/chat/completions", body).await;
+
+    let set_headers = extract_all_set_headers(&responses);
+    assert!(
+        set_headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case(":authority") && h.value == "api.openai.com"),
+        "BBR should rewrite :authority; got {set_headers:?}"
+    );
+    assert!(
+        set_headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case(":path") && h.value == "/v1/chat/completions"),
+        "BBR should rewrite :path with provider prefix; got {set_headers:?}"
+    );
+    assert!(
+        any_clear_route_cache(&responses),
+        "successful BBR routing should set clear_route_cache"
+    );
+}
+
+#[tokio::test]
+async fn bbr_overwrites_authority_and_path() {
+    let (mut client, _shutdown) = start_server(BBR_CONFIG).await;
+
+    let body = br#"{"model":"gpt-4","messages":[]}"#;
+    let responses = send_full_request(&mut client, "POST", "/chat/completions", body).await;
+
+    let set_headers = extract_all_set_header_options(&responses);
+    for (key, value) in [(":authority", "api.openai.com"), (":path", "/v1/chat/completions")] {
+        let option = set_headers
+            .iter()
+            .find(|hvo| hvo.header.as_ref().is_some_and(|h| h.key.eq_ignore_ascii_case(key)));
+        assert!(option.is_some(), "BBR should set {key}; got {set_headers:?}");
+        let option = option.unwrap();
+        assert_eq!(
+            option.header.as_ref().unwrap().value,
+            value,
+            "BBR {key} value should match the provider; got {set_headers:?}"
+        );
+        assert_eq!(
+            option.append_action,
+            i32::from(HeaderAppendAction::OverwriteIfExistsOrAdd),
+            "{key} must overwrite the incoming request header, not append a second value"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bbr_unknown_model_rejects_stream() {
+    let (mut client, _shutdown) = start_server(BBR_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut inbound = client.process(stream).await.expect("process").into_inner();
+
+    tx.send(make_request_headers("POST", "/chat/completions", false))
+        .await
+        .expect("send headers");
+
+    let headers_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out waiting for headers response")
+        .expect("headers stream error")
+        .expect("stream closed before headers response");
+    assert!(
+        matches!(headers_resp.response, Some(RespVariant::RequestHeaders(_))),
+        "BUFFERED headers phase should return RequestHeaders"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: br#"{"model":"unknown-model"}"#.to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    let body_outcome = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out waiting for rejection");
+
+    assert!(
+        body_outcome.is_err(),
+        "unknown model should fail the stream with a Status error, got {body_outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn bbr_trust_boundary_strips_headers_buffered() {
+    let (mut client, _shutdown) = start_server(BBR_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut inbound = client.process(stream).await.expect("process").into_inner();
+
+    tx.send(make_request_headers_with_extra(
+        "POST",
+        "/chat/completions",
+        false,
+        &[("x-maas-provider", "forged"), ("x-provider-token", "stolen")],
+    ))
+    .await
+    .expect("send headers");
+
+    let _headers_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
+
+    // No model field → trust boundary only (no routing).
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: br#"{"messages":[]}"#.to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    let body_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
+
+    let removes = extract_remove_headers_from_response(&body_resp);
+    assert!(
+        removes.iter().any(|h| h.eq_ignore_ascii_case("x-maas-provider")),
+        "should strip x-maas-provider; got {removes:?}"
+    );
+    assert!(
+        removes.iter().any(|h| h.eq_ignore_ascii_case("x-provider-token")),
+        "should strip x-provider-token; got {removes:?}"
+    );
+    assert!(
+        !any_clear_route_cache(std::slice::from_ref(&body_resp)),
+        "trust-only path should not clear route cache"
+    );
+}
+
+#[tokio::test]
+async fn bbr_trust_boundary_strips_headers_streamed() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(BBR_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut inbound = client.process(stream).await.expect("process").into_inner();
+
+    let mut headers =
+        make_request_headers_with_extra("POST", "/chat/completions", false, &[("x-maas-provider", "forged")]);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1, // STREAMED
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    let headers_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out waiting for STREAMED headers response")
+        .expect("stream error")
+        .expect("stream closed");
+
+    let removes = extract_remove_headers_from_response(&headers_resp);
+    assert!(
+        removes.iter().any(|h| h.eq_ignore_ascii_case("x-maas-provider")),
+        "STREAMED trust boundary must strip on HeadersResponse; got {removes:?}"
+    );
+}
+
+#[tokio::test]
+async fn bbr_disabled_applies_no_routing_or_trust_mutations() {
+    let (mut client, _shutdown) = start_server(BBR_DISABLED_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut inbound = client.process(stream).await.expect("process").into_inner();
+
+    tx.send(make_request_headers_with_extra(
+        "POST",
+        "/chat/completions",
+        false,
+        &[("x-maas-provider", "forged")],
+    ))
+    .await
+    .expect("send headers");
+
+    let _headers_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: br#"{"model":"gpt-4"}"#.to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    let body_resp = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), inbound.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
+
+    let set_headers = extract_all_set_headers(std::slice::from_ref(&body_resp));
+    assert!(
+        !set_headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case(":authority") && h.value == "api.openai.com"),
+        "disabled BBR must not rewrite :authority; got {set_headers:?}"
+    );
+
+    let removes = extract_remove_headers_from_response(&body_resp);
+    assert!(
+        !removes.iter().any(|h| h.eq_ignore_ascii_case("x-maas-provider")),
+        "disabled BBR must not strip trust-boundary headers; got {removes:?}"
+    );
+    assert!(
+        !any_clear_route_cache(std::slice::from_ref(&body_resp)),
+        "disabled BBR must not clear route cache"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
@@ -2097,6 +2337,42 @@ filter_chains:
   - name: test
     filters:
       - filter: request_id
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const BBR_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: model_to_header
+        header: X-AI-Model
+maas:
+  bbr:
+    enabled: true
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+const BBR_DISABLED_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: model_to_header
+        header: X-AI-Model
+maas:
+  bbr:
+    enabled: false
+    models:
+      - model: gpt-4
+        provider:
+          authority: api.openai.com
+          path_prefix: /v1
 insecure_options:
   allow_unbounded_body: true
 "#;
@@ -2306,16 +2582,28 @@ async fn send_full_roundtrip(client: &mut ExtProcClient, method: &str, path: &st
 }
 
 fn make_request_headers(method: &str, path: &str, end_of_stream: bool) -> ProcessingRequest {
+    make_request_headers_with_extra(method, path, end_of_stream, &[])
+}
+
+fn make_request_headers_with_extra(
+    method: &str,
+    path: &str,
+    end_of_stream: bool,
+    extra: &[(&str, &str)],
+) -> ProcessingRequest {
+    let mut headers = vec![
+        make_header(":method", method),
+        make_header(":path", path),
+        make_header(":authority", "localhost"),
+        make_header(":scheme", "http"),
+    ];
+    for (key, value) in extra {
+        headers.push(make_header(key, value));
+    }
+
     ProcessingRequest {
         request: Some(ReqVariant::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![
-                    make_header(":method", method),
-                    make_header(":path", path),
-                    make_header(":authority", "localhost"),
-                    make_header(":scheme", "http"),
-                ],
-            }),
+            headers: Some(HeaderMap { headers }),
             end_of_stream,
         })),
         ..Default::default()
@@ -2415,20 +2703,42 @@ fn has_request_headers_response(responses: &[ProcessingResponse]) -> bool {
 }
 
 fn extract_all_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue> {
+    extract_all_set_header_options(responses)
+        .into_iter()
+        .filter_map(|hvo| hvo.header)
+        .collect()
+}
+
+fn extract_all_set_header_options(responses: &[ProcessingResponse]) -> Vec<HeaderValueOption> {
     let mut headers = Vec::new();
     for r in responses {
-        let mutation = match &r.response {
-            Some(RespVariant::RequestHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
-            Some(RespVariant::RequestBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
-            _ => None,
-        };
-        if let Some(m) = mutation {
-            for hvo in &m.set_headers {
-                if let Some(hv) = &hvo.header {
-                    headers.push(hv.clone());
-                }
-            }
+        if let Some(m) = request_header_mutation(r) {
+            headers.extend(m.set_headers.iter().cloned());
         }
     }
     headers
+}
+
+fn extract_remove_headers_from_response(response: &ProcessingResponse) -> Vec<String> {
+    request_header_mutation(response)
+        .map(|m| m.remove_headers.clone())
+        .unwrap_or_default()
+}
+
+fn request_header_mutation(
+    response: &ProcessingResponse,
+) -> Option<&praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+    match &response.response {
+        Some(RespVariant::RequestHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+        Some(RespVariant::RequestBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+        _ => None,
+    }
+}
+
+fn any_clear_route_cache(responses: &[ProcessingResponse]) -> bool {
+    responses.iter().any(|r| match &r.response {
+        Some(RespVariant::RequestHeaders(h)) => h.response.as_ref().is_some_and(|c| c.clear_route_cache),
+        Some(RespVariant::RequestBody(b)) => b.response.as_ref().is_some_and(|c| c.clear_route_cache),
+        _ => false,
+    })
 }

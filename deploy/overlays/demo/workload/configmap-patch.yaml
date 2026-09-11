@@ -15,6 +15,9 @@ data:
       - name: integration-test
         filters:
           - filter: request_id
+          # Required for BBR: extracts model from JSON body into X-AI-Model header
+          - filter: model_to_header
+            header: X-AI-Model
           - filter: headers
             request_add:
               - name: X-Processed-By
@@ -22,6 +25,32 @@ data:
             response_set:
               - name: X-Praxis
                 value: "true"
+
+    # MaaS Body-Based Routing configuration
+    # Requires model_to_header filter above to extract model name
+    maas:
+      bbr:
+        enabled: true
+        models:
+          # Map model names to their providers
+          - model: gpt-4
+            provider:
+              authority: openai-backend.praxis-test.svc.cluster.local
+              path_prefix: /v1
+          - model: gpt-3.5-turbo
+            provider:
+              authority: openai-backend.praxis-test.svc.cluster.local
+              path_prefix: /v1
+          - model: echo
+            provider:
+              authority: echo.praxis-test.svc.cluster.local:8080
+              path_prefix: /
+        # Trust boundary: strip these prefixes from incoming requests
+        trust_boundary:
+          strip_prefixes:
+            - x-maas-
+            - x-provider-
+          strip_authorization: true
 
     insecure_options:
       allow_unbounded_body: true
