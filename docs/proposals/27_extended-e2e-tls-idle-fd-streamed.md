@@ -5,6 +5,8 @@ status: proposed
 authors:
   - henschwartz
 graduation_criteria:
+  - Implementation PRs linked from How? land under
+    [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27)
   - How? section added after the What? and Why? direction is accepted
   - Open questions closed in Decisions before How? (long-running test tier
     mechanism, chained ext-proc scope for 3.6)
@@ -25,12 +27,15 @@ graduation_criteria:
     is required (CA-chain verification alone is insufficient); each run
     records the effective validation mode; TLS-only runs do not count toward
     production qualification unless explicitly documented as an exception
-  - FULL_DUPLEX_STREAMED single ext-proc scenarios assert first-chunk
-    delivery before upstream EOS, multiple client chunks, final completion,
-    and request-body integrity via an independent oracle across empty,
-    single-chunk, multi-chunk, exactly-10-MiB, and above-cap inputs;
-    expected behavior when the documented buffer cap is exceeded must be
-    defined
+  - >-
+    On the default MaaS two-hop ext-proc path (pre-IPP → post-IPP), with both
+    hops in FULL_DUPLEX_STREAMED request mode, scenarios assert first-chunk
+    delivery before upstream EOS, multiple client chunks, final completion, and
+    per-hop request-body integrity via independent header oracles across empty,
+    single-chunk, multi-chunk, exactly-10-MiB, and above-cap inputs; above-cap
+    rejection applies to FULL_DUPLEX_STREAMED accumulation only (10 MiB
+    `MAX_BODY_ACCUMULATION` cap in `src/server.rs`); qualification fails when
+    any FULL_DUPLEX_STREAMED scenario did not execute on that two-hop profile
   - Stale-idle scenarios establish a connection before the idle window,
     disable retries for the assertion, record connection reuse, send exactly
     one post-idle request per cycle, and sweep idle / pool / keepalive
@@ -38,20 +43,16 @@ graduation_criteria:
     in Decisions (reproduce on reused connection or documented clean matrix;
     root-cause proof not required for v1)
   - >-
-    Single-hop qualification targets FULL_DUPLEX_STREAMED (STREAMED as an
-    optional fallback); BUFFERED request + FULL_DUPLEX_STREAMED response is
-    documented as a fallback/regression scenario only, not a v1 production
-    mitigation path
-  - Chained FULL_DUPLEX_STREAMED body-integrity scenarios run when the
-    declared production topology requires chaining; each run publishes
-    `chain=executed` or `chain=deferred` with a reason; qualification fails
-    when chaining is required but the chained scenario did not execute
-  - Mode comparison across BUFFERED, STREAMED, and FULL_DUPLEX_STREAMED
-    request/response combinations documents regression signal for qualification
+    Production-shaped qualification targets FULL_DUPLEX_STREAMED only
+    (BUFFERED / STREAMED mode sweeps are out of this tier's initial scope)
+  - >-
+    Chained ext-proc body-integrity scenarios publish `chain=executed` on the
+    default `maas_two_hop_fd_streamed` profile; `chain=deferred` is allowed only
+    for explicitly documented non-MaaS profiles, not the default pass bar
   - >-
     Each qualification run publishes machine-readable metadata — Envoy,
     Istio, and Praxis versions or image digests; effective TLS and
-    certificate-validation configuration; mode matrix; idle thresholds; retry
+    certificate-validation configuration; ext_proc_modes; idle thresholds; retry
     policy; and connection-pool settings
 stakeholders:
   - crstrn13
@@ -116,46 +117,35 @@ scheduled/nightly job) scenarios that cover at least:
   cycle across idle durations and Envoy upstream connection-pool /
   keepalive settings to characterize failure thresholds.
 
-**`FULL_DUPLEX_STREAMED` (single ext-proc)**
+**`FULL_DUPLEX_STREAMED` (production path)**
 
 - Use a **delayed multi-chunk upstream**. Assert **first-chunk delivery
   before upstream EOS**, observe multiple client chunks, and assert final
-  completion through one ext-proc in full-duplex streamed mode (not merely
+  completion through ext-proc in **FULL_DUPLEX_STREAMED** mode (not merely
   eventual delivery after buffering).
-- Validate **request-body integrity** through a single full-duplex hop
+- Validate **request-body integrity** through the **two-hop** ext-proc chain
   using an **independent oracle**: the client generates known **length and
-  SHA-256** values; compare them at the processor boundary and against an
-  upstream echo or recorded backend payload. Cover **empty**, **single-
+  SHA-256** values; compare them at **each processor boundary** and against
+  an upstream echo or recorded backend payload. Cover **empty**, **single-
   chunk**, **multi-chunk**, **exactly 10 MiB** (per
   [architecture.md](../architecture.md) body cap), and **above-cap**
-  inputs; define expected behavior when the documented 10 MiB buffer cap
-  is exceeded.
+  inputs. Above-cap rejection applies to **FULL_DUPLEX_STREAMED**
+  accumulation via `check_body_limit` in `src/server.rs`.
 
-**Chained ext-proc (declared topology)**
+**Chained ext-proc (MaaS-style two-hop — default for this tier)**
 
-- Maintain an explicit **topology fixture or inventory** (single-hop vs
-  chained ext-proc, mode matrix). Each qualification run must publish
-  `chain=executed` or `chain=deferred` with a reason.
-- When the **declared production topology requires chaining**, exercise
-  request-body integrity through the chain under conditions that reproduce
+- Declared production topology for MaaS-style qualification is **two ext-proc
+  hops**: **pre-IPP ext-proc → (Kuadrant/WASM — out of ext-proc scope) →
+  post-IPP ext-proc**. This tier **always** exercises that dual-hop path; it
+  does not default to single-hop with `chain=deferred`.
+- Maintain an explicit **topology fixture or inventory** recording hop count,
+  TLS mode, and idle matrix. Each qualification run must publish
+  `chain=executed` or document deferral with reason.
+- Exercise request-body integrity through the chain under conditions that
+  reproduce
   [envoyproxy/envoy#44605](https://github.com/envoyproxy/envoy/issues/44605),
   comparing the client oracle digest at **every hop**. Qualification
-  **fails** when chaining is required but the chained scenario did not
-  execute.
-
-**Body-mode qualification (v1 migration target)**
-
-- Qualify **single-hop** `FULL_DUPLEX_STREAMED` as the primary mode aligned
-  with Go IPP → Rust migration; **`STREAMED`** may be exercised as an
-  optional fallback where needed.
-- Document **BUFFERED** request + **FULL_DUPLEX_STREAMED** response as a
-  **fallback / regression** scenario (for example chained-topology
-  workarounds discussed in
-  [praxis-proxy/ai#459](https://github.com/praxis-proxy/ai/issues/459)),
-  not a recommended production inference path — Envoy buffer limits make
-  full request buffering a poor fit for large streaming workloads.
-- Compare BUFFERED, STREAMED, and FULL_DUPLEX_STREAMED combinations on
-  request and response paths for **regression signal** only.
+  **fails** when the chained scenario did not execute.
 
 ### Test tier
 
@@ -199,18 +189,12 @@ and connection-pool settings.
   (CA-chain verification alone is insufficient); record effective validation
   mode per run; exclude TLS-only qualification unless documented as an
   exception
-- Qualify **single-hop** `FULL_DUPLEX_STREAMED` (with **STREAMED** as an
-  optional fallback) using pre-EOS streaming evidence and **independent**
-  request-body integrity (client length + SHA-256 oracle at processor and
-  upstream boundaries)
-- Exercise **chained** full-duplex streamed ext-proc body integrity when
-  the declared topology requires it; publish `chain=executed` or
-  `chain=deferred` with reason; fail qualification when chaining is
-  required but not executed
-- Document **BUFFERED** request + **FULL_DUPLEX_STREAMED** response as a
-  **fallback / regression** path only (not v1 production mitigation)
-- Compare **BUFFERED**, **STREAMED**, and **FULL_DUPLEX_STREAMED**
-  request/response combinations for regression and qualification evidence
+- Qualify **FULL_DUPLEX_STREAMED** on the default **MaaS two-hop** path using
+  pre-EOS streaming evidence and **per-hop** request-body integrity (client
+  digest vs `x-qualification-request-sha256-hop-<N>` and upstream echo); fail
+  qualification when any scenario did not run on that profile
+- Publish **`chain=executed`** metadata for the default profile; non-MaaS
+  profiles may document `chain=deferred` with reason — not the default pass bar
 - Publish **machine-readable run metadata** so passes are reproducible after
   upgrades
 - Produce results maintainers can use for release qualification and for
@@ -241,14 +225,8 @@ and connection-pool settings.
 
 ### Open Questions
 
-1. **Long-running tier wiring.** Feature flag vs `#[ignore]` vs separate
-   crate vs dedicated GitHub Actions workflow — what is the default
-   developer and nightly operator experience? (Named command, timeout, and
-   artifact retention are required regardless of mechanism.)
-2. **3.6 chained ext-proc scope.** Will production chain two or more
-   ext-proc filters in `FULL_DUPLEX_STREAMED` mode? This sets the default
-   `chain=executed` vs `chain=deferred` expectation in the topology
-   fixture.
+Resolved in **Decisions** (long-running tier wiring, 3.6 chained scope).
+No remaining open questions block implementation.
 
 ### Decisions
 
@@ -276,14 +254,11 @@ undefined “first request succeeds” check that retries or fresh connections
 can satisfy.
 
 **Ext-proc body modes (v1).** Go IPP → Rust migration targets
-**`FULL_DUPLEX_STREAMED`** as the primary qualification mode; **`STREAMED`**
-is an optional fallback. **BUFFERED** request + **FULL_DUPLEX_STREAMED**
-response is a **documented fallback / regression** scenario (for example when
-chained full-duplex exposes
-[envoyproxy/envoy#44605](https://github.com/envoyproxy/envoy/issues/44605)),
-not a v1 production mitigation — buffer limits make full request buffering
-unsuitable for all inference workloads
-([praxis-proxy/ai#459](https://github.com/praxis-proxy/ai/issues/459)).
+**`FULL_DUPLEX_STREAMED`** only for this extended tier. **BUFFERED** and
+**STREAMED** mode comparison matrices are **out of initial scope** — they
+remain covered by baseline
+[#21](https://github.com/opendatahub-io/praxis-extproc/issues/21) fast tests
+where applicable, not this long-running tier.
 
 **Repository placement.** Scenario definitions, topology fixtures, and the
 [#21](https://github.com/opendatahub-io/praxis-extproc/issues/21) harness
@@ -298,6 +273,30 @@ CI. It **does** gate **release qualification**: maintainers run it manually or
 via a release pipeline before tagging. Failures **block** release unless
 explicitly waived with a recorded reason and owner approval. How? wires the
 exact workflow hook; this decision locks the release contract.
+
+**Long-running tier wiring.** Extend the existing Forge **k8s-e2e** harness
+([#21](https://github.com/opendatahub-io/praxis-extproc/issues/21)) — do **not**
+introduce a parallel qualification framework. Extended scenarios live beside
+baseline k8s-e2e tests under `tests/k8s_e2e/extended/`, marked **`#[ignore]`**
+and selected with the **`k8s_e2e::extended`** module filter so default
+`cargo test` and PR CI stay fast. The named operator entry points are
+**`make e2e-setup-extended`** (baseline `make e2e-setup` plus
+`deploy/overlays/e2e-extended/`) and **`make test-e2e-extended`** (wrapper
+around `cargo test --features k8s-e2e -- k8s_e2e::extended --ignored`). Deploy
+artifacts for this tier live under **`deploy/overlays/e2e-extended/`** (a thin
+overlay on top of **`deploy/overlays/e2e/`**, which baseline #21 CI already
+uses). Extend **`.github/workflows/ci-k8s-e2e.yaml`** with a
+**`workflow_dispatch`** job for the extended tier; do **not** add a separate
+`qualification.yaml` workflow.
+
+**3.6 chained ext-proc scope (v1 default).** MaaS-style production topology
+for this tier is **two ext-proc hops** — **pre-IPP ext-proc → post-IPP
+ext-proc** (Kuadrant/WASM between them is out of ext-proc test scope). v1
+qualification **always** runs the chained-body-integrity scenario on that path
+with both hops in **`FULL_DUPLEX_STREAMED`** request mode. Qualification
+**fails** when the chained scenario did not execute. Topology inventory
+records hop count and ext-proc Deployment names; `chain=deferred` is allowed
+only for explicitly documented non-MaaS profiles, not the default pass bar.
 
 ## Why?
 
@@ -329,13 +328,11 @@ streamed mode is attractive for latency, but a test that only checks
 eventual delivery cannot distinguish true streaming from buffering until
 EOS. Envoy also has a known defect when **multiple** ext-proc filters use
 full-duplex streamed mode on the request path — bodies can vanish silently.
-Even if 3.6 uses a single Praxis ext-proc, teams need evidence that
-single-hop **FULL_DUPLEX_STREAMED** is safe (pre-EOS chunks, independent
-body oracle). **BUFFERED**-request / streamed-response combinations may be
-documented as a **fallback** for chained-topology regression, but are not
-the v1 production target given buffer limits. Chained tests with an explicit
-topology declaration protect against topology drift and prevent qualification
-gaps when a second ext-proc is added later.
+Even if 3.6 uses a single Praxis ext-proc in some deployments, teams need
+evidence that **FULL_DUPLEX_STREAMED** is safe on the **MaaS two-hop path**
+(pre-EOS chunks, independent body oracle at each hop). Chained tests with an
+explicit topology declaration protect against topology drift and prevent
+qualification gaps when platform wiring adds a second ext-proc hop.
 
 Baseline
 [#21](https://github.com/opendatahub-io/praxis-extproc/issues/21) tests must
@@ -360,12 +357,290 @@ they are not separate tracked issues.
   an explicit topology declaration (`chain=executed` / `chain=deferred`)
   so that Envoy body-loss behavior is visible before we compose multiple
   processors.
-- As an operator, I want **FULL_DUPLEX_STREAMED** qualification evidence
-  (with documented **BUFFERED**-request fallback scenarios where needed)
-  so that streaming inference configs are evidence-based without assuming
-  full request buffering for every workload.
+- As an operator, I want **FULL_DUPLEX_STREAMED** qualification evidence on
+  the MaaS two-hop ext-proc path so that streaming inference configs are
+  evidence-based without assuming full request buffering for every workload.
 - As a release owner, I want these scenarios outside default CI but required
   for release qualification (manual or pipeline), with named invocation,
   timeouts, retained machine-readable results, and an owner, so that
   qualification runs are repeatable, accountable, and gate tagging when they
   fail
+
+## How?
+
+### Implementation
+
+Ship as implementation work under
+[#27](https://github.com/opendatahub-io/praxis-extproc/issues/27) in
+tranches after this How? is accepted:
+
+1. **Harness extension** — `make test-e2e-extended`, `deploy/overlays/e2e-extended/`
+   overlay, topology inventory, metadata reporter, `workflow_dispatch` job on
+   `ci-k8s-e2e.yaml`.
+2. **FD_STREAMED + body oracle** — `e2e_body_oracle` helper (feature-gated),
+   streaming oracle, body-size matrix on the two-hop chain.
+3. **Idle / TLS** — connection-reuse evidence, cert validation matrix,
+   parameterized idle / pool / keepalive sweep (same cluster as baseline e2e).
+4. **Chained body integrity** — default MaaS two-hop profile (pre-IPP →
+   post-IPP); header-based per-hop verification.
+
+No production ExtProc protocol changes beyond what
+[#3](https://github.com/opendatahub-io/praxis-extproc/issues/3) already
+provides for TLS/mTLS.
+
+### Requirements
+
+- Extend the [#21](https://github.com/opendatahub-io/praxis-extproc/issues/21)
+  Forge k8s-e2e harness (`make e2e-setup`, `make e2e-setup-extended`,
+  `make e2e-test`, `make test-e2e-extended`, existing `deploy/overlays/e2e/`,
+  `deploy/overlays/e2e-extended/`, `.github/workflows/ci-k8s-e2e.yaml`) — do
+  **not** fork a second cluster bootstrap or parallel qualification stack.
+- Named invocation: **`make e2e-setup-extended`** then **`make test-e2e-extended`**
+  (wrapper around `cargo test --features k8s-e2e -- k8s_e2e::extended --ignored`;
+  documented in `docs/development.md` and `make help`).
+- Hard job timeout: **120 minutes** per extended-tier workflow run. Per-cell
+  idle waits come from `idle_matrix[].idle_secs`; when a cell omits
+  `idle_secs`, use **`QUALIFICATION_IDLE_SECS`** (default **300**).
+- Retained artifacts: **`target/e2e-extended/report.json`** plus JUnit XML
+  under **`target/e2e-extended/junit/`** uploaded from the release workflow.
+- Assigned failure owner: **release qualification maintainers** (initially
+  proposal authors; recorded in workflow README).
+- Every run publishes **`chain=executed`** or **`chain=deferred`** with reason,
+  topology profile name, and the metadata block from What? (versions, TLS mode,
+  ext_proc_modes, idle/pool/keepalive/retry settings).
+- Idle scenarios: establish connection, **disable client and Envoy retries**,
+  record reuse evidence via Envoy access-log `%CONNECTION_ID%` /
+  `%UPSTREAM_CONNECTION_ID%` (see **Idle / TLS scenarios**), **one**
+  post-idle request, evaluate against the idle-timeout success bar in Decisions.
+- Chained scenarios: verify each ext-proc hop via response headers
+  `x-qualification-request-sha256-hop-<N>` — not pod log scraping.
+- FD_STREAMED scenarios (`tests/k8s_e2e/extended/fd_streamed.rs`,
+  `tests/k8s_e2e/extended/chained.rs`): run only on profile
+  **`maas_two_hop_fd_streamed`**; delayed multi-chunk upstream; assert **first
+  client chunk before upstream EOS**; compare client digest to **each** hop
+  header `x-qualification-request-sha256-hop-<N>` and upstream echo.
+- Body-size matrix on that two-hop profile: **empty**, **single-chunk**,
+  **multi-chunk**, **exactly 10 MiB** (`10_485_760` bytes per
+  `MAX_BODY_ACCUMULATION` in `src/server.rs`), and **above-cap** input on
+  **FULL_DUPLEX_STREAMED**.
+- Above-cap contract (**FULL_DUPLEX_STREAMED only**): expect **request
+  rejection** (gRPC `ResourceExhausted` / `body exceeds maximum size` from
+  `check_body_limit`) — not silent truncation — matching today's 10 MiB
+  `MAX_BODY_ACCUMULATION` cap in `src/server.rs`.
+- TLS matrix: valid handshake; Envoy rejects untrusted / expired / wrong-SAN
+  server certs; Praxis rejects untrusted / expired / missing client certs when
+  mTLS is enabled; **client SAN/hostname validation required**; record effective
+  validation mode in `report.json`.
+
+### Design
+
+#### Repository layout
+
+```text
+tests/k8s_e2e/
+  mod.rs                        # re-exports baseline + extended modules
+  extended/                     # long-running tier (#[ignore]; k8s_e2e::extended filter)
+    mod.rs                        # shared helpers: gateway URL, oracle, metadata
+    idle_tls.rs                   # stale-idle + TLS/mTLS matrix
+    fd_streamed.rs                # FULL_DUPLEX_STREAMED streaming (two-hop profile)
+    chained.rs                    # per-hop body integrity on MaaS chain (default profile)
+deploy/overlays/e2e/            # baseline #21 overlay (existing Forge harness)
+deploy/overlays/e2e-extended/   # supplemental overlay for this tier (on top of e2e/)
+  topology/                     # inventory YAML (profiles, hop count, idle matrix)
+  body-oracle.yaml              # e2e_body_oracle filter chain (feature image)
+  access-log-reuse.yaml         # Envoy access log for connection-reuse evidence
+  envoyfilter-*.yaml            # per-scenario patches (FD mode, TLS, two-hop chain)
+  tls/                          # generated or checked-in test CA / leaf / client certs
+src/e2e/                        # compiled only with --features k8s-e2e (extended helpers)
+  body_oracle.rs                # hashes request body; sets response header (see below)
+hack/e2e-extended-report.sh     # merge cargo junit + env versions → report.json
+.github/workflows/ci-k8s-e2e.yaml  # add workflow_dispatch extended-tier job
+Makefile                        # e2e-setup-extended + test-e2e-extended targets
+docs/development.md             # operator runbook beside existing e2e-setup / e2e-test
+```
+
+Baseline fast k8s-e2e tests remain in the existing integration / k8s-e2e module
+without the `extended` filter.
+
+#### Topology inventory
+
+YAML profile under `deploy/overlays/e2e-extended/topology/` (example fields):
+
+| Field | Purpose |
+| --- | --- |
+| `name` | Profile id recorded in `report.json` |
+| `ext_proc_hops` | Number of ext-proc filters in the chain (default **2** for MaaS) |
+| `ext_proc_modes` | Request/response `BodySendMode` pairs — **`FULL_DUPLEX_STREAMED`** only in v1 |
+| `tls` | `plaintext`, `tls`, or `mtls` between Envoy and praxis-extproc |
+| `idle_matrix` | List of `{ idle_secs, pool_settings_ref }` cells to sweep |
+
+Default profile for v1: `maas_two_hop_fd_streamed` with `ext_proc_hops: 2` →
+`chain=executed`.
+
+#### Tier invocation
+
+```bash
+# Local (Forge k8s-e2e cluster + extended overlay on baseline e2e/)
+make e2e-setup-extended
+make test-e2e-extended
+
+# Equivalent
+make e2e-setup
+kubectl apply -k deploy/overlays/e2e-extended/
+cargo test --features k8s-e2e -- k8s_e2e::extended --ignored
+```
+
+Environment knobs (documented defaults):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUALIFICATION_IDLE_SECS` | `300` | Default `idle_secs` when a matrix cell omits the field |
+| `E2E_EXTENDED_PROFILE` | `maas_two_hop_fd_streamed` | Topology inventory selection |
+| `GATEWAY_URL` | `http://localhost:18080` | Same as [#21](https://github.com/opendatahub-io/praxis-extproc/issues/21) k8s-e2e tests |
+
+#### Idle / TLS scenarios
+
+1. Warm up: send a request on a **reused HTTP/2 connection** (client pool max
+   idle connections = 1). **Connection reuse evidence** uses Envoy **access
+   logs**, not admin `/stats` polling: apply
+   `deploy/overlays/e2e-extended/access-log-reuse.yaml` on the gateway so each
+   request line includes `%CONNECTION_ID%` and `%UPSTREAM_CONNECTION_ID%`.
+   `tests/k8s_e2e/extended/idle_tls.rs` reads these fields from the warm-up
+   access-log line and asserts the post-idle request reuses the same
+   downstream `%CONNECTION_ID%` (and the same upstream
+   `%UPSTREAM_CONNECTION_ID%` when the profile routes through ext-proc).
+   This is deterministic per request without stats scrape timing or
+   ambiguous counter deltas under idle-timeout boundary conditions.
+2. Configure Envoy **upstream connection pool** and **keepalive** from the
+   active profile overlay; set **route retry policy to zero** and use a client
+   with retries disabled.
+3. Sleep the active cell's `idle_secs` (or `QUALIFICATION_IDLE_SECS` when
+   the cell omits `idle_secs`).
+4. Send **exactly one** POST/chat-style request on the same connection; capture
+   success/failure and reuse evidence.
+5. Repeat for each idle-matrix cell; classify pass/fail per Decisions (reproduce
+   on reused connection **or** documented clean matrix).
+
+TLS overlays swap `deploy/overlays/e2e-extended/envoyfilter-tls-*.yaml` and
+praxis-extproc TLS config from [#3](https://github.com/opendatahub-io/praxis-extproc/issues/3).
+Negative cases mount wrong/expired certs via separate overlay files under
+`deploy/overlays/e2e-extended/`; each run records `tls_validation_mode` in
+metadata.
+
+#### FULL_DUPLEX_STREAMED (MaaS two-hop — default profile)
+
+All scenarios in `tests/k8s_e2e/extended/fd_streamed.rs` and
+`tests/k8s_e2e/extended/chained.rs` run against profile
+**`maas_two_hop_fd_streamed`** (`ext_proc_hops: 2`, `chain=executed`). They
+do **not** qualify single-hop FULL_DUPLEX_STREAMED in this tier.
+
+- Apply **`deploy/overlays/e2e-extended/`** on top of **`deploy/overlays/e2e/`**
+  so baseline Gateway/Route remain shared with [#21](https://github.com/opendatahub-io/praxis-extproc/issues/21).
+- Deploy profile with `request_body_mode` and `response_body_mode` set to
+  **`FULL_DUPLEX_STREAMED`** (Envoy enum value `4`) on **both** ext-proc hops.
+- Upstream: **delayed multi-chunk** echo service (extended echo Deployment in
+  `deploy/overlays/e2e-extended/` or patched echo command) emitting at least two
+  response chunks with a configurable delay between them.
+- Client asserts: first chunk received **before** upstream signals EOS; multiple
+  chunks observed; final body complete.
+- Body oracle (three-way compare):
+  1. **Client** generates payload with known length + SHA-256.
+  2. **Processor boundary** — extended deploy enables
+     `deploy/overlays/e2e-extended/body-oracle.yaml`, which activates the
+     **`e2e_body_oracle`** helper (`src/e2e/body_oracle.rs`, compiled only with
+     `--features k8s-e2e`). After request-body EOS the filter hashes the
+     accumulated body and sets response header **`x-qualification-request-sha256`**
+     (lowercase hex). In the two-hop chain, hop *N* sets
+     **`x-qualification-request-sha256-hop-<N>`** and forwards prior hop headers
+     unchanged. The test reads these headers from the gateway response.
+  3. **Upstream echo** — echo Deployment returns the request body; the test
+     hashes the response body and compares to the client digest.
+  Any mismatch fails the scenario.
+
+#### Chained ext-proc (MaaS two-hop — default)
+
+Apply an EnvoyFilter overlay under `deploy/overlays/e2e-extended/` that
+inserts **two** `ext_proc` filters in **`FULL_DUPLEX_STREAMED`** request mode
+(pre-IPP and post-IPP Deployments), reproducing
+[envoyproxy/envoy#44605](https://github.com/envoyproxy/envoy/issues/44605)
+conditions. Enable `body-oracle.yaml` on **each** ext-proc Deployment.
+
+**Per-hop verification (header-based).** Each hop exposes its digest on
+`x-qualification-request-sha256-hop-<N>` in the gateway response. The test
+compares the client digest to **every** hop header. Structured logs
+(`qualification_body_digest` at DEBUG) are optional diagnostics only —
+qualification **pass/fail does not depend** on pod log scraping.
+
+Publish `chain=executed` for the default `maas_two_hop_fd_streamed` profile.
+Non-MaaS profiles may document `chain=deferred` with reason — not the default
+pass bar.
+
+#### Run metadata (`report.json`)
+
+Written at end of `make test-e2e-extended` (via `hack/e2e-extended-report.sh`):
+
+```json
+{
+  "profile": "maas_two_hop_fd_streamed",
+  "chain": "executed",
+  "chain_reason": "maas pre-ipp and post-ipp ext-proc hops",
+  "ext_proc_hops": 2,
+  "envoy_version": "...",
+  "istio_version": "...",
+  "praxis_extproc_image_digest": "...",
+  "tls_validation_mode": "mtls_client_san",
+  "ext_proc_modes": { "request": "FULL_DUPLEX_STREAMED", "response": "FULL_DUPLEX_STREAMED" },
+  "idle_matrix_results": [],
+  "started_at": "...",
+  "finished_at": "...",
+  "outcome": "pass"
+}
+```
+
+#### Release qualification workflow
+
+Extend **`.github/workflows/ci-k8s-e2e.yaml`**:
+
+- Add a **`workflow_dispatch`** job (and optional nightly cron) for the extended
+  tier — **not** a separate `qualification.yaml`.
+- Steps: `make e2e-setup-extended` → build/load image →
+  `make test-e2e-extended` → upload `target/e2e-extended/**` artifacts.
+- Job `timeout-minutes: 120`.
+- Failures block release unless waived per Decisions (manual issue comment with
+  owner approval).
+
+Default PR CI **unchanged** — baseline k8s-e2e only; extended tests stay
+`#[ignore]` / filtered out of the fast path.
+
+### Key files (planned)
+
+| Area | Files |
+| --- | --- |
+| Makefile + docs | `Makefile` (`e2e-setup-extended`, `test-e2e-extended`), `docs/development.md` |
+| Extended k8s-e2e tests | `tests/k8s_e2e/extended/*.rs` |
+| Body oracle helper | `src/e2e/body_oracle.rs`, `deploy/overlays/e2e-extended/body-oracle.yaml` |
+| Connection reuse logging | `deploy/overlays/e2e-extended/access-log-reuse.yaml` |
+| Deploy overlays | `deploy/overlays/e2e/` (baseline), `deploy/overlays/e2e-extended/**` |
+| Reporting | `hack/e2e-extended-report.sh`, `target/e2e-extended/report.json` |
+| Release hook | `.github/workflows/ci-k8s-e2e.yaml` (extended job) |
+| Baseline harness (reuse) | Forge `make e2e-setup` / `make e2e-test`, existing k8s-e2e tests |
+
+### Test plan
+
+- Unit-level helpers for SHA-256 oracle and report JSON schema (Rust tests, no
+  cluster).
+- Qualification integration (ignored, `k8s_e2e::extended` filter): each scenario
+  file above with `V=1` logs.
+- Release workflow dry-run on fork before first tag gate.
+- Document local run in `docs/development.md` beside existing `e2e-setup` /
+  `e2e-test`.
+
+### Explicitly out of this How (see Non-Goals)
+
+- Fixing [envoyproxy/envoy#44605](https://github.com/envoyproxy/envoy/issues/44605)
+  in Envoy or praxis-extproc production code.
+- Moving harnesses to
+  [opendatahub-io/opendatahub-tests](https://github.com/opendatahub-io/opendatahub-tests).
+- Multi-hour longevity or 1000-stream concurrency in default qualification
+  (manual spike scripts only).
+- New ExtProc protocol features beyond [#3](https://github.com/opendatahub-io/praxis-extproc/issues/3).
