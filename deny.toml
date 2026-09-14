@@ -20,6 +20,7 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    "MIT-0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Unlicense",
@@ -38,5 +39,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/praxis-proxy/ai",
-    "https://github.com/praxis-proxy/praxis",
 ]
