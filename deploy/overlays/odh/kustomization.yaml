@@ -11,6 +11,7 @@ resources:
   - envoy-filter.yaml
   - rbac
   - networking
+  - monitoring
 
 images:
   - name: praxis-extproc
