@@ -72,6 +72,11 @@ pub struct ServerConfig {
     /// TLS configuration.
     #[serde(default)]
     pub tls: crate::tls::TlsConfig,
+
+    /// Kubernetes `TokenReview` + `SubjectAccessReview` authentication
+    /// for the metrics endpoint.
+    #[serde(default)]
+    pub metrics_auth: MetricsAuthConfig,
 }
 
 impl Default for ServerConfig {
@@ -81,7 +86,47 @@ impl Default for ServerConfig {
             health_address: "0.0.0.0:50052".to_owned(),
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
+            metrics_auth: MetricsAuthConfig::default(),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// MetricsAuthConfig
+// -----------------------------------------------------------------------------
+
+/// Kubernetes-native authentication for the Prometheus metrics endpoint.
+///
+/// When enabled, the metrics server validates incoming
+/// `Authorization: Bearer <token>` headers via the Kubernetes
+/// `TokenReview` and `SubjectAccessReview` APIs. The bearer token
+/// is expected to be a Kubernetes `ServiceAccount` token; the API
+/// server verifies its validity (`TokenReview`) and checks that the
+/// caller has `GET /metrics` permission (`SubjectAccessReview`).
+///
+/// Health probes (`/healthz`) remain unauthenticated so Kubernetes
+/// liveness checks continue to work.
+///
+/// Enabled by default. Disable with `enabled: false` for local
+/// development outside a Kubernetes cluster.
+///
+/// ```
+/// use praxis_extproc::config::MetricsAuthConfig;
+///
+/// let cfg = MetricsAuthConfig::default();
+/// assert!(cfg.enabled);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetricsAuthConfig {
+    /// Enable Kubernetes `TokenReview` + `SubjectAccessReview`
+    /// authentication on `/metrics`.
+    pub enabled: bool,
+}
+
+impl Default for MetricsAuthConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -317,5 +362,71 @@ bogus_key: true
         );
 
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // MetricsAuthConfig
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn metrics_auth_defaults_to_enabled() {
+        let cfg = MetricsAuthConfig::default();
+
+        assert!(cfg.enabled, "auth should be enabled by default");
+    }
+
+    #[test]
+    fn parse_metrics_auth_enabled_from_yaml() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  metrics_auth:
+    enabled: true
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.server.metrics_auth.enabled, "enabled should be true");
+    }
+
+    #[test]
+    fn parse_metrics_auth_disabled_from_yaml() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  metrics_auth:
+    enabled: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.server.metrics_auth.enabled, "enabled should be false");
+    }
+
+    #[test]
+    fn parse_config_without_metrics_auth_defaults_to_enabled() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  grpc_address: "0.0.0.0:9004"
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.server.metrics_auth.enabled, "auth should default to enabled");
+    }
+
+    #[test]
+    fn metrics_auth_rejects_unknown_fields() {
+        let result: std::result::Result<ExtProcConfig, _> = serde_yaml::from_str(
+            r#"
+server:
+  metrics_auth:
+    enabled: true
+    bogus_field: true
+"#,
+        );
+
+        assert!(result.is_err(), "unknown fields in metrics_auth should be rejected");
     }
 }

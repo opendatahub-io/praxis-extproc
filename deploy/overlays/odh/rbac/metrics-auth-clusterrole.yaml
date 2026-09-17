@@ -1,0 +1,27 @@
+# Allows the payload-processing ServiceAccount to validate incoming
+# bearer tokens via TokenReview and check caller permissions via
+# SubjectAccessReview. Required when metrics_auth is enabled.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payload-processing-metrics-auth
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: payload-processing-metrics-auth
+subjects:
+  - kind: ServiceAccount
+    name: payload-processing
+    namespace: openshift-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: payload-processing-metrics-auth
