@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# OpenShift overlay: same workload + test resources as the `demo`
+# overlay, but the container image is pulled from the cluster's
+# internal image registry instead of a KIND-side-loaded local tag.
+#
+# The in-cluster registry service DNS
+# (image-registry.openshift-image-registry.svc:5000) is identical on
+# every OpenShift cluster, so this address is portable. Push the image
+# to the `praxis-extproc` namespace first (see getting-started.md).
+#
+# Prerequisite: an Istio-based Service Mesh providing the `istio`
+# GatewayClass and the EnvoyFilter CRD (e.g. OpenShift Service Mesh 3).
+
+resources:
+  - ../demo
+
+images:
+  - name: praxis-extproc
+    newName: image-registry.openshift-image-registry.svc:5000/praxis-extproc/praxis-extproc
+    newTag: dev
