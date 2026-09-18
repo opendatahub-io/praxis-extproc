@@ -23,7 +23,7 @@ use praxis_proto::envoy::service::{
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     adapter, metrics,
@@ -718,10 +718,7 @@ async fn run_request_pipeline(
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
 
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    state.filter_state = mem::take(&mut ctx.filter_state);
+    state.carried.carry_out(&mut ctx);
 
     // Emit the authoritative buffer even when empty: a filter that cleared the
     // body must produce an explicit empty body AND content-length: 0. Collapsing
@@ -764,8 +761,7 @@ async fn run_response_pipeline(
     })?;
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
-    ctx.filter_state = mem::take(&mut state.filter_state);
+    state.carried.carry_in(&mut ctx);
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
 
@@ -950,8 +946,7 @@ async fn process_streamed_body_chunk(
         Status::invalid_argument("request headers not received")
     })?;
     let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
-    ctx.filter_state = mem::take(&mut state.filter_state);
+    state.carried.carry_in(&mut ctx);
     if !is_request {
         let resp = state.response.as_mut().ok_or_else(|| {
             metrics::record_invalid_argument("missing_headers", "response");
@@ -969,10 +964,7 @@ async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    state.filter_state = mem::take(&mut ctx.filter_state);
+    state.carried.carry_out(&mut ctx);
     let (mutation, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
@@ -1060,10 +1052,7 @@ async fn run_request_header_filters_early(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    state.filter_state = mem::take(&mut ctx.filter_state);
+    state.carried.carry_out(&mut ctx);
     let mutation = adapter::collect_request_header_mutations(&ctx);
 
     Ok(delivery.deliver_request(mutation, state))
@@ -1080,8 +1069,7 @@ async fn run_response_header_filters_early(
     };
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
-    state.restore_request_ctx(&mut ctx);
-    ctx.filter_state = mem::take(&mut state.filter_state);
+    state.carried.carry_in(&mut ctx);
 
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
@@ -1096,8 +1084,8 @@ async fn run_response_header_filters_early(
     }
 
     state.header_state.response_filters_executed = true;
-    // Move filter_state back so the response-body phase's fresh ctx still sees it.
-    state.filter_state = mem::take(&mut ctx.filter_state);
+    // Carry state into the body phase.
+    state.carried.carry_out(&mut ctx);
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
     Ok(delivery.deliver_response(mutation, state))
@@ -1231,20 +1219,59 @@ impl HeaderDeliveryState {
     }
 }
 
+/// Cross-phase filter-context state carried between ExtProc phases.
+///
+/// A fresh [`HttpFilterContext`] is built per phase, so these fields cross the
+/// boundary only through [`CarriedState::carry_out`] / [`CarriedState::carry_in`].
+#[derive(Debug, Default)]
+struct CarriedState {
+    /// Branch re-entrance counters.
+    branch_iterations: HashMap<Arc<str>, u32>,
+
+    /// Filter indices executed in earlier phases.
+    executed_filter_indices: Vec<bool>,
+
+    /// Flat string metadata.
+    filter_metadata: HashMap<String, String>,
+
+    /// Typed per-filter state.
+    filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl CarriedState {
+    /// Move cross-phase state out of `ctx` at phase end.
+    fn carry_out(&mut self, ctx: &mut HttpFilterContext<'_>) {
+        self.branch_iterations = mem::take(&mut ctx.branch_iterations);
+        self.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+        self.filter_metadata = mem::take(&mut ctx.filter_metadata);
+        self.filter_state = mem::take(&mut ctx.filter_state);
+        trace!(
+            filter_metadata = self.filter_metadata.len(),
+            filter_state = self.filter_state.len(),
+            "carried cross-phase state out of context"
+        );
+    }
+
+    /// Restore cross-phase state into a freshly built `ctx`. Cloneable maps are
+    /// cloned (kept for later phases); `filter_state` is moved.
+    fn carry_in(&mut self, ctx: &mut HttpFilterContext<'_>) {
+        ctx.branch_iterations.clone_from(&self.branch_iterations);
+        ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
+        ctx.filter_metadata.clone_from(&self.filter_metadata);
+        ctx.filter_state = mem::take(&mut self.filter_state);
+        trace!(
+            filter_metadata = ctx.filter_metadata.len(),
+            filter_state = ctx.filter_state.len(),
+            "restored cross-phase state into context"
+        );
+    }
+}
+
 /// Per-stream state accumulated across ExtProc phases.
 #[derive(Debug, Default)]
 struct StreamState {
-    /// Re-entrance counters from request-phase branch chains.
-    branch_iterations: HashMap<Arc<str>, u32>,
-
-    /// Executed filter indices from request phase.
-    executed_filter_indices: Vec<bool>,
-
-    /// Metadata carried from request to response phase.
-    filter_metadata: HashMap<String, String>,
-
-    /// Typed per-filter state carried from request to response phase.
-    filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+    /// Filter-context state carried across phase boundaries.
+    carried: CarriedState,
 
     /// Converted request from the headers phase.
     request: Option<Request>,
@@ -1284,13 +1311,6 @@ impl StreamState {
             protocol_config: ProtocolConfig::default(),
             ..Default::default()
         }
-    }
-
-    /// Restore filter execution state into a response context.
-    fn restore_request_ctx(&self, ctx: &mut HttpFilterContext<'_>) {
-        ctx.executed_filter_indices.clone_from(&self.executed_filter_indices);
-        ctx.branch_iterations.clone_from(&self.branch_iterations);
-        ctx.filter_metadata.clone_from(&self.filter_metadata);
     }
 }
 
@@ -2003,36 +2023,64 @@ mod tests {
     struct Probe(u64);
     /// Sentinel value carried through `filter_state`.
     const PROBE_VALUE: u64 = 0x00C0_FFEE;
-    /// Value the probe observed in `on_response` (0 if state was lost).
-    static PROBE_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    /// Filter that stores `Probe` on request and reports it back on response.
-    struct ProbeFilter;
-    #[async_trait::async_trait]
-    impl praxis_filter::HttpFilter for ProbeFilter {
-        fn name(&self) -> &'static str {
-            "state_probe"
-        }
+    #[tokio::test]
+    async fn filter_state_survives_request_to_response_phase() {
+        let pipeline = carry_probe_pipeline();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
 
-        async fn on_request(
-            &self,
-            ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            ctx.insert_filter_state(Probe(PROBE_VALUE));
-            Ok(FilterAction::Continue)
-        }
+        // Request phase stores state; it must persist into StreamState.
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert!(
+            state.carried.filter_state.contains_key(&0),
+            "request-phase filter_state must persist into StreamState"
+        );
 
-        async fn on_response(
-            &self,
-            ctx: &mut HttpFilterContext<'_>,
-        ) -> Result<FilterAction, praxis_filter::FilterError> {
-            let observed = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
-            PROBE_OBSERVED.store(observed, std::sync::atomic::Ordering::SeqCst);
-            Ok(FilterAction::Continue)
-        }
+        // Response phase restores state; the probe surfaces what it observed.
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+            .await
+            .unwrap();
+        assert_observed_header(&responses, PROBE_VALUE.to_string().as_str());
     }
-    impl ProbeFilter {
-        /// Registry factory for `state_probe`.
+
+    /// Probe that stashes state on the request side and records what it
+    /// observes on the response side.
+    struct CarryProbe;
+
+    impl CarryProbe {
+        /// Response header surfacing the observed value on the terminal path.
+        const OBSERVED_HEADER: &'static str = "x-carry-observed-state";
+        /// Records whether the response side observed the request metadata.
+        const OBSERVED_META_KEY: &'static str = "carry_probe.observed_meta";
+        /// Records the `filter_state` value the response side observed.
+        const OBSERVED_STATE_KEY: &'static str = "carry_probe.observed_state";
+        /// Breadcrumb the request side leaves for the response side.
+        const REQUEST_KEY: &'static str = "carry_probe.request";
+
+        /// Stash typed state + a metadata breadcrumb on the request side.
+        fn stash(ctx: &mut HttpFilterContext<'_>) {
+            ctx.insert_filter_state(Probe(PROBE_VALUE));
+            ctx.set_metadata(Self::REQUEST_KEY, "seen");
+        }
+
+        /// Record what the response side observed of the carry, into metadata
+        /// and, when response headers are present, as a header.
+        fn observe(ctx: &mut HttpFilterContext<'_>) {
+            let state = ctx.get_filter_state::<Probe>().map_or(0, |p| p.0);
+            let meta = u8::from(ctx.get_metadata(Self::REQUEST_KEY).is_some());
+            ctx.set_metadata(Self::OBSERVED_STATE_KEY, state.to_string());
+            ctx.set_metadata(Self::OBSERVED_META_KEY, meta.to_string());
+            if let Some(resp) = ctx.response_header.as_deref_mut() {
+                resp.headers
+                    .insert(Self::OBSERVED_HEADER, state.to_string().parse().unwrap());
+            }
+        }
+
+        /// Registry factory for `carry_probe`.
         #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
         fn from_config(
             _: &serde_yaml::Value,
@@ -2041,42 +2089,229 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn filter_state_survives_request_to_response_phase() {
-        use std::sync::atomic::Ordering;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for CarryProbe {
+        fn name(&self) -> &'static str {
+            "carry_probe"
+        }
 
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadOnly
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadOnly
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Self::stash(ctx);
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _eos: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Self::stash(ctx);
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Self::observe(ctx);
+            Ok(FilterAction::Continue)
+        }
+
+        fn on_response_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _eos: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Self::observe(ctx);
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    /// Build a single-filter pipeline containing `carry_probe`.
+    fn carry_probe_pipeline() -> Arc<FilterPipeline> {
         use praxis_filter::FilterRegistry;
 
-        PROBE_OBSERVED.store(0, Ordering::SeqCst);
         let cfg: crate::config::ExtProcConfig =
-            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: state_probe\n")
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: carry_probe\n")
                 .unwrap();
         let mut registry = FilterRegistry::with_builtins();
         registry
-            .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
+            .register("carry_probe", praxis_filter::http_builtin(CarryProbe::from_config))
             .unwrap();
-        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// Assert the response side observed both carried maps from the request side.
+    fn assert_carry_observed(state: &StreamState) {
+        assert_eq!(
+            state
+                .carried
+                .filter_metadata
+                .get(CarryProbe::OBSERVED_STATE_KEY)
+                .map(String::as_str),
+            Some(PROBE_VALUE.to_string().as_str()),
+            "response side must observe request-side filter_state carried across the phase boundary"
+        );
+        assert_eq!(
+            state
+                .carried
+                .filter_metadata
+                .get(CarryProbe::OBSERVED_META_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "response side must observe request-side filter_metadata carried across the phase boundary"
+        );
+    }
+
+    /// Assert a response carries the observed-state header with `expected`.
+    fn assert_observed_header(responses: &[ProcessingResponse], expected: &str) {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response;
+
+        let found = responses.iter().any(|r| match &r.response {
+            Some(Response::ResponseHeaders(h)) => h
+                .response
+                .as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .is_some_and(|m| {
+                    m.set_headers
+                        .iter()
+                        .filter_map(|hv| hv.header.as_ref())
+                        .any(|hv| hv.key.eq_ignore_ascii_case(CarryProbe::OBSERVED_HEADER) && hv.value == expected)
+                }),
+            _ => false,
+        });
+        assert!(
+            found,
+            "on_response must observe carried state and surface it as a header"
+        );
+    }
+
+    #[tokio::test]
+    async fn carried_state_survives_streamed_body_phases() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+
+        let pipeline = carry_probe_pipeline();
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
-        // Request phase stores state; it must be moved out into StreamState.
-        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+        // Streamed request chunk stashes state; carry_out must persist it.
+        let req_chunk = HttpBody {
+            body: b"req".to_vec(),
+            end_of_stream: true,
+        };
+        process_streamed_body_chunk(&pipeline, req_chunk, &mut state, true)
             .await
             .unwrap();
         assert!(
-            state.filter_state.contains_key(&0),
-            "request-phase filter_state must persist into StreamState"
+            state.carried.filter_state.contains_key(&0),
+            "streamed request-body filter_state must persist into StreamState"
         );
 
-        // Response phase builds a fresh ctx; state must be moved back in.
+        // Streamed response chunk builds a fresh ctx; carry_in must restore it.
         state.response = Some(adapter::envoy_headers_to_response(&[]));
-        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        let resp_chunk = HttpBody {
+            body: b"resp".to_vec(),
+            end_of_stream: true,
+        };
+        process_streamed_body_chunk(&pipeline, resp_chunk, &mut state, false)
             .await
             .unwrap();
+
+        assert_carry_observed(&state);
+    }
+
+    #[tokio::test]
+    async fn carried_state_survives_early_header_phases() {
+        let pipeline = carry_probe_pipeline();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Early request-header execution stashes state; carry_out must persist it.
+        run_request_header_filters_early(&pipeline, &mut state, MutationDelivery::Send)
+            .await
+            .unwrap();
+        assert!(
+            state.carried.filter_state.contains_key(&0),
+            "early request-header filter_state must persist into StreamState"
+        );
+
+        // Early response-header execution (the buffered external_metering flow) restores it.
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        run_response_header_filters_early(&pipeline, &mut state, MutationDelivery::DeferWithResponse)
+            .await
+            .unwrap();
+
+        assert_carry_observed(&state);
+    }
+
+    /// Completeness guard: every carried field survives a round trip.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "per-field populate/assert is the point of the completeness guard"
+    )]
+    fn carried_state_round_trips_every_field() {
+        let pipeline = carry_probe_pipeline();
+        let request = adapter::envoy_headers_to_request(&[]);
+
+        // Populate every carried field with a distinct sentinel.
+        let mut ctx = adapter::build_filter_context(&pipeline, &request);
+        ctx.branch_iterations.insert(Arc::from("branch-a"), 3);
+        ctx.executed_filter_indices = vec![true, false, true];
+        ctx.filter_metadata.insert("carry.meta".to_owned(), "kept".to_owned());
+        ctx.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+
+        // carry_out must move every field out of the source context.
+        let mut carried = CarriedState::default();
+        carried.carry_out(&mut ctx);
+        assert!(
+            ctx.branch_iterations.is_empty(),
+            "carry_out must drain branch_iterations"
+        );
+        assert!(
+            ctx.executed_filter_indices.is_empty(),
+            "carry_out must drain executed_filter_indices"
+        );
+        assert!(ctx.filter_metadata.is_empty(), "carry_out must drain filter_metadata");
+        assert!(ctx.filter_state.is_empty(), "carry_out must drain filter_state");
+
+        // Enumerate every carried field: a new field on `CarriedState` fails to
+        // compile here until it is asserted.
+        let CarriedState {
+            branch_iterations,
+            executed_filter_indices,
+            filter_metadata,
+            filter_state,
+        } = &carried;
+        assert_eq!(branch_iterations.get("branch-a"), Some(&3));
+        assert_eq!(executed_filter_indices, &vec![true, false, true]);
+        assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
+        assert!(filter_state.contains_key(&7));
+
+        // carry_in must restore every field into a freshly built context.
+        let mut fresh = adapter::build_filter_context(&pipeline, &request);
+        carried.carry_in(&mut fresh);
+        assert_eq!(fresh.branch_iterations.get("branch-a"), Some(&3));
+        assert_eq!(fresh.executed_filter_indices, vec![true, false, true]);
+        assert_eq!(fresh.get_metadata("carry.meta"), Some("kept"));
+        let restored = fresh.filter_state.get(&7).and_then(|any| any.downcast_ref::<Probe>());
         assert_eq!(
-            PROBE_OBSERVED.load(Ordering::SeqCst),
-            PROBE_VALUE,
-            "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
+            restored,
+            Some(&Probe(PROBE_VALUE)),
+            "carry_in must restore filter_state"
         );
     }
 }

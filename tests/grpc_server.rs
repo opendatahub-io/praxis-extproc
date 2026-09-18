@@ -315,6 +315,95 @@ async fn response_body_with_header_mutations() {
     );
 }
 
+/// Under BUFFERED, the response pipeline runs early at the response-headers
+/// phase, and `run_response_pipeline` skips `execute_response` at body EOS.
+/// A filter that stashes a decision in `filter_metadata` during `on_response`
+/// and reads it in `on_response_body` (the anthropic messages->chat-completions
+/// transform) only works if that metadata is persisted across the two phases.
+/// Regression test for the fix in `run_response_header_filters_early`: without
+/// it the transform metadata is dropped and the upstream (OpenAI-shaped) body
+/// passes through untransformed.
+#[tokio::test]
+async fn buffered_response_transform_metadata_survives_body_phase() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(ANTHROPIC_TRANSFORM_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // First message carries the BUFFERED protocol config for both directions.
+    let mut headers = make_request_headers("POST", "/v1/messages", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 2,  // BUFFERED
+        response_body_mode: 2, // BUFFERED
+        ..Default::default()
+    });
+    tx.send(headers).await.expect("send request headers");
+    drop(inbound.message().await); // request headers continue
+
+    // Anthropic-shaped request body: on_request_body records the transform intent.
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#
+                .to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send request body");
+    drop(inbound.message().await); // request body (transformed to chat-completions)
+
+    // 200 response headers: on_response runs early under BUFFERED and stashes the
+    // transform decision in filter_metadata.
+    tx.send(make_response_headers(200, false))
+        .await
+        .expect("send response headers");
+    drop(inbound.message().await); // response headers continue
+
+    // Upstream returns an OpenAI chat.completion; on_response_body must convert it
+    // back to Anthropic shape using the metadata set during on_response.
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response body");
+
+    let body_resp = inbound.message().await.expect("receive").expect("response body");
+    let emitted = match &body_resp.response {
+        Some(RespVariant::ResponseBody(b)) => b
+            .response
+            .as_ref()
+            .and_then(|c| c.body_mutation.as_ref())
+            .and_then(|bm| bm.mutation.as_ref())
+            .and_then(|m| match m {
+                body_mutation::Mutation::Body(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("response body should carry a replacement body mutation"),
+        other => panic!("expected ResponseBody, got {other:?}"),
+    };
+
+    let parsed: serde_json::Value = serde_json::from_slice(&emitted).expect("emitted body is JSON");
+    assert_eq!(
+        parsed["type"], "message",
+        "response must be transformed to Anthropic shape, got {parsed}"
+    );
+    assert_eq!(parsed["role"], "assistant", "transformed message role");
+    assert_eq!(parsed["content"][0]["text"], "Hello!", "transformed content text");
+    assert!(
+        parsed.get("choices").is_none(),
+        "OpenAI 'choices' must not survive the transform: {parsed}"
+    );
+}
+
 #[tokio::test]
 async fn multi_chunk_body_accumulation() {
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
@@ -2183,6 +2272,19 @@ filter_chains:
         response_set:
           - name: X-Resp
             value: "true"
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+/// A filter whose response transform is split across the response headers and
+/// body phases: `anthropic_messages_to_chat_completions` records its transform
+/// decision in `filter_metadata` during `on_response` and reads it back in
+/// `on_response_body`. Exercises the BUFFERED metadata-carry path.
+const ANTHROPIC_TRANSFORM_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: anthropic_messages_to_chat_completions
 insecure_options:
   allow_unbounded_body: true
 "#;
