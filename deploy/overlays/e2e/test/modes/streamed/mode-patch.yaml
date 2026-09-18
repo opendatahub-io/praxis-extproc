@@ -1,0 +1,11 @@
+# ipp-pre (configPatches[0]): stream the request body.
+- op: replace
+  path: /spec/configPatches/0/patch/value/typed_config/processing_mode/request_body_mode
+  value: STREAMED
+# ipp (configPatches[1]): stream both bodies.
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/request_body_mode
+  value: STREAMED
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/response_body_mode
+  value: STREAMED
