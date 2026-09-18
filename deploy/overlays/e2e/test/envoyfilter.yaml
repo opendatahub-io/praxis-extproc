@@ -78,9 +78,16 @@ spec:
                           address: payload-processing.istio-system.svc.cluster.local
                           port_value: 9004
     # -----------------------------------------------------------------
+    # Body modes mirror the production odh overlay (deploy/overlays/odh):
+    # BUFFERED request/response bodies and SKIP trailers. Under BUFFERED,
+    # Envoy picks the route at headers-time, so a BBR header mutation that
+    # lands in the body phase only takes effect if the body-phase response
+    # clears the route cache. This is the prod-faithful topology that
+    # reproduces the BBR 404 regression the fix PRs address.
+    #
     # ipp-pre: BBR — model_to_header extracts model from body, sets
-    # X-Gateway-Model-Name + clear_route_cache so Envoy re-evaluates
-    # routes with the header present.
+    # X-Gateway-Model-Name and clears the route cache so Envoy
+    # re-evaluates routes with the header present.
     # -----------------------------------------------------------------
     - applyTo: HTTP_FILTER
       match:
@@ -108,9 +115,9 @@ spec:
             processing_mode:
               request_header_mode: SEND
               response_header_mode: SKIP
-              request_body_mode: FULL_DUPLEX_STREAMED
+              request_body_mode: BUFFERED
               response_body_mode: NONE
-              request_trailer_mode: SEND
+              request_trailer_mode: SKIP
     # -----------------------------------------------------------------
     # ipp: post-processing — response headers, request enrichment.
     # -----------------------------------------------------------------
@@ -140,7 +147,7 @@ spec:
             processing_mode:
               request_header_mode: SEND
               response_header_mode: SEND
-              request_body_mode: FULL_DUPLEX_STREAMED
-              response_body_mode: FULL_DUPLEX_STREAMED
-              request_trailer_mode: SEND
-              response_trailer_mode: SEND
+              request_body_mode: BUFFERED
+              response_body_mode: BUFFERED
+              request_trailer_mode: SKIP
+              response_trailer_mode: SKIP
