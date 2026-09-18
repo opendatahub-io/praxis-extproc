@@ -12,7 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
-    server::PraxisExtProc,
+    server::{KuadrantPolicy, PraxisExtProc},
     tls,
 };
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
@@ -44,6 +44,11 @@ struct Cli {
     #[arg(long)]
     metrics_address: Option<String>,
 
+    /// Optional path to a Kuadrant policy file (`{plugin, upstreams}`). When set,
+    /// enables Authorino auth + Limitador rate limiting for every request.
+    #[arg(long)]
+    kuadrant_config: Option<String>,
+
     /// Validate configuration and exit.
     #[arg(short = 't', long)]
     validate: bool,
@@ -73,6 +78,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry);
+    let kuadrant = cli.kuadrant_config.as_deref().map(load_kuadrant).transpose()?;
 
     if cli.validate {
         pipeline?;
@@ -89,7 +95,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, fips.active)).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active)).await
+    let opts = ServeOptions {
+        body_modes: (cfg.server.request_body_mode, cfg.server.response_body_mode),
+        kuadrant,
+    };
+    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active, opts)).await
+}
+
+/// Serving options threaded from config and CLI into the gRPC service.
+struct ServeOptions {
+    /// Config-pinned request/response body modes.
+    body_modes: (Option<config::BodyModeOverride>, Option<config::BodyModeOverride>),
+    /// Kuadrant policy, if native enforcement is enabled.
+    kuadrant: Option<KuadrantPolicy>,
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
@@ -98,6 +116,7 @@ async fn serve_pipeline(
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     tls_cfg: &tls::TlsConfig,
     fips_active: bool,
+    opts: ServeOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
         Ok(pipeline) => {
@@ -106,7 +125,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active, opts)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -121,12 +140,13 @@ async fn start_services(
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
     fips_active: bool,
+    opts: ServeOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(
         addrs,
         true,
         fips_active,
-        serve_grpc(addrs.0, pipeline, tls_cfg),
+        serve_grpc(addrs.0, pipeline, tls_cfg, opts),
     ))
     .await
 }
@@ -232,8 +252,13 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
+    opts: ServeOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let mut ext = PraxisExtProc::new(pipeline).with_body_modes(opts.body_modes.0, opts.body_modes.1);
+    if let Some(policy) = opts.kuadrant {
+        ext = ext.with_kuadrant(policy);
+    }
+    let svc = ExternalProcessorServer::new(ext);
     match tls::build_tls_config(tls_cfg)? {
         None => Box::pin(serve_plaintext(addr, svc)).await,
         Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
@@ -346,6 +371,51 @@ fn load_config(path: &str) -> Result<ExtProcConfig, ExtProcError> {
     let content = std::fs::read_to_string(path).map_err(|e| ExtProcError::Config(format!("{path}: {e}")))?;
 
     serde_yaml::from_str(&content).map_err(|e| ExtProcError::Config(e.to_string()))
+}
+
+/// Kuadrant policy file: the `kuadrant-filter` plugin configuration plus the
+/// cluster-name -> gRPC endpoint map the transport dials.
+#[derive(serde::Deserialize)]
+struct KuadrantFile {
+    /// The `kuadrant-filter` plugin configuration (services + action sets).
+    plugin: kuadrant_filter::configuration::PluginConfiguration,
+    /// Cluster-name -> gRPC endpoint map the transport dials.
+    #[serde(default)]
+    upstreams: std::collections::HashMap<String, String>,
+    /// Per-upstream TLS keyed by cluster name; absent means plaintext.
+    /// Authorino serves TLS (signed by the cluster service CA); Limitador does not.
+    #[serde(default)]
+    tls: std::collections::HashMap<String, UpstreamTlsFile>,
+}
+
+/// TLS settings for one upstream, as written in the Kuadrant policy file.
+#[derive(serde::Deserialize)]
+struct UpstreamTlsFile {
+    /// Path to a PEM-encoded CA certificate to trust for this upstream.
+    ca_cert: String,
+    /// Server name to send as SNI and verify the certificate against.
+    sni: String,
+}
+
+/// Load and parse a Kuadrant policy file into a [`KuadrantPolicy`].
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Config`] if the file or any referenced CA cannot be
+/// read, or the YAML fails to parse.
+fn load_kuadrant(path: &str) -> Result<KuadrantPolicy, ExtProcError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ExtProcError::Config(format!("{path}: {e}")))?;
+    let file: KuadrantFile = serde_yaml::from_str(&content).map_err(|e| ExtProcError::Config(e.to_string()))?;
+    let mut tls = std::collections::HashMap::new();
+    for (name, entry) in file.tls {
+        let ca_pem =
+            std::fs::read(&entry.ca_cert).map_err(|e| ExtProcError::Config(format!("{}: {e}", entry.ca_cert)))?;
+        tls.insert(
+            name,
+            praxis_extproc::kuadrant_transport::UpstreamTls { ca_pem, sni: entry.sni },
+        );
+    }
+    Ok(KuadrantPolicy::new(file.plugin, file.upstreams, tls))
 }
 
 /// Parse a socket address from CLI override or config default.

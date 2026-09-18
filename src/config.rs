@@ -49,6 +49,21 @@ pub struct ExtProcConfig {
     pub server: ServerConfig,
 }
 
+/// Body processing mode a deployment can pin.
+///
+/// The `ext_proc` normally learns its body modes from Envoy's `protocol_config`,
+/// sent once on the first stream message. Some Envoy builds do not send it, so
+/// the `ext_proc` falls back to buffered and a streamed response never closes.
+/// Setting this in the server config pins the mode regardless.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyModeOverride {
+    /// Process the body incrementally, chunk by chunk.
+    Streamed,
+    /// Accumulate the whole body, then process once.
+    Buffered,
+}
+
 /// gRPC server bind address and options.
 ///
 /// ```
@@ -72,6 +87,17 @@ pub struct ServerConfig {
     /// TLS configuration.
     #[serde(default)]
     pub tls: crate::tls::TlsConfig,
+
+    /// Pin the request body mode, overriding Envoy's `protocol_config`.
+    #[serde(default)]
+    pub request_body_mode: Option<BodyModeOverride>,
+
+    /// Pin the response body mode, overriding Envoy's `protocol_config`.
+    ///
+    /// Set to `streamed` when the gateway streams responses (SSE) but its
+    /// Envoy does not convey the mode, so streamed responses close cleanly.
+    #[serde(default)]
+    pub response_body_mode: Option<BodyModeOverride>,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +107,8 @@ impl Default for ServerConfig {
             health_address: "0.0.0.0:50052".to_owned(),
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
+            request_body_mode: None,
+            response_body_mode: None,
         }
     }
 }

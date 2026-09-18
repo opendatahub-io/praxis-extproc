@@ -229,11 +229,15 @@ fn body_responses(
             // BUFFERED mode (and others): use BodyMutation::Body for full replacement.
             // `Some(&[])` is an explicit clear (emit empty body); `None` = leave as-is.
             let body_mutation = body.map(make_body_mutation);
+            // A header mutation on the request path can change the route, so ask
+            // Envoy to recalculate it.
+            let clear_route_cache = is_request && mutation.is_some();
 
             let common = CommonResponse {
                 status: ResponseStatus::Continue.into(),
                 header_mutation: mutation,
                 body_mutation,
+                clear_route_cache,
                 ..Default::default()
             };
 
@@ -290,6 +294,9 @@ fn make_streamed_response(
     header_mutation: Option<HeaderMutation>,
     is_request: bool,
 ) -> ProcessingResponse {
+    // A header mutation on the request path can change the route, so ask Envoy
+    // to recalculate it.
+    let clear_route_cache = is_request && header_mutation.is_some();
     let streamed = StreamedBodyResponse {
         body: chunk.to_vec(),
         end_of_stream,
@@ -304,6 +311,7 @@ fn make_streamed_response(
             status: ResponseStatus::Continue.into(),
             header_mutation,
             body_mutation,
+            clear_route_cache,
             ..Default::default()
         },
         is_request,
@@ -400,14 +408,26 @@ mod tests {
         };
         let resp = request_headers(Some(mutation));
 
-        assert!(resp.response.is_some(), "response should be present");
+        let Some(Response::RequestHeaders(headers)) = resp.response else {
+            panic!("request headers response should be present");
+        };
+        assert!(
+            headers.response.is_some_and(|common| common.clear_route_cache),
+            "request header mutations must cause Envoy to recalculate its route"
+        );
     }
 
     #[test]
     fn request_headers_response_without_mutation() {
         let resp = request_headers(None);
 
-        assert!(resp.response.is_some(), "response should be present");
+        let Some(Response::RequestHeaders(headers)) = resp.response else {
+            panic!("request headers response should be present");
+        };
+        assert!(
+            headers.response.is_some_and(|common| !common.clear_route_cache),
+            "no request mutation should leave Envoy's route cache intact"
+        );
     }
 
     #[test]

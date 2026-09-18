@@ -196,7 +196,10 @@ async fn tls_grpc_client(addr: SocketAddr) -> ExtProcClient {
         let tls_stream = raw_connect(addr, None).await?;
         Ok::<_, BoxError>(hyper_util::rt::TokioIo::new(tls_stream))
     });
-    let channel = Endpoint::from_static("https://localhost")
+    // The connector brings its own OpenSSL TLS, so use an http scheme: with the
+    // tonic `tls-ring` feature on, an https endpoint would make tonic try to own
+    // the TLS handshake itself and reject the custom connector.
+    let channel = Endpoint::from_static("http://localhost")
         .connect_with_connector(connector)
         .await
         .expect("connect over TLS");

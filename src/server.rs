@@ -12,12 +12,13 @@
 use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
+use kuadrant_filter::configuration::PluginConfiguration;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
-        ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
-        processing_request,
+        ImmediateResponse, ProcessingRequest, ProcessingResponse, ProtocolConfiguration,
+        external_processor_server::ExternalProcessor, processing_request,
     },
 };
 use tokio::sync::mpsc;
@@ -26,7 +27,11 @@ use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streamin
 use tracing::{debug, error, warn};
 
 use crate::{
-    adapter, metrics,
+    adapter,
+    kuadrant_executor::PolicyStream,
+    kuadrant_host::HttpReply,
+    kuadrant_transport::{TonicTransport, UpstreamTls},
+    metrics,
     response::{self, BodyMode},
 };
 
@@ -73,6 +78,24 @@ impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
     }
 }
 
+impl From<crate::config::BodyModeOverride> for BodyMode {
+    fn from(mode: crate::config::BodyModeOverride) -> Self {
+        match mode {
+            crate::config::BodyModeOverride::Streamed => Self::Streamed,
+            crate::config::BodyModeOverride::Buffered => Self::Buffered,
+        }
+    }
+}
+
+/// Body modes a deployment pinned, applied over whatever Envoy conveys.
+#[derive(Debug, Clone, Copy, Default)]
+struct BodyModeOverrides {
+    /// Pinned request body mode, or `None` to use Envoy's.
+    request: Option<BodyMode>,
+    /// Pinned response body mode, or `None` to use Envoy's.
+    response: Option<BodyMode>,
+}
+
 // -----------------------------------------------------------------------------
 // Types
 // -----------------------------------------------------------------------------
@@ -93,12 +116,128 @@ type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingRe
 pub struct PraxisExtProc {
     /// Shared filter pipeline.
     pipeline: Arc<FilterPipeline>,
+
+    /// Body modes pinned by config, overriding Envoy's `protocol_config`.
+    body_modes: BodyModeOverrides,
+
+    /// Optional Kuadrant policy (Authorino auth + Limitador rate limiting) run
+    /// per request. `None` leaves the `ext_proc` as native-filters-only.
+    kuadrant: Option<Arc<KuadrantPolicy>>,
+}
+
+/// Kuadrant policy config + gRPC transport, shared across streams.
+#[derive(Debug)]
+pub struct KuadrantPolicy {
+    /// Compiled Kuadrant plugin configuration (services + action sets).
+    config: PluginConfiguration,
+    /// gRPC transport dialing the Authorino/Limitador upstreams.
+    transport: Arc<TonicTransport>,
+}
+
+impl KuadrantPolicy {
+    /// Build from a parsed plugin configuration, a cluster-name -> endpoint map,
+    /// and per-upstream TLS settings (e.g. the Authorino service CA).
+    #[must_use]
+    pub fn new(
+        config: PluginConfiguration,
+        upstreams: HashMap<String, String>,
+        tls: HashMap<String, UpstreamTls>,
+    ) -> Self {
+        Self {
+            config,
+            transport: Arc::new(TonicTransport::new(upstreams, tls)),
+        }
+    }
+}
+
+/// Flatten Envoy `HeaderValue`s into owned `(key, value)` pairs for the Kuadrant
+/// resolver, preferring `raw_value` (binary-safe) over the UTF-8 `value`.
+fn kuadrant_header_pairs(headers: &[HeaderValue]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|hv| {
+            let value = if hv.raw_value.is_empty() {
+                hv.value.clone()
+            } else {
+                String::from_utf8_lossy(&hv.raw_value).into_owned()
+            };
+            (hv.key.clone(), value)
+        })
+        .collect()
+}
+
+/// Translate a pipeline [`HttpReply`] into an `ext_proc` [`ImmediateResponse`].
+fn to_immediate(reply: HttpReply) -> ImmediateResponse {
+    use praxis_proto::envoy::service::common::v3::HttpStatus;
+    ImmediateResponse {
+        status: Some(HttpStatus {
+            code: i32::try_from(reply.status).unwrap_or(500),
+        }),
+        body: reply
+            .body
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Run the Kuadrant request-phase check (Authorino auth + Limitador rate-limit).
+/// `Some` short-circuits with an immediate denial; `None` continues to native
+/// filters, and the same pipeline resumes on the response phases.
+async fn kuadrant_request_check(
+    stream: &PolicyStream,
+    envoy_headers: &[HeaderValue],
+) -> Result<Option<Vec<ProcessingResponse>>, Status> {
+    let decision = stream
+        .on_request_headers(kuadrant_header_pairs(envoy_headers))
+        .await
+        .map_err(Status::internal)?;
+    Ok(decision.map(|reply| vec![response::immediate(to_immediate(reply))]))
+}
+
+/// Resume the Kuadrant pipeline on the response-headers phase. `Some`
+/// short-circuits with an immediate denial; `None` continues.
+async fn kuadrant_response_check(
+    stream: &PolicyStream,
+    envoy_headers: &[HeaderValue],
+) -> Result<Option<Vec<ProcessingResponse>>, Status> {
+    let decision = stream
+        .on_response_headers(kuadrant_header_pairs(envoy_headers))
+        .await
+        .map_err(Status::internal)?;
+    Ok(decision.map(|reply| vec![response::immediate(to_immediate(reply))]))
 }
 
 impl PraxisExtProc {
     /// Create a new ExtProc service backed by the given pipeline.
     pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
-        Self { pipeline }
+        Self {
+            pipeline,
+            body_modes: BodyModeOverrides::default(),
+            kuadrant: None,
+        }
+    }
+
+    /// Pin the request/response body modes from config, so the `ext_proc` uses
+    /// them even when Envoy does not send a `protocol_config`.
+    #[must_use]
+    pub fn with_body_modes(
+        mut self,
+        request: Option<crate::config::BodyModeOverride>,
+        response: Option<crate::config::BodyModeOverride>,
+    ) -> Self {
+        self.body_modes = BodyModeOverrides {
+            request: request.map(Into::into),
+            response: response.map(Into::into),
+        };
+        self
+    }
+
+    /// Enable Kuadrant policy enforcement for every stream.
+    #[must_use]
+    pub fn with_kuadrant(mut self, policy: KuadrantPolicy) -> Self {
+        self.kuadrant = Some(Arc::new(policy));
+        self
     }
 }
 
@@ -116,11 +255,13 @@ impl ExternalProcessor for PraxisExtProc {
         request: TonicRequest<Streaming<ProcessingRequest>>,
     ) -> Result<TonicResponse<Self::ProcessStream>, Status> {
         let pipeline = Arc::clone(&self.pipeline);
+        let body_modes = self.body_modes;
+        let kuadrant = self.kuadrant.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(&pipeline, &mut inbound, &tx).await {
+            if let Err(e) = handle_stream(&pipeline, body_modes, kuadrant, &mut inbound, &tx).await {
                 error!(error = %e, "stream processing failed");
                 drop(tx.send(Err(e)).await);
             }
@@ -142,11 +283,17 @@ impl ExternalProcessor for PraxisExtProc {
 /// pipeline at the appropriate phase boundaries.
 async fn handle_stream(
     pipeline: &FilterPipeline,
+    body_modes: BodyModeOverrides,
+    kuadrant: Option<Arc<KuadrantPolicy>>,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
 ) -> Result<(), Status> {
     let start = Instant::now();
-    let mut stream_state = StreamState::new();
+    let mut stream_state = StreamState::new(body_modes);
+    // Spawn a per-stream policy executor: the Kuadrant pipeline is `!Send` and
+    // spans request->response, so it lives on its own thread, not in this state.
+    stream_state.kuadrant =
+        kuadrant.map(|policy| PolicyStream::spawn(policy.config.clone(), Arc::clone(&policy.transport)));
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -229,6 +376,7 @@ fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: Protocol
         metrics::record_invalid_argument("protocol_config", "unsupported_mode");
         Status::invalid_argument(m)
     })?;
+    stream_state.apply_body_mode_overrides();
     debug!(
         request_mode = ?stream_state.protocol_config.request_body_mode,
         response_mode = ?stream_state.protocol_config.response_body_mode,
@@ -527,6 +675,12 @@ async fn handle_request_headers(
     let envoy_headers = extract_header_list(&headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
+    if let Some(stream) = state.kuadrant.as_ref()
+        && let Some(reply) = kuadrant_request_check(stream, &envoy_headers).await?
+    {
+        return Ok(reply);
+    }
+
     if headers.end_of_stream {
         return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
@@ -617,6 +771,12 @@ async fn handle_response_headers(
     let envoy_headers = extract_header_list(&headers);
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
+    if let Some(stream) = state.kuadrant.as_ref()
+        && let Some(reply) = kuadrant_response_check(stream, &envoy_headers).await?
+    {
+        return Ok(reply);
+    }
+
     if headers.end_of_stream {
         return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
     }
@@ -673,6 +833,20 @@ async fn accumulate_response_body(
 
     if !body.end_of_stream {
         return Ok(Vec::new());
+    }
+
+    // Resume the Kuadrant pipeline on the response-body phase: the token-usage
+    // task parses the completion and reports consumption to Limitador (the
+    // rate-limit debit). Buffered mode is one chunk with end_of_stream = true.
+    if let Some(stream) = state.kuadrant.as_ref() {
+        let response_body = state.response_body.clone();
+        if let Some(reply) = stream
+            .on_response_body(response_body, true)
+            .await
+            .map_err(Status::internal)?
+        {
+            return Ok(vec![response::immediate(to_immediate(reply))]);
+        }
     }
 
     run_response_pipeline(ResponsePhase::Body, pipeline, state).await
@@ -784,6 +958,13 @@ async fn run_response_pipeline(
 
     let current_mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
+    // Persist filter state so a later response phase sees it. Without this, the
+    // response-header phase's metadata (e.g. token_count's SSE/JSON mode) is
+    // lost before the body phase, and body filters that read it do nothing.
+    state.filter_metadata.clone_from(&ctx.filter_metadata);
+    state.executed_filter_indices.clone_from(&ctx.executed_filter_indices);
+    state.branch_iterations.clone_from(&ctx.branch_iterations);
+
     let mutation = match phase {
         ResponsePhase::Headers => current_mutation,
         ResponsePhase::Body => {
@@ -813,7 +994,7 @@ async fn execute_response_pipeline_and_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     response_body: &mut Vec<u8>,
     filters_executed: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     let should_execute = match phase {
         ResponsePhase::Headers => true,
         ResponsePhase::Body => !filters_executed,
@@ -945,6 +1126,21 @@ async fn process_streamed_body_chunk(
     state: &mut StreamState,
     is_request: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    // Kuadrant token report over a STREAMED response: feed each chunk to the
+    // per-stream executor. The crate accumulates chunks and the report/debit
+    // fires on `end_of_stream`. Content chunks return quickly (no gRPC), so this
+    // does not stall the stream. Done before the `&mut state.response` borrow.
+    let kuadrant_reply = match state.kuadrant.as_ref() {
+        Some(kstream) if !is_request => kstream
+            .on_response_body(body.body.clone(), body.end_of_stream)
+            .await
+            .map_err(Status::internal)?,
+        _ => None,
+    };
+    if let Some(reply) = kuadrant_reply {
+        return Ok(vec![response::immediate(to_immediate(reply))]);
+    }
+
     let request = state.request.as_ref().ok_or_else(|| {
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
@@ -1128,7 +1324,7 @@ async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext
 }
 
 /// Convert a [`FilterAction::Reject`] into an `ImmediateResponse`.
-fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+fn check_reject(action: FilterAction) -> Option<ImmediateResponse> {
     if let FilterAction::Reject(rejection) = action {
         metrics::record_immediate_response();
         Some(adapter::rejection_to_immediate(&rejection))
@@ -1147,7 +1343,7 @@ async fn run_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
     eos: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
     }
@@ -1175,7 +1371,7 @@ fn run_resp_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
     eos: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
     }
@@ -1267,6 +1463,9 @@ struct StreamState {
     /// Protocol configuration parsed from Envoy's first message.
     protocol_config: ProtocolConfig,
 
+    /// Body modes pinned by config, re-applied over Envoy's `protocol_config`.
+    body_mode_overrides: BodyModeOverrides,
+
     /// Deferred request header mutation for FDS passthrough mode.
     deferred_request_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 
@@ -1275,14 +1474,32 @@ struct StreamState {
 
     /// Per-direction phase ordering guard.
     phase_order: PhaseOrderTracker,
+
+    /// Per-stream Kuadrant policy executor, if enabled. Owns the `!Send`,
+    /// cross-phase pipeline on its own thread.
+    kuadrant: Option<PolicyStream>,
 }
 
 impl StreamState {
-    /// Create a new empty stream state with default protocol configuration.
-    fn new() -> Self {
-        Self {
+    /// Create a new empty stream state, applying any pinned body modes.
+    fn new(body_mode_overrides: BodyModeOverrides) -> Self {
+        let mut state = Self {
             protocol_config: ProtocolConfig::default(),
+            body_mode_overrides,
             ..Default::default()
+        };
+        state.apply_body_mode_overrides();
+        state
+    }
+
+    /// Apply the config-pinned body modes over `protocol_config`, so they win
+    /// whether or not Envoy sent a `protocol_config`.
+    fn apply_body_mode_overrides(&mut self) {
+        if let Some(mode) = self.body_mode_overrides.request {
+            self.protocol_config.request_body_mode = mode;
+        }
+        if let Some(mode) = self.body_mode_overrides.response {
+            self.protocol_config.response_body_mode = mode;
         }
     }
 
@@ -1845,7 +2062,7 @@ mod tests {
 
     #[test]
     fn apply_protocol_config_after_first_message_records_metric() {
-        let mut state = StreamState::new();
+        let mut state = StreamState::new(BodyModeOverrides::default());
         let count = invalid_arg_count("protocol_config", "after_first_message", || {
             let result = apply_protocol_config(&mut state, Some(ProtocolConfiguration::default()), true);
             assert!(
@@ -1858,7 +2075,7 @@ mod tests {
 
     #[test]
     fn config_from_first_message_unsupported_mode_records_metric() {
-        let mut state = StreamState::new();
+        let mut state = StreamState::new(BodyModeOverrides::default());
         // 3 == BUFFERED_PARTIAL, an unsupported body mode.
         let bad = ProtocolConfiguration {
             request_body_mode: 3,
@@ -1957,7 +2174,7 @@ mod tests {
         use praxis_filter::FilterRegistry;
 
         let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
-        let mut state = StreamState::new();
+        let mut state = StreamState::new(BodyModeOverrides::default());
 
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -1979,7 +2196,7 @@ mod tests {
         use praxis_filter::FilterRegistry;
 
         let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
-        let mut state = StreamState::new();
+        let mut state = StreamState::new(BodyModeOverrides::default());
         // Request headers present, response headers absent: isolates the response branch.
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
@@ -2056,7 +2273,7 @@ mod tests {
             .register("state_probe", praxis_filter::http_builtin(ProbeFilter::from_config))
             .unwrap();
         let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
-        let mut state = StreamState::new();
+        let mut state = StreamState::new(BodyModeOverrides::default());
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
         // Request phase stores state; it must be moved out into StreamState.
