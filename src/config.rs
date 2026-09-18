@@ -72,6 +72,22 @@ pub struct ServerConfig {
     /// TLS configuration.
     #[serde(default)]
     pub tls: crate::tls::TlsConfig,
+
+    /// Maximum seconds to drain in-flight streams on shutdown before
+    /// forcefully cancelling them.
+    ///
+    /// Defaults to [`SHUTDOWN_DRAIN_TIMEOUT`] in seconds.
+    #[serde(default = "default_shutdown_drain_timeout_secs")]
+    pub shutdown_drain_timeout_secs: u64,
+}
+
+/// Default graceful-drain deadline; aligns with the common Kubernetes 30s
+/// `terminationGracePeriodSeconds`.
+pub const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serde default for [`ServerConfig::shutdown_drain_timeout_secs`].
+const fn default_shutdown_drain_timeout_secs() -> u64 {
+    SHUTDOWN_DRAIN_TIMEOUT.as_secs()
 }
 
 impl Default for ServerConfig {
@@ -81,7 +97,24 @@ impl Default for ServerConfig {
             health_address: "0.0.0.0:50052".to_owned(),
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
+            shutdown_drain_timeout_secs: SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Validate server settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the drain timeout is zero.
+    pub fn validate(&self) -> Result<()> {
+        if self.shutdown_drain_timeout_secs == 0 {
+            return Err(ExtProcError::Config(
+                "server.shutdown_drain_timeout_secs must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -197,6 +230,47 @@ server:
         .unwrap();
 
         assert_eq!(cfg.server.grpc_address, "127.0.0.1:9004", "address should match");
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_defaults() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(
+            cfg.server.shutdown_drain_timeout_secs, 30,
+            "drain timeout should default to 30s"
+        );
+    }
+
+    #[test]
+    fn parse_custom_shutdown_drain_timeout() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  shutdown_drain_timeout_secs: 5
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.server.shutdown_drain_timeout_secs, 5, "drain timeout should match");
+        cfg.server.validate().expect("non-zero drain timeout is valid");
+    }
+
+    #[test]
+    fn zero_shutdown_drain_timeout_rejected() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  shutdown_drain_timeout_secs: 0
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.server.validate().expect_err("zero drain timeout should fail");
+        assert!(
+            err.to_string().contains("shutdown_drain_timeout_secs"),
+            "error should name the field: {err}"
+        );
     }
 
     #[test]

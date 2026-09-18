@@ -153,6 +153,7 @@ server:
   grpc_address: "0.0.0.0:50051"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  shutdown_drain_timeout_secs: 30
   tls:
     mode: none
 ```
@@ -162,7 +163,19 @@ server:
 | `grpc_address` | string | `0.0.0.0:50051` | gRPC ExtProc listen address |
 | `health_address` | string | `0.0.0.0:50052` | gRPC health check address |
 | `metrics_address` | string | `0.0.0.0:9090` | Prometheus metrics address |
+| `shutdown_drain_timeout_secs` | integer | `30` | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled |
 | `tls` | object | `mode: none` | TLS configuration |
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` the server stops accepting new
+connections and drains in-flight streams. If any are
+still running after `shutdown_drain_timeout_secs`,
+they are forcefully cancelled with `UNAVAILABLE` so
+the process can exit promptly. The default of 30s
+aligns with the common Kubernetes
+`terminationGracePeriodSeconds`. Must be greater
+than zero.
 
 ### TLS
 
@@ -312,6 +325,9 @@ problems:
   not match each other.
 - **Invalid TLS values**: `handshake_concurrency`
   or `handshake_timeout_secs` set to zero cause an
+  immediate startup error.
+- **Invalid drain timeout**:
+  `shutdown_drain_timeout_secs` set to zero causes an
   immediate startup error.
 - **Address bind failure**: the server fails to start
   if any listen address is already in use.

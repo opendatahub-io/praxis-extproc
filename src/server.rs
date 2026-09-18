@@ -20,7 +20,7 @@ use praxis_proto::envoy::service::{
         processing_request,
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streaming};
 use tracing::{debug, error, warn};
@@ -93,13 +93,43 @@ type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingRe
 pub struct PraxisExtProc {
     /// Shared filter pipeline.
     pipeline: Arc<FilterPipeline>,
+    /// Latch flipped to `true` when the shutdown drain deadline expires,
+    /// signalling in-flight streams to cancel forcefully.
+    force_shutdown: watch::Receiver<bool>,
 }
 
 impl PraxisExtProc {
     /// Create a new ExtProc service backed by the given pipeline.
+    ///
+    /// No drain deadline is wired: the force-shutdown latch never fires. Use
+    /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one.
     pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
-        Self { pipeline }
+        let (_tx, rx) = watch::channel(false); // `_tx` dropped => latch never fires
+        Self {
+            pipeline,
+            force_shutdown: rx,
+        }
     }
+
+    /// Wire a force-shutdown latch driven by the drain deadline.
+    #[must_use]
+    pub fn with_force_shutdown(mut self, rx: watch::Receiver<bool>) -> Self {
+        self.force_shutdown = rx;
+        self
+    }
+}
+
+/// Resolve only when the latch flips to `true`.
+///
+/// A closed channel (no drain deadline wired) stays pending forever, so the
+/// caller's other `select!` branch always wins in that case.
+async fn wait_force(mut rx: watch::Receiver<bool>) {
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 #[tonic::async_trait]
@@ -116,13 +146,25 @@ impl ExternalProcessor for PraxisExtProc {
         request: TonicRequest<Streaming<ProcessingRequest>>,
     ) -> Result<TonicResponse<Self::ProcessStream>, Status> {
         let pipeline = Arc::clone(&self.pipeline);
+        let force = self.force_shutdown.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(&pipeline, &mut inbound, &tx).await {
-                error!(error = %e, "stream processing failed");
-                drop(tx.send(Err(e)).await);
+            tokio::select! {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx)) => {
+                    if let Err(e) = r {
+                        error!(error = %e, "stream processing failed");
+                        drop(tx.send(Err(e)).await);
+                    }
+                }
+                () = wait_force(force) => {
+                    // Best-effort notification: never block on a full channel. The
+                    // deadline race in the binary drops the serving future, which
+                    // force-closes the connection regardless of delivery.
+                    warn!("drain deadline exceeded; forcefully cancelling stream");
+                    drop(tx.try_send(Err(Status::unavailable("server shutting down"))));
+                }
             }
         });
 

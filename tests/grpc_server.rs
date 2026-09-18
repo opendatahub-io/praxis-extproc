@@ -2432,3 +2432,81 @@ fn extract_all_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue>
     }
     headers
 }
+
+// -----------------------------------------------------------------------------
+// Graceful shutdown drain
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn drain_deadline_force_cancels_in_flight_stream() {
+    let yaml = r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+"#;
+    let cfg: config::ExtProcConfig = serde_yaml::from_str(yaml).expect("parse config");
+    let registry = praxis_ai_filters::build_ai_registry();
+    let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    // Wire a force-shutdown latch we can trigger directly, standing in for the
+    // drain-deadline timer.
+    let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let svc = PraxisExtProc::new(pipeline).with_force_shutdown(force_rx);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ExternalProcessorServer::new(svc))
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                drop(shutdown_rx.await);
+            })
+            .await
+            .expect("server failed");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("uri")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = ExtProcClient::new(channel);
+
+    // Keep the stream in-flight: send headers without end_of_stream and hold the
+    // sender open so the handler parks awaiting further messages.
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    tx.send(make_request_headers("GET", "/", false))
+        .await
+        .expect("send headers");
+
+    // Consume the header response so the next item is the forced cancellation.
+    let first = inbound.message().await.expect("first message ok");
+    assert!(first.is_some(), "should receive a header response");
+
+    // Trigger the drain deadline.
+    force_tx.send(true).expect("flip latch");
+
+    let err = loop {
+        match inbound.message().await {
+            Ok(Some(_)) => {},
+            Ok(None) => panic!("stream ended cleanly; expected forced cancellation"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "in-flight stream should be force-cancelled with Unavailable, got {err:?}"
+    );
+
+    drop(shutdown_tx);
+}
