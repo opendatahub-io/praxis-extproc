@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Shane Utt
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Red Hat, Inc.
 
 //! Integration tests requiring a Kubernetes cluster with Istio and
 //! praxis-extproc deployed.

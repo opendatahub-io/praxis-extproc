@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Shane Utt
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Red Hat, Inc.
 
 //! In-process gRPC integration tests for the ExtProc server.
 //!

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Shane Utt
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Red Hat, Inc.
 
 //! gRPC health check service for the ExtProc server.
 //!

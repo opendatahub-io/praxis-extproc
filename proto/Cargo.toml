@@ -3,11 +3,11 @@ name = "praxis-proxy-proto"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-authors = ["Shane Utt <shaneutt@linux.com>"]
+authors = ["Red Hat, Inc."]
 description = "Protobuf and gRPC definitions for Praxis external processing"
-# Composite: MIT for hand-written code, Apache-2.0 for vendored Envoy
-# protos, BSD-3-Clause for vendored Google well-known types.
-license = "MIT AND Apache-2.0 AND BSD-3-Clause"
+# Composite: Apache-2.0 for hand-written code and the vendored Envoy protos,
+# BSD-3-Clause for vendored Google well-known types.
+license = "Apache-2.0 AND BSD-3-Clause"
 repository = "https://github.com/opendatahub-io/praxis-extproc"
 publish = false
 

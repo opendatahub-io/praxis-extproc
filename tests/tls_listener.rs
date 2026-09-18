@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Red Hat, Inc.
 
 //! Protocol-level integration tests for the TLS listener.
 //!

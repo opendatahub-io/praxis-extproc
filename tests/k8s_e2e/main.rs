@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Red Hat, Inc.
 
 //! K8s black-box e2e tests for Praxis AI filters.
 //!
