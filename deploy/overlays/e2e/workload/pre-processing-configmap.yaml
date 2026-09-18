@@ -16,6 +16,10 @@ data:
         filters:
           - filter: model_to_header
             header: X-Gateway-Model-Name
+          # Mirror deploy/base: normalize publishers/<pub>/models/<name> body
+          # model values to the short <name> for KServe/LLMISvc routing.
+          - filter: llmisvc_model_provider_resolver
+            header: X-Gateway-Model-Name
 
     insecure_options:
       allow_unbounded_body: true

@@ -28,6 +28,7 @@
     clippy::needless_raw_strings,
     clippy::needless_raw_string_hashes,
     clippy::missing_docs_in_private_items,
+    clippy::doc_markdown,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::future_not_send,
@@ -39,6 +40,7 @@
 
 mod fixtures;
 
+mod anthropic;
 mod completions;
 mod direct;
 mod errors;

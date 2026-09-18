@@ -105,6 +105,44 @@ spec:
           namespace: llm
           port: 8080
 ---
+# Anthropic column: /v1/messages + BBR header → llm-katan (OpenAI-mode).
+# Routing stays header-based like every other column: BBR (ipp-pre) lifts the
+# body "model" into X-Gateway-Model-Name, so this rule matches BOTH the
+# /v1/messages path AND X-Gateway-Model-Name: gpt-4 — more specific than the
+# header-only model-routes rule, so it wins for Anthropic traffic. If FDS
+# deferral drops the header mutation the rule cannot match → 404, exactly like
+# the other columns. The ipp ext-proc (INSERT_BEFORE router) still sees the
+# original /v1/messages path and activates the anthropic_messages_* filters;
+# the URLRewrite then forwards the translated OpenAI request to the backend's
+# /v1/chat/completions endpoint.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: anthropic-route
+  namespace: istio-system
+spec:
+  parentRefs:
+    - name: e2e-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/messages
+          headers:
+            - name: X-Gateway-Model-Name
+              type: Exact
+              value: gpt-4
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1/chat/completions
+      backendRefs:
+        - name: llm-katan
+          namespace: llm
+          port: 443
+---
 # Direct path-based routes: no BBR header matching required.
 # /direct/external/v1/... and /direct/internal/v1/... are rewritten
 # to /v1/... before forwarding. Tests IPP in isolation without BBR.

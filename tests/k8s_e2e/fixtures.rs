@@ -50,6 +50,40 @@ pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Resp
         .expect("request failed")
 }
 
+/// POST an Anthropic Messages-format chat request to `/v1/messages`.
+///
+/// The `anthropic_messages_*` filter chain (gated to `/v1/messages` via
+/// request `conditions`) translates the request body to OpenAI
+/// chat-completions and the non-streaming response back to Anthropic
+/// Messages shape; the `/v1/messages` route rewrites the upstream path to
+/// `/v1/chat/completions` for the OpenAI-mode backend. The response
+/// therefore comes back in Anthropic shape.
+pub(crate) async fn anthropic_message(model: &str, content: &str) -> reqwest::Response {
+    anthropic_request(serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": content}]
+    }))
+    .await
+}
+
+/// POST an arbitrary Anthropic Messages-format body to `/v1/messages`.
+///
+/// Sets the `anthropic-version` header so the translation filter activates
+/// regardless of path rewriting.
+pub(crate) async fn anthropic_request(body: serde_json::Value) -> reqwest::Response {
+    let client = http_client();
+    let url = format!("{}/v1/messages", gateway_url());
+
+    client
+        .post(&url)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .expect("request failed")
+}
+
 /// Assert that IPP response mutations are present.
 ///
 /// `X-Praxis-Version` is set by the IPP ext-proc `headers` filter.

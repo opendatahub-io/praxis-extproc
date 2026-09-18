@@ -14,6 +14,28 @@ data:
     filter_chains:
       - name: ipp
         filters:
+          # Anthropic provider column: translate Anthropic Messages-format
+          # requests to OpenAI chat-completions (request body) and the
+          # non-streaming response back to Anthropic Messages shape.
+          #
+          # ext-proc flattens every chain into ONE global pipeline that runs
+          # on all traffic, and anthropic_messages_to_chat_completions
+          # translates unconditionally — ungated it would corrupt the OpenAI
+          # /v1/chat/completions bodies the other columns exercise. The
+          # request `conditions` gate confines both filters to /v1/messages;
+          # the response phase is skipped automatically for requests that did
+          # not run in the request phase (executed_filter_indices), so OpenAI
+          # traffic is untouched in both directions.
+          - filter: anthropic_messages_format
+            on_invalid: continue
+            conditions:
+              - when:
+                  path_prefix: "/v1/messages"
+          - filter: anthropic_messages_to_chat_completions
+            max_body_bytes: 1048576
+            conditions:
+              - when:
+                  path_prefix: "/v1/messages"
           - filter: headers
             request_add:
               - name: X-Praxis-Processed
