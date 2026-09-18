@@ -263,6 +263,42 @@ pub fn rejection_to_immediate(rejection: &praxis_filter::Rejection) -> Immediate
     }
 }
 
+/// Convert a [`TerminalResponse`] into an ExtProc [`ImmediateResponse`].
+///
+/// A terminal response is a complete reply produced by a request-phase filter
+/// (e.g. the iterative router returning an upstream response). Envoy can only
+/// deliver it as a local reply, which ends the stream.
+///
+/// [`TerminalResponse`]: praxis_filter::TerminalResponse
+/// [`ImmediateResponse`]: praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse
+pub fn terminal_response_to_immediate(terminal: &praxis_filter::TerminalResponse) -> ImmediateResponse {
+    let set_headers = terminal
+        .headers
+        .iter()
+        .map(|(name, value)| header_value_option(name.as_str(), value.to_str().unwrap_or_default()))
+        .collect::<Vec<_>>();
+    let headers = (!set_headers.is_empty()).then(|| HeaderMutation {
+        set_headers,
+        remove_headers: Vec::new(),
+    });
+
+    let body = terminal
+        .body
+        .as_ref()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+
+    ImmediateResponse {
+        status: Some(HttpStatus {
+            code: i32::from(terminal.status),
+        }),
+        headers,
+        body,
+        grpc_status: None,
+        details: String::new(),
+    }
+}
+
 /// Build a [`Response`] from ExtProc response headers.
 ///
 /// Extracts `:status` pseudo-header for the status code; remaining
@@ -616,6 +652,37 @@ mod tests {
         assert_eq!(
             hdrs.set_headers[0].header.as_ref().unwrap().key,
             "Retry-After",
+            "header key should match"
+        );
+    }
+
+    #[test]
+    fn terminal_response_to_immediate_basic() {
+        let terminal = praxis_filter::TerminalResponse::new(200);
+        let imm = terminal_response_to_immediate(&terminal);
+
+        assert_eq!(imm.status.unwrap().code, 200, "status should be 200");
+        assert!(imm.headers.is_none(), "no headers on bare terminal response");
+        assert!(imm.body.is_empty(), "no body on bare terminal response");
+    }
+
+    #[test]
+    fn terminal_response_to_immediate_with_body_and_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let terminal = praxis_filter::TerminalResponse::new(200)
+            .with_headers(headers)
+            .with_body(Bytes::from_static(b"{\"ok\":true}"));
+        let imm = terminal_response_to_immediate(&terminal);
+
+        assert_eq!(imm.status.unwrap().code, 200, "status should be 200");
+        assert_eq!(imm.body, "{\"ok\":true}", "body should match");
+
+        let hdrs = imm.headers.unwrap();
+        assert_eq!(hdrs.set_headers.len(), 1, "should have one header");
+        assert_eq!(
+            hdrs.set_headers[0].header.as_ref().unwrap().key,
+            "content-type",
             "header key should match"
         );
     }
