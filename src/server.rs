@@ -532,14 +532,14 @@ async fn handle_request_headers(
     }
 
     match state.protocol_config.request_body_mode {
+        BodyMode::None | BodyMode::Streamed => {
+            state.header_state.request_headers_sent = true;
+            run_request_header_filters_early(pipeline, state, MutationDelivery::Send).await
+        },
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
             run_request_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
-        BodyMode::Streamed => {
-            state.header_state.request_headers_sent = true;
-            run_request_header_filters_early(pipeline, state, MutationDelivery::Send).await
-        },
         _ => Ok(vec![response::request_headers(None)]),
     }
 }
@@ -592,6 +592,8 @@ async fn accumulate_request_body(
 ///
 /// For `BUFFERED`, runs filters early and defers mutations to body phase
 /// (Envoy honours `CommonResponse.header_mutation` on body responses).
+/// For `NONE`, runs filters early and sends mutations immediately because no
+/// response body message is delivered.
 /// For `STREAMED`, runs filters early and sends mutations immediately
 /// (Envoy ignores header mutations on body responses for non-`BUFFERED`).
 /// For `FDS` with body filters, returns no response — full pipeline at body EOS.
@@ -622,14 +624,14 @@ async fn handle_response_headers(
     }
 
     match state.protocol_config.response_body_mode {
+        BodyMode::None | BodyMode::Streamed => {
+            state.header_state.response_headers_sent = true;
+            run_response_header_filters_early(pipeline, state, MutationDelivery::Send).await
+        },
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_response_body => {
             run_response_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
-        BodyMode::Streamed => {
-            state.header_state.response_headers_sent = true;
-            run_response_header_filters_early(pipeline, state, MutationDelivery::Send).await
-        },
         _ => run_response_header_filters_early(pipeline, state, MutationDelivery::DeferWithResponse).await,
     }
 }
@@ -2041,6 +2043,187 @@ mod tests {
         }
     }
 
+    /// Removes temporary files created by protocol integration tests even
+    /// when an assertion fails before the normal cleanup path runs.
+    struct TempFiles(Vec<std::path::PathBuf>);
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                drop(std::fs::remove_file(path));
+            }
+        }
+    }
+
+    struct RequestMutationFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RequestMutationFilter {
+        fn name(&self) -> &'static str {
+            "request_mutation_probe"
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.request_headers_to_set
+                .push(("x-request-probe".parse().unwrap(), "sent".parse().unwrap()));
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl RequestMutationFilter {
+        /// Registry factory for the request-phase protocol test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    struct ResponseMutationFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ResponseMutationFilter {
+        fn name(&self) -> &'static str {
+            "response_mutation_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if let Some(response) = ctx.response_header.as_mut() {
+                response.headers.insert("x-response-probe", "sent".parse().unwrap());
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl ResponseMutationFilter {
+        /// Registry factory for the response-phase protocol test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "protocol regression test deliberately exercises the complete handoff"
+    )]
+    #[tokio::test]
+    async fn none_request_body_mode_delivers_header_mutation_immediately() {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: request_mutation_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "request_mutation_probe",
+                praxis_filter::http_builtin(RequestMutationFilter::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::None;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        let responses = handle_request_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1, "NONE must complete the request in headers");
+        assert!(state.header_state.request_headers_sent);
+        let response = responses.first().and_then(|response| response.response.as_ref());
+        assert!(matches!(
+            response,
+            Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
+        ));
+        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(headers)) =
+            response
+        else {
+            return;
+        };
+        let Some(common) = headers.response.as_ref() else {
+            return;
+        };
+        assert!(
+            common.clear_route_cache,
+            "request mutation must clear Envoy route cache"
+        );
+        assert!(common.header_mutation.as_ref().is_some_and(|mutation| {
+            mutation.set_headers.iter().any(|header| {
+                header
+                    .header
+                    .as_ref()
+                    .is_some_and(|header| header.key == "x-request-probe" && header.value == "sent")
+            })
+        }));
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "protocol regression test deliberately exercises the complete handoff"
+    )]
+    #[tokio::test]
+    async fn none_response_body_mode_delivers_header_mutation_immediately() {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: response_mutation_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "response_mutation_probe",
+                praxis_filter::http_builtin(ResponseMutationFilter::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::None;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        let responses = handle_response_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1, "NONE must complete the response in headers");
+        assert!(state.header_state.response_headers_sent);
+        assert!(!responses.is_empty(), "NONE must produce a response-header message");
+        let Some(response) = responses.first() else {
+            return;
+        };
+        assert!(matches!(
+            &response.response,
+            Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseHeaders(headers))
+                if headers.response.as_ref().is_some_and(|common| common
+                    .header_mutation
+                    .as_ref()
+                    .is_some_and(|mutation| mutation.set_headers.iter().any(|header| header
+                        .header
+                        .as_ref()
+                        .is_some_and(|header| header.key == "x-response-probe"))))
+        ));
+    }
+
     #[tokio::test]
     async fn filter_state_survives_request_to_response_phase() {
         use std::sync::atomic::Ordering;
@@ -2077,6 +2260,102 @@ mod tests {
             PROBE_OBSERVED.load(Ordering::SeqCst),
             PROBE_VALUE,
             "on_response must see state stored in on_request; 0 means it was dropped at the phase boundary"
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "protocol handoff regression test deliberately exercises the complete filter chain"
+    )]
+    #[tokio::test]
+    async fn post_auth_handoff_selects_provider_replaces_spoof_and_clears_route_cache() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let overlay_path = std::env::temp_dir().join(format!("praxis-extproc-overlay-{suffix}.json"));
+        let credential_path = std::env::temp_dir().join(format!("praxis-extproc-credential-{suffix}"));
+        let _temporary_files = TempFiles(vec![overlay_path.clone(), credential_path.clone()]);
+        std::fs::write(&overlay_path, r#"{
+            "local_site":"local",
+            "candidates":[{
+                "kind":"inference_model",
+                "name":"demo",
+                "site":"local",
+                "cluster":"provider-provider-a",
+                "fresh":true,
+                "stable_id":"provider-provider-a",
+                "credential":{"strategy":"bearer_token","secretRef":{"name":"provider-a-secret","namespace":"tenant-a","key":"api-key"}}
+            }]
+        }"#).unwrap();
+        std::fs::write(&credential_path, "projected-provider-token").unwrap();
+
+        let config: crate::config::ExtProcConfig = serde_yaml::from_str(&format!(
+            "filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n        overlay_file: {}\n        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [provider-provider-a]\n      - filter: credential_inject\n        credentials:\n          - name: provider-a-secret\n            namespace: tenant-a\n            key: api-key\n            strategy: bearer_token\n            file: {}\n",
+            overlay_path.display(), credential_path.display()
+        )).unwrap();
+        let pipeline = crate::config::build_pipeline(&config, &praxis_ai_filters::build_ai_registry()).unwrap();
+        let header = |key: &str, value: &str| HeaderValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            raw_value: Vec::new(),
+        };
+        let request = adapter::envoy_headers_to_request(&[
+            header(":method", "POST"),
+            header(":path", "/tenant-a/demo/v1/chat/completions"),
+            header("X-Gateway-Model-Name", "demo"),
+            header("x-ai-routing-candidate", "provider-provider-b"),
+            header("x-ai-routing-request-id", "attacker"),
+            header("x-ai-routing-revision", "attacker"),
+            header("authorization", "Bearer caller"),
+            header("x-api-key", "caller-key"),
+        ]);
+        let mut context = adapter::build_filter_context(&pipeline, &request);
+        let _action = pipeline.execute_http_request(&mut context).await.unwrap();
+        let mutation = adapter::collect_request_header_mutations(&context).expect("handoff must mutate headers");
+
+        let set = mutation
+            .set_headers
+            .iter()
+            .filter_map(|header| header.header.as_ref())
+            .collect::<Vec<_>>();
+        assert!(
+            set.iter()
+                .any(|header| header.key == "x-ai-routing-candidate" && header.value == "provider-provider-a")
+        );
+        assert!(
+            set.iter()
+                .any(|header| header.key == "authorization" && header.value == "Bearer projected-provider-token")
+        );
+        for name in [
+            "x-ai-routing-candidate",
+            "x-ai-routing-request-id",
+            "x-ai-routing-revision",
+            "authorization",
+            "x-api-key",
+        ] {
+            assert!(
+                mutation.remove_headers.iter().any(|removed| removed == name),
+                "missing removal for {name}"
+            );
+        }
+
+        let response = response::request_headers(Some(mutation));
+        let common = match response.response.unwrap() {
+            praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(headers) => {
+                headers.response.unwrap()
+            },
+            other => panic!("unexpected response variant: {other:?}"),
+        };
+        assert!(
+            common.clear_route_cache,
+            "trusted provider handoff must clear Envoy's route cache"
         );
     }
 }

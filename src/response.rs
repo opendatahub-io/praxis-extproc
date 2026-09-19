@@ -25,7 +25,6 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum BodyMode {
     /// No body sent.
-    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     None = 0,
     /// Body sent in streaming mode (incremental processing).
     Streamed = 1,
@@ -44,15 +43,16 @@ impl TryFrom<i32> for BodyMode {
 
     /// Parse from Envoy's `protocol_config` field.
     ///
-    /// Supported: `STREAMED` (1), `BUFFERED` (2), `FULL_DUPLEX_STREAMED` (4).
-    /// `NONE` (0) maps to `BUFFERED` (2).
+    /// Supported: `NONE` (0), `STREAMED` (1), `BUFFERED` (2),
+    /// `FULL_DUPLEX_STREAMED` (4).
     ///
     /// # Errors
     ///
     /// Returns error message for unsupported modes.
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 | 2 => Ok(Self::Buffered),
+            0 => Ok(Self::None),
+            2 => Ok(Self::Buffered),
             1 => Ok(Self::Streamed),
             4 => Ok(Self::FullDuplexStreamed),
             3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
@@ -401,6 +401,16 @@ mod tests {
         let resp = request_headers(Some(mutation));
 
         assert!(resp.response.is_some(), "response should be present");
+        let Some(Response::RequestHeaders(headers)) = resp.response else {
+            panic!("response should be RequestHeaders");
+        };
+        let Some(common) = headers.response else {
+            panic!("common response should be present");
+        };
+        assert!(
+            common.clear_route_cache,
+            "request header mutation must clear Envoy route cache"
+        );
     }
 
     #[test]
@@ -408,6 +418,16 @@ mod tests {
         let resp = request_headers(None);
 
         assert!(resp.response.is_some(), "response should be present");
+        let Some(Response::RequestHeaders(headers)) = resp.response else {
+            panic!("response should be RequestHeaders");
+        };
+        let Some(common) = headers.response else {
+            panic!("common response should be present");
+        };
+        assert!(
+            !common.clear_route_cache,
+            "unchanged request must not clear Envoy route cache"
+        );
     }
 
     #[test]
@@ -519,6 +539,8 @@ mod tests {
         let responses = request_body(Some(&data), Some(mutation), BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "should produce single body response with mutation");
+        assert!(matches!(&responses[0].response, Some(Response::RequestBody(body))
+            if body.response.as_ref().is_some_and(|common| common.header_mutation.is_some())));
     }
 
     #[test]
@@ -648,6 +670,8 @@ mod tests {
                 .is_some()),
             "first chunk should include header mutation"
         );
+        assert!(matches!(&first.response, Some(Response::RequestBody(body))
+            if body.response.as_ref().is_some_and(|common| common.header_mutation.is_some())));
 
         // Second chunk should not
         let second = &responses[1];
@@ -718,7 +742,7 @@ mod tests {
 
     #[test]
     fn body_mode_from_i32_valid_modes() {
-        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::None);
         assert_eq!(BodyMode::try_from(1).unwrap(), BodyMode::Streamed);
         assert_eq!(BodyMode::try_from(2).unwrap(), BodyMode::Buffered);
         assert_eq!(BodyMode::try_from(4).unwrap(), BodyMode::FullDuplexStreamed);
