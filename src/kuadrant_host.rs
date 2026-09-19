@@ -314,11 +314,13 @@ impl AttributeResolver for PraxisResolver {
         message: Vec<u8>,
         timeout: Duration,
     ) -> Result<u32, ServiceError> {
-        let mut tok = lock(&self.next_token);
-        let token = *tok;
-        *tok = tok.wrapping_add(1);
-        drop(tok);
-        let pending = GrpcDispatch {
+        let token = {
+            let mut tok = lock(&self.next_token);
+            let token = *tok;
+            *tok = tok.wrapping_add(1);
+            token
+        };
+        let dispatch = GrpcDispatch {
             token,
             upstream: upstream_name.to_owned(),
             service: service_name.to_owned(),
@@ -327,10 +329,20 @@ impl AttributeResolver for PraxisResolver {
             message,
             timeout,
         };
-        // NOTE: single-slot for now. A pipeline that dispatches more than one
-        // call before yielding would overwrite; Kuadrant's auth->RL flow is
-        // sequential (pauses between), but harden to a queue before shipping.
-        *lock(&self.pending) = Some(pending);
+        // Single deferred slot: the driver drains `pending` between dispatches. A
+        // second call while one is still pending means the pipeline dispatched two
+        // calls in one eval step, which this bridge cannot correlate. Overwriting
+        // would feed one backend's response to the other's token, an undefined
+        // decision, so fail closed and let the task run its service's failureMode
+        // (auth denies) instead of silently allowing.
+        let mut slot = lock(&self.pending);
+        if slot.is_some() {
+            return Err(ServiceError::Dispatch(
+                "kuadrant: a gRPC dispatch is already pending (concurrent dispatch unsupported)".to_owned(),
+            ));
+        }
+        *slot = Some(dispatch);
+        drop(slot);
         Ok(token)
     }
 
@@ -454,6 +466,20 @@ mod tests {
             .dispatch_grpc_call("up", "svc.B", "M", vec![], b"m2".to_vec(), Duration::from_secs(1))
             .expect("dispatch");
         assert_ne!(t1, t2, "tokens increment");
+    }
+
+    #[test]
+    fn second_dispatch_before_drain_fails_closed() {
+        // A second dispatch while one is still pending (undrained) must be
+        // refused, not silently overwrite the first: the driver never sees two
+        // un-correlated calls, so an auth call cannot be dropped for a later one.
+        let r = PraxisResolver::new(vec![], vec![], None, None);
+        r.dispatch_grpc_call("up", "svc.A", "M", vec![], b"m1".to_vec(), Duration::from_secs(1))
+            .expect("first dispatch");
+        let second = r.dispatch_grpc_call("up", "svc.B", "M", vec![], b"m2".to_vec(), Duration::from_secs(1));
+        assert!(second.is_err(), "second dispatch before drain is rejected");
+        let pending = r.take_pending().expect("first dispatch still pending");
+        assert_eq!(pending.service, "svc.A", "the first call was not overwritten");
     }
 
     #[test]

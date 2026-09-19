@@ -12,7 +12,7 @@
 use std::{collections::HashMap, mem, pin::Pin, sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use kuadrant_filter::configuration::PluginConfiguration;
+use kuadrant_filter::{configuration::PluginConfiguration, filter::DescriptorManager, kuadrant::PipelineFactory};
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -125,28 +125,41 @@ pub struct PraxisExtProc {
     kuadrant: Option<Arc<KuadrantPolicy>>,
 }
 
-/// Kuadrant policy config + gRPC transport, shared across streams.
-#[derive(Debug)]
+/// Kuadrant pipeline factory + gRPC transport, shared across streams.
 pub struct KuadrantPolicy {
-    /// Compiled Kuadrant plugin configuration (services + action sets).
-    config: PluginConfiguration,
+    /// Kuadrant pipeline factory, compiled once from the plugin config so no
+    /// request pays config compilation.
+    factory: Arc<PipelineFactory>,
     /// gRPC transport dialing the Authorino/Limitador upstreams.
     transport: Arc<TonicTransport>,
 }
 
+impl std::fmt::Debug for KuadrantPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // PipelineFactory is not Debug; the compiled blueprints are not useful here.
+        f.debug_struct("KuadrantPolicy").finish_non_exhaustive()
+    }
+}
+
 impl KuadrantPolicy {
     /// Build from a parsed plugin configuration, a cluster-name -> endpoint map,
-    /// and per-upstream TLS settings (e.g. the Authorino service CA).
-    #[must_use]
+    /// and per-upstream TLS settings (e.g. the Authorino service CA). Compiles the
+    /// pipeline factory once here, off the request path.
+    ///
+    /// # Errors
+    /// Returns an error string if the plugin configuration fails to compile.
     pub fn new(
         config: PluginConfiguration,
         upstreams: HashMap<String, String>,
         tls: HashMap<String, UpstreamTls>,
-    ) -> Self {
-        Self {
-            config,
+    ) -> Result<Self, String> {
+        let descriptors = Arc::new(DescriptorManager::default());
+        let factory =
+            PipelineFactory::try_from(config, &descriptors).map_err(|e| format!("compile kuadrant policy: {e:?}"))?;
+        Ok(Self {
+            factory: Arc::new(factory),
             transport: Arc::new(TonicTransport::new(upstreams, tls)),
-        }
+        })
     }
 }
 
@@ -293,7 +306,7 @@ async fn handle_stream(
     // Spawn a per-stream policy executor: the Kuadrant pipeline is `!Send` and
     // spans request->response, so it lives on its own thread, not in this state.
     stream_state.kuadrant =
-        kuadrant.map(|policy| PolicyStream::spawn(policy.config.clone(), Arc::clone(&policy.transport)));
+        kuadrant.map(|policy| PolicyStream::spawn(Arc::clone(&policy.factory), Arc::clone(&policy.transport)));
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -815,10 +828,44 @@ async fn handle_response_body(
 
     let needs_body = pipeline.body_capabilities().needs_response_body;
 
-    match (mode, needs_body) {
-        (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => Ok(passthrough_chunk(&body, state, mode, false)),
-        (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, false).await,
-        _ => accumulate_response_body(pipeline, body, state).await,
+    match route_response_body(mode, needs_body, state.kuadrant.is_some()) {
+        ResponseBodyRoute::Passthrough => Ok(passthrough_chunk(&body, state, mode, false)),
+        ResponseBodyRoute::Streamed => process_streamed_body_chunk(pipeline, body, state, false).await,
+        ResponseBodyRoute::Accumulate => accumulate_response_body(pipeline, body, state).await,
+    }
+}
+
+/// Where a response-body chunk is routed.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseBodyRoute {
+    /// Emit the chunk without running body filters or the Kuadrant executor.
+    Passthrough,
+    /// Per-chunk path: run streamed body filters and feed the Kuadrant executor
+    /// (which reports token usage at end-of-stream) without buffering the body.
+    Streamed,
+    /// Buffer to end-of-stream, then run the pipeline / Kuadrant report.
+    Accumulate,
+}
+
+/// Decide how to route a response-body chunk. Native routing is unchanged; when
+/// Kuadrant is enabled it must see every chunk so the token report fires, so a
+/// route that would skip it (passthrough) is upgraded to a body-aware one. Left
+/// as passthrough, the Limitador debit would be a silent no-op on the common
+/// streamed-response shape with no native body filter.
+fn route_response_body(mode: BodyMode, needs_body: bool, kuadrant: bool) -> ResponseBodyRoute {
+    let native = match (mode, needs_body) {
+        (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => ResponseBodyRoute::Passthrough,
+        (BodyMode::Streamed, true) => ResponseBodyRoute::Streamed,
+        _ => ResponseBodyRoute::Accumulate,
+    };
+    match (kuadrant, &native, mode) {
+        // Kuadrant on but native chose passthrough: stream the chunks (so the
+        // report fires at eos) for the streamed modes, else buffer to eos.
+        (true, ResponseBodyRoute::Passthrough, BodyMode::Streamed | BodyMode::FullDuplexStreamed) => {
+            ResponseBodyRoute::Streamed
+        },
+        (true, ResponseBodyRoute::Passthrough, _) => ResponseBodyRoute::Accumulate,
+        _ => native,
     }
 }
 
@@ -1576,6 +1623,26 @@ fn merge_mutations(
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kuadrant_routes_streamed_response_body_off_passthrough() {
+        // Regression: with Kuadrant enabled and no native body filter, a streamed
+        // response body must reach the executor (so the token report fires),
+        // never passthrough (which would make the Limitador debit a silent
+        // no-op). Native routing is unchanged when Kuadrant is off.
+        use ResponseBodyRoute::{Accumulate, Passthrough, Streamed};
+        // (mode, needs_native_body, kuadrant) -> route.
+        assert_eq!(route_response_body(BodyMode::Streamed, false, false), Passthrough);
+        assert_eq!(route_response_body(BodyMode::Streamed, false, true), Streamed);
+        assert_eq!(route_response_body(BodyMode::FullDuplexStreamed, false, true), Streamed);
+        assert_eq!(route_response_body(BodyMode::Buffered, false, true), Accumulate);
+        // Native routing is unchanged when Kuadrant is off.
+        assert_eq!(route_response_body(BodyMode::Streamed, true, false), Streamed);
+        assert_eq!(
+            route_response_body(BodyMode::FullDuplexStreamed, true, false),
+            Accumulate
+        );
+    }
 
     #[test]
     fn phase_state_default_is_active() {

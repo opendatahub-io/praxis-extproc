@@ -18,11 +18,7 @@
 
 use std::{sync::Arc, thread::JoinHandle};
 
-use kuadrant_filter::{
-    configuration::PluginConfiguration,
-    filter::DescriptorManager,
-    kuadrant::{Pipeline, PipelineFactory, ReqRespCtx, resolver::AttributeResolver},
-};
+use kuadrant_filter::kuadrant::{Pipeline, PipelineFactory, ReqRespCtx, resolver::AttributeResolver};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::kuadrant_host::{GrpcTransport, HttpReply, PhaseOutcome, PraxisResolver, drive_phase};
@@ -60,9 +56,10 @@ pub struct PolicyStream {
 }
 
 impl PolicyStream {
-    /// Spawn a policy executor for one stream. `config` is the compiled Kuadrant
-    /// plugin config; `transport` dials Authorino/Limitador. Generic over the
-    /// transport (monomorphized, no vtable) so tests inject a fake.
+    /// Spawn a policy executor for one stream. `factory` is the Kuadrant pipeline
+    /// factory, compiled once at startup and shared across streams; `transport`
+    /// dials Authorino/Limitador. Generic over the transport (monomorphized, no
+    /// vtable) so tests inject a fake.
     ///
     /// # Panics
     /// Panics if the OS cannot spawn the thread or build its tokio runtime —
@@ -72,7 +69,7 @@ impl PolicyStream {
         clippy::expect_used,
         reason = "thread/runtime creation failure at stream start is unrecoverable"
     )]
-    pub fn spawn<T: GrpcTransport + 'static>(config: PluginConfiguration, transport: Arc<T>) -> Self {
+    pub fn spawn<T: GrpcTransport + 'static>(factory: Arc<PipelineFactory>, transport: Arc<T>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let thread = std::thread::Builder::new()
             .name("kuadrant-policy".to_owned())
@@ -81,7 +78,7 @@ impl PolicyStream {
                     .enable_all()
                     .build()
                     .expect("build kuadrant-policy current-thread runtime");
-                rt.block_on(run_executor(rx, config, transport));
+                rt.block_on(run_executor(rx, factory, transport));
             })
             .expect("spawn kuadrant-policy thread");
         Self { tx, _thread: thread }
@@ -145,7 +142,7 @@ enum ExecState {
 )]
 async fn run_executor<T: GrpcTransport>(
     mut rx: mpsc::UnboundedReceiver<PhaseMsg>,
-    config: PluginConfiguration,
+    factory: Arc<PipelineFactory>,
     transport: Arc<T>,
 ) {
     // One resolver for the whole stream; phases install their data on it and the
@@ -154,7 +151,7 @@ async fn run_executor<T: GrpcTransport>(
     let mut state = ExecState::Fresh;
 
     while let Some(msg) = rx.recv().await {
-        let result = handle_phase(&mut state, &resolver, &config, transport.as_ref(), msg.phase).await;
+        let result = handle_phase(&mut state, &resolver, &factory, transport.as_ref(), msg.phase).await;
         // Receiver may be gone if the stream was cancelled; that's fine.
         drop(msg.reply.send(result));
     }
@@ -172,7 +169,7 @@ async fn run_executor<T: GrpcTransport>(
 async fn handle_phase<T: GrpcTransport>(
     state: &mut ExecState,
     resolver: &Arc<PraxisResolver>,
-    config: &PluginConfiguration,
+    factory: &PipelineFactory,
     transport: &T,
     phase: Phase,
 ) -> Result<Option<HttpReply>, String> {
@@ -201,9 +198,8 @@ async fn handle_phase<T: GrpcTransport>(
         ExecState::Done => return Ok(None),
         ExecState::Paused(pipeline) => pipeline,
         ExecState::Fresh => {
-            let descriptors = Arc::new(DescriptorManager::default());
-            let factory =
-                PipelineFactory::try_from(config.clone(), &descriptors).map_err(|e| format!("compile: {e:?}"))?;
+            // The factory is compiled once at startup (KuadrantPolicy::new) and
+            // shared; per stream we build only the per-request pipeline + ctx.
             let resolver_concrete = Arc::clone(resolver);
             let resolver_dyn: Arc<dyn AttributeResolver> = resolver_concrete;
             let ctx = ReqRespCtx::new(resolver_dyn);
@@ -247,9 +243,18 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use kuadrant_filter::{configuration::PluginConfiguration, filter::DescriptorManager};
 
     use super::*;
     use crate::kuadrant_host::GrpcDispatch;
+
+    /// Compile a plugin-config JSON into the shared pipeline factory, mirroring
+    /// `KuadrantPolicy::new` so the tests drive the same startup path.
+    fn compile(config_json: &str) -> Arc<PipelineFactory> {
+        let config: PluginConfiguration = serde_yaml::from_str(config_json).expect("parse RL config");
+        let descriptors = Arc::new(DescriptorManager::default());
+        Arc::new(PipelineFactory::try_from(config, &descriptors).expect("compile RL config"))
+    }
 
     /// Records each dispatch's `(service, method)` and returns a canned
     /// Limitador `RateLimitResponse { code: OK }` (`[8, 1]`, field 1 varint = 1).
@@ -314,9 +319,8 @@ mod tests {
     /// both, and allow throughout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn check_on_request_then_report_on_response_body() {
-        let config: PluginConfiguration = serde_yaml::from_str(RL_CONFIG).expect("parse RL config");
         let transport = Arc::new(MockTransport::default());
-        let stream = PolicyStream::spawn(config, Arc::clone(&transport));
+        let stream = PolicyStream::spawn(compile(RL_CONFIG), Arc::clone(&transport));
 
         // Request phase: host + path match the action set, so the RL check fires.
         let request_headers = vec![
@@ -366,9 +370,8 @@ mod tests {
     /// unaffected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn report_fires_once_on_streamed_end_of_stream() {
-        let config: PluginConfiguration = serde_yaml::from_str(RL_CONFIG).expect("parse RL config");
         let transport = Arc::new(MockTransport::default());
-        let stream = PolicyStream::spawn(config, Arc::clone(&transport));
+        let stream = PolicyStream::spawn(compile(RL_CONFIG), Arc::clone(&transport));
 
         let request_headers = vec![
             (":authority".to_owned(), "example.com".to_owned()),

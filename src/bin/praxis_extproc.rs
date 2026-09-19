@@ -415,7 +415,7 @@ fn load_kuadrant(path: &str) -> Result<KuadrantPolicy, ExtProcError> {
             praxis_extproc::kuadrant_transport::UpstreamTls { ca_pem, sni: entry.sni },
         );
     }
-    Ok(KuadrantPolicy::new(file.plugin, file.upstreams, tls))
+    KuadrantPolicy::new(file.plugin, file.upstreams, tls).map_err(ExtProcError::Config)
 }
 
 /// Parse a socket address from CLI override or config default.

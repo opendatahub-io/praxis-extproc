@@ -19,6 +19,7 @@ use tonic::{
     metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue, MetadataMap},
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
+use tracing::warn;
 
 use crate::kuadrant_host::{GrpcDispatch, GrpcTransport};
 
@@ -111,39 +112,70 @@ impl TonicTransport {
         }
         Ok(endpoint)
     }
+
+    /// Execute the dispatch as a real gRPC call. Returns the completed call's
+    /// `(status, body)` (status 0 = OK, non-zero = a real gRPC status the
+    /// pipeline maps through failureMode), or `Err(reason)` for a transport-level
+    /// failure (unknown upstream, connect/DNS/TLS failure, unready channel, or an
+    /// elapsed deadline) that `call` collapses to UNAVAILABLE.
+    async fn try_call(&self, pending: &GrpcDispatch) -> Result<(u32, Vec<u8>), String> {
+        let uri = self
+            .upstreams
+            .get(&pending.upstream)
+            .ok_or_else(|| format!("unknown upstream cluster: {}", pending.upstream))?;
+        // A fresh channel per call: a tonic `Channel` binds its connection-driver
+        // task to the runtime that built it, and this transport is shared across
+        // the per-stream current-thread runtimes, so a channel cached here would
+        // outlive the runtime that created it. `connect_timeout` bounds the dial.
+        let channel = self
+            .endpoint(uri, pending)?
+            .connect()
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let path = PathAndQuery::from_maybe_shared(format!("/{}/{}", pending.service, pending.method))
+            .map_err(|e| format!("path: {e}"))?;
+        let mut request = tonic::Request::new(pending.message.clone());
+        attach_metadata(request.metadata_mut(), &pending.headers);
+        let mut grpc = tonic::client::Grpc::new(channel);
+        // Bound the whole RPC (ready + unary): a backend that connects then hangs
+        // must not stall the request forever. `Err(None)` = unready channel,
+        // `Err(Some)` = a completed non-OK status (a real result, not a failure).
+        // Boxed to keep the large tonic client future off `try_call`'s frame.
+        let rpc = Box::pin(async move {
+            if grpc.ready().await.is_err() {
+                return Err(None);
+            }
+            grpc.unary(request, path, BytesCodec).await.map_err(Some)
+        });
+        match tokio::time::timeout(pending.timeout, rpc).await {
+            Ok(Ok(response)) => Ok((0, response.into_inner())),
+            Ok(Err(Some(status))) => Ok((status.code() as u32, Vec::new())),
+            Ok(Err(None)) => Err("channel not ready".to_owned()),
+            Err(_) => Err("rpc deadline elapsed".to_owned()),
+        }
+    }
+}
+
+/// The `(status, body)` for a backend we could not reach. Reported instead of an
+/// error so the pipeline runs each service's own failureMode.
+fn unavailable() -> (u32, Vec<u8>) {
+    (Code::Unavailable as u32, Vec::new())
 }
 
 #[async_trait]
 impl GrpcTransport for TonicTransport {
     async fn call(&self, pending: &GrpcDispatch) -> Result<(u32, Vec<u8>), String> {
-        let uri = self
-            .upstreams
-            .get(&pending.upstream)
-            .ok_or_else(|| format!("unknown upstream cluster: {}", pending.upstream))?;
-        let channel = self
-            .endpoint(uri, pending)?
-            .connect()
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut grpc = tonic::client::Grpc::new(channel);
-        // A backend we cannot reach is not a transport panic: report it as
-        // UNAVAILABLE so the pipeline applies the service's failure mode
-        // (Authorino auth fails closed, Limitador rate-limit fails open).
-        if grpc.ready().await.is_err() {
-            return Ok((Code::Unavailable as u32, Vec::new()));
-        }
-        let path = PathAndQuery::from_maybe_shared(format!("/{}/{}", pending.service, pending.method))
-            .map_err(|e| e.to_string())?;
-        let mut request = tonic::Request::new(pending.message.clone());
-        attach_metadata(request.metadata_mut(), &pending.headers);
-        match grpc.unary(request, path, BytesCodec).await {
-            // gRPC status 0: the policy decision (allow / OVER_LIMIT / denied)
-            // lives in-band, inside the response message body.
-            Ok(response) => Ok((0, response.into_inner())),
-            // A non-OK gRPC status is a call-level failure. Hand its code back so
-            // the pipeline runs the service's failure mode instead of aborting the
-            // whole stream; there is no message body to parse on an error status.
-            Err(status) => Ok((status.code() as u32, Vec::new())),
+        // Never surface a transport failure as `Err`: that escapes the pipeline
+        // and hands the allow/deny decision to Envoy's single `failure_mode_allow`,
+        // which cannot be both fail-closed for auth and fail-open for rate-limit.
+        // Mapping to UNAVAILABLE lets each service's own failureMode govern
+        // (Authorino fails closed, Limitador fails open).
+        match self.try_call(pending).await {
+            Ok(outcome) => Ok(outcome),
+            Err(reason) => {
+                warn!(upstream = %pending.upstream, reason = %reason, "kuadrant transport: backend unreachable, applying failureMode");
+                Ok(unavailable())
+            },
         }
     }
 }
