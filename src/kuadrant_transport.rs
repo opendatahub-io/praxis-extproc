@@ -209,7 +209,9 @@ impl Service<Uri> for OpenSslConnector {
         let connector = Arc::clone(&self.connector);
         let sni = Arc::clone(&self.sni);
         Box::pin(async move {
-            let host = req.host().ok_or("gRPC endpoint URI has no host")?;
+            // `http::Uri::host` keeps the brackets on an IPv6 literal (`[::1]`).
+            // Strip them so `TcpStream::connect` can parse the address.
+            let host = strip_brackets(req.host().ok_or("gRPC endpoint URI has no host")?);
             let port = req.port_u16().unwrap_or(443);
             let tcp = TcpStream::connect((host, port)).await?;
             // into_ssl sets SNI and the cert hostname to verify against.
@@ -223,6 +225,11 @@ impl Service<Uri> for OpenSslConnector {
 
 /// Build the connector: trust only the pinned CA, PEER verify, h2 ALPN.
 fn openssl_connector(tls: &UpstreamTls) -> Result<OpenSslConnector, String> {
+    // An empty sni makes `into_ssl` clear OpenSSL's host-verify list, silently
+    // disabling SAN/hostname verification while chain verify still holds. Fail loud.
+    if tls.sni.trim().is_empty() {
+        return Err("upstream TLS sni must not be empty".to_owned());
+    }
     let ca = X509::from_pem(&tls.ca_pem).map_err(|e| format!("upstream CA cert: {e}"))?;
     let mut store = X509StoreBuilder::new().map_err(|e| format!("cert store: {e}"))?;
     store.add_cert(ca).map_err(|e| format!("trust CA cert: {e}"))?;
@@ -240,6 +247,12 @@ fn openssl_connector(tls: &UpstreamTls) -> Result<OpenSslConnector, String> {
         connector: Arc::new(builder.build()),
         sni: Arc::from(tls.sni.as_str()),
     })
+}
+
+/// Strip the surrounding brackets from an IPv6-literal host (`[::1]` -> `::1`).
+/// Leaves DNS names and IPv4 untouched.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
 /// Flatten an error and its `source()` chain: tonic's Display drops the TLS
@@ -294,5 +307,33 @@ fn attach_metadata(md: &mut MetadataMap, headers: &[(String, Vec<u8>)]) {
         ) {
             md.insert(k, v);
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::{UpstreamTls, openssl_connector, strip_brackets};
+
+    #[test]
+    fn openssl_connector_rejects_empty_sni() {
+        // Empty/blank sni is refused before the CA is even parsed, so a misconfig
+        // fails loud instead of dialing with hostname verification disabled.
+        for sni in ["", "   "] {
+            let tls = UpstreamTls {
+                ca_pem: b"unused".to_vec(),
+                sni: sni.to_owned(),
+            };
+            let err = openssl_connector(&tls).expect_err("empty sni must be rejected");
+            assert!(err.contains("sni"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn strip_brackets_only_unwraps_ipv6_literals() {
+        assert_eq!(strip_brackets("[::1]"), "::1");
+        assert_eq!(strip_brackets("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(strip_brackets("authorino.svc"), "authorino.svc");
+        assert_eq!(strip_brackets("10.0.0.1"), "10.0.0.1");
     }
 }
