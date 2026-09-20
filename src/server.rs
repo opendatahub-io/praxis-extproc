@@ -156,9 +156,10 @@ impl KuadrantPolicy {
         let descriptors = Arc::new(DescriptorManager::default());
         let factory =
             PipelineFactory::try_from(config, &descriptors).map_err(|e| format!("compile kuadrant policy: {e:?}"))?;
+        let transport = TonicTransport::new(upstreams, tls).map_err(|e| format!("build kuadrant transport: {e}"))?;
         Ok(Self {
             factory: Arc::new(factory),
-            transport: Arc::new(TonicTransport::new(upstreams, tls)),
+            transport: Arc::new(transport),
         })
     }
 }
@@ -197,6 +198,12 @@ fn to_immediate(reply: HttpReply) -> ImmediateResponse {
 /// Run the Kuadrant request-phase check (Authorino auth + Limitador rate-limit).
 /// `Some` short-circuits with an immediate denial; `None` continues to native
 /// filters, and the same pipeline resumes on the response phases.
+///
+/// Deploy the `ext_proc` filter with `failure_mode_allow: false`. Transport
+/// failures are already mapped to each service's own failureMode, but an
+/// executor-thread error surfaces as a stream error, and an in-process filter
+/// cannot honor per-service fail-closed once its own executor fails. Envoy's
+/// `failure_mode_allow` is then the only backstop, so it must deny.
 async fn kuadrant_request_check(
     stream: &PolicyStream,
     envoy_headers: &[HeaderValue],
@@ -859,12 +866,12 @@ fn route_response_body(mode: BodyMode, needs_body: bool, kuadrant: bool) -> Resp
         _ => ResponseBodyRoute::Accumulate,
     };
     match (kuadrant, &native, mode) {
-        // Kuadrant on but native chose passthrough: stream the chunks (so the
-        // report fires at eos) for the streamed modes, else buffer to eos.
+        // Kuadrant on but native chose passthrough: stream the chunks so the token
+        // report fires at eos. Passthrough only arises for the streamed modes, so
+        // this covers every passthrough case.
         (true, ResponseBodyRoute::Passthrough, BodyMode::Streamed | BodyMode::FullDuplexStreamed) => {
             ResponseBodyRoute::Streamed
         },
-        (true, ResponseBodyRoute::Passthrough, _) => ResponseBodyRoute::Accumulate,
         _ => native,
     }
 }
@@ -887,12 +894,13 @@ async fn accumulate_response_body(
     // rate-limit debit). Buffered mode is one chunk with end_of_stream = true.
     if let Some(stream) = state.kuadrant.as_ref() {
         let response_body = state.response_body.clone();
-        if let Some(reply) = stream
-            .on_response_body(response_body, true)
-            .await
-            .map_err(Status::internal)?
-        {
-            return Ok(vec![response::immediate(to_immediate(reply))]);
+        match stream.on_response_body(response_body, true).await {
+            Ok(Some(reply)) => return Ok(vec![response::immediate(to_immediate(reply))]),
+            Ok(None) => {},
+            // Fail open on the response phase: the token report is a post-hoc debit
+            // and the response is already complete, so an executor error must not
+            // reset it. Request-phase auth stays fail-closed.
+            Err(e) => warn!(error = %e, "kuadrant response report failed; allowing response"),
         }
     }
 
@@ -1178,10 +1186,16 @@ async fn process_streamed_body_chunk(
     // fires on `end_of_stream`. Content chunks return quickly (no gRPC), so this
     // does not stall the stream. Done before the `&mut state.response` borrow.
     let kuadrant_reply = match state.kuadrant.as_ref() {
-        Some(kstream) if !is_request => kstream
-            .on_response_body(body.body.clone(), body.end_of_stream)
-            .await
-            .map_err(Status::internal)?,
+        Some(kstream) if !is_request => match kstream.on_response_body(body.body.clone(), body.end_of_stream).await {
+            Ok(reply) => reply,
+            // Fail open on the response phase: the token report is a post-hoc debit
+            // and chunks are already streaming, so an executor error must not reset
+            // an in-flight response. Request-phase auth stays fail-closed.
+            Err(e) => {
+                warn!(error = %e, "kuadrant response report failed; allowing response");
+                None
+            },
+        },
         _ => None,
     };
     if let Some(reply) = kuadrant_reply {
@@ -2280,6 +2294,39 @@ mod tests {
             &[("reason", "missing_headers"), ("detail", "response")],
         );
         assert_eq!(count, 1, "missing response headers must increment the counter");
+    }
+
+    #[tokio::test]
+    async fn response_phase_report_error_fails_open_not_reset() {
+        use praxis_filter::FilterRegistry;
+
+        use crate::kuadrant_executor::PolicyStream;
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new(BodyModeOverrides::default());
+        // Request headers present so the fall-through reaches the response branch.
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        // A dead Kuadrant executor makes on_response_body error at end-of-stream.
+        state.kuadrant = Some(PolicyStream::dead());
+
+        let body = praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: b"{}".to_vec(),
+            end_of_stream: true,
+        };
+        let result = accumulate_response_body(&pipeline, body, &mut state).await;
+        // Fail open: the report error must not reset the response with an internal
+        // status. It falls through to the pipeline, which here errs only because no
+        // response headers were set (invalid_argument). The pre-fix `?` returned
+        // internal.
+        assert!(
+            result.is_err(),
+            "pipeline still runs after fail-open (no response headers set)"
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "response-phase report error must fail open, not reset the stream with an internal status"
+        );
     }
 
     /// Typed marker a probe filter stashes on request and reads on response.

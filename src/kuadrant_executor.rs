@@ -84,6 +84,18 @@ impl PolicyStream {
         Self { tx, _thread: thread }
     }
 
+    /// A stream whose executor is already gone: the receiver is dropped, so every
+    /// `phase` send fails. Used to exercise the response-phase fail-open path.
+    #[cfg(test)]
+    pub(crate) fn dead() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        Self {
+            tx,
+            _thread: std::thread::spawn(|| {}),
+        }
+    }
+
     /// Enforce the request phase (auth + rate-limit check). `Ok(Some)` rejects.
     ///
     /// # Errors

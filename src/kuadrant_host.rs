@@ -183,17 +183,20 @@ impl PraxisResolver {
     }
 }
 
+/// Split a dotted attribute path into its `Path` tokens.
+fn path_tokens(path: &str) -> Vec<String> {
+    path.split('.').map(str::to_owned).collect()
+}
+
 /// Store `request.<attr>` (or any dotted path) as a string property.
 fn put_str(properties: &mut HashMap<Path, Vec<u8>>, path: &str, value: &str) {
-    let tokens = path.split('.').map(str::to_owned).collect();
-    properties.insert(Path::new(tokens), value.as_bytes().to_vec());
+    properties.insert(Path::new(path_tokens(path)), value.as_bytes().to_vec());
 }
 
 /// Store a dotted path as an i64 little-endian property (the encoding the CEL
 /// layer decodes `Int` attributes with).
 fn put_i64(properties: &mut HashMap<Path, Vec<u8>>, path: &str, value: i64) {
-    let tokens = path.split('.').map(str::to_owned).collect();
-    properties.insert(Path::new(tokens), value.to_le_bytes().to_vec());
+    properties.insert(Path::new(path_tokens(path)), value.to_le_bytes().to_vec());
 }
 
 /// Seed the `request.*` (and peer) attributes the pipeline reads, from the Envoy
@@ -211,11 +214,13 @@ fn seed_request_properties(properties: &mut HashMap<Path, Vec<u8>>, headers: &[(
             ":method" => put_str(properties, "request.method", value),
             ":scheme" => put_str(properties, "request.scheme", value),
             ":path" => {
-                // `url_path` is the path without the query; `path` keeps it.
-                let path_only = value.split('?').next().unwrap_or(value);
-                put_str(properties, "request.url_path", path_only);
+                // `path` keeps the query; `url_path` is the path without it.
                 put_str(properties, "request.path", value);
-                if let Some((_, query)) = value.split_once('?') {
+                let (url_path, query) = value
+                    .split_once('?')
+                    .map_or((value.as_str(), None), |(p, q)| (p, Some(q)));
+                put_str(properties, "request.url_path", url_path);
+                if let Some(query) = query {
                     put_str(properties, "request.query", query);
                 }
             },
@@ -225,8 +230,7 @@ fn seed_request_properties(properties: &mut HashMap<Path, Vec<u8>>, headers: &[(
 
     // Attributes the ext_proc header phase does not carry. Defaults keep the
     // CheckRequest well-formed; auth (API key / identity) does not key off them.
-    let entry = |p: &str| Path::new(p.split('.').map(str::to_owned).collect());
-    if !properties.contains_key(&entry("request.scheme")) {
+    if !properties.contains_key(&Path::new(path_tokens("request.scheme"))) {
         put_str(properties, "request.scheme", "https");
     }
     put_str(properties, "request.protocol", "HTTP/1.1");

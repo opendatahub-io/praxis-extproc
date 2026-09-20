@@ -5,20 +5,34 @@
 //!
 //! Executes a [`GrpcDispatch`] as a real gRPC unary call. The request message is
 //! already serialized protobuf built by `kuadrant-filter`, so the codec is a
-//! pass-through — no shared proto types with the crate, hence no version
-//! coupling. The upstream cluster name is resolved to a gRPC endpoint via a
-//! configured map.
+//! pass-through, no shared proto types with the crate, hence no version coupling.
+//! The upstream cluster name is resolved to a gRPC endpoint via a configured map.
+//! TLS dials through system `OpenSSL`, not tonic's rustls, so the auth channel
+//! honors the platform FIPS provider like the rest of this binary.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
-use http::uri::PathAndQuery;
+use http::{Uri, uri::PathAndQuery};
+use hyper_util::rt::TokioIo;
+use openssl::{
+    ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion},
+    x509::{X509, store::X509StoreBuilder},
+};
+use tokio::net::TcpStream;
 use tonic::{
     Code, Status,
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue, MetadataMap},
-    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+    transport::{Channel, Endpoint},
 };
+use tower_service::Service;
 use tracing::warn;
 
 use crate::kuadrant_host::{GrpcDispatch, GrpcTransport};
@@ -75,9 +89,7 @@ impl Decoder for BytesDecoder {
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Vec<u8>>, Status> {
         use bytes::Buf as _;
         let n = src.remaining();
-        let mut out = vec![0_u8; n];
-        src.copy_to_slice(&mut out);
-        Ok(Some(out))
+        Ok(Some(src.copy_to_bytes(n).to_vec()))
     }
 }
 
@@ -86,31 +98,36 @@ impl Decoder for BytesDecoder {
 pub struct TonicTransport {
     /// Cluster name (e.g. `authorino`, `limitador`) -> endpoint URI.
     upstreams: HashMap<String, String>,
-    /// Per-upstream TLS settings. Absent = plaintext.
-    tls: HashMap<String, UpstreamTls>,
+    /// Per-upstream `OpenSSL` connector, built once at startup. Absent = plaintext.
+    connectors: HashMap<String, OpenSslConnector>,
 }
 
 impl TonicTransport {
     /// Build a transport from a cluster-name -> URI map plus per-upstream TLS.
-    #[must_use]
-    pub fn new(upstreams: HashMap<String, String>, tls: HashMap<String, UpstreamTls>) -> Self {
-        Self { upstreams, tls }
+    /// Connectors are built once here so dispatch never re-parses a CA.
+    ///
+    /// # Errors
+    /// Returns an error if any upstream CA cannot be built into a connector.
+    pub fn new(upstreams: HashMap<String, String>, tls: HashMap<String, UpstreamTls>) -> Result<Self, String> {
+        let connectors = tls
+            .into_iter()
+            .map(|(name, t)| openssl_connector(&t).map(|c| (name, c)))
+            .collect::<Result<HashMap<_, _>, String>>()?;
+        Ok(Self { upstreams, connectors })
     }
 
-    /// Build the (optionally TLS-wrapped) endpoint for a dispatch. Kept separate
-    /// from the async `call` so the large `ClientTlsConfig`/`Certificate` locals
-    /// live in this synchronous frame, not the dispatch future's state machine.
-    fn endpoint(&self, uri: &str, pending: &GrpcDispatch) -> Result<Endpoint, String> {
-        let mut endpoint = Channel::from_shared(uri.to_owned())
+    /// Resolve the dispatch's endpoint (with `connect_timeout`) and its optional
+    /// pre-built TLS connector. Kept out of the async `call` so the endpoint build
+    /// stays off the dispatch future's frame.
+    fn prepare(&self, pending: &GrpcDispatch) -> Result<(Endpoint, Option<OpenSslConnector>), String> {
+        let uri = self
+            .upstreams
+            .get(&pending.upstream)
+            .ok_or_else(|| format!("unknown upstream cluster: {}", pending.upstream))?;
+        let endpoint = Channel::from_shared(uri.to_owned())
             .map_err(|e| e.to_string())?
             .connect_timeout(pending.timeout);
-        if let Some(t) = self.tls.get(&pending.upstream) {
-            let tls = ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(&t.ca_pem))
-                .domain_name(t.sni.clone());
-            endpoint = endpoint.tls_config(tls).map_err(|e| e.to_string())?;
-        }
-        Ok(endpoint)
+        Ok((endpoint, self.connectors.get(&pending.upstream).cloned()))
     }
 
     /// Execute the dispatch as a real gRPC call. Returns the completed call's
@@ -119,26 +136,25 @@ impl TonicTransport {
     /// failure (unknown upstream, connect/DNS/TLS failure, unready channel, or an
     /// elapsed deadline) that `call` collapses to UNAVAILABLE.
     async fn try_call(&self, pending: &GrpcDispatch) -> Result<(u32, Vec<u8>), String> {
-        let uri = self
-            .upstreams
-            .get(&pending.upstream)
-            .ok_or_else(|| format!("unknown upstream cluster: {}", pending.upstream))?;
-        // A fresh channel per call: a tonic `Channel` binds its connection-driver
+        let (endpoint, connector) = self.prepare(pending)?;
+        // Fresh channel per call: a tonic `Channel` binds its connection-driver
         // task to the runtime that built it, and this transport is shared across
-        // the per-stream current-thread runtimes, so a channel cached here would
-        // outlive the runtime that created it. `connect_timeout` bounds the dial.
-        let channel = self
-            .endpoint(uri, pending)?
-            .connect()
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
+        // the per-stream current-thread runtimes. `connect_timeout` bounds the dial
+        // (including the OpenSSL handshake).
+        // Boxed so the large connect future stays off `try_call`'s stack frame.
+        let channel = match connector {
+            Some(c) => Box::pin(endpoint.connect_with_connector(c)).await,
+            None => Box::pin(endpoint.connect()).await,
+        }
+        .map_err(|e| format!("connect: {}", error_chain(&e)))?;
         let path = PathAndQuery::from_maybe_shared(format!("/{}/{}", pending.service, pending.method))
             .map_err(|e| format!("path: {e}"))?;
         let mut request = tonic::Request::new(pending.message.clone());
         attach_metadata(request.metadata_mut(), &pending.headers);
         let mut grpc = tonic::client::Grpc::new(channel);
-        // Bound the whole RPC (ready + unary): a backend that connects then hangs
-        // must not stall the request forever. `Err(None)` = unready channel,
+        // Bound the RPC (ready + unary) so a backend that connects then hangs cannot
+        // stall the request. With `connect_timeout` above, worst-case wall time is
+        // up to ~2x `pending.timeout` (dial then RPC). `Err(None)` = unready channel,
         // `Err(Some)` = a completed non-OK status (a real result, not a failure).
         // Boxed to keep the large tonic client future off `try_call`'s frame.
         let rpc = Box::pin(async move {
@@ -160,6 +176,83 @@ impl TonicTransport {
 /// error so the pipeline runs each service's own failureMode.
 fn unavailable() -> (u32, Vec<u8>) {
     (Code::Unavailable as u32, Vec::new())
+}
+
+/// Client TLS through system `OpenSSL` rather than tonic's rustls
+/// `ClientTlsConfig`, so the dial honors the platform FIPS provider.
+#[derive(Clone)]
+struct OpenSslConnector {
+    /// CA-pinned client context advertising h2 ALPN.
+    connector: Arc<SslConnector>,
+    /// SNI and certificate hostname to verify against.
+    sni: Arc<str>,
+}
+
+impl std::fmt::Debug for OpenSslConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSslConnector")
+            .field("sni", &self.sni)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Service<Uri> for OpenSslConnector {
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Response = TokioIo<tokio_openssl::SslStream<TcpStream>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Uri) -> Self::Future {
+        let connector = Arc::clone(&self.connector);
+        let sni = Arc::clone(&self.sni);
+        Box::pin(async move {
+            let host = req.host().ok_or("gRPC endpoint URI has no host")?;
+            let port = req.port_u16().unwrap_or(443);
+            let tcp = TcpStream::connect((host, port)).await?;
+            // into_ssl sets SNI and the cert hostname to verify against.
+            let ssl = connector.configure()?.into_ssl(sni.as_ref())?;
+            let mut tls = tokio_openssl::SslStream::new(ssl, tcp)?;
+            Pin::new(&mut tls).connect().await?;
+            Ok(TokioIo::new(tls))
+        })
+    }
+}
+
+/// Build the connector: trust only the pinned CA, PEER verify, h2 ALPN.
+fn openssl_connector(tls: &UpstreamTls) -> Result<OpenSslConnector, String> {
+    let ca = X509::from_pem(&tls.ca_pem).map_err(|e| format!("upstream CA cert: {e}"))?;
+    let mut store = X509StoreBuilder::new().map_err(|e| format!("cert store: {e}"))?;
+    store.add_cert(ca).map_err(|e| format!("trust CA cert: {e}"))?;
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| format!("SSL connector: {e}"))?;
+    builder.set_cert_store(store.build());
+    builder.set_verify(SslVerifyMode::PEER);
+    // Floor at TLS 1.2 so it holds without relying on the system crypto policy.
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| format!("min TLS version: {e}"))?;
+    builder
+        .set_alpn_protos(b"\x02h2")
+        .map_err(|e| format!("ALPN protos: {e}"))?;
+    Ok(OpenSslConnector {
+        connector: Arc::new(builder.build()),
+        sni: Arc::from(tls.sni.as_str()),
+    })
+}
+
+/// Flatten an error and its `source()` chain: tonic's Display drops the TLS
+/// handshake / cert-verify cause that lives in `source()`.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
 }
 
 #[async_trait]
