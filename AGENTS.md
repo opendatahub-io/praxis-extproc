@@ -50,11 +50,16 @@ Envoy -> [gRPC] -> praxis-extproc -> FilterPipeline
   translation
 - `config`: YAML config loading (filter chains only)
 - `error`: error types
+- `handlers`: per-phase ExtProc message handlers
 - `health`: gRPC health check service
 - `metrics`: Prometheus metrics endpoint
+- `pipeline`: filter execution + `ProcessingResponse`
+  assembly
+- `protocol`: ExtProc sequencing + protocol config
 - `response`: `ProcessingResponse` builders +
   chunking
-- `server`: `ExternalProcessor` gRPC implementation
+- `server`: `ExternalProcessor` gRPC service,
+  per-stream loop, and dispatch
 - `tls`: TLS configuration for gRPC listener
 
 ## Conventions

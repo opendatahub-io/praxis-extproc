@@ -16,8 +16,14 @@ pub mod adapter;
 pub mod config;
 pub mod error;
 pub mod fips;
+mod handlers;
 pub mod health;
 pub mod metrics;
+mod pipeline;
+mod protocol;
 pub mod response;
 pub mod server;
 pub mod tls;
+
+#[cfg(test)]
+mod test_support;
