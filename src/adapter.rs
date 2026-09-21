@@ -455,6 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_path_falls_back_to_root() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "not a valid uri !!!"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        assert_eq!(
+            req.uri.path(),
+            "/",
+            "malformed path should fall back to / instead of panicking"
+        );
+    }
+
+    #[test]
     fn pseudo_headers_excluded_from_header_map() {
         let headers = vec![
             make_header(":method", "GET"),
@@ -498,6 +514,22 @@ mod tests {
             ctx.client_addr,
             Some("10.0.0.1".parse().unwrap()),
             "should extract first IP from XFF"
+        );
+    }
+
+    #[test]
+    fn build_context_invalid_xff_returns_none() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-forwarded-for", "not-an-ip-address"),
+        ];
+        let req = envoy_headers_to_request(&headers);
+        let ctx = build_filter_context(test_pipeline(), &req);
+
+        assert!(
+            ctx.client_addr.is_none(),
+            "unparseable XFF should return None instead of panicking"
         );
     }
 
