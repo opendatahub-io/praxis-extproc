@@ -348,6 +348,7 @@ async fn dispatch_request(
     req: processing_request::Request,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    validate_body_message(&req, &state.protocol_config)?;
     state.phase_order.check_and_advance(&req)?;
 
     match req {
@@ -358,6 +359,28 @@ async fn dispatch_request(
         processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
         processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
     }
+}
+
+/// Reject body messages for phases Envoy configured not to send.
+///
+/// This check intentionally runs before phase ordering, EOS tracking, body
+/// accumulation, and filter execution. A body message in `NONE` mode is a
+/// malformed ExtProc stream, not an empty body to process.
+fn validate_body_message(req: &processing_request::Request, config: &ProtocolConfig) -> Result<(), Status> {
+    let (phase, mode) = match req {
+        processing_request::Request::RequestBody(_) => ("RequestBody", config.request_body_mode),
+        processing_request::Request::ResponseBody(_) => ("ResponseBody", config.response_body_mode),
+        _ => return Ok(()),
+    };
+
+    if mode == BodyMode::None {
+        metrics::record_invalid_argument("body_mode", "body_message_in_none_mode");
+        return Err(Status::invalid_argument(format!(
+            "received {phase} message while its body mode is NONE"
+        )));
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -2151,30 +2174,24 @@ mod tests {
         assert_eq!(responses.len(), 1, "NONE must complete the request in headers");
         assert!(state.header_state.request_headers_sent);
         let response = responses.first().and_then(|response| response.response.as_ref());
-        assert!(matches!(
-            response,
-            Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
-        ));
-        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(headers)) =
-            response
-        else {
-            return;
-        };
-        let Some(common) = headers.response.as_ref() else {
-            return;
-        };
         assert!(
-            common.clear_route_cache,
-            "request mutation must clear Envoy route cache"
+            matches!(
+                response,
+                Some(
+                    praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(headers)
+                ) if headers.response.as_ref().is_some_and(|common| {
+                    common.clear_route_cache
+                        && common.header_mutation.as_ref().is_some_and(|mutation| {
+                            mutation.set_headers.iter().any(|header| {
+                                header.header.as_ref().is_some_and(|header| {
+                                    header.key == "x-request-probe" && header.value == "sent"
+                                })
+                            })
+                        })
+                })
+            ),
+            "NONE must return CommonResponse with the mutation and clear_route_cache"
         );
-        assert!(common.header_mutation.as_ref().is_some_and(|mutation| {
-            mutation.set_headers.iter().any(|header| {
-                header
-                    .header
-                    .as_ref()
-                    .is_some_and(|header| header.key == "x-request-probe" && header.value == "sent")
-            })
-        }));
     }
 
     #[expect(
@@ -2207,12 +2224,8 @@ mod tests {
         .unwrap();
         assert_eq!(responses.len(), 1, "NONE must complete the response in headers");
         assert!(state.header_state.response_headers_sent);
-        assert!(!responses.is_empty(), "NONE must produce a response-header message");
-        let Some(response) = responses.first() else {
-            return;
-        };
         assert!(matches!(
-            &response.response,
+            responses.first().and_then(|response| response.response.as_ref()),
             Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseHeaders(headers))
                 if headers.response.as_ref().is_some_and(|common| common
                     .header_mutation
@@ -2222,6 +2235,117 @@ mod tests {
                         .as_ref()
                         .is_some_and(|header| header.key == "x-response-probe"))))
         ));
+    }
+
+    /// Counts body-filter execution so malformed body messages can prove they
+    /// are rejected before the pipeline is entered.
+    static BODY_FILTER_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct BodyExecutionProbe;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for BodyExecutionProbe {
+        fn name(&self) -> &'static str {
+            "body_execution_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            BODY_FILTER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            BODY_FILTER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl BodyExecutionProbe {
+        /// Registry factory for malformed-stream tests.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    fn body_probe_pipeline() -> Arc<FilterPipeline> {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: body_execution_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "body_execution_probe",
+                praxis_filter::http_builtin(BodyExecutionProbe::from_config),
+            )
+            .unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_body_in_none_mode_is_rejected_before_tracking_or_filters() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+        use processing_request::Request;
+
+        BODY_FILTER_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let pipeline = body_probe_pipeline();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::None;
+
+        let result = dispatch_request(
+            &pipeline,
+            Request::RequestBody(HttpBody {
+                body: b"unexpected".to_vec(),
+                end_of_stream: true,
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert!(result.is_err(), "RequestBody in NONE mode must be rejected");
+        if let Err(error) = result {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("RequestBody"));
+        }
+        assert!(!state.eos_tracker.request_body.is_complete(), "EOS must not be tracked");
+        assert!(state.request_body.is_empty(), "body must not be accumulated");
+        assert_eq!(BODY_FILTER_RUNS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn response_body_in_none_mode_is_rejected_before_tracking_or_filters() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+        use processing_request::Request;
+
+        BODY_FILTER_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let pipeline = body_probe_pipeline();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::None;
+
+        let result = dispatch_request(
+            &pipeline,
+            Request::ResponseBody(HttpBody {
+                body: b"unexpected".to_vec(),
+                end_of_stream: true,
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert!(result.is_err(), "ResponseBody in NONE mode must be rejected");
+        if let Err(error) = result {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("ResponseBody"));
+        }
+        assert!(
+            !state.eos_tracker.response_body.is_complete(),
+            "EOS must not be tracked"
+        );
+        assert!(state.response_body.is_empty(), "body must not be accumulated");
+        assert_eq!(BODY_FILTER_RUNS.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
