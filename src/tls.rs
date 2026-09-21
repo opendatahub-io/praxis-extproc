@@ -504,6 +504,20 @@ mod tests {
 
     use super::*;
 
+    /// Unique temp directory per call, so parallel or repeated test runs never
+    /// collide on a shared cert/key fixture path.
+    fn unique_tmp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "praxis_tls_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique temp dir");
+        dir
+    }
+
     fn make_test_acceptor() -> SslAcceptor {
         build_tls_config(&TlsConfig {
             mode: TlsMode::SelfSigned,
@@ -774,9 +788,9 @@ ca_cert_path: /etc/tls/ca.pem
         let cert_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert generation");
         let key_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("key generation");
 
-        let tmp = std::env::temp_dir();
-        let cert_path = tmp.join("praxis_tls_mismatch_cert.pem");
-        let key_path = tmp.join("praxis_tls_mismatch_key.pem");
+        let tmp = unique_tmp_dir();
+        let cert_path = tmp.join("cert.pem");
+        let key_path = tmp.join("key.pem");
 
         std::fs::write(&cert_path, cert_owner.cert.pem()).expect("write cert");
         std::fs::write(&key_path, key_owner.key_pair.serialize_pem()).expect("write key from different pair");
@@ -799,9 +813,9 @@ ca_cert_path: /etc/tls/ca.pem
     fn provided_mode_nonexistent_ca_cert_errors() {
         let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
 
-        let tmp = std::env::temp_dir();
-        let cert_path = tmp.join("praxis_tls_neg_test_cert.pem");
-        let key_path = tmp.join("praxis_tls_neg_test_key.pem");
+        let tmp = unique_tmp_dir();
+        let cert_path = tmp.join("cert.pem");
+        let key_path = tmp.join("key.pem");
 
         std::fs::write(&cert_path, server.cert.pem()).expect("write cert");
         std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("write key");
@@ -825,10 +839,10 @@ ca_cert_path: /etc/tls/ca.pem
         let ca = rcgen::generate_simple_self_signed(vec!["ca.example.com".to_owned()]).expect("CA cert generation");
         let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
 
-        let tmp = std::env::temp_dir();
-        let cert_path = tmp.join("praxis_tls_test_cert.pem");
-        let key_path = tmp.join("praxis_tls_test_key.pem");
-        let ca_path = tmp.join("praxis_tls_test_ca.pem");
+        let tmp = unique_tmp_dir();
+        let cert_path = tmp.join("cert.pem");
+        let key_path = tmp.join("key.pem");
+        let ca_path = tmp.join("ca.pem");
 
         std::fs::write(&cert_path, server.cert.pem()).expect("write cert");
         std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("write key");
