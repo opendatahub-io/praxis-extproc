@@ -1,3 +1,13 @@
+# Forge environment configuration for Praxis e2e tests.
+#
+# This file defines the Kind clusters, infrastructure stacks (MetalLB, Istio, Gateway API),
+# and Praxis deployments used for end-to-end testing. Use it with the praxis-forge CLI:
+#
+#   praxis-forge --config forge.yaml cluster create e2e
+#   praxis-forge --config forge.yaml stack apply e2e
+#   praxis-forge --config forge.yaml cluster delete e2e
+#
+# See https://github.com/praxis-proxy/forge for full documentation.
 apiVersion: forge.praxis.dev/v1alpha1
 kind: Environment
 
