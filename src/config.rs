@@ -318,4 +318,21 @@ bogus_key: true
 
         assert!(result.is_err(), "unknown fields should be rejected");
     }
+
+    #[test]
+    fn empty_filter_chain_builds_empty_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: empty
+    filters: []
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert_eq!(pipeline.len(), 0, "empty chain should produce empty pipeline");
+    }
 }
