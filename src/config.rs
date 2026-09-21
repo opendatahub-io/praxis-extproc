@@ -86,10 +86,12 @@ pub struct ServerConfig {
     /// long. Only applies when the interval is non-zero.
     pub http2_keepalive_timeout_secs: u64,
 
-    /// Maximum connection age in seconds (0 disables the bound).
+    /// Maximum connection age in seconds (0 disables it).
     ///
-    /// The server gracefully closes a connection older than this so clients
-    /// periodically reconnect, bounding otherwise long-lived connections.
+    /// Once a connection exceeds this age the server signals a graceful HTTP/2
+    /// GOAWAY and lets in-flight requests drain. No grace period is set, so the
+    /// server never force-closes. This is a soft cap that prompts periodic
+    /// reconnection rather than a hard lifetime bound.
     pub max_connection_age_secs: u64,
 }
 
