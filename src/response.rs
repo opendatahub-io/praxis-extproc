@@ -758,6 +758,60 @@ mod tests {
         assert!(BodyMode::try_from(999).is_err());
     }
 
+    #[test]
+    fn body_mode_none_with_no_mutation() {
+        let responses = request_body(None, None, BodyMode::None, true);
+
+        assert_eq!(responses.len(), 1, "None mode should produce single response");
+        assert!(
+            extract_body_mutation(&responses[0]).is_none(),
+            "None mode with no body should not produce body_mutation"
+        );
+    }
+
+    #[test]
+    fn body_mode_none_with_body_mutation() {
+        let data = b"modified by filter";
+        let responses = request_body(Some(data), None, BodyMode::None, true);
+
+        assert_eq!(responses.len(), 1, "None mode should produce single response");
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(
+                    bytes, data,
+                    "None mode should use Body variant when filter modified body"
+                );
+            },
+            other => panic!("None mode should use Body variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_mode_streamed_uses_body_variant() {
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
+        let responses = request_body(Some(&data), None, BodyMode::Streamed, true);
+
+        assert_eq!(
+            responses.len(),
+            1,
+            "non-full-duplex Streamed mode should produce single response"
+        );
+
+        let body_mut = extract_body_mutation(&responses[0]);
+        match body_mut.unwrap() {
+            body_mutation::Mutation::Body(bytes) => {
+                assert_eq!(
+                    bytes.len(),
+                    data.len(),
+                    "Streamed (non-full-duplex) should use Body variant with full body"
+                );
+            },
+            other => panic!("Streamed (non-full-duplex) should use Body variant, got {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------------
