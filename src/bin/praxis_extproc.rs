@@ -89,14 +89,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, fips.active)).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active)).await
+    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server, fips.active)).await
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
-    tls_cfg: &tls::TlsConfig,
+    server: &config::ServerConfig,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -106,7 +106,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -119,14 +119,14 @@ async fn serve_pipeline(
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server: &config::ServerConfig,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(
         addrs,
         true,
         fips_active,
-        serve_grpc(addrs.0, pipeline, tls_cfg),
+        serve_grpc(addrs.0, pipeline, server),
     ))
     .await
 }
@@ -231,31 +231,52 @@ where
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server: &config::ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
-    match tls::build_tls_config(tls_cfg)? {
-        None => Box::pin(serve_plaintext(addr, svc)).await,
-        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
+    let builder = grpc_server_builder(server);
+    match tls::build_tls_config(&server.tls)? {
+        None => Box::pin(serve_plaintext(builder, addr, svc)).await,
+        Some(acceptor) => Box::pin(serve_tls(builder, addr, svc, acceptor, &server.tls)).await,
     }
+}
+
+/// Build the tonic [`Server`] with H2 keepalive and connection-age bounds.
+///
+/// Keepalive lets the server detect and reclaim a dead client connection. The
+/// connection-age bound, when set, recycles long-lived ones. Zero disables
+/// either. The keepalive timeout is floored at one second so an enabled
+/// keepalive cannot be configured to time out instantly.
+fn grpc_server_builder(server: &config::ServerConfig) -> Server {
+    let mut builder = Server::builder();
+    if server.http2_keepalive_interval_secs > 0 {
+        builder = builder
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(
+                server.http2_keepalive_interval_secs,
+            )))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(
+                server.http2_keepalive_timeout_secs.max(1),
+            )));
+    }
+    if server.max_connection_age_secs > 0 {
+        builder = builder.max_connection_age(std::time::Duration::from_secs(server.max_connection_age_secs));
+    }
+    builder
 }
 
 /// Serve gRPC over plaintext TCP.
 async fn serve_plaintext(
+    mut builder: Server,
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(
-        Server::builder()
-            .add_service(svc)
-            .serve_with_shutdown(addr, shutdown_signal()),
-    )
-    .await?;
+    Box::pin(builder.add_service(svc).serve_with_shutdown(addr, shutdown_signal())).await?;
     Ok(())
 }
 
 /// Serve gRPC over TLS using the provided acceptor.
 async fn serve_tls(
+    mut builder: Server,
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
     acceptor: openssl::ssl::SslAcceptor,
@@ -265,7 +286,7 @@ async fn serve_tls(
     let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
     let incoming = tls::build_tls_incoming(listener, acceptor, tls_cfg.handshake_concurrency, timeout);
     Box::pin(
-        Server::builder()
+        builder
             .add_service(svc)
             .serve_with_incoming_shutdown(incoming, shutdown_signal()),
     )

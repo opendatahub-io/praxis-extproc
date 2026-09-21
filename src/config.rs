@@ -72,6 +72,27 @@ pub struct ServerConfig {
     /// TLS configuration.
     #[serde(default)]
     pub tls: crate::tls::TlsConfig,
+
+    /// HTTP/2 keepalive ping interval in seconds (0 disables keepalive).
+    ///
+    /// The server pings idle client connections at this interval so a dead
+    /// peer (e.g. a gone Envoy) is detected and its connection reclaimed
+    /// rather than lingering.
+    pub http2_keepalive_interval_secs: u64,
+
+    /// HTTP/2 keepalive ping timeout in seconds.
+    ///
+    /// A connection is closed when a keepalive ping is unacknowledged for this
+    /// long. Only applies when the interval is non-zero.
+    pub http2_keepalive_timeout_secs: u64,
+
+    /// Maximum connection age in seconds (0 disables it).
+    ///
+    /// Once a connection exceeds this age the server signals a graceful HTTP/2
+    /// GOAWAY and lets in-flight requests drain. No grace period is set, so the
+    /// server never force-closes. This is a soft cap that prompts periodic
+    /// reconnection rather than a hard lifetime bound.
+    pub max_connection_age_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +102,11 @@ impl Default for ServerConfig {
             health_address: "0.0.0.0:50052".to_owned(),
             metrics_address: "0.0.0.0:9090".to_owned(),
             tls: crate::tls::TlsConfig::default(),
+            // Keepalive on by default to detect dead peers. Connection-age bound
+            // stays off by default so it does not change connection churn unless set.
+            http2_keepalive_interval_secs: 60,
+            http2_keepalive_timeout_secs: 20,
+            max_connection_age_secs: 0,
         }
     }
 }
@@ -197,6 +223,49 @@ server:
         .unwrap();
 
         assert_eq!(cfg.server.grpc_address, "127.0.0.1:9004", "address should match");
+    }
+
+    #[test]
+    fn server_keepalive_defaults() {
+        let cfg = ServerConfig::default();
+        assert_eq!(
+            cfg.http2_keepalive_interval_secs, 60,
+            "keepalive interval should default to 60s"
+        );
+        assert_eq!(
+            cfg.http2_keepalive_timeout_secs, 20,
+            "keepalive timeout should default to 20s"
+        );
+        assert_eq!(
+            cfg.max_connection_age_secs, 0,
+            "max connection age should default to disabled"
+        );
+    }
+
+    #[test]
+    fn parse_server_keepalive_overrides() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+server:
+  http2_keepalive_interval_secs: 30
+  http2_keepalive_timeout_secs: 10
+  max_connection_age_secs: 3600
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.server.http2_keepalive_interval_secs, 30,
+            "interval override should apply"
+        );
+        assert_eq!(
+            cfg.server.http2_keepalive_timeout_secs, 10,
+            "timeout override should apply"
+        );
+        assert_eq!(
+            cfg.server.max_connection_age_secs, 3600,
+            "max age override should apply"
+        );
     }
 
     #[test]
