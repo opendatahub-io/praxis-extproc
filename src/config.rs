@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::error::{ExtProcError, Result};
 
 // -----------------------------------------------------------------------------
-// ExtProcConfig
+// ExtProc Server
 // -----------------------------------------------------------------------------
 
 /// Top-level ExtProc server configuration.

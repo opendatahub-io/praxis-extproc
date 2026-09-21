@@ -16,6 +16,16 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 };
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum body chunk size for streamed responses.
+///
+/// Envoy enforces a ~64 KiB limit per streamed body chunk. Using 62 KiB
+/// provides a safety margin.
+const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
+
+// -----------------------------------------------------------------------------
 // Body Processing Modes
 // -----------------------------------------------------------------------------
 
@@ -26,14 +36,18 @@ use praxis_proto::envoy::service::ext_proc::v3::{
 pub(crate) enum BodyMode {
     /// No body sent.
     None = 0,
+
     /// Body sent in streaming mode (incremental processing).
     Streamed = 1,
+
     /// Body buffered until complete, then sent as single chunk.
     #[default]
     Buffered = 2,
+
     /// Body sent in buffered partial mode.
     #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     BufferedPartial = 3,
+
     /// Body sent in full-duplex streaming mode with chunked responses.
     FullDuplexStreamed = 4,
 }
@@ -60,16 +74,6 @@ impl TryFrom<i32> for BodyMode {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum body chunk size for streamed responses.
-///
-/// Envoy enforces a ~64 KiB limit per streamed body chunk. Using 62 KiB
-/// provides a safety margin.
-const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
 
 // -----------------------------------------------------------------------------
 // Header Responses

@@ -40,6 +40,10 @@ const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 /// Channel buffer size for the response stream.
 const RESPONSE_CHANNEL_SIZE: usize = 16;
 
+// -----------------------------------------------------------------------------
+// Envoy Protocol Configuration
+// -----------------------------------------------------------------------------
+
 /// Parsed protocol configuration from Envoy.
 ///
 /// Extracted from the first `ProcessingRequest` message's `protocol_config` field.
@@ -47,10 +51,11 @@ const RESPONSE_CHANNEL_SIZE: usize = 16;
 struct ProtocolConfig {
     /// Request body processing mode.
     request_body_mode: BodyMode,
+
     /// Response body processing mode.
     response_body_mode: BodyMode,
+
     /// Whether body is sent immediately without waiting for header response.
-    ///
     /// Only applies to `STREAMED` body mode per Envoy spec; ignored for other
     /// modes. `FULL_DUPLEX_STREAMED` inherently streams body without waiting.
     ///
@@ -74,15 +79,11 @@ impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
 }
 
 // -----------------------------------------------------------------------------
-// Types
+// PraxisExtProc
 // -----------------------------------------------------------------------------
 
 /// Output stream type for the `Process` RPC.
 type ProcessStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ProcessingResponse, Status>> + Send>>;
-
-// -----------------------------------------------------------------------------
-// PraxisExtProc
-// -----------------------------------------------------------------------------
 
 /// Praxis ExtProc gRPC service.
 ///
@@ -242,6 +243,7 @@ fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: Protocol
 enum PhaseSide {
     /// Request-side phases (headers, body, trailers).
     Request,
+
     /// Response-side phases (headers, body, trailers).
     Response,
 }
@@ -253,8 +255,10 @@ enum PhaseSide {
 enum PhaseStep {
     /// Headers phase.
     Headers,
+
     /// Body phase.
     Body,
+
     /// Trailers phase.
     Trailers,
 }
@@ -285,8 +289,10 @@ const fn message_order(req: &processing_request::Request) -> (PhaseSide, PhaseSt
 struct PhaseOrderTracker {
     /// Furthest request-side step seen.
     request: Option<PhaseStep>,
+
     /// Furthest response-side step seen.
     response: Option<PhaseStep>,
+
     /// Whether request headers have been received, gating response processing.
     request_headers_seen: bool,
 }
@@ -392,10 +398,13 @@ fn validate_body_message(req: &processing_request::Request, config: &ProtocolCon
 enum ProtocolPhase {
     /// Request headers phase.
     RequestHeaders,
+
     /// Request body phase.
     RequestBody,
+
     /// Response headers phase.
     ResponseHeaders,
+
     /// Response body phase.
     ResponseBody,
 }
@@ -410,6 +419,7 @@ enum PhaseState {
     /// No `end_of_stream` seen yet; the phase is still being processed.
     #[default]
     Active,
+
     /// `end_of_stream` received; the phase is complete.
     Completed,
 }
@@ -426,10 +436,13 @@ impl PhaseState {
 struct EosTracker {
     /// Request headers phase state.
     request_headers: PhaseState,
+
     /// Request body phase state.
     request_body: PhaseState,
+
     /// Response headers phase state.
     response_headers: PhaseState,
+
     /// Response body phase state.
     response_body: PhaseState,
 }
@@ -712,6 +725,7 @@ async fn accumulate_response_body(
 enum RequestPhase {
     /// Headers phase (headers EOS=true).
     Headers,
+
     /// Body phase (body EOS=true).
     Body,
 }
@@ -765,6 +779,7 @@ async fn run_request_pipeline(
 enum ResponsePhase {
     /// Headers phase (response headers EOS=true).
     Headers,
+
     /// Body phase (response body EOS=true).
     Body,
 }
@@ -1023,8 +1038,10 @@ async fn process_streamed_body_chunk(
 enum MutationDelivery {
     /// Send mutations immediately in the `HeadersResponse`.
     Send,
+
     /// Defer mutations — send empty `HeadersResponse` now.
     DeferWithResponse,
+
     /// Defer mutations — send no response (FDS passthrough).
     DeferSilent,
 }
@@ -1234,8 +1251,10 @@ fn run_resp_body_filters(
 struct HeaderDeliveryState {
     /// Whether response-phase filters already ran at header time.
     response_filters_executed: bool,
+
     /// Whether the deferred request `HeadersResponse` has been sent.
     request_headers_sent: bool,
+
     /// Whether the deferred response `HeadersResponse` has been sent.
     response_headers_sent: bool,
 }

@@ -42,6 +42,22 @@ use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::info;
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
+///
+/// When all slots are occupied the accept loop stalls until one completes
+/// or times out, providing natural back-pressure on new connections.
+pub const HANDSHAKE_CONCURRENCY: usize = 64;
+
+/// Maximum duration allowed for a single TLS handshake.
+///
+/// Connections that stall during the handshake are dropped after this
+/// deadline, freeing their slot for the next accept.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// -----------------------------------------------------------------------------
 // TlsMode
 // -----------------------------------------------------------------------------
 
@@ -122,19 +138,6 @@ pub struct TlsConfig {
     pub handshake_timeout_secs: u64,
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            mode: TlsMode::None,
-            cert_path: None,
-            key_path: None,
-            ca_cert_path: None,
-            handshake_concurrency: HANDSHAKE_CONCURRENCY,
-            handshake_timeout_secs: HANDSHAKE_TIMEOUT.as_secs(),
-        }
-    }
-}
-
 impl TlsConfig {
     /// Validate that no path fields are set for a mode that does not use them.
     ///
@@ -178,6 +181,29 @@ impl TlsConfig {
     }
 }
 
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: TlsMode::None,
+            cert_path: None,
+            key_path: None,
+            ca_cert_path: None,
+            handshake_concurrency: HANDSHAKE_CONCURRENCY,
+            handshake_timeout_secs: HANDSHAKE_TIMEOUT.as_secs(),
+        }
+    }
+}
+
+/// Returns the default maximum number of concurrent TLS handshakes for serde.
+const fn default_handshake_concurrency() -> usize {
+    HANDSHAKE_CONCURRENCY
+}
+
+/// Returns the default TLS handshake timeout in seconds for serde.
+const fn default_handshake_timeout_secs() -> u64 {
+    HANDSHAKE_TIMEOUT.as_secs()
+}
+
 // -----------------------------------------------------------------------------
 // OpenSslStream
 // -----------------------------------------------------------------------------
@@ -188,8 +214,10 @@ impl TlsConfig {
 pub struct OpenSslStream {
     /// Underlying async TLS stream.
     inner: tokio_openssl::SslStream<TcpStream>,
+
     /// Local socket address, captured before the TLS handshake.
     local_addr: Option<SocketAddr>,
+
     /// Remote socket address, captured before the TLS handshake.
     remote_addr: Option<SocketAddr>,
 }
@@ -247,28 +275,6 @@ pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAccep
         TlsMode::Provided => build_provided(cfg).map(Some),
     }
 }
-
-/// Returns the default maximum number of concurrent TLS handshakes for serde.
-const fn default_handshake_concurrency() -> usize {
-    HANDSHAKE_CONCURRENCY
-}
-
-/// Returns the default TLS handshake timeout in seconds for serde.
-const fn default_handshake_timeout_secs() -> u64 {
-    HANDSHAKE_TIMEOUT.as_secs()
-}
-
-/// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
-///
-/// When all slots are occupied the accept loop stalls until one completes
-/// or times out, providing natural back-pressure on new connections.
-pub const HANDSHAKE_CONCURRENCY: usize = 64;
-
-/// Maximum duration allowed for a single TLS handshake.
-///
-/// Connections that stall during the handshake are dropped after this
-/// deadline, freeing their slot for the next accept.
-pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Build a stream of TLS-wrapped connections from a bound [`TcpListener`].
 ///

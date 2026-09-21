@@ -10,10 +10,9 @@ use std::future::Future;
 
 use tracing::info;
 
-/// The `ExternalProcessor` gRPC server type whose serving status is reported.
-type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
-    crate::server::PraxisExtProc,
->;
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Health service name carrying the FIPS approved-mode state.
 ///
@@ -24,6 +23,11 @@ pub const FIPS_SERVICE: &str = "fips";
 // -----------------------------------------------------------------------------
 // Health Service
 // -----------------------------------------------------------------------------
+
+/// The `ExternalProcessor` gRPC server type whose serving status is reported.
+type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+    crate::server::PraxisExtProc,
+>;
 
 /// Start a gRPC health check server on the given address.
 ///

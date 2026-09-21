@@ -34,9 +34,7 @@ yourself with the following documentation first:
 - [Conventions](docs/conventions.md)
 - [Development](docs/development.md)
 
-For larger changes, open a [discussion] and follow
-the [proposal process](docs/proposals.md).
+For larger changes create an issue and discuss it with us first.
 
 [Issues]: https://github.com/opendatahub-io/praxis-extproc/issues/new
 [pull requests]: https://github.com/opendatahub-io/praxis-extproc/compare
-[discussion]: https://github.com/opendatahub-io/praxis-extproc/discussions

@@ -7,7 +7,7 @@ feature proposals.
 
 ## Prerequisites
 
-- Rust stable 1.96+
+- Rust stable 1.94+
 - Rust nightly (for `rustfmt`)
 - Docker 29.3.0+ or Podman (for container builds)
 
@@ -28,26 +28,6 @@ make lint           # clippy + fmt check
 make doc            # build docs with warnings denied
 make audit          # cargo audit + cargo deny check
 ```
-
-## Developer Certificate of Origin
-
-> **WARNING**: TBD - not currently in effect, we're
-> waiting on CNCF sandbox submission.
-
-All commits must be signed off per the
-[Developer Certificate of Origin][dco] (DCO). This
-certifies that you have the right to submit the
-contribution under the project's license.
-
-Sign off by adding `-s` to your commit command:
-
-```console
-git commit -s -m "your commit message"
-```
-
-This adds a `Signed-off-by` trailer with your name
-and email. Commits without sign-off will be rejected
-by CI.
 
 ## Pull Request Process
 
@@ -110,11 +90,6 @@ are submitting.
 - [GitHub Issues][issues] for bugs and feature requests
 - [GitHub Discussions][disc] for questions and design
 
-## Code of Conduct
-
-All participants must follow the [CNCF Code of Conduct][coc].
-
 [dco]: https://developercertificate.org/
 [issues]: https://github.com/opendatahub-io/praxis-extproc/issues
 [disc]: https://github.com/opendatahub-io/praxis-extproc/discussions
-[coc]: https://github.com/cncf/foundation/blob/main/code-of-conduct.md
