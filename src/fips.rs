@@ -91,4 +91,21 @@ mod tests {
         // FIPS-enabled host.
         let _ = active();
     }
+
+    #[test]
+    fn assess_returns_consistent_status() {
+        let status = assess();
+
+        if cfg!(feature = "fips") && !status.active {
+            assert!(!status.serve_ok, "FIPS required but inactive must refuse to serve");
+        }
+
+        if !cfg!(feature = "fips") {
+            assert!(status.serve_ok, "non-FIPS build must be willing to serve");
+        }
+
+        if cfg!(feature = "fips") && status.active {
+            assert!(status.serve_ok, "FIPS required and active must serve");
+        }
+    }
 }
