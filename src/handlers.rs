@@ -260,7 +260,7 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
 
 /// Reject body accumulation exceeding [`MAX_BODY_ACCUMULATION`].
 fn check_body_limit(current: usize, incoming: usize) -> Result<(), Status> {
-    if current + incoming > MAX_BODY_ACCUMULATION {
+    if current.saturating_add(incoming) > MAX_BODY_ACCUMULATION {
         metrics::record_body_size_rejection();
         return Err(Status::resource_exhausted("body exceeds maximum size"));
     }
