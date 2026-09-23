@@ -132,16 +132,27 @@ async fn build_kube_client(config: &MetricsAuthConfig) -> crate::error::Result<O
 // TokenReview + SubjectAccessReview
 // -----------------------------------------------------------------------------
 
+/// Outcome of a `TokenReview` authentication attempt.
+enum AuthnOutcome {
+    /// Token is valid; contains the authenticated identity.
+    Authenticated(TokenReviewResult),
+    /// Token is invalid or expired (authentication denied by the API server).
+    NotAuthenticated,
+    /// The Kubernetes API call itself failed (network error, missing RBAC,
+    /// malformed response). The caller should return 500, not 401, because
+    /// the server cannot determine whether the token is valid.
+    ApiError(String),
+}
+
 /// Validate a bearer token via the Kubernetes `TokenReview` API.
 ///
 /// Sends the raw bearer token to the API server, which verifies
-/// the JWT signature and expiry. On success, returns the
-/// authenticated username and group list.
-///
-/// # Errors
-///
-/// Returns an error if the API call fails (network, RBAC, etc.).
-async fn authenticate_token(client: &kube::Client, token: &str) -> Result<TokenReviewResult, String> {
+/// the JWT signature and expiry. Returns [`AuthnOutcome::Authenticated`]
+/// with the identity on success, [`AuthnOutcome::NotAuthenticated`] when
+/// the token is invalid or expired, and [`AuthnOutcome::ApiError`] when
+/// the API call itself fails (network, RBAC misconfiguration, malformed
+/// response) — callers must return 500 for that case, not 401.
+async fn authenticate_token(client: &kube::Client, token: &str) -> AuthnOutcome {
     use k8s_openapi::api::authentication::v1::TokenReview;
 
     let review = TokenReview {
@@ -153,19 +164,21 @@ async fn authenticate_token(client: &kube::Client, token: &str) -> Result<TokenR
     };
 
     let api: kube::Api<TokenReview> = kube::Api::all(client.clone());
-    let result = api
-        .create(&kube::api::PostParams::default(), &review)
-        .await
-        .map_err(|e| format!("TokenReview API call failed: {e}"))?;
+    let result = match api.create(&kube::api::PostParams::default(), &review).await {
+        Ok(r) => r,
+        Err(e) => return AuthnOutcome::ApiError(format!("TokenReview API call failed: {e}")),
+    };
 
-    let status = result.status.ok_or("TokenReview response missing status")?;
+    let Some(status) = result.status else {
+        return AuthnOutcome::ApiError("TokenReview response missing status".to_owned());
+    };
 
     if !status.authenticated.unwrap_or(false) {
-        return Err("token not authenticated".to_owned());
+        return AuthnOutcome::NotAuthenticated;
     }
 
     let user = status.user.unwrap_or_default();
-    Ok(TokenReviewResult {
+    AuthnOutcome::Authenticated(TokenReviewResult {
         username: user.username.unwrap_or_default(),
         groups: user.groups.unwrap_or_default(),
     })
@@ -329,6 +342,10 @@ async fn route_request<B: Sync>(
 // multiple Prometheus replicas or short intervals are configured.
 #[expect(clippy::large_stack_frames, reason = "async state machine for API calls")]
 #[expect(clippy::cognitive_complexity, reason = "sequential authn/authz steps")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential authn/authz/render steps; extraction would split tightly coupled logic"
+)]
 async fn serve_metrics<B: Sync>(
     req: &Request<B>,
     handle: &PrometheusHandle,
@@ -344,10 +361,14 @@ async fn serve_metrics<B: Sync>(
     };
 
     let identity = match authenticate_token(client, bearer).await {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "metrics TokenReview failed");
+        AuthnOutcome::Authenticated(id) => id,
+        AuthnOutcome::NotAuthenticated => {
+            warn!("metrics token not authenticated");
             return response_with_status(StatusCode::UNAUTHORIZED, "unauthorized");
+        },
+        AuthnOutcome::ApiError(e) => {
+            error!(error = %e, "metrics TokenReview API call failed");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         },
     };
 
