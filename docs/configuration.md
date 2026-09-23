@@ -153,16 +153,68 @@ server:
   grpc_address: "0.0.0.0:50051"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  shutdown_drain_timeout_secs: 20
+  max_body_bytes: 10485760
   tls:
     mode: none
 ```
 
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `grpc_address` | string | `0.0.0.0:50051` | gRPC ExtProc listen address |
-| `health_address` | string | `0.0.0.0:50052` | gRPC health check address |
-| `metrics_address` | string | `0.0.0.0:9090` | Prometheus metrics address |
-| `tls` | object | `mode: none` | TLS configuration |
+| Field                         | Type    | Default         | Description                                                                                                                                                                                                       |
+|-------------------------------|---------|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `grpc_address`                | string  | `0.0.0.0:50051` | gRPC ExtProc listen address                                                                                                                                                                                       |
+| `health_address`              | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
+| `metrics_address`             | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
+ | `shutdown_drain_timeout_secs` | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
+| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before a stream is rejected with `RESOURCE_EXHAUSTED`. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely |
+| `tls`                         | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` the health server immediately
+flips the `ExternalProcessor` readiness status to
+`NotServing` (staying up to report it) so Kubernetes
+and Envoy stop routing before the drain, while the
+gRPC server stops accepting new connections and drains
+in-flight streams. If any are still running after
+`shutdown_drain_timeout_secs`, they are forcefully
+cancelled with `UNAVAILABLE` so the process can exit
+promptly. Must be greater than zero.
+
+#### Kubernetes deployment
+
+Keep the drain deadline **within** the pod's grace
+period, with room to spare — otherwise the process is
+`SIGKILL`ed mid-drain. Budget it as:
+
+```text
+terminationGracePeriodSeconds >= preStop lameduck
+                               + shutdown_drain_timeout_secs
+                               + cleanup margin
+```
+
+The shipped Deployment uses the default `30`s grace
+period split as preStop `5`s + drain `20`s + ~`5`s
+margin. The **preStop lameduck** keeps the pod serving
+while its endpoint removal propagates to Envoy /
+kube-proxy, so no new streams arrive after `SIGTERM`
+starts the drain. It is required, not cosmetic: the
+underlying tonic server closes its gRPC listener the
+moment shutdown begins (no in-process lameduck; see
+grpc-rust#1940), so connections opened after `SIGTERM`
+would be refused. Use the native `sleep` action — the
+image ships no shell or `sleep` binary for an `exec`
+hook:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: payload-processing
+      lifecycle:
+        preStop:
+          sleep:
+            seconds: 5
+```
 
 ### TLS
 
@@ -228,7 +280,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation |
+| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes` |
 
 ```yaml
 insecure_options:
@@ -313,6 +365,9 @@ problems:
 - **Invalid TLS values**: `handshake_concurrency`
   or `handshake_timeout_secs` set to zero cause an
   immediate startup error.
+- **Invalid drain timeout**:
+  `shutdown_drain_timeout_secs` set to zero causes an
+  immediate startup error.
 - **Address bind failure**: the server fails to start
   if any listen address is already in use.
 
@@ -320,9 +375,12 @@ At runtime:
 
 - **Filter error**: an `Err` from a filter produces
   a gRPC `INTERNAL` status on the stream.
-- **Body too large**: exceeding the 10 MiB
-  accumulation limit produces a gRPC
-  `RESOURCE_EXHAUSTED` status.
+- **Body too large**: exceeding the
+  `server.max_body_bytes` accumulation limit
+  (10 MiB by default) produces a gRPC
+  `RESOURCE_EXHAUSTED` status. The limit is lifted
+  entirely when `insecure_options.allow_unbounded_body`
+  is set.
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.

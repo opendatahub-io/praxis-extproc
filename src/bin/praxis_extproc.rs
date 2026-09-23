@@ -17,7 +17,7 @@ use praxis_extproc::{
 };
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // -----------------------------------------------------------------------------
 // CLI
@@ -89,14 +89,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, fips.active)).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active)).await
+    Box::pin(serve_pipeline(
+        addrs,
+        pipeline,
+        &cfg.server,
+        cfg.max_body_accumulation(),
+        fips.active,
+    ))
+    .await
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -106,7 +114,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, max_body, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -119,15 +127,13 @@ async fn serve_pipeline(
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(
-        addrs,
-        true,
-        fips_active,
-        serve_grpc(addrs.0, pipeline, tls_cfg),
-    ))
+    Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
+        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
+    }))
     .await
 }
 
@@ -138,8 +144,8 @@ async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, fips_active, async {
-        shutdown_signal().await;
+    Box::pin(run_with_sidecars(addrs, false, fips_active, |drain_rx| async move {
+        wait_drain(drain_rx).await;
         Ok(())
     }))
     .await
@@ -158,27 +164,38 @@ enum Selected {
 
 /// Run the health and metrics sidecars alongside a foreground future.
 ///
-/// Health is registered as serving per `serving`. All three futures are
-/// supervised together: whichever completes first triggers shutdown of the
-/// remaining tasks, and its result (including a sidecar's bind failure) is
-/// returned as the originating error.
-async fn run_with_sidecars(
+/// A single shutdown-signal listener drives a shared drain latch: `foreground`
+/// receives its [`watch::Receiver`] to start its own drain, and the health
+/// sidecar uses it to flip readiness to `NotServing` the moment the signal
+/// fires. All three futures are supervised together: whichever completes first
+/// triggers shutdown of the remaining tasks, and its result (including a
+/// sidecar's bind failure) is returned as the originating error.
+///
+/// [`watch::Receiver`]: tokio::sync::watch::Receiver
+async fn run_with_sidecars<F, Fut>(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     serving: bool,
     fips_active: bool,
-    foreground: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    foreground: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+{
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let drain_rx = spawn_drain_signal();
 
     let health_rx = shutdown_tx.subscribe();
+    let health_drain = wait_drain(drain_rx.clone());
     let mut health = tokio::spawn(async move {
-        praxis_extproc::health::serve(addrs.1, serving, fips_active, wait_broadcast(health_rx)).await
+        praxis_extproc::health::serve(addrs.1, serving, fips_active, health_drain, wait_broadcast(health_rx)).await
     });
 
     let metrics_rx = shutdown_tx.subscribe();
     let mut metrics =
         tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
 
+    let foreground = foreground(drain_rx);
     tokio::pin!(foreground);
 
     let (outcome, selected) = tokio::select! {
@@ -231,27 +248,56 @@ where
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
+    max_body: Option<usize>,
+    drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
-    match tls::build_tls_config(tls_cfg)? {
-        None => Box::pin(serve_plaintext(addr, svc)).await,
-        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
+    // The latch fires when the drain deadline expires, forcing any streams still
+    // running after graceful shutdown began to cancel.
+    let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let svc = ExternalProcessorServer::new(
+        PraxisExtProc::new(pipeline)
+            .with_max_body_accumulation(max_body)
+            .with_force_shutdown(force_rx.clone()),
+    );
+    let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
+    let controls = ShutdownControls {
+        signal: Box::pin(shutdown_with_deadline(drain_rx, force_tx, drain)),
+        force_rx,
+    };
+
+    match tls::build_tls_config(&server_cfg.tls)? {
+        None => Box::pin(serve_plaintext(addr, svc, controls)).await,
+        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, &server_cfg.tls, controls)).await,
     }
+}
+
+/// Shutdown wiring shared by the plaintext and TLS serving paths.
+struct ShutdownControls {
+    /// Resolves when graceful shutdown should begin, starting tonic's drain.
+    ///
+    /// tonic's `serve_with_shutdown` closes the listener immediately here — it
+    /// has no in-process lameduck that keeps accepting new connections during a
+    /// grace window (see grpc-rust#1940). Deployments therefore rely on a k8s
+    /// preStop lameduck to stop routing before SIGTERM; see `deploy/` and the
+    /// "Kubernetes deployment" section of `docs/configuration.md`.
+    signal: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Force-close latch; flips when the drain deadline expires.
+    force_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Serve gRPC over plaintext TCP.
 async fn serve_plaintext(
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
+    controls: ShutdownControls,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(
+    let serve = Box::pin(
         Server::builder()
             .add_service(svc)
-            .serve_with_shutdown(addr, shutdown_signal()),
-    )
-    .await?;
-    Ok(())
+            .serve_with_shutdown(addr, controls.signal),
+    );
+    serve_bounded(serve, controls.force_rx).await
 }
 
 /// Serve gRPC over TLS using the provided acceptor.
@@ -260,22 +306,90 @@ async fn serve_tls(
     svc: ExternalProcessorServer<PraxisExtProc>,
     acceptor: openssl::ssl::SslAcceptor,
     tls_cfg: &tls::TlsConfig,
+    controls: ShutdownControls,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
     let incoming = tls::build_tls_incoming(listener, acceptor, tls_cfg.handshake_concurrency, timeout);
-    Box::pin(
+    let serve = Box::pin(
         Server::builder()
             .add_service(svc)
-            .serve_with_incoming_shutdown(incoming, shutdown_signal()),
-    )
-    .await?;
+            .serve_with_incoming_shutdown(incoming, controls.signal),
+    );
+    serve_bounded(serve, controls.force_rx).await
+}
+
+/// Await a tonic serving future, but abandon it once the drain deadline latch
+/// fires.
+///
+/// tonic's graceful drain can hang when a client stops reading and fills a
+/// stream's response channel: the accepted connection never becomes idle.
+/// Dropping the serving future when the latch flips force-closes any such
+/// connections, so completion stays bounded by the configured drain timeout.
+///
+/// # Errors
+///
+/// Returns the serving future's transport error if it fails before the latch
+/// fires.
+async fn serve_bounded(
+    serve: impl Future<Output = Result<(), tonic::transport::Error>> + Send,
+    mut force_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::select! {
+        res = serve => res?,
+        Ok(_) = force_rx.wait_for(|forced| *forced) => {
+            warn!("drain deadline expired; force-closing remaining connections");
+        },
+    }
     Ok(())
 }
 
 // -----------------------------------------------------------------------------
 // Shutdown
 // -----------------------------------------------------------------------------
+
+/// Wait for the shared drain signal, then arm the drain deadline.
+///
+/// Returning starts tonic's graceful drain; a detached timer force-cancels any
+/// streams still running once `drain` elapses by flipping the shared latch.
+async fn shutdown_with_deadline(
+    drain_rx: tokio::sync::watch::Receiver<bool>,
+    force_tx: tokio::sync::watch::Sender<bool>,
+    drain: std::time::Duration,
+) {
+    wait_drain(drain_rx).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(drain).await;
+        warn!(
+            timeout_secs = drain.as_secs(),
+            "graceful drain deadline exceeded; forcing stream cancellation"
+        );
+        if force_tx.send(true).is_err() {
+            info!("drain deadline expired but no streams remained to cancel");
+        }
+    });
+}
+
+/// Spawn the single SIGTERM/SIGINT listener, returning a latch that flips to
+/// `true` when graceful shutdown should begin.
+///
+/// Both the gRPC serving path and the health sidecar observe this one receiver,
+/// so shutdown has a single signal source and a single log line.
+fn spawn_drain_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        if drain_tx.send(true).is_err() {
+            info!("shutdown signal fired but no drain receivers remained");
+        }
+    });
+    drain_rx
+}
+
+/// Wait until the shared drain latch flips to `true`.
+async fn wait_drain(mut drain_rx: tokio::sync::watch::Receiver<bool>) {
+    drop(drain_rx.wait_for(|started| *started).await);
+}
 
 /// Wait for SIGTERM or SIGINT for graceful shutdown.
 #[expect(
@@ -355,4 +469,48 @@ fn parse_addr(
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let s = cli_override.as_deref().unwrap_or(config_default);
     Ok(s.parse()?)
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A hung serving future (graceful drain that never completes, e.g. a
+    /// non-reading client holding a connection open) must still be abandoned
+    /// once the drain deadline latch fires, bounding shutdown. Both the
+    /// plaintext and TLS paths delegate to `serve_bounded`, so this covers both.
+    #[tokio::test]
+    async fn serve_bounded_returns_when_latch_fires() {
+        let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+        let serve = std::future::pending::<Result<(), tonic::transport::Error>>();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            force_tx.send(true).unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), serve_bounded(serve, force_rx))
+            .await
+            .expect("serve_bounded must return once the latch fires")
+            .expect("bounded shutdown is not an error");
+    }
+
+    /// Normal shutdown: the serving future completes on its own before the
+    /// latch ever fires.
+    #[tokio::test]
+    async fn serve_bounded_returns_when_serve_completes() {
+        let (_force_tx, force_rx) = tokio::sync::watch::channel(false);
+        let serve = std::future::ready(Ok::<(), tonic::transport::Error>(()));
+
+        serve_bounded(serve, force_rx)
+            .await
+            .expect("normal completion is not an error");
+    }
 }

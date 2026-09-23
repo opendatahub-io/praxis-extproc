@@ -7,6 +7,7 @@ server:
   grpc_address: "0.0.0.0:50051"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  shutdown_drain_timeout_secs: 20   # optional: default shown; force-cancel in-flight streams after this (keep < k8s terminationGracePeriodSeconds)
   tls:
     mode: none
 

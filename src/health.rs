@@ -32,8 +32,11 @@ type ExtProcServer = praxis_proto::envoy::service::ext_proc::v3::external_proces
 /// Start a gRPC health check server on the given address.
 ///
 /// Registers the `ExternalProcessor` service as `Serving` when `serving` is
-/// true, otherwise `NotServing`, reports the FIPS state under [`FIPS_SERVICE`],
-/// and blocks until the provided shutdown future completes.
+/// true, otherwise `NotServing`, and reports the FIPS state under
+/// [`FIPS_SERVICE`]. When `on_drain` resolves (the graceful-shutdown signal),
+/// readiness flips to `NotServing` so Kubernetes and Envoy stop routing before
+/// the gRPC drain begins, while the server keeps answering until `shutdown`
+/// completes.
 ///
 /// # Errors
 ///
@@ -42,11 +45,27 @@ pub async fn serve(
     addr: std::net::SocketAddr,
     serving: bool,
     fips_active: bool,
+    on_drain: impl Future<Output = ()>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    use tonic_health::ServingStatus;
-
     let (reporter, svc) = tonic_health::server::health_reporter();
+    set_initial_status(&reporter, serving, fips_active).await;
+
+    info!(address = %addr, serving, fips = fips_active, "health server listening");
+
+    let server = tonic::transport::Server::builder()
+        .add_service(svc)
+        .serve_with_shutdown(addr, shutdown);
+
+    tokio::select! {
+        res = server => res,
+        () = report_not_serving_on_drain(reporter, on_drain) => Ok(()),
+    }
+}
+
+/// Register the initial serving status for the ExtProc and FIPS services.
+async fn set_initial_status(reporter: &tonic_health::server::HealthReporter, serving: bool, fips_active: bool) {
+    use tonic_health::ServingStatus;
 
     if serving {
         reporter.set_serving::<ExtProcServer>().await;
@@ -60,11 +79,17 @@ pub async fn serve(
         ServingStatus::NotServing
     };
     reporter.set_service_status(FIPS_SERVICE, fips_status).await;
+}
 
-    info!(address = %addr, serving, fips = fips_active, "health server listening");
-
-    tonic::transport::Server::builder()
-        .add_service(svc)
-        .serve_with_shutdown(addr, shutdown)
-        .await
+/// Flip ExtProc readiness to `NotServing` once the drain signal fires, then hold
+/// that status indefinitely so the server keeps reporting it until `serve`'s own
+/// shutdown future stops the health server.
+async fn report_not_serving_on_drain(
+    reporter: tonic_health::server::HealthReporter,
+    on_drain: impl Future<Output = ()>,
+) {
+    on_drain.await;
+    reporter.set_not_serving::<ExtProcServer>().await;
+    info!("shutdown signalled; health reporting NotServing during drain");
+    std::future::pending::<()>().await;
 }

@@ -6,8 +6,8 @@
 //! Each handler owns one protocol phase (request/response headers and body):
 //! it marks end-of-stream, converts Envoy messages into filter inputs, and
 //! routes to the [`crate::pipeline`] by body mode and filter capabilities.
-//! Buffered bodies are accumulated here up to [`MAX_BODY_ACCUMULATION`] and run
-//! through the full pipeline at EOS.
+//! Buffered bodies are accumulated here up to the stream's effective
+//! body-accumulation limit and run through the full pipeline at EOS.
 
 use praxis_filter::FilterPipeline;
 use praxis_proto::envoy::service::{common::v3::HeaderValue, ext_proc::v3::ProcessingResponse};
@@ -25,13 +25,6 @@ use crate::{
     response::{self, BodyMode},
     server::StreamState,
 };
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum accumulated body size before rejecting.
-const MAX_BODY_ACCUMULATION: usize = 10_485_760; // 10 MiB
 
 // -----------------------------------------------------------------------------
 // Redelivery Policy
@@ -139,7 +132,7 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len())?;
+    check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation)?;
     state.request_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
@@ -235,7 +228,7 @@ async fn accumulate_response_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.response_body.len(), body.body.len())?;
+    check_body_limit(state.response_body.len(), body.body.len(), state.max_body_accumulation)?;
     state.response_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
@@ -258,9 +251,14 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
         .unwrap_or_default()
 }
 
-/// Reject body accumulation exceeding [`MAX_BODY_ACCUMULATION`].
-fn check_body_limit(current: usize, incoming: usize) -> Result<(), Status> {
-    if current.saturating_add(incoming) > MAX_BODY_ACCUMULATION {
+/// Reject body accumulation exceeding the effective limit.
+///
+/// `limit` is `None` when bounding is disabled via
+/// `insecure_options.allow_unbounded_body`, in which case any size is accepted.
+fn check_body_limit(current: usize, incoming: usize, limit: Option<usize>) -> Result<(), Status> {
+    if let Some(max) = limit
+        && current.saturating_add(incoming) > max
+    {
         metrics::record_body_size_rejection();
         return Err(Status::resource_exhausted("body exceeds maximum size"));
     }
@@ -311,11 +309,24 @@ mod tests {
     fn check_body_limit_rejection_records_metric() {
         let count = counter_value("praxis_extproc_body_size_rejections_total", &[], || {
             assert!(
-                check_body_limit(MAX_BODY_ACCUMULATION, 1).is_err(),
+                check_body_limit(
+                    crate::config::DEFAULT_MAX_BODY_BYTES,
+                    1,
+                    Some(crate::config::DEFAULT_MAX_BODY_BYTES)
+                )
+                .is_err(),
                 "exceeding the body limit must be rejected"
             );
         });
         assert_eq!(count, 1, "body-size rejection must increment the counter");
+    }
+
+    #[test]
+    fn check_body_limit_unbounded_accepts_any_size() {
+        assert!(
+            check_body_limit(usize::MAX, usize::MAX, None).is_ok(),
+            "unbounded limit must accept any accumulation without overflow"
+        );
     }
 
     struct RequestMutationFilter;

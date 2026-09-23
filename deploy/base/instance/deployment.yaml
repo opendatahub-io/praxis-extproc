@@ -12,12 +12,17 @@ spec:
       labels:
         app: payload-processing
     spec:
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
       containers:
         - name: payload-processing
           image: praxis-extproc
           imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

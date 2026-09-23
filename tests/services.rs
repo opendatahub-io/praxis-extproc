@@ -35,7 +35,10 @@ async fn health_server_starts_and_stops() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let handle = tokio::spawn(async move {
-        praxis_extproc::health::serve(addr, true, true, async { drop(shutdown_rx.await) }).await
+        praxis_extproc::health::serve(addr, true, true, std::future::pending(), async {
+            drop(shutdown_rx.await);
+        })
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -55,9 +58,12 @@ async fn health_check_responds_serving() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(
-        async move { praxis_extproc::health::serve(addr, true, true, async { drop(shutdown_rx.await) }).await },
-    );
+    tokio::spawn(async move {
+        praxis_extproc::health::serve(addr, true, true, std::future::pending(), async {
+            drop(shutdown_rx.await);
+        })
+        .await
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -87,14 +93,63 @@ async fn health_check_responds_serving() {
 }
 
 #[tokio::test]
+async fn health_flips_not_serving_on_drain() {
+    let addr = next_addr();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // serving=true initially; on_drain fires when `drain_tx` is dropped.
+    tokio::spawn(async move {
+        praxis_extproc::health::serve(addr, true, true, async { drop(drain_rx.await) }, async {
+            drop(shutdown_rx.await);
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("valid uri")
+        .connect()
+        .await
+        .expect("should connect to health server");
+
+    let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
+
+    let service = <praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+        praxis_extproc::server::PraxisExtProc,
+    > as tonic::server::NamedService>::NAME
+        .to_owned();
+
+    // Fire the drain signal; the health server must stay up and flip to NotServing.
+    drop(drain_tx);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .check(tonic_health::pb::HealthCheckRequest { service })
+        .await
+        .expect("health check should still succeed while draining");
+
+    assert_eq!(
+        resp.into_inner().status,
+        i32::from(tonic_health::pb::health_check_response::ServingStatus::NotServing),
+        "should report NotServing once the drain signal fires"
+    );
+}
+
+#[tokio::test]
 async fn health_check_responds_not_serving() {
     let addr = next_addr();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(
-        async move { praxis_extproc::health::serve(addr, false, false, async { drop(shutdown_rx.await) }).await },
-    );
+    tokio::spawn(async move {
+        praxis_extproc::health::serve(addr, false, false, std::future::pending(), async {
+            drop(shutdown_rx.await);
+        })
+        .await
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -130,9 +185,12 @@ async fn health_reports_fips_service_status() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // serving=false, fips_active=true: the ExtProc and FIPS statuses are independent.
-    tokio::spawn(
-        async move { praxis_extproc::health::serve(addr, false, true, async { drop(shutdown_rx.await) }).await },
-    );
+    tokio::spawn(async move {
+        praxis_extproc::health::serve(addr, false, true, std::future::pending(), async {
+            drop(shutdown_rx.await);
+        })
+        .await
+    });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

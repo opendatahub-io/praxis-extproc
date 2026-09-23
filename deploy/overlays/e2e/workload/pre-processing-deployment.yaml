@@ -12,6 +12,7 @@ spec:
       labels:
         app: payload-pre-processing
     spec:
+      terminationGracePeriodSeconds: 30
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -19,6 +20,10 @@ spec:
         - name: payload-pre-processing
           image: praxis-extproc
           imagePullPolicy: Never
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

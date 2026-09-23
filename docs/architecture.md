@@ -249,6 +249,15 @@ settings.
 ## Graceful Shutdown
 
 The server listens for `SIGTERM` and `SIGINT`. On
-signal, the gRPC server stops accepting new streams
-and drains in-flight connections. Health and metrics
-servers shut down via a broadcast channel.
+signal, the health server immediately flips the
+`ExternalProcessor` readiness status to `NotServing`
+so Kubernetes and Envoy stop routing new traffic to
+the pod, while the health endpoint stays up answering
+that status throughout the drain. Concurrently, the
+gRPC server stops accepting new streams and drains
+in-flight connections; any still running after
+`shutdown_drain_timeout_secs` are force-cancelled.
+Once the gRPC server has drained, the health and
+metrics servers shut down via a broadcast channel.
+Liveness is left untouched so Kubernetes does not
+`SIGKILL` the pod mid-drain.
