@@ -207,7 +207,8 @@ async fn authorize_metrics_access(client: &kube::Client, username: &str, groups:
         .await
         .map_err(|e| format!("SubjectAccessReview API call failed: {e}"))?;
 
-    Ok(result.status.is_some_and(|s| s.allowed))
+    let status = result.status.ok_or("SubjectAccessReview response missing status")?;
+    Ok(status.allowed)
 }
 
 // -----------------------------------------------------------------------------
