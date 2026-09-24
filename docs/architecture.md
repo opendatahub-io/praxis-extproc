@@ -46,12 +46,15 @@ src/
   bin/
     praxis_extproc.rs  # Binary entry point, CLI, startup
   adapter.rs       # ExtProc ↔ HttpFilterContext translation
-  config.rs        # YAML config loading, pipeline construction
+  config.rs        # YAML config loading (filter chains only)
   error.rs         # Error types (thiserror)
+  handlers.rs      # Per-phase ExtProc message handlers
   health.rs        # gRPC health check service
   metrics.rs       # Prometheus metrics endpoint
+  pipeline.rs      # Filter execution + ProcessingResponse assembly
+  protocol.rs      # ExtProc sequencing + protocol config
   response.rs      # ProcessingResponse builders + chunking
-  server.rs        # ExternalProcessor gRPC implementation
+  server.rs        # ExternalProcessor gRPC service, per-stream loop, and dispatch
   tls.rs           # TLS configuration for the gRPC listener
 ```
 
