@@ -34,7 +34,8 @@ spec:
       ports:
         - protocol: TCP
           port: 9004
-    # Monitoring scrape
+    # Monitoring scrape — allow Prometheus / OTel Collector from all
+    # monitoring namespaces (platform, user-workload, and RHOAI).
     - from:
         - namespaceSelector:
             matchLabels:
@@ -42,6 +43,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openshift-user-workload-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redhat-ods-monitoring
       ports:
         - protocol: TCP
           port: 9090
