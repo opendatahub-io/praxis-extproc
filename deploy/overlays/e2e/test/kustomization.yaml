@@ -5,3 +5,4 @@ resources:
   - gateway.yaml
   - envoyfilter.yaml
   - internal-model.yaml
+  - local-reply-policy.yaml

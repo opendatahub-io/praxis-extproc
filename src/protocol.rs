@@ -102,7 +102,15 @@ const fn message_order(req: &processing_request::Request) -> (PhaseSide, PhaseSt
 ///
 /// Each direction advances monotonically (`Headers` → `Body` → `Trailers`); the
 /// two are independent so `FULL_DUPLEX_STREAMED` interleaving is allowed.
-/// Response messages are gated on request headers having been seen.
+/// A stream that opens with a response message carries a local reply from an
+/// earlier filter (an auth 401, a rate-limit 429): Envoy runs it through this
+/// filter's encoder path only, so no request message may follow. The ExtProc
+/// API allows a stream without request headers (`request_header_mode: SKIP`),
+/// which looks the same and is treated the same way.
+///
+/// See: `envoy/extensions/filters/http/ext_proc/v3/processing_mode.proto`
+/// (`ProcessingMode.HeaderSendMode`) and Envoy's
+/// `DownstreamFilterManager::sendLocalReply` (`source/common/http/filter_manager.cc`).
 #[derive(Debug, Default)]
 pub(crate) struct PhaseOrderTracker {
     /// Furthest request-side step seen.
@@ -111,8 +119,8 @@ pub(crate) struct PhaseOrderTracker {
     /// Furthest response-side step seen.
     response: Option<PhaseStep>,
 
-    /// Whether request headers have been received, gating response processing.
-    request_headers_seen: bool,
+    /// Whether the stream opened with a response message.
+    local_reply: bool,
 }
 
 impl PhaseOrderTracker {
@@ -125,21 +133,22 @@ impl PhaseOrderTracker {
     /// # Errors
     ///
     /// Returns [`Status::invalid_argument`] when `req` regresses within its
-    /// direction, or when a response message precedes request headers.
+    /// direction, or when a request message follows a local reply.
     pub(crate) fn check_and_advance(&mut self, req: &processing_request::Request) -> Result<(), Status> {
         let (side, step) = message_order(req);
+        if side == PhaseSide::Request && self.local_reply {
+            metrics::record_invalid_argument("message_order", "request_after_local_reply");
+            return Err(Status::invalid_argument(format!(
+                "out-of-order ExtProc message: {} arrived after a local reply",
+                request_type_label(req)
+            )));
+        }
+        // Request phases always open with headers, so an empty request side
+        // means this filter never saw the request.
+        let opens_local_reply = side == PhaseSide::Response && self.request.is_none();
         let current = match side {
             PhaseSide::Request => &mut self.request,
-            PhaseSide::Response => {
-                if !self.request_headers_seen {
-                    metrics::record_invalid_argument("message_order", "response_before_request_headers");
-                    return Err(Status::invalid_argument(format!(
-                        "out-of-order ExtProc message: {} arrived before request headers",
-                        request_type_label(req)
-                    )));
-                }
-                &mut self.response
-            },
+            PhaseSide::Response => &mut self.response,
         };
         let invalid_transition = match *current {
             None => step != PhaseStep::Headers,
@@ -154,11 +163,13 @@ impl PhaseOrderTracker {
             )));
         }
         *current = Some(step);
-
-        if matches!(req, processing_request::Request::RequestHeaders(_)) {
-            self.request_headers_seen = true;
-        }
+        self.local_reply |= opens_local_reply;
         Ok(())
+    }
+
+    /// Whether the stream opened with a local reply from an earlier filter.
+    pub(crate) const fn local_reply(&self) -> bool {
+        self.local_reply
     }
 }
 
@@ -532,17 +543,65 @@ mod tests {
     }
 
     #[test]
-    fn phase_order_rejects_response_before_request_headers() {
+    fn phase_order_accepts_local_reply_and_rejects_request_after_it() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders, HttpTrailers};
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        for req in [
+            Request::ResponseHeaders(HttpHeaders::default()),
+            Request::ResponseBody(HttpBody::default()),
+            Request::ResponseTrailers(HttpTrailers::default()),
+        ] {
+            assert!(
+                tracker.check_and_advance(&req).is_ok(),
+                "local reply phases must be accepted"
+            );
+        }
+        assert!(tracker.local_reply, "a response-first stream is a local reply");
+
+        let result = tracker.check_and_advance(&Request::RequestHeaders(HttpHeaders::default()));
+        assert!(
+            result.is_err(),
+            "request headers after a local reply should be rejected"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("after a local reply"));
+        }
+    }
+
+    #[test]
+    fn phase_order_invalid_first_response_is_not_a_local_reply() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        let result = tracker.check_and_advance(&Request::ResponseBody(HttpBody::default()));
+
+        assert!(result.is_err(), "a stream cannot open with a response body");
+        assert!(
+            !tracker.local_reply,
+            "a rejected message must leave the tracker unchanged"
+        );
+    }
+
+    #[test]
+    fn phase_order_request_first_stream_is_not_a_local_reply() {
         use praxis_proto::envoy::service::ext_proc::v3::HttpHeaders;
         use processing_request::Request;
         let mut tracker = PhaseOrderTracker::default();
 
-        let result = tracker.check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()));
-        assert!(result.is_err(), "response before request headers should be rejected");
-        if let Err(err) = result {
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
-            assert!(err.message().contains("before request headers"));
+        for req in [
+            Request::RequestHeaders(HttpHeaders::default()),
+            Request::ResponseHeaders(HttpHeaders::default()),
+        ] {
+            assert!(tracker.check_and_advance(&req).is_ok());
         }
+        assert!(
+            !tracker.local_reply,
+            "a stream that saw request headers is not a local reply"
+        );
     }
 
     #[test]
@@ -682,20 +741,26 @@ mod tests {
     }
 
     #[test]
-    fn phase_order_response_before_request_headers_records_metric() {
+    fn phase_order_request_after_local_reply_records_metric() {
         use praxis_proto::envoy::service::ext_proc::v3::HttpHeaders;
         use processing_request::Request;
 
         let mut tracker = PhaseOrderTracker::default();
-        let count = invalid_arg_count("message_order", "response_before_request_headers", || {
+        assert!(
+            tracker
+                .check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()))
+                .is_ok(),
+            "local reply must be accepted"
+        );
+        let count = invalid_arg_count("message_order", "request_after_local_reply", || {
             assert!(
                 tracker
-                    .check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()))
+                    .check_and_advance(&Request::RequestHeaders(HttpHeaders::default()))
                     .is_err(),
-                "response before request headers must be rejected"
+                "request after a local reply must be rejected"
             );
         });
-        assert_eq!(count, 1, "response-before-request-headers must increment the counter");
+        assert_eq!(count, 1, "request-after-local-reply must increment the counter");
     }
 
     #[test]

@@ -10,7 +10,10 @@
 //! body-accumulation limit and run through the full pipeline at EOS.
 
 use praxis_filter::FilterPipeline;
-use praxis_proto::envoy::service::{common::v3::HeaderValue, ext_proc::v3::ProcessingResponse};
+use praxis_proto::envoy::service::{
+    common::v3::HeaderValue,
+    ext_proc::v3::{ProcessingResponse, processing_request},
+};
 use tonic::Status;
 use tracing::debug;
 
@@ -21,10 +24,90 @@ use crate::{
         run_request_header_filters_early, run_request_pipeline, run_response_header_filters_early,
         run_response_pipeline,
     },
-    protocol::{PhaseState, ProtocolPhase, duplicate_after_eos},
+    protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
     server::StreamState,
 };
+
+// -----------------------------------------------------------------------------
+// Local Replies
+// -----------------------------------------------------------------------------
+
+/// Acknowledge a local reply from an earlier filter without running filters.
+///
+/// There is no request context for the pipeline to act on, so every response
+/// phase continues unchanged, under the same EOS rules as any other stream.
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] for a phase the EOS tracker rejects,
+/// and [`Status::internal`] for a request message, which
+/// [`crate::protocol::PhaseOrderTracker`] rejects before dispatch.
+pub(crate) fn local_reply_passthrough(
+    req: &processing_request::Request,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    match req {
+        processing_request::Request::ResponseHeaders(h) => local_reply_headers(h, state),
+        processing_request::Request::ResponseBody(b) => local_reply_body(b, state),
+        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestHeaders(_)
+        | processing_request::Request::RequestBody(_)
+        | processing_request::Request::RequestTrailers(_) => Err(Status::internal(format!(
+            "{} dispatched as part of a local reply",
+            request_type_label(req)
+        ))),
+    }
+}
+
+/// Acknowledge the headers of a local reply.
+///
+/// `FULL_DUPLEX_STREAMED` carries the headers response with the first body
+/// chunk, as in [`passthrough_chunk`].
+fn local_reply_headers(
+    headers: &praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if state
+        .eos_tracker
+        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?
+        == PhaseState::Completed
+    {
+        return Err(duplicate_after_eos(ProtocolPhase::ResponseHeaders));
+    }
+    metrics::record_local_reply(
+        headers
+            .headers
+            .as_ref()
+            .and_then(|hm| adapter::response_status(&hm.headers)),
+    );
+    debug!("stream opened with response headers, passing the local reply through without filters");
+
+    if !headers.end_of_stream && state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed {
+        return Ok(Vec::new());
+    }
+    state.header_state.response_headers_sent = true;
+    Ok(vec![response::response_headers(None)])
+}
+
+/// Acknowledge a local reply body chunk, ignoring the final chunk Envoy re-sends
+/// in `FULL_DUPLEX_STREAMED` as [`handle_response_body`] does.
+fn local_reply_body(
+    body: &praxis_proto::envoy::service::ext_proc::v3::HttpBody,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mode = state.protocol_config.response_body_mode;
+    let entry_state = state
+        .eos_tracker
+        .check_and_mark(ProtocolPhase::ResponseBody, body.end_of_stream)?;
+    if let Some(response) = handle_body_redelivery(entry_state, mode, ProtocolPhase::ResponseBody, body.body.len())? {
+        return Ok(response);
+    }
+    if mode == BodyMode::FullDuplexStreamed {
+        return Ok(passthrough_chunk(body, state, mode, false));
+    }
+    Ok(response::response_body(None, None, mode, body.end_of_stream))
+}
 
 // -----------------------------------------------------------------------------
 // Redelivery Policy
@@ -486,5 +569,61 @@ mod tests {
                         .as_ref()
                         .is_some_and(|header| header.key == "x-response-probe"))))
         ));
+    }
+
+    #[test]
+    fn local_reply_records_one_metric_per_stream_by_status_class() {
+        for (status, class) in [(Some("401"), "4xx"), (Some("200"), "2xx"), (None, "other")] {
+            let count = counter_value("praxis_extproc_local_replies_total", &[("status_class", class)], || {
+                let mut state = StreamState::new();
+                state.protocol_config.response_body_mode = BodyMode::Buffered;
+                for message in [local_reply_headers(status), local_reply_body()] {
+                    state.phase_order.check_and_advance(&message).unwrap();
+                    local_reply_passthrough(&message, &mut state).unwrap();
+                }
+            });
+
+            assert_eq!(count, 1, "a {status:?} local reply must be counted once as {class}");
+        }
+    }
+    #[test]
+    fn local_reply_passthrough_rejects_request_messages() {
+        let request = processing_request::Request::RequestHeaders(
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+        );
+        let result = local_reply_passthrough(&request, &mut StreamState::new());
+
+        assert!(
+            matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
+            "a request message must never be acknowledged as a local reply: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn local_reply_headers(status: Option<&str>) -> processing_request::Request {
+        use praxis_proto::envoy::service::ext_proc::v3::{HeaderMap, HttpHeaders};
+
+        let headers = status
+            .map(|value| HeaderValue {
+                key: ":status".to_owned(),
+                value: value.to_owned(),
+                raw_value: Vec::new(),
+            })
+            .into_iter()
+            .collect();
+        processing_request::Request::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap { headers }),
+            end_of_stream: false,
+        })
+    }
+
+    fn local_reply_body() -> processing_request::Request {
+        processing_request::Request::ResponseBody(praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: b"denied".to_vec(),
+            end_of_stream: true,
+        })
     }
 }
