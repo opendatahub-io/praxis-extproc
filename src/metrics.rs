@@ -41,7 +41,7 @@ pub fn register() {
     );
     metrics::describe_counter!(
         "praxis_extproc_local_replies_total",
-        "Total streams that opened with a local reply from an earlier filter"
+        "Total streams that opened with a local reply from an earlier filter, by status class"
     );
 }
 
@@ -61,12 +61,26 @@ pub fn record_body_size_rejection() {
     metrics::counter!("praxis_extproc_body_size_rejections_total").increment(1);
 }
 
-/// Record a stream that opened with a local reply from an earlier filter.
+/// Record a stream that opened with a local reply from an earlier filter,
+/// labelled by the class of the reply's `:status`.
 ///
-/// Such a stream bypasses the filter pipeline, so a steady count on a route
-/// that should run response filters points at a skipped request phase.
-pub fn record_local_reply() {
-    metrics::counter!("praxis_extproc_local_replies_total").increment(1);
+/// Such a stream bypasses the filter pipeline. Auth and quota rejections land
+/// in `4xx`; a steady `2xx` count points at a route that skips request headers,
+/// so an upstream response went out unfiltered.
+pub fn record_local_reply(status: Option<u16>) {
+    metrics::counter!("praxis_extproc_local_replies_total", "status_class" => status_class(status)).increment(1);
+}
+
+/// Bounded class of an HTTP status: `2xx` to `5xx`, or `other` for anything
+/// else, including a missing or unparsable `:status`.
+const fn status_class(status: Option<u16>) -> &'static str {
+    match status {
+        Some(200..=299) => "2xx",
+        Some(300..=399) => "3xx",
+        Some(400..=499) => "4xx",
+        Some(500..=599) => "5xx",
+        _ => "other",
+    }
 }
 
 /// Record an `invalid_argument` rejection under bounded `reason` and `detail` labels.
@@ -165,4 +179,29 @@ async fn bind_listener(addr: SocketAddr) -> crate::error::Result<tokio::net::Tcp
     tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| crate::error::ExtProcError::Config(format!("metrics bind: {e}")))
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_class_is_bounded() {
+        for (status, class) in [
+            (Some(200), "2xx"),
+            (Some(302), "3xx"),
+            (Some(401), "4xx"),
+            (Some(429), "4xx"),
+            (Some(503), "5xx"),
+            (Some(101), "other"),
+            (Some(600), "other"),
+            (None, "other"),
+        ] {
+            assert_eq!(status_class(status), class, "status {status:?}");
+        }
+    }
 }

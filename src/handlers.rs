@@ -75,7 +75,12 @@ fn local_reply_headers(
     {
         return Err(duplicate_after_eos(ProtocolPhase::ResponseHeaders));
     }
-    metrics::record_local_reply();
+    metrics::record_local_reply(
+        headers
+            .headers
+            .as_ref()
+            .and_then(|hm| adapter::response_status(&hm.headers)),
+    );
     debug!("stream opened with response headers, passing the local reply through without filters");
 
     if !headers.end_of_stream && state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed {
@@ -567,28 +572,20 @@ mod tests {
     }
 
     #[test]
-    fn local_reply_records_one_metric_per_stream() {
-        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders};
+    fn local_reply_records_one_metric_per_stream_by_status_class() {
+        for (status, class) in [(Some("401"), "4xx"), (Some("200"), "2xx"), (None, "other")] {
+            let count = counter_value("praxis_extproc_local_replies_total", &[("status_class", class)], || {
+                let mut state = StreamState::new();
+                state.protocol_config.response_body_mode = BodyMode::Buffered;
+                for message in [local_reply_headers(status), local_reply_body()] {
+                    state.phase_order.check_and_advance(&message).unwrap();
+                    local_reply_passthrough(&message, &mut state).unwrap();
+                }
+            });
 
-        let count = counter_value("praxis_extproc_local_replies_total", &[], || {
-            let mut state = StreamState::new();
-            state.protocol_config.response_body_mode = BodyMode::Buffered;
-            let messages = [
-                processing_request::Request::ResponseHeaders(HttpHeaders::default()),
-                processing_request::Request::ResponseBody(HttpBody {
-                    body: b"denied".to_vec(),
-                    end_of_stream: true,
-                }),
-            ];
-            for message in messages {
-                state.phase_order.check_and_advance(&message).unwrap();
-                local_reply_passthrough(&message, &mut state).unwrap();
-            }
-        });
-
-        assert_eq!(count, 1, "a local reply stream must be counted once");
+            assert_eq!(count, 1, "a {status:?} local reply must be counted once as {class}");
+        }
     }
-
     #[test]
     fn local_reply_passthrough_rejects_request_messages() {
         let request = processing_request::Request::RequestHeaders(
@@ -600,5 +597,33 @@ mod tests {
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
             "a request message must never be acknowledged as a local reply: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn local_reply_headers(status: Option<&str>) -> processing_request::Request {
+        use praxis_proto::envoy::service::ext_proc::v3::{HeaderMap, HttpHeaders};
+
+        let headers = status
+            .map(|value| HeaderValue {
+                key: ":status".to_owned(),
+                value: value.to_owned(),
+                raw_value: Vec::new(),
+            })
+            .into_iter()
+            .collect();
+        processing_request::Request::ResponseHeaders(HttpHeaders {
+            headers: Some(HeaderMap { headers }),
+            end_of_stream: false,
+        })
+    }
+
+    fn local_reply_body() -> processing_request::Request {
+        processing_request::Request::ResponseBody(praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: b"denied".to_vec(),
+            end_of_stream: true,
+        })
     }
 }

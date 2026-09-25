@@ -307,6 +307,17 @@ pub fn envoy_headers_to_response(headers: &[HeaderValue]) -> Response {
 // Utilities
 // -----------------------------------------------------------------------------
 
+/// Parse the `:status` pseudo-header of ExtProc response headers.
+///
+/// `None` when it is missing or not a number, unlike [`envoy_headers_to_response`],
+/// which falls back to `200`.
+pub(crate) fn response_status(headers: &[HeaderValue]) -> Option<u16> {
+    headers
+        .iter()
+        .find(|hv| hv.key == ":status")
+        .and_then(|hv| header_value_str(hv).parse().ok())
+}
+
 /// Extract string value from a [`HeaderValue`], preferring `raw_value`.
 fn header_value_str(hv: &HeaderValue) -> &str {
     if hv.raw_value.is_empty() {
@@ -871,6 +882,32 @@ mod tests {
             mutation.remove_headers,
             vec!["x-drop".to_owned()],
             "remove list untouched"
+        );
+    }
+
+    #[test]
+    fn response_status_reads_raw_value_and_rejects_missing_or_invalid() {
+        let raw = HeaderValue {
+            key: ":status".to_owned(),
+            value: String::new(),
+            raw_value: b"429".to_vec(),
+        };
+
+        assert_eq!(response_status(&[raw]), Some(429), "raw_value carries the status");
+        assert_eq!(
+            response_status(&[make_header(":status", "401")]),
+            Some(401),
+            "value carries the status"
+        );
+        assert_eq!(
+            response_status(&[make_header("content-type", "text/plain")]),
+            None,
+            "missing :status"
+        );
+        assert_eq!(
+            response_status(&[make_header(":status", "abc")]),
+            None,
+            "unparsable :status"
         );
     }
 

@@ -223,7 +223,7 @@ Six metrics are exported:
 | `praxis_extproc_request_duration_seconds`   | histogram | Per-stream duration                                              |
 | `praxis_extproc_body_size_rejections_total` | counter   | Requests rejected for exceeding max body accumulation            |
 | `praxis_extproc_invalid_argument_total`     | counter   | `invalid_argument` rejections, labelled by `reason` and `detail` |
-| `praxis_extproc_local_replies_total`        | counter   | Streams opened by a local reply, passed through without filters  |
+| `praxis_extproc_local_replies_total`        | counter   | Local replies passed through without filters, by `status_class`  |
 
 
 The `praxis_extproc_invalid_argument_total` counter carries bounded
@@ -236,6 +236,11 @@ The `praxis_extproc_invalid_argument_total` counter carries bounded
 | `message_order`   | `request_after_local_reply`, `invalid_phase_transition`, `body_after_headers_eos`       |
 | `duplicate_eos`   | `redelivery`                                                                            |
 | `missing_headers` | `request`, `response`                                                                   |
+
+`praxis_extproc_local_replies_total` carries a bounded `status_class` label
+(`2xx`, `3xx`, `4xx`, `5xx`, `other`) from the reply's `:status`. Auth and
+quota rejections land in `4xx`; a steady `2xx` count points at a route that
+skips request headers, so an upstream response went out unfiltered.
 
 ## TLS
 
