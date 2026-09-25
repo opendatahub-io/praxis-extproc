@@ -154,6 +154,7 @@ filter_chains:
 [#5]: https://github.com/opendatahub-io/praxis-extproc/issues/5
 [#6]: https://github.com/opendatahub-io/praxis-extproc/issues/6
 [#7]: https://github.com/opendatahub-io/praxis-extproc/issues/7
+[crd-weight]: https://github.com/opendatahub-io/ai-gateway-payload-processing/blob/02b214fc48e14ed12981d5e0c8bee76492e3800a/api/inference/v1alpha1/externalmodel_types.go#L101-L109
 
 ### Per-plugin notes
 
@@ -175,6 +176,29 @@ filter_chains:
   overlay (`routing-overlay.json`) with hot reload.
   The K8s-native routing behavior is tracked in [#5]
   and [#7].
+
+  **Weight scale and disable semantics differ — the
+  controller must translate.** The `ExternalModel`
+  CRD's `externalProviderRefs[].weight` is an integer
+  in `0–100`, defaulting to `1`, where `0` means
+  *disabled* — folding magnitude and enablement into
+  one field ([`externalmodel_types.go`][crd-weight]).
+  The overlay splits these into two orthogonal fields
+  per candidate:
+  - `traffic_weight` — an integer in `1–1000`
+    (only consulted when the selection group's picker
+    mode is `weighted_random`). `0` is **rejected**,
+    so a disabled provider must not be emitted as
+    `traffic_weight: 0`.
+  - `admission_state` — enablement, independent of
+    weight. Use `none` to exclude a candidate.
+
+  So when rendering the overlay, map a Go weight `w`:
+  - `w == 0` → **omit** `traffic_weight` and set
+    `admission_state: none` (disabled).
+  - `w in 1–100` → rescale into `1–1000` (for example
+    `traffic_weight = w * 10`) and leave
+    `admission_state` at its enabled value.
 - **`stream-usage-enforcer` → none.** No Praxis
   filter injects `stream_options: {include_usage:
   true}` today. This is the only capability with no
