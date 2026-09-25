@@ -28,7 +28,10 @@ use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streamin
 use tracing::{debug, error, warn};
 
 use crate::{
-    handlers::{handle_request_body, handle_request_headers, handle_response_body, handle_response_headers},
+    handlers::{
+        handle_request_body, handle_request_headers, handle_response_body, handle_response_headers,
+        local_reply_passthrough,
+    },
     metrics,
     protocol::{EosTracker, PhaseOrderTracker, ProtocolConfig, request_type_label, validate_body_message},
     response,
@@ -282,6 +285,9 @@ async fn dispatch_request(
 ) -> Result<Vec<ProcessingResponse>, Status> {
     validate_body_message(&req, &state.protocol_config)?;
     state.phase_order.check_and_advance(&req)?;
+    if state.phase_order.local_reply() {
+        return local_reply_passthrough(&req, state);
+    }
 
     match req {
         processing_request::Request::RequestHeaders(h) => handle_request_headers(pipeline, h, state).await,
@@ -626,6 +632,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_reply_passes_through_buffered_response_without_filters() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response;
+
+        BODY_FILTER_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let messages = vec![
+            local_reply_headers_message(false),
+            local_reply_body_message(br#"{"error":"unauthorized"}"#, true),
+        ];
+        let mut results = dispatch_local_reply(BodyMode::Buffered, messages)
+            .await
+            .into_iter()
+            .map(Result::unwrap);
+        let (headers, body) = (results.next().unwrap(), results.next().unwrap());
+
+        assert!(
+            matches!(headers.as_slice(), [ProcessingResponse { response: Some(Response::ResponseHeaders(h)), .. }]
+                if h.response.as_ref().is_some_and(|c| c.header_mutation.is_none())),
+            "local reply headers must continue unchanged: {headers:?}"
+        );
+        assert!(
+            matches!(body.as_slice(), [ProcessingResponse { response: Some(Response::ResponseBody(b)), .. }]
+                if b.response.as_ref().is_some_and(|c| c.body_mutation.is_none())),
+            "local reply body must continue unchanged: {body:?}"
+        );
+        assert_eq!(
+            BODY_FILTER_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no filter may run on a local reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_reply_in_full_duplex_sends_headers_with_first_chunk() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response;
+
+        let messages = vec![
+            local_reply_headers_message(false),
+            local_reply_body_message(b"rate limited", true),
+        ];
+        let mut results = dispatch_local_reply(BodyMode::FullDuplexStreamed, messages)
+            .await
+            .into_iter()
+            .map(Result::unwrap);
+        let (headers, body) = (results.next().unwrap(), results.next().unwrap());
+
+        assert!(
+            headers.is_empty(),
+            "FDS defers the headers response to the first chunk: {headers:?}"
+        );
+        assert!(
+            matches!(
+                body.as_slice(),
+                [
+                    ProcessingResponse {
+                        response: Some(Response::ResponseHeaders(_)),
+                        ..
+                    },
+                    ProcessingResponse {
+                        response: Some(Response::ResponseBody(_)),
+                        ..
+                    },
+                ]
+            ),
+            "first chunk must carry the headers response, then the echoed chunk: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_reply_ignores_redelivered_full_duplex_eos_chunk() {
+        let messages = vec![
+            local_reply_headers_message(false),
+            local_reply_body_message(b"rate limited", true),
+            local_reply_body_message(b"rate limited", true),
+        ];
+        let results = dispatch_local_reply(BodyMode::FullDuplexStreamed, messages).await;
+
+        assert!(
+            matches!(results.as_slice(), [Ok(_), Ok(_), Ok(redelivered)] if redelivered.is_empty()),
+            "a re-delivered FDS EOS chunk must not be echoed again: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_reply_keeps_eos_hardening() {
+        let duplicate_eos = dispatch_local_reply(
+            BodyMode::Buffered,
+            vec![
+                local_reply_headers_message(false),
+                local_reply_body_message(b"denied", true),
+                local_reply_body_message(b"denied", true),
+            ],
+        )
+        .await;
+        let body_after_headers_eos = dispatch_local_reply(
+            BodyMode::Buffered,
+            vec![
+                local_reply_headers_message(true),
+                local_reply_body_message(b"denied", true),
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(duplicate_eos.last(), Some(Err(e)) if e.code() == tonic::Code::InvalidArgument),
+            "a duplicate BUFFERED EOS chunk must be rejected: {duplicate_eos:?}"
+        );
+        assert!(
+            matches!(body_after_headers_eos.last(), Some(Err(e)) if e.code() == tonic::Code::InvalidArgument),
+            "a body after headers EOS must be rejected: {body_after_headers_eos:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn response_body_in_none_mode_is_rejected_before_tracking_or_filters() {
         use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
         use processing_request::Request;
@@ -656,5 +775,38 @@ mod tests {
         );
         assert!(state.response_body.is_empty(), "body must not be accumulated");
         assert_eq!(BODY_FILTER_RUNS.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn local_reply_headers_message(end_of_stream: bool) -> processing_request::Request {
+        processing_request::Request::ResponseHeaders(praxis_proto::envoy::service::ext_proc::v3::HttpHeaders {
+            end_of_stream,
+            ..Default::default()
+        })
+    }
+
+    fn local_reply_body_message(body: &[u8], end_of_stream: bool) -> processing_request::Request {
+        processing_request::Request::ResponseBody(praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })
+    }
+
+    /// Dispatch a stream that opens with response messages, one message at a time, in `mode`.
+    async fn dispatch_local_reply(
+        mode: BodyMode,
+        messages: Vec<processing_request::Request>,
+    ) -> Vec<Result<Vec<ProcessingResponse>, Status>> {
+        let pipeline = body_probe_pipeline();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = mode;
+        let mut results = Vec::new();
+        for message in messages {
+            results.push(dispatch_request(&pipeline, message, &mut state).await);
+        }
+        results
     }
 }

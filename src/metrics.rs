@@ -39,6 +39,10 @@ pub fn register() {
         "praxis_extproc_invalid_argument_total",
         "Total invalid_argument rejections, by reason and detail"
     );
+    metrics::describe_counter!(
+        "praxis_extproc_local_replies_total",
+        "Total streams that opened with a local reply from an earlier filter"
+    );
 }
 
 /// Record a completed stream.
@@ -55,6 +59,14 @@ pub fn record_immediate_response() {
 /// Record a rejection for exceeding max body accumulation.
 pub fn record_body_size_rejection() {
     metrics::counter!("praxis_extproc_body_size_rejections_total").increment(1);
+}
+
+/// Record a stream that opened with a local reply from an earlier filter.
+///
+/// Such a stream bypasses the filter pipeline, so a steady count on a route
+/// that should run response filters points at a skipped request phase.
+pub fn record_local_reply() {
+    metrics::counter!("praxis_extproc_local_replies_total").increment(1);
 }
 
 /// Record an `invalid_argument` rejection under bounded `reason` and `detail` labels.

@@ -55,3 +55,26 @@ async fn empty_messages_handled() {
         "expected 200 or 4xx, got {status}"
     );
 }
+
+#[tokio::test]
+async fn local_reply_ahead_of_ipp_keeps_its_status() {
+    ensure_gateway_ready().await;
+    let url = format!("{}/v1/chat/completions", gateway_url());
+
+    let resp = http_client()
+        .post(&url)
+        .header("x-e2e-local-reply", "deny")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "a local reply from a filter ahead of ipp must reach the client as sent, not as a 500"
+    );
+}

@@ -31,7 +31,7 @@ use praxis_extproc::{config, server::PraxisExtProc};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
-        HeaderMap, HttpBody, HttpHeaders, HttpTrailers, ProcessingRequest, ProcessingResponse,
+        BodySendMode, HeaderMap, HttpBody, HttpHeaders, HttpTrailers, ProcessingRequest, ProcessingResponse,
         external_processor_server::ExternalProcessorServer, processing_request::Request as ReqVariant,
         processing_response::Response as RespVariant,
     },
@@ -909,6 +909,109 @@ async fn response_body_before_response_headers_rejected() {
     assert!(
         err.message().contains("out-of-order") || err.message().contains("invalid"),
         "should reject response body before response headers: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn local_reply_buffered_passes_through_without_filters() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(with_response_body_mode(
+        make_response_headers(401, false),
+        BodySendMode::Buffered,
+    ))
+    .await
+    .unwrap();
+    let headers = next_full_duplex_msg(&mut stream).await;
+    tx.send(make_response_body(br#"{"error":"unauthorized"}"#, true))
+        .await
+        .unwrap();
+    let body = next_full_duplex_msg(&mut stream).await;
+
+    assert!(
+        matches!(&headers.response, Some(RespVariant::ResponseHeaders(h)) if h.response.as_ref().is_some_and(|c| c.header_mutation.is_none())),
+        "local reply headers must pass through without the response filter's mutation: {headers:?}"
+    );
+    assert!(
+        matches!(&body.response, Some(RespVariant::ResponseBody(b))
+            if b.response.as_ref().is_some_and(|c| c.body_mutation.is_none() && c.header_mutation.is_none())),
+        "local reply body must pass through unchanged, without deferred header mutations: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_reply_without_body_passes_through() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(make_response_headers(429, true)).await.unwrap();
+    let headers = next_full_duplex_msg(&mut stream).await;
+
+    assert!(
+        matches!(&headers.response, Some(RespVariant::ResponseHeaders(h)) if h.response.as_ref().is_some_and(|c| c.header_mutation.is_none())),
+        "headers-only local reply must pass through without the response filter's mutation: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_reply_streamed_body_and_trailers_pass_through() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(with_response_body_mode(
+        make_response_headers(403, false),
+        BodySendMode::Streamed,
+    ))
+    .await
+    .unwrap();
+    let mut responses = vec![next_full_duplex_msg(&mut stream).await];
+    for chunk in [b"forbidden-1".as_slice(), b"forbidden-2"] {
+        tx.send(make_response_body(chunk, false)).await.unwrap();
+        responses.push(next_full_duplex_msg(&mut stream).await);
+    }
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    responses.push(next_full_duplex_msg(&mut stream).await);
+
+    assert!(
+        matches!(
+            responses.iter().map(|r| r.response.as_ref()).collect::<Vec<_>>().as_slice(),
+            [
+                Some(RespVariant::ResponseHeaders(h)),
+                Some(RespVariant::ResponseBody(b1)),
+                Some(RespVariant::ResponseBody(b2)),
+                Some(RespVariant::ResponseTrailers(_)),
+            ] if h.response.as_ref().is_some_and(|c| c.header_mutation.is_none())
+                && [b1, b2].iter().all(|b| b.response.as_ref().is_some_and(|c| c.body_mutation.is_none()))
+        ),
+        "every local reply phase must continue unchanged: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn request_headers_after_local_reply_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(make_response_headers(401, true)).await.unwrap();
+    let _headers = next_full_duplex_msg(&mut stream).await;
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+
+    let err = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("request headers after a local reply should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("after a local reply"),
+        "should name the local reply: {}",
         err.message()
     );
 }
@@ -2433,6 +2536,41 @@ fn make_response_headers(status: u32, end_of_stream: bool) -> ProcessingRequest 
         })),
         ..Default::default()
     }
+}
+
+fn make_response_body(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
+    ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: body.to_vec(),
+            end_of_stream,
+        })),
+        ..Default::default()
+    }
+}
+
+/// Attach a first-message `protocol_config` selecting `response_body_mode`.
+fn with_response_body_mode(mut msg: ProcessingRequest, response_body_mode: BodySendMode) -> ProcessingRequest {
+    msg.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        request_body_mode: BodySendMode::None as i32,
+        response_body_mode: response_body_mode as i32,
+        send_body_without_waiting_for_header_response: false,
+    });
+    msg
+}
+
+async fn open_stream(
+    client: &mut ExtProcClient,
+) -> (
+    tokio::sync::mpsc::Sender<ProcessingRequest>,
+    tonic::Streaming<ProcessingResponse>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .expect("process call failed")
+        .into_inner();
+    (tx, stream)
 }
 
 fn make_header(key: &str, value: &str) -> HeaderValue {

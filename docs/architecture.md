@@ -214,7 +214,7 @@ no pipeline reload or runtime degradation handling.
 
 ### Metrics
 
-Five metrics are exported:
+Six metrics are exported:
 
 | Metric                                      | Type      | Description                                                      |
 |---------------------------------------------|-----------|------------------------------------------------------------------|
@@ -223,6 +223,7 @@ Five metrics are exported:
 | `praxis_extproc_request_duration_seconds`   | histogram | Per-stream duration                                              |
 | `praxis_extproc_body_size_rejections_total` | counter   | Requests rejected for exceeding max body accumulation            |
 | `praxis_extproc_invalid_argument_total`     | counter   | `invalid_argument` rejections, labelled by `reason` and `detail` |
+| `praxis_extproc_local_replies_total`        | counter   | Streams opened by a local reply, passed through without filters  |
 
 
 The `praxis_extproc_invalid_argument_total` counter carries bounded
@@ -232,7 +233,7 @@ The `praxis_extproc_invalid_argument_total` counter carries bounded
 | reason            | detail                                                                                  |
 |-------------------|-----------------------------------------------------------------------------------------|
 | `protocol_config` | `after_first_message`, `unsupported_mode`                                               |
-| `message_order`   | `response_before_request_headers`, `invalid_phase_transition`, `body_after_headers_eos` |
+| `message_order`   | `request_after_local_reply`, `invalid_phase_transition`, `body_after_headers_eos`       |
 | `duplicate_eos`   | `redelivery`                                                                            |
 | `missing_headers` | `request`, `response`                                                                   |
 

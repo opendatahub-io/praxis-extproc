@@ -1,0 +1,19 @@
+# Denies requests carrying x-e2e-local-reply: deny at the gateway. Istio's
+# RBAC filter runs ahead of ipp, so the 403 is a local reply that reaches ipp
+# through its encoder path only: the ExtProc stream opens with response
+# headers, as it does for Kuadrant's 401 and 429.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: e2e-local-reply
+  namespace: istio-system
+spec:
+  targetRefs:
+    - kind: Gateway
+      group: gateway.networking.k8s.io
+      name: e2e-gateway
+  action: DENY
+  rules:
+    - when:
+        - key: request.headers[x-e2e-local-reply]
+          values: ["deny"]
