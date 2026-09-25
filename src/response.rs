@@ -34,7 +34,7 @@ const BODY_CHUNK_LIMIT: usize = 63_488; // 62 KiB
 /// See: `envoy/service/ext_proc/v3/external_processor.proto`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum BodyMode {
-    /// No body sent.
+    /// No body sent: the headers message is the complete message.
     None = 0,
 
     /// Body sent in streaming mode (incremental processing).
@@ -66,8 +66,8 @@ impl TryFrom<i32> for BodyMode {
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::None),
-            2 => Ok(Self::Buffered),
             1 => Ok(Self::Streamed),
+            2 => Ok(Self::Buffered),
             4 => Ok(Self::FullDuplexStreamed),
             3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
             _ => Err(format!("unknown BodySendMode value {value}")),
@@ -180,6 +180,16 @@ pub(crate) fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
         response: Some(Response::ImmediateResponse(imm)),
         ..Default::default()
     }
+}
+
+/// Whether a [`ProcessingResponse`] is an `ImmediateResponse`.
+///
+/// Envoy ignores every message after an immediate response, so callers use this
+/// to stop emitting follow-up messages (e.g. a trailers acknowledgement).
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn is_immediate(resp: &ProcessingResponse) -> bool {
+    matches!(resp.response, Some(Response::ImmediateResponse(_)))
 }
 
 // -----------------------------------------------------------------------------

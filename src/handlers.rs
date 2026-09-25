@@ -12,14 +12,14 @@
 use praxis_filter::FilterPipeline;
 use praxis_proto::envoy::service::{common::v3::HeaderValue, ext_proc::v3::ProcessingResponse};
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     adapter, metrics,
     pipeline::{
-        MutationDelivery, RequestPhase, ResponsePhase, passthrough_chunk, process_streamed_body_chunk,
-        run_request_header_filters_early, run_request_pipeline, run_response_header_filters_early,
-        run_response_pipeline,
+        MutationDelivery, RequestPhase, ResponsePhase, direction_label, flush_streamed_body_filters, passthrough_chunk,
+        process_streamed_body_chunk, run_request_header_filters_early, run_request_pipeline,
+        run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos},
     response::{self, BodyMode},
@@ -236,6 +236,101 @@ async fn accumulate_response_body(
     }
 
     run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+}
+
+// -----------------------------------------------------------------------------
+// Trailers
+// -----------------------------------------------------------------------------
+
+/// Handle trailers for one direction: release any held-back body work, then
+/// acknowledge with a `TrailersResponse`.
+pub(crate) async fn handle_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = finalize_body_on_trailers(pipeline, state, is_request).await?;
+    // Envoy ignores everything after an immediate response, so skip the ack then.
+    if !responses.last().is_some_and(response::is_immediate) {
+        responses.push(if is_request {
+            response::request_trailers()
+        } else {
+            response::response_trailers()
+        });
+    }
+    Ok(responses)
+}
+
+/// Complete a body phase that trailers, not `end_of_stream`, close.
+///
+/// Envoy signals the end of a body carrying trailers with the trailers message
+/// itself. Work held back for end-of-stream — the accumulated `BUFFERED` body or
+/// a `STREAMED` filter's end-of-stream call — must run now or the stream stalls.
+async fn finalize_body_on_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if !state.body_open(is_request) {
+        return Ok(Vec::new());
+    }
+
+    let (phase, mode, needs_body) = trailing_body_phase(pipeline, state, is_request);
+    state.eos_tracker.mark_complete(phase);
+
+    match mode {
+        BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
+        // A BUFFERED body that never arrived (empty) still needs its pipeline run,
+        // but there is no body message to carry header/body mutations; only an
+        // immediate (rejection) applies.
+        BodyMode::Buffered => {
+            let responses = if is_request {
+                run_request_pipeline(RequestPhase::Body, pipeline, state).await?
+            } else {
+                run_response_pipeline(ResponsePhase::Body, pipeline, state).await?
+            };
+            Ok(rejection_only(responses, is_request))
+        },
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the body phase, configured body mode, and body need for one direction.
+fn trailing_body_phase(
+    pipeline: &FilterPipeline,
+    state: &StreamState,
+    is_request: bool,
+) -> (ProtocolPhase, BodyMode, bool) {
+    let caps = pipeline.body_capabilities();
+    if is_request {
+        (
+            ProtocolPhase::RequestBody,
+            state.protocol_config.request_body_mode,
+            caps.needs_request_body,
+        )
+    } else {
+        (
+            ProtocolPhase::ResponseBody,
+            state.protocol_config.response_body_mode,
+            caps.needs_response_body,
+        )
+    }
+}
+
+/// Keep only an `ImmediateResponse` from a pipeline run that had no body message
+/// to answer.
+///
+/// A BUFFERED body that turns out to be empty never produces a body message, so
+/// header and body mutations have nothing to ride on; a rejection still applies.
+fn rejection_only(responses: Vec<ProcessingResponse>, is_request: bool) -> Vec<ProcessingResponse> {
+    let immediate: Vec<ProcessingResponse> = responses.into_iter().filter(response::is_immediate).collect();
+    if immediate.is_empty() {
+        warn!(
+            direction = direction_label(is_request),
+            "trailers closed an empty BUFFERED body; pipeline header mutations have no message to apply to and are dropped"
+        );
+    }
+    immediate
 }
 
 // -----------------------------------------------------------------------------

@@ -28,10 +28,13 @@ use tonic::{Request as TonicRequest, Response as TonicResponse, Status, Streamin
 use tracing::{debug, error, warn};
 
 use crate::{
-    handlers::{handle_request_body, handle_request_headers, handle_response_body, handle_response_headers},
+    handlers::{
+        handle_request_body, handle_request_headers, handle_response_body, handle_response_headers, handle_trailers,
+    },
     metrics,
-    protocol::{EosTracker, PhaseOrderTracker, ProtocolConfig, request_type_label, validate_body_message},
-    response,
+    protocol::{
+        EosTracker, PhaseOrderTracker, ProtocolConfig, ProtocolPhase, request_type_label, validate_body_message,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -288,8 +291,8 @@ async fn dispatch_request(
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,
-        processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
-        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestTrailers(_) => handle_trailers(pipeline, state, true).await,
+        processing_request::Request::ResponseTrailers(_) => handle_trailers(pipeline, state, false).await,
     }
 }
 
@@ -502,6 +505,30 @@ impl StreamState {
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
         }
+    }
+
+    /// Whether a direction's body phase is still open — headers were received but
+    /// neither the headers nor the body phase has run the pipeline yet.
+    ///
+    /// True only when trailers, not a body message, will close the body: the
+    /// pipeline has held back its work and must be released now.
+    pub(crate) fn body_open(&self, is_request: bool) -> bool {
+        let (present, headers, body) = if is_request {
+            (
+                self.request.is_some(),
+                ProtocolPhase::RequestHeaders,
+                ProtocolPhase::RequestBody,
+            )
+        } else {
+            (
+                self.response.is_some(),
+                ProtocolPhase::ResponseHeaders,
+                ProtocolPhase::ResponseBody,
+            )
+        };
+        present
+            && !self.eos_tracker.phase_state(headers).is_complete()
+            && !self.eos_tracker.phase_state(body).is_complete()
     }
 }
 

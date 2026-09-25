@@ -244,7 +244,7 @@ pub(crate) struct EosTracker {
 
 impl EosTracker {
     /// Current state of a phase.
-    fn phase_state(&self, phase: ProtocolPhase) -> PhaseState {
+    pub(crate) fn phase_state(&self, phase: ProtocolPhase) -> PhaseState {
         match phase {
             ProtocolPhase::RequestHeaders => self.request_headers,
             ProtocolPhase::RequestBody => self.request_body,
@@ -287,15 +287,23 @@ impl EosTracker {
         }
 
         if received_eos {
-            match phase {
-                ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
-                ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
-                ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
-                ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
-            }
+            self.mark_complete(phase);
         }
 
         Ok(PhaseState::Active)
+    }
+
+    /// Force a phase to [`PhaseState::Completed`].
+    ///
+    /// Used when trailers, rather than an `end_of_stream` flag, close a body
+    /// phase.
+    pub(crate) fn mark_complete(&mut self, phase: ProtocolPhase) {
+        match phase {
+            ProtocolPhase::RequestHeaders => self.request_headers = PhaseState::Completed,
+            ProtocolPhase::RequestBody => self.request_body = PhaseState::Completed,
+            ProtocolPhase::ResponseHeaders => self.response_headers = PhaseState::Completed,
+            ProtocolPhase::ResponseBody => self.response_body = PhaseState::Completed,
+        }
     }
 }
 
