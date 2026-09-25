@@ -1,0 +1,83 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: praxis-extproc-ext-proc
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: e2e-gateway
+  configPatches:
+    # -----------------------------------------------------------------
+    # configPatches[0] — ipp-pre: BBR. model_to_header extracts the model
+    # from the body, sets X-Gateway-Model-Name + clear_route_cache so
+    # Envoy re-evaluates routes with the header present.
+    #
+    # Body/trailer modes below are the FDS defaults; the buffered/
+    # overlay patches them by configPatches index.
+    # -----------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp-pre
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: true
+            allow_mode_override: true
+            send_body_without_waiting_for_header_response: true
+            grpc_service:
+              envoy_grpc:
+                cluster_name: praxis-pre-processing-grpc
+              timeout: 300s
+            message_timeout: 300s
+            processing_mode:
+              request_header_mode: SEND
+              response_header_mode: SKIP
+              request_body_mode: FULL_DUPLEX_STREAMED
+              response_body_mode: NONE
+              request_trailer_mode: SEND
+    # -----------------------------------------------------------------
+    # configPatches[1] — ipp: post-processing (response headers, request
+    # enrichment).
+    # -----------------------------------------------------------------
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_proc.ipp
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            failure_mode_allow: false
+            allow_mode_override: true
+            send_body_without_waiting_for_header_response: true
+            grpc_service:
+              envoy_grpc:
+                cluster_name: praxis-processing-grpc
+              timeout: 300s
+            message_timeout: 300s
+            processing_mode:
+              request_header_mode: SEND
+              response_header_mode: SEND
+              request_body_mode: FULL_DUPLEX_STREAMED
+              response_body_mode: FULL_DUPLEX_STREAMED
+              request_trailer_mode: SEND
+              response_trailer_mode: SEND

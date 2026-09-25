@@ -323,10 +323,15 @@ FORGE_CONFIG := forge.yaml
 INFERENCE_SIM_IMAGE ?= ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
 FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONTAINER_ENGINE))"
 
+# ext-proc body mode under test: fds (default) or buffered.
+MODE             ?= fds
+E2E_KIND_CONTEXT ?= kind-praxis-e2e
+
 e2e-setup: images
 	$(FORGE_CMD) cluster create e2e
 	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
 	$(FORGE_CMD) stack apply e2e
+	kubectl --context $(E2E_KIND_CONTEXT) apply -k deploy/overlays/e2e/test/modes/$(MODE)
 
 e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
@@ -377,6 +382,7 @@ help:
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
 	@echo "  EXTPROC_IMAGE      container image tag (default: docker.io/library/praxis-extproc:dev)"
+	@echo "  MODE               ext-proc body mode: fds (default), buffered"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + lint + test + audit"
@@ -428,7 +434,7 @@ help:
 	@echo "  manifests-odh    kubectl kustomize deploy/overlays/odh"
 	@echo ""
 	@echo "E2E (Forge):"
-	@echo "  e2e-setup        create Kind cluster + install all stacks"
+	@echo "  e2e-setup        create Kind cluster + install all stacks (MODE=fds|buffered)"
 	@echo "  e2e-teardown     delete Kind e2e cluster"
 	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""

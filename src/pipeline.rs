@@ -16,6 +16,7 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
 use praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse;
 use tonic::Status;
+use tracing::warn;
 
 use crate::{
     adapter, metrics,
@@ -278,9 +279,9 @@ pub(crate) fn passthrough_chunk(
 
 /// Process a single body chunk in `STREAMED` mode.
 ///
-/// Runs body filters on the chunk and responds immediately.
-/// Header mutations are sent at header time for `STREAMED`, so
-/// `deferred_*_header_mutation` will be `None` here.
+/// Runs body filters on the chunk and responds immediately. Body filters may
+/// derive header mutations from the body, so collect them from the filter
+/// context and merge with any deferred header-phase mutation before responding.
 #[expect(
     clippy::too_many_lines,
     reason = "Reusable for request and response processing, better than 2 different functions"
@@ -298,14 +299,18 @@ pub(crate) async fn process_streamed_body_chunk(
     let mut ctx = adapter::build_filter_context(pipeline, request);
     // Resolve the fallible response ref before hydrate drains carried state, so an
     // early return here leaves the parked state untouched.
-    if !is_request {
+    let original_response_headers = if is_request {
+        None
+    } else {
         let resp = state.response.as_mut().ok_or_else(|| {
             metrics::record_invalid_argument("missing_headers", "response");
             Status::invalid_argument("response headers not received")
         })?;
+        let original = capture_original_headers(resp);
         ctx.response_header = Some(resp);
         ctx.upstream_reached = true;
-    }
+        Some(original)
+    };
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
     let eos = body.end_of_stream;
     let mut chunk = body.body;
@@ -317,8 +322,16 @@ pub(crate) async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
+    warn_unapplied_header_mutations(&ctx, is_request, original_response_headers.as_ref());
+    let current_mutation = if is_request {
+        adapter::collect_request_header_mutations(&ctx)
+    } else {
+        original_response_headers
+            .as_ref()
+            .and_then(|original| adapter::collect_response_header_mutations_diff(&ctx, original))
+    };
     ctx.dehydrate(&mut state.carried_context)?;
-    let (mutation, body_mode) = if is_request {
+    let (deferred, body_mode) = if is_request {
         (
             state.deferred_request_header_mutation.take(),
             state.protocol_config.request_body_mode,
@@ -329,6 +342,7 @@ pub(crate) async fn process_streamed_body_chunk(
             state.protocol_config.response_body_mode,
         )
     };
+    let mutation = merge_mutations(deferred, current_mutation);
 
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
@@ -337,6 +351,65 @@ pub(crate) async fn process_streamed_body_chunk(
         response::response_body(body_data, mutation, body_mode, eos)
     };
     Ok(responses)
+}
+
+/// Once-per-process warning: `STREAMED` body filters produced header mutations.
+static STREAMED_HEADER_MUTATIONS: OnceWarning = OnceWarning::new();
+
+/// A configuration-mismatch warning that fires once per process.
+///
+/// The condition it guards depends on the pipeline and on Envoy's processing
+/// mode, not on the request, so repeating it for every stream would only flood
+/// the log; later occurrences are suppressed.
+struct OnceWarning(std::sync::atomic::AtomicBool);
+
+impl OnceWarning {
+    /// A warning that has not fired yet.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Whether this call is the first; every later call returns `false`.
+    fn first(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the warning has not fired yet, without firing it.
+    fn pending(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Warn (once per process) when body filters changed headers that Envoy will not apply.
+///
+/// Header mutations on a body response only take effect in `BUFFERED` mode.
+/// In `STREAMED` mode the headers were forwarded when the `HeadersResponse`
+/// went out, so a filter that derives headers from the body is silently
+/// ineffective. Surface that so operators can switch the direction to
+/// `BUFFERED` or `FULL_DUPLEX_STREAMED`.
+fn warn_unapplied_header_mutations(
+    ctx: &HttpFilterContext<'_>,
+    is_request: bool,
+    original_response_headers: Option<&HashMap<String, String>>,
+) {
+    if !STREAMED_HEADER_MUTATIONS.pending() {
+        return;
+    }
+    let mutation = if is_request {
+        adapter::collect_request_header_mutations(ctx)
+    } else {
+        original_response_headers.and_then(|original| adapter::collect_response_header_mutations_diff(ctx, original))
+    };
+    if let Some(mutation) = mutation
+        && STREAMED_HEADER_MUTATIONS.first()
+    {
+        warn!(
+            direction = if is_request { "request" } else { "response" },
+            set_headers = mutation.set_headers.len(),
+            remove_headers = mutation.remove_headers.len(),
+            "STREAMED body filters produced header mutations, which Envoy applies only in BUFFERED mode; dropped"
+        );
+    }
 }
 
 /// How header mutations are delivered after early filter execution.
@@ -1269,6 +1342,115 @@ mod tests {
             slot.as_ref().unwrap().filter_metadata.get("kept").map(String::as_str),
             Some("yes"),
             "a rejected dehydrate must not overwrite the parked context"
+        );
+    }
+
+    /// Body filter that derives a routing header from the request body,
+    /// modelling BBR's `model_to_header`. Declares `ReadOnly` body access so
+    /// the pipeline reports `needs_request_body`, and sets the header only in
+    /// the body phase -- never at header time.
+    struct ModelHeaderProbe;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ModelHeaderProbe {
+        fn name(&self) -> &'static str {
+            "model_header_probe"
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadOnly
+        }
+
+        async fn on_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if body.as_ref().is_some_and(|b| !b.is_empty()) {
+                ctx.request_headers_to_set.push((
+                    "x-gateway-model-name".parse().unwrap(),
+                    "internal-model".parse().unwrap(),
+                ));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl ModelHeaderProbe {
+        /// Registry factory for `model_header_probe`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// A body-derived routing header (BBR) must reach Envoy under `STREAMED`.
+    ///
+    /// The mutation surfaces only in the body phase, so `process_streamed_body_chunk`
+    /// must collect it from the filter context and set `clear_route_cache` -- without
+    /// this, the routing header is dropped and Envoy 404s (the streamed e2e gap).
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "test sets up a pipeline, filter, and assertions")]
+    async fn streamed_request_body_collects_body_derived_header_and_clears_route_cache() {
+        use praxis_filter::FilterRegistry;
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ProtoResponse;
+
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: model_header_probe\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register(
+                "model_header_probe",
+                praxis_filter::http_builtin(ModelHeaderProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        assert!(
+            pipeline.body_capabilities().needs_request_body,
+            "probe must opt into the request body so STREAMED routes through process_streamed_body_chunk"
+        );
+
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+
+        let body = praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: br#"{"model":"internal-model"}"#.to_vec(),
+            end_of_stream: true,
+        };
+        let responses = process_streamed_body_chunk(&pipeline, body, &mut state, true)
+            .await
+            .unwrap();
+
+        let common = responses
+            .iter()
+            .find_map(|r| match &r.response {
+                Some(ProtoResponse::RequestBody(b)) => b.response.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+
+        let mutation = common.header_mutation.as_ref().unwrap();
+        assert!(
+            mutation
+                .set_headers
+                .iter()
+                .filter_map(|h| h.header.as_ref())
+                .any(|h| h.key == "x-gateway-model-name"),
+            "the routing header set in the body phase must be emitted to Envoy"
+        );
+        assert!(
+            common.clear_route_cache,
+            "a request-phase body header mutation must clear the route cache so Envoy re-routes"
         );
     }
 }
