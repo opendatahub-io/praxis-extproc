@@ -143,6 +143,9 @@ overlay which adds:
 - DestinationRules with SIMPLE TLS and explicit SNI
 - EnvoyFilter anchored around Kuadrant auth
   (supports Istio <=1.25 through >=1.30 and RHCL)
+- Istio's InferencePool filter moved in front of
+  the router, so the endpoint picker sees the
+  model header set by pre-auth BBR
 
 ```console
 kubectl apply -k deploy/overlays/odh

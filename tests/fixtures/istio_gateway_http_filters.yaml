@@ -1,0 +1,52 @@
+# HTTP filters an Istio 1.29.2 gateway with one InferencePool renders before the
+# ODH overlay's payload-processing EnvoyFilter applies, taken from Envoy config
+# dumps of the maas-default-gateway listeners on kind. Kuadrant's own
+# EnvoyFilter (priority 0) has already applied. The overlay's ipp-pre and ipp
+# are stripped, and the WasmPlugin namespace is the overlay's openshift-ingress
+# placeholder, which ai-gateway-controller rewrites on both sides alike.
+
+# Istio's static InferencePool filter (pilot/pkg/xds/filters), as rendered.
+inference_pool_filter:
+  name: envoy.filters.http.ext_proc
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+    grpc_service:
+      envoy_grpc:
+        cluster_name: dummy
+      timeout: 10s
+    failure_mode_allow: true
+    processing_mode:
+      request_header_mode: SKIP
+      response_header_mode: SKIP
+    message_timeout: 1000s
+    metadata_options:
+      forwarding_namespaces:
+        untyped:
+          - envoy.lb
+      receiving_namespaces:
+        untyped:
+          - envoy.lb
+
+chains:
+  # Kuadrant 1.5.3 (RHCL 1.4): wasm-shim inserted right before the router.
+  wasm:
+    - istio.metadata_exchange
+    - envoy.filters.http.ext_proc
+    - envoy.filters.http.grpc_stats
+    - istio.alpn
+    - envoy.filters.http.fault
+    - envoy.filters.http.cors
+    - istio.stats
+    - envoy.filters.http.wasm
+    - envoy.filters.http.router
+  # Kuadrant 1.4.7: WasmPlugin, placed by Istio ahead of the InferencePool filter.
+  wasmplugin:
+    - istio.metadata_exchange
+    - extensions.istio.io/wasmplugin/openshift-ingress.kuadrant-maas-default-gateway
+    - envoy.filters.http.ext_proc
+    - envoy.filters.http.grpc_stats
+    - istio.alpn
+    - envoy.filters.http.fault
+    - envoy.filters.http.cors
+    - istio.stats
+    - envoy.filters.http.router
