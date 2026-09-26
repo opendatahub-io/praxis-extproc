@@ -282,10 +282,10 @@ The crypto picture above began as the praxis FIPS work
 ([praxis-proxy/praxis#1254]), which praxis releases have carried since
 0.7.0. The praxis crates now come from crates.io at the same 0.7 spec
 praxis-ai pins, so the `PipelineExtension` types unify, and praxis-ai is
-pinned at a `main` commit that builds against that release; the temporary
-`[patch.crates-io]` this section used to describe is gone, and `deny.toml`
-no longer allows a praxis git source. Any praxis before 0.7 brings back the
-0.9 Pingora fork, whose rustls crate carries a ring provider, and
-`make fips-deps` fails on it.
+pinned at its own tagged release, which builds against that spec; the
+temporary `[patch.crates-io]` this section used to describe is gone, and
+`deny.toml` no longer allows a praxis git source. Any praxis before 0.7
+brings back the 0.9 Pingora fork, whose rustls crate carries a ring
+provider, and `make fips-deps` fails on it.
 
 [praxis-proxy/praxis#1254]: https://github.com/praxis-proxy/praxis/pull/1254

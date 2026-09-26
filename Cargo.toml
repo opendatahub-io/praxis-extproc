@@ -44,10 +44,10 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-# praxis-ai at its main, where the larger capabilities are opt-in features;
-# the [features] above choose which ones this server builds in.
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", rev = "7c00920d3c299e1dcddf41b8f5d8e9784407e657", default-features = false, optional = true }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "7c00920d3c299e1dcddf41b8f5d8e9784407e657", default-features = false }
+# praxis-ai at its v0.4.1 release, where the larger capabilities are opt-in
+# features; the [features] above choose which ones this server builds in.
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false, optional = true }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
 # types unify (praxis-ai pins the same 0.7 from crates.io). No default
 # features: praxis-filter's default turns on the policy engine, whose
