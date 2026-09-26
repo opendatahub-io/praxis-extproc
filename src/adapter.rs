@@ -95,6 +95,7 @@ pub fn build_filter_context<'a>(pipeline: &'a FilterPipeline, request: &'a Reque
         metrics_route: None,
         peer_identity: None,
         extensions: RequestExtensions::default(),
+        executed_branch_filters: Vec::new(),
         executed_filter_indices: Vec::new(),
         extra_request_headers: Vec::new(),
         request_headers_to_remove: Vec::new(),

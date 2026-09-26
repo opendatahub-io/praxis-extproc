@@ -40,11 +40,10 @@ pub(crate) const DENIED: &[&str] = &[
 fn hint_location(crate_name: &str) -> &'static str {
     match crate_name {
         "ring" => {
-            "the Pingora fork before 0.10.0 (its rustls crate carried a ring provider), which praxis 0.6.0 from \
-             crates.io brings back when Cargo.toml's [patch.crates-io] is removed or no longer applies; a \
-             dependency enabling rustls' 'ring' feature; rcgen outside dev-dependencies; a manifest built from \
-             'cargo metadata' (which activates rustls-webpki's weak 'ring?/alloc' feature) when the graph itself \
-             is clean"
+            "the Pingora fork before 0.10.0 (its rustls crate carried a ring provider), which any praxis before \
+             the 0.7 FIPS release brings back; a dependency enabling rustls' 'ring' feature; rcgen outside \
+             dev-dependencies; a manifest built from 'cargo metadata' (which activates rustls-webpki's weak \
+             'ring?/alloc' feature) when the graph itself is clean"
         },
         "aws-lc-rs" | "aws-lc-sys" => {
             "a dependency enabling rustls' 'aws_lc_rs' feature (rustls' default, kept off in Cargo.toml); \
@@ -52,10 +51,13 @@ fn hint_location(crate_name: &str) -> &'static str {
              before its FIPS work)"
         },
         "sha2" => {
-            "aws-sigv4 (feature aws-sigv4); sqlx-core's migration checksums (feature responses-store); praxis-ai \
-             before its FIPS work; the praxis policy engine (feature policy-engine)"
+            "sqlx-core's migration checksums (feature responses-store); the praxis policy engine (feature \
+             policy-engine); the aws-sigv4 crate if praxis-ai's OpenSSL-backed signer ever regresses to it"
         },
-        "hmac" => "aws-sigv4 (feature aws-sigv4); the praxis policy engine's 'oauth' builtin (feature policy-engine)",
+        "hmac" => {
+            "the praxis policy engine's 'oauth' builtin (feature policy-engine); the aws-sigv4 crate if \
+             praxis-ai's OpenSSL-backed signer ever regresses to it"
+        },
         "sha1" => "tokio-tungstenite WebSocket accept key (test utilities)",
         "openssl-src" => "the 'vendored' feature of the openssl crate, or OPENSSL_STATIC",
         "boring" | "boring-sys" => "pingora 'boringssl' feature",
@@ -75,9 +77,9 @@ fn hint_fix(crate_name: &str) -> &'static str {
              policy-engine out of the FIPS build (FIPS_FEATURES in the Makefile)"
         },
         "sha2" | "hmac" => {
-            "leave aws-sigv4, policy-engine and responses-store out of the FIPS build (FIPS_FEATURES in the \
-             Makefile), or route the operation through openssl (EVP APIs: openssl::hash, openssl::sign, \
-             openssl::pkey)"
+            "leave policy-engine and responses-store out of the FIPS build (FIPS_FEATURES in the Makefile), or \
+             route the operation through openssl (EVP APIs: openssl::hash, openssl::sign, openssl::pkey) the way \
+             praxis-ai's SigV4 signer does"
         },
         "sha1" => "keep it a dev-dependency; it must not appear in the release graph",
         "openssl-src" => "remove 'vendored', build with OPENSSL_NO_VENDOR=1, never set OPENSSL_STATIC",

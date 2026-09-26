@@ -18,8 +18,9 @@ default = ["aws-sigv4", "policy-engine", "responses-full"]
 # The praxis-ai filter groups this server can carry, each mapped onto the
 # praxis-ai feature that provides it. The FIPS build (FIPS_FEATURES in the
 # Makefile, mirrored by the Containerfile's defaults) picks among them.
-# aws_sigv4_sign: AWS Signature V4 request signing. Its signing crates (sha2,
-# hmac) are pure-Rust cryptography, so the FIPS build leaves it out.
+# aws_sigv4_sign: AWS Signature V4 request signing. Signs through the system
+# OpenSSL (praxis-ai's hash and HMAC seam; the aws-sigv4 crate is only
+# praxis-ai's test oracle), so the FIPS build ships it.
 aws-sigv4 = ["praxis-ai-filters/aws-sigv4-filter"]
 # The praxis `policy` filter (the Praxis Policy Engine). Its runtime and its
 # JWT, OAuth and Valkey plugins carry pure-Rust cryptography (aws-lc-rs, sha2,
@@ -43,16 +44,17 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-# praxis-ai at its main, where the larger capabilities are opt-in features;
-# the [features] above choose which ones this server builds in.
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", rev = "5fddd7317edcb41b8616156bfc8106021ff61f21", default-features = false, optional = true }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "5fddd7317edcb41b8616156bfc8106021ff61f21", default-features = false }
+# praxis-ai at its v0.4.1 release, where the larger capabilities are opt-in
+# features; the [features] above choose which ones this server builds in.
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false, optional = true }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
-# types unify (see [patch.crates-io] below). No default features:
-# praxis-filter's default turns on the policy engine, whose plugins carry
-# pure-Rust cryptography; the policy-engine feature above opts back in.
-praxis-core = { version = "0.6.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.6.0", package = "praxis-proxy-filter", default-features = false }
+# types unify (praxis-ai pins the same 0.7 from crates.io). No default
+# features: praxis-filter's default turns on the policy engine, whose
+# plugins carry pure-Rust cryptography; the policy-engine feature above
+# opts back in.
+praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -62,12 +64,11 @@ metrics-exporter-prometheus = { version = "0.16.2", default-features = false }
 prost = "0.14.3"
 futures = "0.3.32"
 openssl = "0.10.81"
-# rustls without its default features: those would compile in aws-lc-rs, a
-# second crypto provider. The one provider is the OpenSSL-backed fork below,
-# the same crate praxis installs, so every primitive goes to the system
-# libcrypto. Never with `vendored`.
-rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
-rustls-openssl = { version = "0.4.1", package = "quixotic-plecostomus-rustls-openssl", default-features = false, features = ["tls12"] }
+# The crypto provider comes through praxis-tls (the OpenSSL-backed fork,
+# never with `vendored`), whose provider module src/fips.rs delegates to;
+# rustls itself arrives transitively with its default features (aws-lc-rs)
+# kept off by every praxis crate.
+praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"
@@ -332,15 +333,4 @@ debug = 2
 strip = false
 lto = false
 
-# Temporary: the praxis crates at the revision praxis-ai's [patch.crates-io]
-# pins, a commit from praxis-proxy/praxis#1254 (the FIPS work: all crypto
-# through the system OpenSSL, the 0.10 Pingora fork without ring), until a
-# praxis release carries it. A dependency's patches do not apply here, so this
-# repeats praxis-ai's and is the one praxis-ai itself builds with; keep it on
-# praxis-ai's revision. Remove this section and bump the versions above when
-# that release is published.
-[patch.crates-io]
-praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
 

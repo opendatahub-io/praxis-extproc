@@ -7,7 +7,7 @@
 //! OpenSSL. The ExtProc listener speaks TLS through OpenSSL directly
 //! (`tokio-openssl`), and everything the Praxis filters do over TLS, such as
 //! subrequests, goes through rustls, which performs no cryptography of its own
-//! and delegates every primitive to a [`CryptoProvider`]. This process installs
+//! and delegates every primitive to a `CryptoProvider`. This process installs
 //! exactly one, the OpenSSL-backed provider, before any filter or connector is
 //! built. On a FIPS-enabled Red Hat Enterprise Linux host the library behind
 //! both paths is the platform's validated module.
@@ -18,113 +18,15 @@
 //! at startup and, when [`REQUIRE_FIPS_ENV`] is set, refuse to serve unless
 //! both are present.
 //!
-//! The signals, the variable and the messages are those of praxis's
-//! `praxis_tls::provider`; once a praxis release carries that module, this one
-//! can delegate to it.
-//!
-//! [`CryptoProvider`]: rustls::crypto::CryptoProvider
+//! The provider, the signals, the variable and the messages are
+//! [`praxis_tls::provider`]'s, the module this one was copied from while no
+//! praxis release carried it; now that one does, this module only adds the
+//! [`ExtProcError`] shape and the fail-closed [`require`] helper.
 
-use rustls::crypto::CryptoProvider;
+pub use praxis_tls::provider::{REQUIRE_FIPS_ENV, Status, required, status};
 use tracing::{debug, info};
 
 use crate::error::ExtProcError;
-
-/// Environment variable that makes FIPS mode a hard requirement.
-///
-/// Set it to `1`, `true`, `yes` or `on` (case-insensitive) and the server
-/// refuses to serve unless [`Status::unmet`] is empty. It is a check, never a
-/// switch: nothing here turns FIPS mode on.
-pub const REQUIRE_FIPS_ENV: &str = "PRAXIS_REQUIRE_FIPS";
-
-/// Name of the provider compiled into this build.
-pub const PROVIDER_NAME: &str = "openssl";
-
-/// Path of the kernel's FIPS mode flag.
-const KERNEL_FIPS_FLAG: &str = "/proc/sys/crypto/fips_enabled";
-
-// -----------------------------------------------------------------------------
-// Status
-// -----------------------------------------------------------------------------
-
-/// What the process knows about FIPS once the provider is installed.
-///
-/// Two independent signals, kept apart so a log line says which one is
-/// missing: the installed provider's own view of whether every primitive it
-/// offers is FIPS approved, and the kernel's FIPS mode, which on Red Hat
-/// Enterprise Linux is what activates the validated OpenSSL provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Status {
-    /// Whether the installed provider reports every cipher suite, key exchange
-    /// and signature algorithm as FIPS approved (rustls' `CryptoProvider::fips`,
-    /// which the OpenSSL provider answers from
-    /// `EVP_default_properties_is_fips_enabled`).
-    pub provider_fips: bool,
-    /// Whether the kernel is in FIPS mode, from `/proc/sys/crypto/fips_enabled`;
-    /// `None` where that file does not exist (a non-Linux host, or a container
-    /// without `/proc`).
-    pub kernel_fips: Option<bool>,
-}
-
-impl Status {
-    /// Whether FIPS mode is in effect: both signals present.
-    #[must_use]
-    pub fn active(self) -> bool {
-        self.provider_fips && self.kernel_fips == Some(true)
-    }
-
-    /// Why FIPS mode is not in effect, one reason per missing signal. Empty
-    /// when it is.
-    #[must_use]
-    pub fn unmet(self) -> Vec<&'static str> {
-        let mut reasons = Vec::new();
-        if !self.provider_fips {
-            reasons
-                .push("the OpenSSL provider does not report FIPS-approved algorithms (is the fips provider active?)");
-        }
-        match self.kernel_fips {
-            Some(true) => {},
-            Some(false) => reasons.push("the kernel is not in FIPS mode (/proc/sys/crypto/fips_enabled is 0)"),
-            None => reasons.push("the kernel FIPS flag cannot be read (/proc/sys/crypto/fips_enabled)"),
-        }
-        reasons
-    }
-
-    /// Fail closed: when [`REQUIRE_FIPS_ENV`] is set and FIPS mode is not in
-    /// effect, an error naming every missing signal.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExtProcError::Crypto`] with the reasons from [`Status::unmet`].
-    pub fn require(self) -> Result<(), ExtProcError> {
-        self.require_if(required())
-    }
-
-    /// [`Status::require`] with the requirement decided by the caller.
-    fn require_if(self, required: bool) -> Result<(), ExtProcError> {
-        if !required {
-            return Ok(());
-        }
-        let unmet = self.unmet();
-        if unmet.is_empty() {
-            return Ok(());
-        }
-        Err(ExtProcError::Crypto(format!(
-            "{REQUIRE_FIPS_ENV} is set but FIPS mode is not in effect: {}",
-            unmet.join("; ")
-        )))
-    }
-}
-
-/// Whether this deployment requires FIPS mode; see [`REQUIRE_FIPS_ENV`].
-#[must_use]
-pub fn required() -> bool {
-    std::env::var(REQUIRE_FIPS_ENV).is_ok_and(|value| is_truthy(&value))
-}
-
-/// The affirmative spellings [`REQUIRE_FIPS_ENV`] accepts.
-fn is_truthy(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
 
 // -----------------------------------------------------------------------------
 // Install
@@ -143,22 +45,18 @@ fn is_truthy(value: &str) -> bool {
 ///
 /// Returns [`ExtProcError::Crypto`] when no provider is installed afterwards.
 pub fn install() -> Result<Status, ExtProcError> {
-    if rustls_openssl::default_provider().install_default().is_err() {
+    if !praxis_tls::provider::install() {
         debug!("a crypto provider was already installed; keeping it");
     }
-    let Some(provider) = CryptoProvider::get_default() else {
+    let status = status();
+    if !status.installed {
         return Err(ExtProcError::Crypto(format!(
-            "failed to install the {PROVIDER_NAME} crypto provider"
+            "failed to install the {} crypto provider",
+            praxis_tls::provider::name()
         )));
-    };
-    let status = Status {
-        provider_fips: provider.fips(),
-        kernel_fips: std::fs::read_to_string(KERNEL_FIPS_FLAG)
-            .ok()
-            .and_then(|contents| kernel_fips_from(&contents)),
-    };
+    }
     info!(
-        provider = PROVIDER_NAME,
+        provider = status.name,
         provider_fips = status.provider_fips,
         kernel_fips = ?status.kernel_fips,
         fips_required = required(),
@@ -167,16 +65,79 @@ pub fn install() -> Result<Status, ExtProcError> {
     Ok(status)
 }
 
-/// Interpret the contents of the kernel's FIPS flag.
+// -----------------------------------------------------------------------------
+// Non-FIPS Filters
+// -----------------------------------------------------------------------------
+
+/// Registered filter names whose dependencies do their own cryptography
+/// outside the system OpenSSL, so a binary that registers one cannot honor
+/// [`REQUIRE_FIPS_ENV`] whatever the provider reports.
 ///
-/// The kernel writes a single digit and a newline; anything else is unknown
-/// rather than "off", so an unexpected file never reads as a claim either way.
-fn kernel_fips_from(contents: &str) -> Option<bool> {
-    match contents.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
+/// - `policy`: the Praxis Policy Engine's JWT verification runs on `aws-lc-rs` (through `jsonwebtoken`) and its `OAuth`
+///   and Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
+/// - `openai_response_store`: registered exactly when the store is compiled in (feature `responses-store`), whose
+///   `sqlx` brings `sha2`. Everything on the store (`responses-full`) implies it, so this one name covers them all.
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+
+/// Why this binary cannot honor [`REQUIRE_FIPS_ENV`], if it cannot.
+///
+/// The provider and kernel signals say nothing about what is compiled in: a
+/// filter on `NON_FIPS_FILTERS` carries its own cryptography. Checked
+/// against the registry rather than the configuration, so a config that
+/// merely leaves the filter out does not mask what the binary carries.
+#[must_use]
+pub fn blocker(registry: &praxis_filter::FilterRegistry) -> Option<String> {
+    let available = registry.available_filters();
+    let registered: Vec<String> = NON_FIPS_FILTERS
+        .iter()
+        .copied()
+        .filter(|name| available.contains(name))
+        .map(|name| format!("`{name}` filter"))
+        .collect();
+
+    (!registered.is_empty()).then(|| {
+        format!(
+            "{REQUIRE_FIPS_ENV} is set but this binary registers the {}, whose dependencies do their own \
+             cryptography outside the system OpenSSL; run the FIPS build",
+            registered.join(" and ")
+        )
+    })
+}
+
+// -----------------------------------------------------------------------------
+// Requirement
+// -----------------------------------------------------------------------------
+
+/// Whether FIPS mode is in effect: a provider installed and both signals
+/// present ([`Status::unmet`] empty).
+#[must_use]
+pub fn active(status: &Status) -> bool {
+    status.unmet().is_empty()
+}
+
+/// Fail closed: when [`REQUIRE_FIPS_ENV`] is set and FIPS mode is not in
+/// effect, an error naming every missing signal.
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Crypto`] with the reasons from [`Status::unmet`].
+pub fn require(status: &Status) -> Result<(), ExtProcError> {
+    require_if(status, required())
+}
+
+/// [`require`] with the requirement decided by the caller.
+fn require_if(status: &Status, required: bool) -> Result<(), ExtProcError> {
+    if !required {
+        return Ok(());
     }
+    let unmet = status.unmet();
+    if unmet.is_empty() {
+        return Ok(());
+    }
+    Err(ExtProcError::Crypto(format!(
+        "{REQUIRE_FIPS_ENV} is set but FIPS mode is not in effect: {}",
+        unmet.join("; ")
+    )))
 }
 
 // -----------------------------------------------------------------------------
@@ -190,23 +151,27 @@ mod tests {
 
     /// The status of a FIPS host.
     const FIPS_HOST: Status = Status {
+        name: "openssl",
+        installed: true,
         provider_fips: true,
         kernel_fips: Some(true),
     };
 
     #[test]
     fn fips_mode_needs_both_signals() {
-        assert!(FIPS_HOST.active(), "provider and kernel both report FIPS");
+        assert!(active(&FIPS_HOST), "provider and kernel both report FIPS");
         assert!(FIPS_HOST.unmet().is_empty(), "nothing is missing on a FIPS host");
         let neither = Status {
             provider_fips: false,
             kernel_fips: Some(false),
+            ..FIPS_HOST
         };
-        assert!(!neither.active(), "no signal, no FIPS mode");
+        assert!(!active(&neither), "no signal, no FIPS mode");
         assert_eq!(neither.unmet().len(), 2, "both missing signals are named");
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one case per missing signal")]
     fn each_missing_signal_is_named() {
         for (status, missing) in [
             (
@@ -215,6 +180,14 @@ mod tests {
                     ..FIPS_HOST
                 },
                 "OpenSSL provider",
+            ),
+            (
+                Status {
+                    installed: false,
+                    provider_fips: false,
+                    ..FIPS_HOST
+                },
+                "not the installed crypto provider",
             ),
             (
                 Status {
@@ -231,7 +204,7 @@ mod tests {
                 "cannot be read",
             ),
         ] {
-            assert!(!status.active(), "one missing signal means no FIPS mode: {status:?}");
+            assert!(!active(&status), "one missing signal means no FIPS mode: {status:?}");
             let unmet = status.unmet();
             assert_eq!(unmet.len(), 1, "exactly the missing signal is named: {unmet:?}");
             let reason = unmet.first().copied().expect("one reason");
@@ -244,10 +217,11 @@ mod tests {
         let off = Status {
             provider_fips: false,
             kernel_fips: Some(false),
+            ..FIPS_HOST
         };
-        assert!(off.require_if(false).is_ok(), "not required: serve regardless");
-        assert!(FIPS_HOST.require_if(true).is_ok(), "required and met: serve");
-        let err = off.require_if(true).expect_err("required and unmet: refuse");
+        assert!(require_if(&off, false).is_ok(), "not required: serve regardless");
+        assert!(require_if(&FIPS_HOST, true).is_ok(), "required and met: serve");
+        let err = require_if(&off, true).expect_err("required and unmet: refuse");
         let message = err.to_string();
         assert!(
             message.contains("PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect"),
@@ -260,20 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn the_variable_accepts_the_usual_affirmatives_only() {
-        for value in ["1", "true", "TRUE", "yes", " on "] {
-            assert!(is_truthy(value), "{value:?} requires FIPS");
+    fn the_blocker_names_exactly_the_registered_non_fips_filters() {
+        let registry = praxis_ai_filters::build_ai_registry();
+        let blocker = blocker(&registry);
+        if cfg!(any(feature = "policy-engine", feature = "responses-store")) {
+            let reason = blocker.expect("a binary with non-FIPS filters is blocked");
+            assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
+            if cfg!(feature = "policy-engine") {
+                assert!(reason.contains("`policy` filter"), "{reason}");
+            }
+            if cfg!(feature = "responses-store") {
+                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            }
+        } else {
+            assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
         }
-        for value in ["", "0", "false", "no", "off", "maybe"] {
-            assert!(!is_truthy(value), "{value:?} does not");
-        }
-    }
-
-    #[test]
-    fn the_kernel_flag_is_a_single_digit() {
-        assert_eq!(kernel_fips_from("1\n"), Some(true), "1 is FIPS mode");
-        assert_eq!(kernel_fips_from("0\n"), Some(false), "0 is not");
-        assert_eq!(kernel_fips_from("garbage"), None, "anything else is unknown");
     }
 
     #[test]
@@ -281,6 +256,6 @@ mod tests {
         let first = install().expect("install");
         let second = install().expect("a second install keeps the first provider");
         assert_eq!(first, second, "the signals do not change between calls");
-        assert!(CryptoProvider::get_default().is_some(), "a provider is installed");
+        assert!(praxis_tls::provider::installed(), "a provider is installed");
     }
 }

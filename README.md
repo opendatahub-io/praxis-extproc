@@ -22,7 +22,7 @@ start deploying alongside Envoy.
 - [Architecture](docs/architecture.md): how the ExtProc server works
 - [Configuration](docs/configuration.md): YAML reference for filter chains, server, and TLS
 - [IPP → Praxis Migration](docs/migration-ipp-to-praxis.md): moving from the Go Inference Payload Processor
-- [FIPS](docs/fips.md): the image is the FIPS build; what it leaves out, host prerequisites, `PRAXIS_REQUIRE_FIPS`
+- [FIPS](docs/fips.md): the image is the FIPS build; what it leaves out, host prerequisites, `PRAXIS_REQUIRE_FIPS`, and the runtime proof on a FIPS host
 - [Development](docs/development.md): building, testing, contributing
 - [Conventions](docs/conventions.md): coding standards
 
