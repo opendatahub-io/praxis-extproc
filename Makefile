@@ -124,15 +124,15 @@ images: container-release
 # what is known to carry pure-Rust cryptography, so nobody has to know which
 # features to pick:
 #
-#   aws-sigv4         aws_sigv4_sign signs with sha2 and hmac
 #   policy-engine     the praxis policy filter's JWT, OAuth and Valkey
 #                     plugins carry aws-lc-rs, sha2 and hmac
 #   responses-store   the Responses store is built on sqlx, whose migration
 #                     checksums use sha2
 #
-# The Responses filters themselves (responses) stay in. FIPS_FEATURES is the
-# single place this is defined; the Containerfile's CARGO_FEATURES default
-# mirrors it and must be kept in sync.
+# The Responses filters (responses) and the SigV4 signer (aws-sigv4, which
+# signs through the system OpenSSL since praxis-ai moved it off sha2/hmac)
+# stay in. FIPS_FEATURES is the single place this is defined; the
+# Containerfile's CARGO_FEATURES default mirrors it and must be kept in sync.
 #
 # The local FIPS build goes to its own target directory so it never
 # overwrites, or is mistaken for, the default build.
@@ -157,7 +157,7 @@ images: container-release
 # The report, the image verification and the signature-store setup are
 # `cargo xtask fips` commands (xtask/src/fips/). See docs/fips.md.
 
-FIPS_FEATURES           := responses
+FIPS_FEATURES           := responses,aws-sigv4
 FIPS_TARGET_DIR         := target/fips
 FIPS_BIN                ?= $(FIPS_TARGET_DIR)/release/praxis-extproc
 FIPS_CARGO_ARGS         := -p praxis-extproc --no-default-features --features $(FIPS_FEATURES) --target-dir $(FIPS_TARGET_DIR)

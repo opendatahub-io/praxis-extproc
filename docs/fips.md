@@ -37,7 +37,7 @@ know which features to pick:
 | `responses`: the OpenAI Responses filters | yes | yes |
 | `responses-store`: the response store the Responses filters keep state in | yes | no: built on sqlx, whose migration checksums use `sha2` |
 | `responses-full`: the rest of what Praxis AI offers on that store (the Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: all of it needs the store |
-| `aws-sigv4`: the `aws_sigv4_sign` filter | yes | no: signs with `sha2` and `hmac` |
+| `aws-sigv4`: the `aws_sigv4_sign` filter | yes | yes: signs through the system OpenSSL (praxis-ai moved it off `sha2`/`hmac`; the `aws-sigv4` crate is only its test oracle) |
 | `policy-engine`: the praxis `policy` filter (the Praxis Policy Engine) | yes | no: its runtime and plugins carry `aws-lc-rs`, `sha2` and `hmac` |
 
 `FIPS_FEATURES` is defined once, in the Makefile; the `Containerfile`'s
@@ -68,12 +68,13 @@ resolver (`openai_file_resolve`, the same reqwest). All of them need the
 store, so they go with it; a configuration naming one of those filters is
 rejected at startup by the image. No shipped configuration does.
 
-**The `aws_sigv4_sign` filter** (`aws-sigv4`). AWS Signature V4 request
-signing for Bedrock-style backends. The `aws-sigv4` crate computes the
-signature with `sha2` and `hmac`, both on the denylist. No shipped
-configuration uses the filter. Fixing it means signing through OpenSSL's EVP
-APIs (`openssl::hash`, `openssl::sign`) in praxis-ai instead of the
-`aws-sigv4` crate.
+**The `aws_sigv4_sign` filter** (`aws-sigv4`) is in the FIPS build. AWS
+Signature V4 request signing for Bedrock-style backends. It used to be
+excluded because the `aws-sigv4` crate computes the signature with `sha2`
+and `hmac`, both on the denylist; praxis-ai has since moved the signing
+onto OpenSSL's EVP APIs (`openssl::hash`, `openssl::sign`), keeping the
+`aws-sigv4` crate only as the test oracle the signer is checked against,
+so the filter ships.
 
 **The praxis `policy` filter** (`policy-engine`). The Praxis Policy Engine,
 which praxis-filter builds from the praxis-policy crates
@@ -217,16 +218,14 @@ defines no symbol of a bundled crypto backend.
 
 ## Status of the dependency pins
 
-The crypto picture above depends on the praxis FIPS work
-([praxis-proxy/praxis#1254]), which no praxis release carries yet. praxis-ai
-is pinned at a `main` that includes its own FIPS work and takes the praxis
-crates through a temporary `[patch.crates-io]` at a commit from that pull
-request. Patches do not carry over to dependents, so `Cargo.toml` repeats
-the same `[patch.crates-io]` (and `deny.toml` allows the praxis git source).
-Ours is the one that applies, to praxis-ai as well, so keep it on
-praxis-ai's revision: praxis-ai is only built and tested against that one.
-Without it, praxis 0.6.0 from crates.io brings back the 0.9 Pingora fork,
-whose rustls crate carries a ring provider, and `make fips-deps` fails. Once
-a praxis release carries the work, drop the patch and bump the versions.
+The crypto picture above began as the praxis FIPS work
+([praxis-proxy/praxis#1254]), which praxis releases have carried since
+0.7.0. The praxis crates now come from crates.io at the same 0.7 spec
+praxis-ai pins, so the `PipelineExtension` types unify, and praxis-ai is
+pinned at a `main` commit that builds against that release; the temporary
+`[patch.crates-io]` this section used to describe is gone, and `deny.toml`
+no longer allows a praxis git source. Any praxis before 0.7 brings back the
+0.9 Pingora fork, whose rustls crate carries a ring provider, and
+`make fips-deps` fails on it.
 
 [praxis-proxy/praxis#1254]: https://github.com/praxis-proxy/praxis/pull/1254

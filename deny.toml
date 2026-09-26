@@ -39,6 +39,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/praxis-proxy/ai",
-    # Temporary: the praxis FIPS revision in Cargo.toml's [patch.crates-io].
-    "https://github.com/praxis-proxy/praxis",
 ]
