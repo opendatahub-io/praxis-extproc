@@ -6,10 +6,13 @@
 #
 # This is the product image, and it is the FIPS build: the defaults below
 # produce it with no Makefile involvement, which is how Konflux (.tekton/)
-# builds it. Three stages:
+# builds it. Four stages:
 #
-#   builder   builds the FIPS feature set with Red Hat's own Rust toolchain
-#             and OpenSSL (make container-release, make fips-check)
+#   toolchain Red Hat's Rust toolchain and OpenSSL, no sources; also the
+#             image `make test-fips-host` runs the suite in on a FIPS host
+#             (make fips-toolchain)
+#   builder   builds the FIPS feature set with that toolchain
+#             (make container-release, make fips-check)
 #   report    runs `cargo xtask fips report` on that binary and keeps the
 #             result (make fips-check)
 #   runtime   the shippable image on ubi9/ubi-minimal (make container-release)
@@ -44,10 +47,10 @@ ARG CARGO_PROFILE=release
 ARG CARGO_ARGS="--ignore-rust-version"
 
 # ------------------------------------------------------------------------------
-# Stage 1: build with Red Hat's toolchain
+# Stage 1: Red Hat's toolchain and OpenSSL
 # ------------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS builder
+FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS toolchain
 
 # Everything comes from Red Hat's UBI repositories (GPG-checked by dnf):
 #   rust-toolset   Red Hat's rustc and cargo
@@ -69,6 +72,12 @@ RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
     cargo install cargo-auditable --version "${CARGO_AUDITABLE_VERSION}" --locked
 
 WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Stage 2: build the FIPS feature set
+# ------------------------------------------------------------------------------
+
+FROM toolchain AS builder
 
 # The whole workspace, so the build resolves the committed lockfile as is
 # (--locked) and the report stage can run `cargo xtask fips`.
@@ -121,7 +130,7 @@ RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
     cp "${BIN}" /out/praxis-extproc
 
 # ------------------------------------------------------------------------------
-# Stage 2: compliance report
+# Stage 3: compliance report
 # ------------------------------------------------------------------------------
 
 # Only built when this stage is the target (make fips-check), so the product
@@ -145,7 +154,7 @@ RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
 CMD ["sh", "-c", "cat /fips/report.txt; exit $(cat /fips/status)"]
 
 # ------------------------------------------------------------------------------
-# Stage 3: runtime
+# Stage 4: runtime
 # ------------------------------------------------------------------------------
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal@${UBI9_MINIMAL_DIGEST} AS runtime
