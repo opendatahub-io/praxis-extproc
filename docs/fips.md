@@ -244,7 +244,11 @@ repository too). The job never runs a fork's code (same-repository pull
 requests only); the runner takes one job at a time, which serializes it
 with the praxis and praxis-ai runs sharing the machine. The first run
 builds the `praxis-extproc-fips-host-*` cache volumes cold and is slow;
-later runs are incremental.
+later runs are incremental. Pull requests run before review, so the job
+points them at their own `-pr` volumes (`FIPS_HOST_VOLUME_SUFFIX`) and
+removes those volumes when it ends: the warm ones serve only main, the
+schedule and manual dispatch, and never see what an unreviewed branch
+wrote.
 
 The module build the UBI 9 images currently carry is in validation with
 NIST rather than on an active certificate; `fips-host-check` grades it

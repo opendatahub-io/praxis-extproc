@@ -54,7 +54,8 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The named volumes `make test-fips-host` uses, shared so a probe after it
 /// is incremental: the cargo home (the image's is root-owned, and the
-/// container runs as the invoking user) and the target directory.
+/// container runs as the invoking user) and the target directory. The
+/// `--volume-suffix` argument is appended to both names.
 const CARGO_VOLUME: &str = "praxis-extproc-fips-host-cargo";
 /// The target directory volume.
 const TARGET_VOLUME: &str = "praxis-extproc-fips-host-target";
@@ -85,6 +86,12 @@ pub(crate) struct Args {
     /// image.
     #[arg(long)]
     host_cargo: bool,
+
+    /// Appended to the cache volume names, so runs of different trust keep
+    /// separate cargo and target volumes (the Makefile's
+    /// `FIPS_HOST_VOLUME_SUFFIX`).
+    #[arg(long, default_value = "", value_name = "SUFFIX")]
+    volume_suffix: String,
 
     /// Also write the container's log here.
     #[arg(long, value_name = "FILE")]
@@ -277,7 +284,7 @@ fn run_probe_tests(args: &Args, work: &Path, port: u16) -> Result<(), String> {
     let status = if args.host_cargo {
         host_cargo_test(&addr, work)
     } else {
-        toolchain_cargo_test(&args.toolchain_image, &addr, work)
+        toolchain_cargo_test(args, &addr, work)
     }
     .map_err(|err| format!("cannot run the probe tests: {err}"))?;
     if status.success() {
@@ -303,7 +310,8 @@ fn host_cargo_test(addr: &str, work: &Path) -> std::io::Result<std::process::Exi
 /// The probe tests inside the toolchain image, on the host network so the
 /// published port is reachable, with the checkout bind-mounted and the same
 /// cache volumes as `make test-fips-host`.
-fn toolchain_cargo_test(toolchain_image: &str, addr: &str, work: &Path) -> std::io::Result<std::process::ExitStatus> {
+fn toolchain_cargo_test(args: &Args, addr: &str, work: &Path) -> std::io::Result<std::process::ExitStatus> {
+    let suffix = &args.volume_suffix;
     Command::new("podman")
         .args(["run", "--rm", "--network", "host", "--userns=keep-id"])
         .args(["--security-opt", "label=disable"])
@@ -313,13 +321,13 @@ fn toolchain_cargo_test(toolchain_image: &str, addr: &str, work: &Path) -> std::
             "--workdir",
             "/src",
         ])
-        .args(["--volume", &format!("{CARGO_VOLUME}:/cargo:U")])
-        .args(["--volume", &format!("{TARGET_VOLUME}:/target")])
+        .args(["--volume", &format!("{CARGO_VOLUME}{suffix}:/cargo:U")])
+        .args(["--volume", &format!("{TARGET_VOLUME}{suffix}:/target")])
         .args(["--volume", &format!("{}:{PROBE_MOUNT}:ro", work.display())])
         .args(["--env", "PRAXIS_FIPS_HOST=1", "--env", "PRAXIS_REQUIRE_FIPS=1"])
         .args(["--env", &format!("PRAXIS_FIPS_PROBE_ADDR={addr}")])
         .args(["--env", &format!("PRAXIS_FIPS_PROBE_CA={PROBE_MOUNT}/ca.pem")])
-        .args(["--env", "CARGO_TERM_COLOR=always", toolchain_image])
+        .args(["--env", "CARGO_TERM_COLOR=always", &args.toolchain_image])
         .args(["cargo", "test", "--target-dir", "/target", "--no-default-features"])
         .args(["--features", FIPS_FEATURES])
         .args(["-p", "praxis-extproc", "--test", "fips", "--ignore-rust-version"])

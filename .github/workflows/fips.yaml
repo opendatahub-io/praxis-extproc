@@ -132,13 +132,20 @@ jobs:
 
   fips-host:
     needs: ubi-image
-    # Never a fork's code on the self-hosted runner: pull requests only from
-    # this repository's own branches.
+    # Never a fork's code on the self-hosted runner: this repository only
+    # (a clone would otherwise queue forever for a runner it does not have),
+    # and pull requests only from this repository's own branches.
     if: >-
       needs.ubi-image.result == 'success'
+      && github.repository == 'opendatahub-io/praxis-extproc'
       && (github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, fips, rhel]
+    env:
+      # Pull requests run before review, so they get their own cache volumes,
+      # removed below; the warm ones serve only main, the schedule and manual
+      # dispatch, and never see what an unreviewed branch wrote.
+      FIPS_HOST_VOLUME_SUFFIX: ${{ github.event_name == 'pull_request' && '-pr' || '' }}
     # Queue behind this repository's other runs rather than pile up; the
     # runner itself takes one job at a time, which is what serializes it
     # with the praxis and praxis-ai repositories sharing the machine.
@@ -177,3 +184,11 @@ jobs:
       - name: Remove the loaded image
         if: always()
         run: podman rmi --force "$(make -s fips-image-ref)" || true
+
+      - name: Remove the pull request's cache volumes
+        if: always() && github.event_name == 'pull_request'
+        run: >-
+          podman volume rm --force
+          praxis-extproc-fips-host-cargo-pr
+          praxis-extproc-fips-host-target-pr
+          || true
