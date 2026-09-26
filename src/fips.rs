@@ -66,6 +66,45 @@ pub fn install() -> Result<Status, ExtProcError> {
 }
 
 // -----------------------------------------------------------------------------
+// Non-FIPS Filters
+// -----------------------------------------------------------------------------
+
+/// Registered filter names whose dependencies do their own cryptography
+/// outside the system OpenSSL, so a binary that registers one cannot honor
+/// [`REQUIRE_FIPS_ENV`] whatever the provider reports.
+///
+/// - `policy`: the Praxis Policy Engine's JWT verification runs on `aws-lc-rs` (through `jsonwebtoken`) and its `OAuth`
+///   and Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
+/// - `openai_response_store`: registered exactly when the store is compiled in (feature `responses-store`), whose
+///   `sqlx` brings `sha2`. Everything on the store (`responses-full`) implies it, so this one name covers them all.
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+
+/// Why this binary cannot honor [`REQUIRE_FIPS_ENV`], if it cannot.
+///
+/// The provider and kernel signals say nothing about what is compiled in: a
+/// filter on `NON_FIPS_FILTERS` carries its own cryptography. Checked
+/// against the registry rather than the configuration, so a config that
+/// merely leaves the filter out does not mask what the binary carries.
+#[must_use]
+pub fn blocker(registry: &praxis_filter::FilterRegistry) -> Option<String> {
+    let available = registry.available_filters();
+    let registered: Vec<String> = NON_FIPS_FILTERS
+        .iter()
+        .copied()
+        .filter(|name| available.contains(name))
+        .map(|name| format!("`{name}` filter"))
+        .collect();
+
+    (!registered.is_empty()).then(|| {
+        format!(
+            "{REQUIRE_FIPS_ENV} is set but this binary registers the {}, whose dependencies do their own \
+             cryptography outside the system OpenSSL; run the FIPS build",
+            registered.join(" and ")
+        )
+    })
+}
+
+// -----------------------------------------------------------------------------
 // Requirement
 // -----------------------------------------------------------------------------
 
@@ -192,6 +231,24 @@ mod tests {
             message.contains("provider") && message.contains("kernel"),
             "and every missing signal: {message}"
         );
+    }
+
+    #[test]
+    fn the_blocker_names_exactly_the_registered_non_fips_filters() {
+        let registry = praxis_ai_filters::build_ai_registry();
+        let blocker = blocker(&registry);
+        if cfg!(any(feature = "policy-engine", feature = "responses-store")) {
+            let reason = blocker.expect("a binary with non-FIPS filters is blocked");
+            assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
+            if cfg!(feature = "policy-engine") {
+                assert!(reason.contains("`policy` filter"), "{reason}");
+            }
+            if cfg!(feature = "responses-store") {
+                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            }
+        } else {
+            assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
+        }
     }
 
     #[test]
