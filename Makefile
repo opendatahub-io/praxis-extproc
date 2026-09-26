@@ -441,8 +441,8 @@ fips-image-load: | require-podman
 # Makefile variable (IMAGE, EXTPROC_IMAGE): the environment would override
 # the Makefile's own and corrupt FIPS_IMAGE_REF, the tag target.
 fips-image-tag: | require-podman
-	@[ -n "$(FIPS_IMAGE_SOURCE)" ] || { echo "set FIPS_IMAGE_SOURCE to the reference to tag as $(FIPS_IMAGE_REF)"; exit 1; }
-	podman tag $(FIPS_IMAGE_SOURCE) $(FIPS_IMAGE_REF)
+	@[ -n "$$FIPS_IMAGE_SOURCE" ] || { echo "set FIPS_IMAGE_SOURCE to the reference to tag as $(FIPS_IMAGE_REF)"; exit 1; }
+	podman tag "$$FIPS_IMAGE_SOURCE" "$(FIPS_IMAGE_REF)"
 
 # ---------------------------------------------------------------------------
 # KIND
