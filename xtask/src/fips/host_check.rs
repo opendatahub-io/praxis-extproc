@@ -279,6 +279,14 @@ fn host_module(attestation: &mut Attestation, require_certified: bool) {
         attestation.fail("openssl is not installed on the host, so the loaded module cannot be read");
         return;
     };
+    if !output.status.success() {
+        attestation.fail(&format!(
+            "openssl list -providers failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+        return;
+    }
     let listing = String::from_utf8_lossy(&output.stdout);
     match provider_entry(&listing, "fips") {
         Some((version, status)) if status == "active" => {
