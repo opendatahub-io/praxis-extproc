@@ -383,7 +383,7 @@ fips-host-facts:
 	@case "$$(echo "$${PRAXIS_FIPS_HOST:-}" | tr A-Z a-z)" in \
 	''|0|false|no|off) echo "verdict: PRAXIS_FIPS_HOST not declared; the FIPS tests take whichever branch the provider dictates" ;; \
 	*) [ "$$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ] || { echo "verdict: PRAXIS_FIPS_HOST is set but the kernel is not in FIPS mode"; exit 1; }; \
-	   openssl list -providers 2>/dev/null | grep -qx '  fips' || { echo "verdict: PRAXIS_FIPS_HOST is set but the fips provider is not active"; exit 1; }; \
+	   openssl list -providers 2>/dev/null | grep -Eqx '[[:space:]]*fips[[:space:]]*' || { echo "verdict: PRAXIS_FIPS_HOST is set but the fips provider is not active"; exit 1; }; \
 	   echo x | openssl dgst -md5 >/dev/null 2>&1 && { echo "verdict: PRAXIS_FIPS_HOST is set but MD5 works"; exit 1; }; \
 	   echo "verdict: FIPS mode confirmed for this container; every test below runs in it" ;; \
 	esac
