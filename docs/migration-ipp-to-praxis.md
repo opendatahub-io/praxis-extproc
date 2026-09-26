@@ -142,14 +142,14 @@ filter_chains:
 
 ### Plugin mapping
 
-| Go IPP plugin | Praxis filter | Parity | Gap tracked by |
-|---|---|---|---|
-| `body-field-to-header` | `model_to_header` | Full | — |
-| `maas-headers-guard` | `headers` + `when`/`unless` | Partial | [#5] |
-| `model-provider-resolver` | `intelligent_route` | Partial (K8s) | [#5], [#7] |
-| `stream-usage-enforcer` | *(none yet)* | **None** | [#44] |
-| `api-translation` | provider-native chain | Partial (reverse) | [#6] |
-| `apikey-injection` | `credential_inject` | Partial (SigV4/OAuth2) | [#6] |
+| Go IPP plugin             | Praxis filter                         | Parity                 | Gap tracked by |
+|---------------------------|---------------------------------------|------------------------|----------------|
+| `body-field-to-header`    | `model_to_header` / `json_body_field` | Full                   | —              |
+| `maas-headers-guard`      | `headers` + `when`/`unless`           | Partial                | [#5]           |
+| `model-provider-resolver` | `intelligent_route`                   | Partial (K8s)          | [#5], [#7]     |
+| `stream-usage-enforcer`   | *(none yet)*                          | **None**               | [#44]          |
+| `api-translation`         | provider-native chain                 | Partial (reverse)      | [#6]           |
+| `apikey-injection`        | `credential_inject`                   | Partial (SigV4/OAuth2) | [#6]           |
 
 [#5]: https://github.com/opendatahub-io/praxis-extproc/issues/5
 [#6]: https://github.com/opendatahub-io/praxis-extproc/issues/6
@@ -157,10 +157,16 @@ filter_chains:
 
 ### Per-plugin notes
 
-- **`body-field-to-header` → `model_to_header`.**
-  Full parity. IPP's `fieldName: model` is fixed in
-  the Praxis filter (it always promotes the `model`
-  field); `headerName` maps to the `header` option.
+- **`body-field-to-header` → `model_to_header` /
+  `json_body_field`.** Full parity, but the target
+  depends on `fieldName`. `model_to_header` is the
+  shortcut for the common `fieldName: model` case
+  used in the profile above: it always promotes the
+  `model` field, so only `headerName` (→ `header`) is
+  configurable. For any other `fieldName`, use the
+  core `json_body_field` filter, which takes both
+  `field` (→ `fieldName`) and `header` (→ `headerName`)
+  and can promote an arbitrary body field.
 - **`maas-headers-guard` → `headers`.** IPP captures
   inbound `x-maas-*` headers into request state for
   downstream plugins and guards them from
