@@ -53,8 +53,8 @@ praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "7c0
 # features: praxis-filter's default turns on the policy engine, whose
 # plugins carry pure-Rust cryptography; the policy-engine feature above
 # opts back in.
-praxis-core = { version = "0.7.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter", default-features = false }
+praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -68,7 +68,7 @@ openssl = "0.10.81"
 # never with `vendored`), whose provider module src/fips.rs delegates to;
 # rustls itself arrives transitively with its default features (aws-lc-rs)
 # kept off by every praxis crate.
-praxis-tls = { version = "0.7.0", package = "praxis-proxy-tls" }
+praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"

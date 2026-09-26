@@ -187,7 +187,7 @@ mod tests {
                     provider_fips: false,
                     ..FIPS_HOST
                 },
-                "no crypto provider",
+                "not the installed crypto provider",
             ),
             (
                 Status {
