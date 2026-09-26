@@ -64,12 +64,11 @@ metrics-exporter-prometheus = { version = "0.16.2", default-features = false }
 prost = "0.14.3"
 futures = "0.3.32"
 openssl = "0.10.81"
-# rustls without its default features: those would compile in aws-lc-rs, a
-# second crypto provider. The one provider is the OpenSSL-backed fork below,
-# the same crate praxis installs, so every primitive goes to the system
-# libcrypto. Never with `vendored`.
-rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
-rustls-openssl = { version = "0.4.1", package = "quixotic-plecostomus-rustls-openssl", default-features = false, features = ["tls12"] }
+# The crypto provider comes through praxis-tls (the OpenSSL-backed fork,
+# never with `vendored`), whose provider module src/fips.rs delegates to;
+# rustls itself arrives transitively with its default features (aws-lc-rs)
+# kept off by every praxis crate.
+praxis-tls = { version = "0.7.0", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"

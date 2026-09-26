@@ -79,7 +79,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        fips.require()?;
+        praxis_extproc::fips::require(&fips)?;
         pipeline?;
         info!("configuration is valid");
         return Ok(());
@@ -90,9 +90,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
     // inspectable (health NotServing) but serves no traffic.
-    if let Err(e) = fips.require() {
+    if let Err(e) = praxis_extproc::fips::require(&fips) {
         error!(error = %e, "refusing to serve");
-        return Box::pin(serve_unready(addrs, fips.active())).await;
+        return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
     }
 
     Box::pin(serve_pipeline(
@@ -100,7 +100,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pipeline,
         &cfg.server,
         cfg.max_body_accumulation(),
-        fips.active(),
+        praxis_extproc::fips::active(&fips),
     ))
     .await
 }
