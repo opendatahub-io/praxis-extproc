@@ -234,6 +234,10 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
+    pipeline.set_subrequest_client(praxis_core::subrequest::SubRequestClient::new(
+        praxis_core::subrequest::SubRequestConnector::new(8, None),
+    ));
     #[cfg(feature = "responses-store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
@@ -453,6 +457,14 @@ filter_chains:
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 2, "pipeline should have two filters");
+    }
+
+    #[test]
+    fn private_callout_policy_reaches_pipeline() {
+        let cfg: ExtProcConfig =
+            serde_yaml::from_str("insecure_options:\n  allow_private_upstreams: true\nfilter_chains: []\n").unwrap();
+        let pipeline = build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).unwrap();
+        assert!(pipeline.allow_private_upstreams());
     }
 
     #[test]

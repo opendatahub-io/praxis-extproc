@@ -12,6 +12,7 @@
 
 use std::{collections::HashMap, net::IpAddr, time::Instant};
 
+use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use praxis_filter::{
     BodyMode, FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response, SubRequestResponseMode,
@@ -268,6 +269,35 @@ pub fn rejection_to_immediate(rejection: &praxis_filter::Rejection) -> Immediate
         grpc_status: None,
         details: String::new(),
     }
+}
+
+/// Convert a completed terminal response into an Envoy local reply.
+pub(crate) fn terminal_to_immediate(
+    response: &Response,
+    body: Option<Bytes>,
+) -> Result<ImmediateResponse, tonic::Status> {
+    let body = body.map_or_else(
+        || Ok(String::new()),
+        |bytes| String::from_utf8(bytes.to_vec()).map_err(|e| tonic::Status::internal(e.to_string())),
+    )?;
+    let headers = response
+        .headers
+        .iter()
+        .filter(|(name, _)| !name.as_str().starts_with("x-praxis-"))
+        .map(|(name, value)| header_value_option(name.as_str(), value.to_str().unwrap_or_default()))
+        .collect();
+    Ok(ImmediateResponse {
+        status: Some(HttpStatus {
+            code: i32::from(response.status.as_u16()),
+        }),
+        headers: Some(HeaderMutation {
+            set_headers: headers,
+            remove_headers: Vec::new(),
+        }),
+        body,
+        grpc_status: None,
+        details: String::new(),
+    })
 }
 
 /// Build a [`Response`] from ExtProc response headers.
