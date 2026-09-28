@@ -407,10 +407,17 @@ fn require_fips_validate_fails_closed_unless_the_host_is_in_fips_mode() {
             !ok,
             "on a non-FIPS host the requirement is unmet and validate must fail"
         );
-        assert!(
-            output.contains("PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect"),
-            "the refusal names the variable and the state, got: {output}"
-        );
+        if carries_non_fips_filters() {
+            assert!(
+                output.contains("run the FIPS build"),
+                "the contents refuse first, on any host, got: {output}"
+            );
+        } else {
+            assert!(
+                output.contains("PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect"),
+                "the refusal names the variable and the state, got: {output}"
+            );
+        }
     }
 }
 

@@ -153,9 +153,13 @@ fn require_if(status: &Status, required: bool) -> Result<(), ExtProcError> {
     )))
 }
 
-/// Fail closed on both grounds: what the host reports ([`require`]) and what
-/// the binary carries ([`require_build`]); the one refusal gate the server
+/// Fail closed on both grounds: what the binary carries ([`require_build`]),
+/// then what the host reports ([`require`]); the one refusal gate the server
 /// consults before serving.
+///
+/// Contents come first because they refuse the same way on every host, so
+/// the gate's refusal is observable in tests wherever they run; the host
+/// signals only ever matter on a machine that already passes the contents.
 ///
 /// # Errors
 ///
@@ -170,8 +174,8 @@ fn require_serving_if(
     registry: &praxis_filter::FilterRegistry,
     required: bool,
 ) -> Result<(), ExtProcError> {
-    require_if(status, required)?;
-    require_build_if(registry, required)
+    require_build_if(registry, required)?;
+    require_if(status, required)
 }
 
 // -----------------------------------------------------------------------------
@@ -288,6 +292,44 @@ mod tests {
             }
         } else {
             assert!(checked.is_ok(), "the FIPS feature set registers no blocked filter");
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one case per feature set and host")]
+    fn contents_refuse_the_same_on_any_host() {
+        let off = Status {
+            provider_fips: false,
+            kernel_fips: Some(false),
+            ..FIPS_HOST
+        };
+        let registry = praxis_ai_filters::build_ai_registry();
+        assert!(
+            require_serving_if(&off, &registry, false).is_ok(),
+            "not required: serve regardless"
+        );
+        if cfg!(any(feature = "policy-engine", feature = "responses-store")) {
+            for host in [&FIPS_HOST, &off] {
+                let reason = require_serving_if(host, &registry, true)
+                    .expect_err("a binary with non-FIPS filters is refused on any host")
+                    .to_string();
+                assert!(
+                    reason.contains("run the FIPS build"),
+                    "the contents are the cause: {reason}"
+                );
+            }
+        } else {
+            assert!(
+                require_serving_if(&FIPS_HOST, &registry, true).is_ok(),
+                "the FIPS build serves on a FIPS host"
+            );
+            let reason = require_serving_if(&off, &registry, true)
+                .expect_err("off a FIPS host the requirement is unmet")
+                .to_string();
+            assert!(
+                reason.contains("FIPS mode is not in effect"),
+                "the host is the cause: {reason}"
+            );
         }
     }
 
