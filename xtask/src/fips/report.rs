@@ -12,8 +12,8 @@
 //!
 //! 1. dependency graph: crates on the scanner's `rust_denied_crypto` list must not be in the shipped binary's normal
 //!    dependency graph
-//! 2. binary: must link the system libcrypto dynamically, define no symbol of a bundled crypto backend, and carry a
-//!    cargo-auditable manifest
+//! 2. binary: must link the system libcrypto dynamically, define no symbol of a bundled crypto backend, import only
+//!    reviewed OpenSSL (`@OPENSSL_3.0.0`) symbols, and carry a cargo-auditable manifest
 //! 3. source: the application must never enable a FIPS provider itself, must not use OpenSSL's legacy (non-provider)
 //!    APIs, and must not vendor OpenSSL
 //!

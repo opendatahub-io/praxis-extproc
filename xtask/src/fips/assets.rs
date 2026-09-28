@@ -29,3 +29,10 @@ pub(crate) const FIPS_PROVIDER_CNF: &str = include_str!("../../assets/fips/fips-
 /// string the module reports, with their CMVP status and sources;
 /// `host-check` grades the module a host or an image carries against it.
 pub(crate) const CERTIFIED_MODULES: &str = include_str!("../../assets/fips/certified-modules.json");
+
+/// The OpenSSL symbols the shipped binary may import from the system
+/// libcrypto/libssl under the `OPENSSL_3.0.0` version, one per line (blank
+/// lines and `#` comments ignored). `binary` fails the report on any imported
+/// `@OPENSSL_3.0.0` symbol not on this list, so a new call into OpenSSL is
+/// reviewed before it ships.
+pub(crate) const OPENSSL_3_0_0_SYMBOLS: &str = include_str!("../../assets/fips/openssl-3.0.0-symbols.txt");

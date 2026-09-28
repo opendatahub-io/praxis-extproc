@@ -3,13 +3,22 @@
 
 //! Binary section of the report: the shipped binary must link the system
 //! libcrypto dynamically, define no symbol of a bundled crypto backend, import
-//! OpenSSL, and carry the cargo-auditable manifest and the rustc producer
-//! string. A binary that is not given, cannot be read or is not an ELF file is
-//! a finding too, so the report never passes a build it did not inspect.
+//! OpenSSL and only `@OPENSSL_3.0.0` symbols on the reviewed allowlist, and
+//! carry the cargo-auditable manifest and the rustc producer string. A binary
+//! that is not given, cannot be read or is not an ELF file is a finding too, so
+//! the report never passes a build it did not inspect.
 
-use std::{collections::BTreeMap, io::Read as _, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read as _,
+    path::Path,
+    process::Command,
+};
 
-use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
+use object::{
+    Endianness, Object as _, ObjectSection as _, ObjectSymbol as _,
+    read::elf::{ElfFile64, Sym as _},
+};
 
 use super::{
     graph::DENIED,
@@ -41,6 +50,7 @@ fn assess(report: &mut Report, binary: Option<&Path>) -> Result<(), Finding> {
     linkage(report, binary);
     defined_symbols(report, &file);
     imports(report, &file);
+    openssl_imports(report, &data);
     manifest(report, &file, binary);
     producer(report, &file);
     Ok(())
@@ -234,6 +244,119 @@ fn imports(report: &mut Report, file: &object::File<'_>) {
             location: "same as the libcrypto linkage finding".to_owned(),
             fix: "same as the libcrypto linkage finding".to_owned(),
         });
+    }
+}
+
+// -----------------------------------------------------------------------------
+// OpenSSL Symbol Allowlist
+// -----------------------------------------------------------------------------
+
+/// The ELF symbol version the system OpenSSL 3 exports its base ABI under.
+const OPENSSL_3_0_0_VERSION: &[u8] = b"OPENSSL_3.0.0";
+
+/// Every `@OPENSSL_3.0.0` symbol the binary imports must be on the reviewed
+/// allowlist, so a call into a not-yet-vetted OpenSSL function is caught before
+/// it ships.
+fn openssl_imports(report: &mut Report, data: &[u8]) {
+    let imported = match openssl_symbols(data) {
+        Ok(imported) => imported,
+        Err(reason) => {
+            report.fail(unreadable_versions(&reason));
+            return;
+        },
+    };
+    let allowed = allowlist();
+    let unexpected = unexpected_imports(&imported, &allowed);
+    if unexpected.is_empty() {
+        report.ok(&format!(
+            "every one of the {} @OPENSSL_3.0.0 symbols imported is on the reviewed allowlist",
+            imported.len()
+        ));
+    } else {
+        report.fail(unexpected_openssl(&unexpected));
+    }
+}
+
+/// The base names (without the `@OPENSSL_3.0.0` suffix) of the undefined
+/// symbols the binary imports under the `OPENSSL_3.0.0` version.
+fn openssl_symbols(data: &[u8]) -> Result<BTreeSet<&str>, String> {
+    let elf = ElfFile64::<Endianness>::parse(data).map_err(|err| err.to_string())?;
+    let endian = elf.endian();
+    let symbols = elf.elf_dynamic_symbol_table();
+    let Some(versions) = elf
+        .elf_section_table()
+        .versions(endian, data)
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let mut imported = BTreeSet::new();
+    for (index, symbol) in symbols.enumerate() {
+        if !symbol.is_undefined(endian) {
+            continue;
+        }
+        let version = versions
+            .version(versions.version_index(endian, index))
+            .map_err(|err| err.to_string())?;
+        if version.is_none_or(|version| version.name() != OPENSSL_3_0_0_VERSION) {
+            continue;
+        }
+        let Ok(name) = symbol.name(endian, symbols.strings()) else {
+            continue;
+        };
+        if let Ok(name) = std::str::from_utf8(name) {
+            imported.insert(name);
+        }
+    }
+    Ok(imported)
+}
+
+/// The reviewed set of allowed `@OPENSSL_3.0.0` symbols, from the compiled-in
+/// asset.
+fn allowlist() -> BTreeSet<&'static str> {
+    super::assets::OPENSSL_3_0_0_SYMBOLS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+/// The imported symbols that are not on the allowlist, sorted.
+fn unexpected_imports<'a>(imported: &BTreeSet<&'a str>, allowed: &BTreeSet<&str>) -> Vec<&'a str> {
+    imported
+        .iter()
+        .copied()
+        .filter(|name| !allowed.contains(name))
+        .collect()
+}
+
+/// The finding for a binary importing an OpenSSL symbol nobody reviewed.
+fn unexpected_openssl(symbols: &[&str]) -> Finding {
+    Finding {
+        title: format!(
+            "imports @OPENSSL_3.0.0 symbols not on the reviewed allowlist: {}",
+            symbols.join(" ")
+        ),
+        why: "the allowlist is the set of OpenSSL calls reviewed for this FIPS build; a symbol outside it is a new, \
+              unreviewed call into libcrypto/libssl that could reach a non-approved algorithm"
+            .to_owned(),
+        location: "xtask/assets/fips/openssl-3.0.0-symbols.txt holds the reviewed symbols".to_owned(),
+        fix: "confirm each new OpenSSL call is appropriate for the FIPS build, then add its symbol to \
+              xtask/assets/fips/openssl-3.0.0-symbols.txt"
+            .to_owned(),
+    }
+}
+
+/// The finding for a binary whose symbol versions the check cannot read.
+fn unreadable_versions(reason: &str) -> Finding {
+    Finding {
+        title: format!("cannot read the binary's OpenSSL symbol versions ({reason})"),
+        why:
+            "the @OPENSSL_3.0.0 allowlist check confirms the binary calls only reviewed OpenSSL functions; without it \
+              a new, unreviewed call could ship unnoticed"
+                .to_owned(),
+        location: "the ELF dynamic symbol table and GNU version-requirement (.gnu.version_r) section".to_owned(),
+        fix: "assess a 64-bit ELF built by 'make release-fips'; keep .gnu.version_r (do not strip it)".to_owned(),
     }
 }
 
@@ -491,5 +614,53 @@ mod tests {
         let mut report = Report::default();
         producer(&mut report, &file);
         assert!(!report.failed(), "a rustc-built binary carries the producer string");
+        // xtask links the system OpenSSL, so exactly what it imports depends on
+        // the host; the scan must at least run against a real ELF and return
+        // named symbols.
+        let imported = openssl_symbols(&data).expect("the version scan reads a real ELF");
+        assert!(
+            imported.iter().all(|name| !name.is_empty()),
+            "the scan returns named @OPENSSL_3.0.0 imports: {imported:?}"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_parses_symbols_and_ignores_comments_and_blank_lines() {
+        let allowed = allowlist();
+        assert!(
+            allowed.contains("EVP_sha256") && allowed.contains("SSL_new") && allowed.contains("X509_free"),
+            "known OpenSSL symbols are on the list"
+        );
+        assert!(
+            !allowed.iter().any(|line| line.is_empty() || line.starts_with('#')),
+            "comments and blank lines are not entries: {allowed:?}"
+        );
+        assert!(
+            allowed.len() > 100,
+            "the full allowlist is loaded, not a fragment: {}",
+            allowed.len()
+        );
+    }
+
+    #[test]
+    fn unexpected_imports_are_only_the_symbols_off_the_allowlist() {
+        let allowed = allowlist();
+        let imported = BTreeSet::from(["EVP_sha256", "EVP_brandnew", "SSL_new"]);
+        assert_eq!(
+            unexpected_imports(&imported, &allowed),
+            ["EVP_brandnew"],
+            "only the symbol the allowlist does not cover is reported"
+        );
+        let clean = BTreeSet::from(["EVP_sha256", "SSL_new"]);
+        assert!(
+            unexpected_imports(&clean, &allowed).is_empty(),
+            "an all-allowed set has no unexpected imports"
+        );
+        let finding = unexpected_openssl(&["EVP_brandnew"]);
+        assert!(
+            finding.title.contains("EVP_brandnew"),
+            "the finding names the offending symbol: {}",
+            finding.title
+        );
     }
 }
