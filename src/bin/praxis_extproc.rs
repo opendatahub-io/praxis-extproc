@@ -79,9 +79,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        if let Some(reason) = fips_refusal(&fips, &registry) {
-            return Err(reason.into());
-        }
+        praxis_extproc::fips::require_serving(&fips, &registry)?;
         pipeline?;
         info!("configuration is valid");
         return Ok(());
@@ -92,7 +90,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
     // inspectable (health NotServing) but serves no traffic.
-    if let Some(reason) = fips_refusal(&fips, &registry) {
+    if let Err(reason) = praxis_extproc::fips::require_serving(&fips, &registry) {
         error!(error = %reason, "refusing to serve");
         return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
     }
@@ -105,20 +103,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         praxis_extproc::fips::active(&fips),
     ))
     .await
-}
-
-/// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
-/// not: FIPS mode is not in effect on the host, or the binary registers
-/// filters whose dependencies do their own cryptography (the same refusal,
-/// by contents rather than by host).
-fn fips_refusal(fips: &praxis_extproc::fips::Status, registry: &praxis_filter::FilterRegistry) -> Option<String> {
-    if let Err(e) = praxis_extproc::fips::require(fips) {
-        return Some(e.to_string());
-    }
-    if praxis_extproc::fips::required() {
-        return praxis_extproc::fips::blocker(registry);
-    }
-    None
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.

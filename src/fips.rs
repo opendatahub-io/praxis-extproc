@@ -21,7 +21,8 @@
 //! The provider, the signals, the variable and the messages are
 //! [`praxis_tls::provider`]'s, the module this one was copied from while no
 //! praxis release carried it; now that one does, this module only adds the
-//! [`ExtProcError`] shape and the fail-closed [`require`] helper.
+//! [`ExtProcError`] shape and the fail-closed [`require`], [`require_build`]
+//! and [`require_serving`] helpers.
 
 pub use praxis_tls::provider::{REQUIRE_FIPS_ENV, Status, required, status};
 use tracing::{debug, info};
@@ -79,14 +80,26 @@ pub fn install() -> Result<Status, ExtProcError> {
 ///   `sqlx` brings `sha2`. Everything on the store (`responses-full`) implies it, so this one name covers them all.
 const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
 
-/// Why this binary cannot honor [`REQUIRE_FIPS_ENV`], if it cannot.
+/// Fail closed by contents: when [`REQUIRE_FIPS_ENV`] is set and the binary
+/// registers a filter on `NON_FIPS_FILTERS`, an error naming each one.
 ///
 /// The provider and kernel signals say nothing about what is compiled in: a
 /// filter on `NON_FIPS_FILTERS` carries its own cryptography. Checked
 /// against the registry rather than the configuration, so a config that
 /// merely leaves the filter out does not mask what the binary carries.
-#[must_use]
-pub fn blocker(registry: &praxis_filter::FilterRegistry) -> Option<String> {
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Crypto`] naming every registered non-FIPS filter.
+pub fn require_build(registry: &praxis_filter::FilterRegistry) -> Result<(), ExtProcError> {
+    require_build_if(registry, required())
+}
+
+/// [`require_build`] with the requirement decided by the caller.
+fn require_build_if(registry: &praxis_filter::FilterRegistry, required: bool) -> Result<(), ExtProcError> {
+    if !required {
+        return Ok(());
+    }
     let available = registry.available_filters();
     let registered: Vec<String> = NON_FIPS_FILTERS
         .iter()
@@ -94,14 +107,14 @@ pub fn blocker(registry: &praxis_filter::FilterRegistry) -> Option<String> {
         .filter(|name| available.contains(name))
         .map(|name| format!("`{name}` filter"))
         .collect();
-
-    (!registered.is_empty()).then(|| {
-        format!(
-            "{REQUIRE_FIPS_ENV} is set but this binary registers the {}, whose dependencies do their own \
-             cryptography outside the system OpenSSL; run the FIPS build",
-            registered.join(" and ")
-        )
-    })
+    if registered.is_empty() {
+        return Ok(());
+    }
+    Err(ExtProcError::Crypto(format!(
+        "{REQUIRE_FIPS_ENV} is set but this binary registers the {}, whose dependencies do their own \
+         cryptography outside the system OpenSSL; run the FIPS build",
+        registered.join(" and ")
+    )))
 }
 
 // -----------------------------------------------------------------------------
@@ -138,6 +151,27 @@ fn require_if(status: &Status, required: bool) -> Result<(), ExtProcError> {
         "{REQUIRE_FIPS_ENV} is set but FIPS mode is not in effect: {}",
         unmet.join("; ")
     )))
+}
+
+/// Fail closed on both grounds: what the host reports ([`require`]) and what
+/// the binary carries ([`require_build`]); the one refusal gate the server
+/// consults before serving.
+///
+/// # Errors
+///
+/// Returns [`ExtProcError::Crypto`] from whichever ground refuses.
+pub fn require_serving(status: &Status, registry: &praxis_filter::FilterRegistry) -> Result<(), ExtProcError> {
+    require_serving_if(status, registry, required())
+}
+
+/// [`require_serving`] with the requirement decided by the caller.
+fn require_serving_if(
+    status: &Status,
+    registry: &praxis_filter::FilterRegistry,
+    required: bool,
+) -> Result<(), ExtProcError> {
+    require_if(status, required)?;
+    require_build_if(registry, required)
 }
 
 // -----------------------------------------------------------------------------
@@ -234,11 +268,17 @@ mod tests {
     }
 
     #[test]
-    fn the_blocker_names_exactly_the_registered_non_fips_filters() {
+    fn the_build_check_names_exactly_the_registered_non_fips_filters() {
         let registry = praxis_ai_filters::build_ai_registry();
-        let blocker = blocker(&registry);
+        assert!(
+            require_build_if(&registry, false).is_ok(),
+            "not required: any build serves"
+        );
+        let checked = require_build_if(&registry, true);
         if cfg!(any(feature = "policy-engine", feature = "responses-store")) {
-            let reason = blocker.expect("a binary with non-FIPS filters is blocked");
+            let reason = checked
+                .expect_err("a binary with non-FIPS filters is refused")
+                .to_string();
             assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
             if cfg!(feature = "policy-engine") {
                 assert!(reason.contains("`policy` filter"), "{reason}");
@@ -247,7 +287,7 @@ mod tests {
                 assert!(reason.contains("`openai_response_store` filter"), "{reason}");
             }
         } else {
-            assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
+            assert!(checked.is_ok(), "the FIPS feature set registers no blocked filter");
         }
     }
 
