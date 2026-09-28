@@ -347,7 +347,7 @@ impl HeaderDeliveryState {
 /// error instead of silently carrying an empty context. `#[must_use]` flags parked
 /// state that is dropped instead of hydrated.
 #[must_use = "parked cross-phase state must be hydrated into a context"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct CarriedContext {
     /// Branch re-entrance counters.
     pub(super) branch_iterations: HashMap<Arc<str>, u32>,
@@ -360,6 +360,15 @@ pub(super) struct CarriedContext {
 
     /// Typed per-filter state.
     pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+
+    /// Typed request state shared by body and response filters.
+    pub(super) extensions: praxis_filter::RequestExtensions,
+}
+
+impl std::fmt::Debug for CarriedContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarriedContext").finish_non_exhaustive()
+    }
 }
 
 /// A context holding hydrated cross-phase state.
@@ -387,6 +396,7 @@ impl<'a> HydratedContext<'a> {
         ctx.executed_filter_indices = carried.executed_filter_indices;
         ctx.filter_metadata = carried.filter_metadata;
         ctx.filter_state = carried.filter_state;
+        ctx.extensions = carried.extensions;
         Ok(Self { ctx })
     }
 
@@ -413,6 +423,7 @@ impl<'a> HydratedContext<'a> {
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
+            extensions: self.ctx.extensions,
         });
         Ok(())
     }

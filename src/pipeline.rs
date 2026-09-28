@@ -13,8 +13,10 @@
 use std::{collections::HashMap, mem};
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
-use praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse;
+use praxis_filter::{
+    FilterAction, FilterPipeline, HttpFilterContext, Response, StreamingTerminalResponse, TerminalResponse,
+};
+use praxis_proto::envoy::service::ext_proc::v3::{ImmediateResponse, ProcessingResponse};
 use tonic::Status;
 
 use crate::{
@@ -52,31 +54,57 @@ pub(crate) async fn run_request_pipeline(
     let ctx = adapter::build_filter_context(pipeline, request);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
-    let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    let original_len = state.request_body.len();
+    if matches!(phase, RequestPhase::Body)
+        && let Some(imm) = pre_read_request(pipeline, &mut ctx, &mut state.request_body).await?
+    {
         return Ok(vec![response::immediate(imm)]);
     }
-
-    let original_len = state.request_body.len();
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
-    if let Some(imm) = body_reject {
+    let action = execute_request(pipeline, &mut ctx).await?;
+    if let Some(imm) = request_action_to_immediate(
+        pipeline,
+        &mut ctx,
+        &mut state.response,
+        action,
+        state.max_body_accumulation,
+    )
+    .await?
+    {
         return Ok(vec![response::immediate(imm)]);
     }
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
-
     ctx.dehydrate(&mut state.carried_context)?;
+    Ok(complete_request_phase(phase, mutation, original_len, state))
+}
 
-    // Emit the authoritative buffer even when empty: a filter that cleared the
-    // body must produce an explicit empty body AND content-length: 0. Collapsing
-    // empty -> None here would drop both (buffered) or desync CL (FDS+flag).
+/// Emit the authoritative body, including an explicit empty replacement on clear.
+fn complete_request_phase(
+    phase: RequestPhase,
+    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    original_len: usize,
+    state: &StreamState,
+) -> Vec<ProcessingResponse> {
     let body = Some(state.request_body.as_slice());
-    Ok(build_request_for_phase(
+    build_request_for_phase(
         phase,
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.request_body_mode,
-    ))
+    )
+}
+
+/// Run body pre-read before header-phase filters such as IRR consume the result.
+async fn pre_read_request(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Vec<u8>,
+) -> Result<Option<ImmediateResponse>, Status> {
+    let rejection = run_body_filters(pipeline, ctx, body, true).await?;
+    if rejection.is_none() {
+        ctx.buffered_request_body = Some(Bytes::copy_from_slice(body));
+    }
+    Ok(rejection)
 }
 
 /// Response filter execution phase.
@@ -159,7 +187,7 @@ async fn execute_response_pipeline_and_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     response_body: &mut Vec<u8>,
     filters_executed: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     let should_execute = match phase {
         ResponsePhase::Headers => true,
         ResponsePhase::Body => !filters_executed,
@@ -472,12 +500,138 @@ async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext
 }
 
 /// Convert a [`FilterAction::Reject`] into an `ImmediateResponse`.
-fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+fn check_reject(action: FilterAction) -> Option<ImmediateResponse> {
     if let FilterAction::Reject(rejection) = action {
         metrics::record_immediate_response();
         Some(adapter::rejection_to_immediate(&rejection))
     } else {
         None
+    }
+}
+
+/// Finish a locally generated response through the parent response filters.
+async fn request_action_to_immediate<'a>(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'a>,
+    response_slot: &'a mut Option<Response>,
+    action: FilterAction,
+    limit: Option<usize>,
+) -> Result<Option<ImmediateResponse>, Status> {
+    match action {
+        FilterAction::Reject(rejection) => Ok(Some(adapter::rejection_to_immediate(&rejection))),
+        FilterAction::TerminalResponse(terminal) => {
+            finish_terminal(pipeline, ctx, response_slot, *terminal).await.map(Some)
+        },
+        FilterAction::StreamingTerminalResponse(terminal) => {
+            finish_streaming_terminal(pipeline, ctx, response_slot, *terminal, limit)
+                .await
+                .map(Some)
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Run response header and body filters before emitting an Envoy local reply.
+async fn finish_terminal<'a>(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'a>,
+    response_slot: &'a mut Option<Response>,
+    terminal: TerminalResponse,
+) -> Result<ImmediateResponse, Status> {
+    let TerminalResponse {
+        status,
+        headers,
+        mut body,
+    } = terminal;
+    let resp = response_slot.insert(Response {
+        status: http::StatusCode::from_u16(status).map_err(|e| Status::internal(e.to_string()))?,
+        headers,
+    });
+    ctx.response_header = Some(resp);
+    if let Some(imm) = check_reject(execute_response(pipeline, ctx).await?) {
+        return Ok(imm);
+    }
+    if let Some(imm) = check_reject(
+        pipeline
+            .execute_http_response_body(ctx, &mut body, true)
+            .map_err(|e| Status::internal(e.to_string()))?,
+    ) {
+        return Ok(imm);
+    }
+    adapter::terminal_to_immediate(
+        ctx.response_header
+            .as_deref()
+            .ok_or_else(|| Status::internal("missing terminal response"))?,
+        body,
+    )
+}
+
+/// ExtProc local replies carry one string body, so drain the logical stream first.
+async fn finish_streaming_terminal<'a>(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'a>,
+    response_slot: &'a mut Option<Response>,
+    terminal: StreamingTerminalResponse,
+    limit: Option<usize>,
+) -> Result<ImmediateResponse, Status> {
+    let StreamingTerminalResponse {
+        status,
+        headers,
+        mut body,
+    } = terminal;
+    body.swap_extensions(&mut ctx.extensions);
+    let resp = response_slot.insert(Response {
+        status: http::StatusCode::from_u16(status).map_err(|e| Status::internal(e.to_string()))?,
+        headers,
+    });
+    ctx.response_header = Some(resp);
+    let header_action = execute_response(pipeline, ctx).await?;
+    body.swap_extensions(&mut ctx.extensions);
+    if let Some(imm) = check_reject(header_action) {
+        body.cancel().await;
+        return Ok(imm);
+    }
+    let result = drain_terminal_stream(pipeline, ctx, body.as_mut(), limit).await;
+    if result.is_err() {
+        body.cancel().await;
+    }
+    adapter::terminal_to_immediate(
+        ctx.response_header
+            .as_deref()
+            .ok_or_else(|| Status::internal("missing terminal response"))?,
+        Some(result?),
+    )
+}
+
+/// Apply parent response-body filters per chunk to preserve store/stream state.
+async fn drain_terminal_stream(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut dyn praxis_filter::StreamingResponseBody,
+    limit: Option<usize>,
+) -> Result<Bytes, Status> {
+    let mut collected = Vec::new();
+    loop {
+        let chunk = body.next_chunk().await.map_err(|e| Status::internal(e.to_string()))?;
+        body.swap_extensions(&mut ctx.extensions);
+        let eos = chunk.is_none();
+        let mut part = chunk;
+        let action = pipeline
+            .execute_http_response_body(ctx, &mut part, eos)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        body.swap_extensions(&mut ctx.extensions);
+        if matches!(action, FilterAction::Reject(_)) {
+            return Err(Status::internal("terminal stream rejected by response filter"));
+        }
+        if let Some(bytes) = part {
+            if limit.is_some_and(|max| bytes.len() > max.saturating_sub(collected.len())) {
+                return Err(Status::resource_exhausted("terminal response exceeds maximum size"));
+            }
+            collected.extend_from_slice(&bytes);
+        }
+        if eos {
+            return Ok(Bytes::from(collected));
+        }
     }
 }
 
@@ -491,7 +645,7 @@ async fn run_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
     eos: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
     }
@@ -519,7 +673,7 @@ fn run_resp_body_filters(
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
     eos: bool,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+) -> Result<Option<ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
     }
@@ -578,6 +732,98 @@ mod tests {
 
     use super::*;
     use crate::test_support::snapshot_counter;
+
+    /// A local reply that checks the buffered request and exercises response filters.
+    struct TerminalProbe;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for TerminalProbe {
+        fn name(&self) -> &'static str {
+            "terminal_probe"
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if ctx.buffered_request_body.as_deref() != Some(b"request".as_slice()) {
+                return Ok(FilterAction::Reject(praxis_filter::Rejection::status(400)));
+            }
+            Ok(FilterAction::TerminalResponse(Box::new(
+                TerminalResponse::new(201).with_body("reply"),
+            )))
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if let Some(response) = ctx.response_header.as_deref_mut() {
+                response.headers.insert("x-probe", "executed".parse().unwrap());
+            }
+            Ok(FilterAction::Continue)
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn on_response_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            _: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            *body = Some(Bytes::from_static(b"filtered"));
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl TerminalProbe {
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    #[expect(clippy::too_many_lines, clippy::panic, reason = "terminal response integration test")]
+    #[tokio::test]
+    async fn buffered_request_can_return_filtered_terminal_response() {
+        use praxis_filter::FilterRegistry;
+        crate::fips::install().unwrap();
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: terminal_probe\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register(
+                "terminal_probe",
+                praxis_filter::http_builtin(TerminalProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = b"request".to_vec();
+        let result = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state)
+            .await
+            .unwrap();
+        let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(reply)) =
+            result.first().and_then(|message| message.response.as_ref())
+        else {
+            panic!("expected local reply");
+        };
+        assert_eq!(reply.status.as_ref().unwrap().code, 201);
+        assert_eq!(reply.body, "filtered");
+        assert!(reply.headers.as_ref().unwrap().set_headers.iter().any(|header| {
+            header
+                .header
+                .as_ref()
+                .is_some_and(|value| value.key == "x-probe" && value.value == "executed")
+        }));
+    }
 
     /// Read the `content-length` value from a header mutation, if present.
     fn content_length_of(
@@ -1168,6 +1414,7 @@ mod tests {
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+        hydrated.extensions.insert(Probe(PROBE_VALUE));
 
         // Capture (`dehydrate`) must move every field into the empty slot.
         let mut slot = None;
@@ -1181,11 +1428,13 @@ mod tests {
             executed_filter_indices,
             filter_metadata,
             filter_state,
+            extensions,
         } = &carried;
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
+        assert_eq!(extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
@@ -1199,6 +1448,7 @@ mod tests {
             .get(&7)
             .and_then(|any| any.downcast_ref::<Probe>());
         assert_eq!(restored, Some(&Probe(PROBE_VALUE)), "hydrate must restore filter_state");
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
     }
 
     /// A missing parked context (`None`) means a prior phase never restored its
