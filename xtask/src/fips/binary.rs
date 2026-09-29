@@ -261,7 +261,7 @@ fn openssl_imports(report: &mut Report, data: &[u8]) {
     let imported = match openssl_symbols(data) {
         Ok(imported) => imported,
         Err(reason) => {
-            report.fail(unreadable_versions(&reason));
+            report.fail(uninspectable_imports(&reason));
             return;
         },
     };
@@ -303,12 +303,16 @@ fn openssl_symbols(data: &[u8]) -> Result<BTreeSet<&str>, String> {
         if version.is_none_or(|version| version.name() != OPENSSL_3_0_0_VERSION) {
             continue;
         }
-        let Ok(name) = symbol.name(endian, symbols.strings()) else {
-            continue;
-        };
-        if let Ok(name) = std::str::from_utf8(name) {
-            imported.insert(name);
-        }
+        let name = symbol
+            .name(endian, symbols.strings())
+            .map_err(|err| format!("an @OPENSSL_3.0.0 import has an unreadable name: {err}"))?;
+        let name = std::str::from_utf8(name).map_err(|err| {
+            format!(
+                "an @OPENSSL_3.0.0 import has a non-UTF-8 name ({err}): {:?}",
+                String::from_utf8_lossy(name)
+            )
+        })?;
+        imported.insert(name);
     }
     Ok(imported)
 }
@@ -350,14 +354,15 @@ fn unexpected_openssl(symbols: &[&str]) -> Finding {
     }
 }
 
-/// The finding for a binary whose symbol versions the check cannot read.
-fn unreadable_versions(reason: &str) -> Finding {
+/// The finding for a binary whose OpenSSL imports the check cannot inspect: not
+/// a 64-bit ELF, no symbol version table, or an `@OPENSSL_3.0.0` import with an
+/// unreadable or non-UTF-8 name.
+fn uninspectable_imports(reason: &str) -> Finding {
     Finding {
-        title: format!("cannot read the binary's OpenSSL symbol versions ({reason})"),
-        why:
-            "the @OPENSSL_3.0.0 allowlist check keys on each import's symbol version; without that data an unversioned \
-              OpenSSL import would slip past the allowlist and ship unchecked"
-                .to_owned(),
+        title: format!("cannot inspect the binary's OpenSSL symbol imports ({reason})"),
+        why: "the allowlist check reads the version and UTF-8 name of every OpenSSL import to match it; a versioned \
+              OpenSSL import it cannot read would otherwise slip past the allowlist and ship unchecked"
+            .to_owned(),
         location: "the ELF dynamic symbol table and GNU version sections (.gnu.version / .gnu.version_r)".to_owned(),
         fix: "assess a 64-bit ELF built by 'make release-fips'; keep the .gnu.version and .gnu.version_r sections (do \
               not strip them)"
@@ -674,7 +679,7 @@ mod tests {
         let mut report = Report::default();
         openssl_imports(&mut report, b"not an ELF file");
         assert!(
-            report.has_finding("cannot read the binary's OpenSSL symbol versions"),
+            report.has_finding("cannot inspect the binary's OpenSSL symbol imports"),
             "unreadable version data fails the report instead of reporting zero imports as a pass"
         );
     }
