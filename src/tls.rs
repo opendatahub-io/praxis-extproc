@@ -26,7 +26,10 @@ use openssl::{
     nid::Nid,
     pkey::{Id, PKey, Private},
     pkey_ctx::PkeyCtx,
-    ssl::{AlpnError, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode, select_next_proto},
+    ssl::{
+        AlpnError, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode, SslVersion,
+        select_next_proto,
+    },
     x509::{
         X509, X509Builder, X509NameBuilder,
         extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
@@ -332,11 +335,32 @@ async fn perform_handshake(
     })
 }
 
+/// A TLS 1.2 + 1.3 acceptor that uses ECDHE only. Built from `mozilla_modern_v5`
+/// specifically because — unlike `mozilla_intermediate_v5` — it never sets
+/// finite-field DH params, so the binary does not import the OpenSSL 3.0
+/// deprecated `PEM_read_bio_DHparams`/`DH_free`, which are outside the FIPS
+/// symbol surface. TLS 1.2 is re-enabled with ECDHE suites (no `DHE-RSA-*`); the
+/// TLS 1.3 ciphersuites and default ECDH groups come from `mozilla_modern_v5`.
+fn ecdhe_acceptor() -> crate::error::Result<SslAcceptorBuilder> {
+    let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls()).map_err(|e| cfg_err("SSL context", e))?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| cfg_err("min protocol", e))?;
+    builder
+        .set_cipher_list(
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+             ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+             ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305",
+        )
+        .map_err(|e| cfg_err("cipher list", e))?;
+    Ok(builder)
+}
+
 /// Build a `SslAcceptor` for an ephemeral self-signed certificate.
 fn build_self_signed() -> crate::error::Result<SslAcceptor> {
     info!("generating self-signed TLS certificate");
     let (cert, pkey) = self_signed_cert()?;
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(|e| cfg_err("SSL context", e))?;
+    let mut builder = ecdhe_acceptor()?;
     builder
         .set_certificate(&cert)
         .map_err(|e| cfg_err("set certificate", e))?;
@@ -451,8 +475,7 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<SslAcceptor> {
         .as_deref()
         .ok_or_else(|| crate::error::ExtProcError::Config("tls.key_path required for provided mode".to_owned()))?;
     info!(cert = cert_path, key = key_path, "loading TLS certificate");
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
-        .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
+    let mut builder = ecdhe_acceptor()?;
     builder
         .set_certificate_chain_file(cert_path)
         .map_err(|e| crate::error::ExtProcError::Config(format!("certificate: {e}")))?;
