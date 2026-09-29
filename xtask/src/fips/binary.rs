@@ -334,15 +334,16 @@ fn unexpected_imports<'a>(imported: &BTreeSet<&'a str>, allowed: &BTreeSet<&str>
 fn unexpected_openssl(symbols: &[&str]) -> Finding {
     Finding {
         title: format!(
-            "imports @OPENSSL_3.0.0 symbols not on the reviewed allowlist: {}",
+            "imports @OPENSSL_3.0.0 symbols not on the allowlist: {}",
             symbols.join(" ")
         ),
-        why: "the allowlist is the set of OpenSSL calls reviewed for this FIPS build; a symbol outside it is a new, \
-              unreviewed call into libcrypto/libssl that could reach a non-approved algorithm"
+        why: "the allowlist is every non-deprecated OpenSSL 3.0 export plus the deprecated symbols already in use; a \
+              symbol outside it is a deprecated or otherwise non-standard call into libcrypto/libssl that has not been \
+              reviewed for this FIPS build"
             .to_owned(),
-        location: "xtask/assets/fips/openssl-3.0.0-symbols.txt holds the reviewed symbols".to_owned(),
-        fix: "confirm each new OpenSSL call is appropriate for the FIPS build, then add its symbol to \
-              xtask/assets/fips/openssl-3.0.0-symbols.txt"
+        location: "xtask/assets/fips/openssl-3.0-nondeprecated-symbols.txt holds the allowed symbols".to_owned(),
+        fix: "prefer a non-deprecated replacement; if the call is appropriate for the FIPS build, add its symbol to \
+              xtask/assets/fips/openssl-3.0-nondeprecated-symbols.txt (deprecated symbols go in the header block)"
             .to_owned(),
     }
 }
