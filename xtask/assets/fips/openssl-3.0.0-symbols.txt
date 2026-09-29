@@ -7,7 +7,7 @@
 # Blank lines and lines beginning with '#' are ignored. To regenerate the set a
 # binary actually imports:
 #
-#   readelf --dyn-syms BINARY | awk '/@OPENSSL_3.0.0/ {sub(/@.*/,"",$8); print $8}' | sort -u
+#   readelf --wide --dyn-syms BINARY | awk '/@OPENSSL_3.0.0/ {sub(/@.*/,"",$8); print $8}' | sort -u
 #
 # Add a symbol here only after confirming the OpenSSL call it names is
 # appropriate for the FIPS build.
@@ -37,22 +37,12 @@ BN_new
 BN_rand
 BN_to_ASN1_INTEGER
 CRYPTO_get_ex_new_index
-d2i_ASN1_TYPE
-d2i_AutoPrivateKey
-d2i_PUBKEY
-d2i_X509_NAME
 DH_free
 EC_GROUP_free
 EC_GROUP_new_by_curve_name
 ERR_get_error_all
 ERR_lib_error_string
 ERR_reason_error_string
-EVP_aes_128_ecb
-EVP_aes_128_gcm
-EVP_aes_256_ecb
-EVP_aes_256_gcm
-EVP_chacha20
-EVP_chacha20_poly1305
 EVP_CIPHER_CTX_ctrl
 EVP_CIPHER_CTX_free
 EVP_CIPHER_CTX_get0_cipher
@@ -61,14 +51,13 @@ EVP_CIPHER_CTX_get_iv_length
 EVP_CIPHER_CTX_get_key_length
 EVP_CIPHER_CTX_new
 EVP_CIPHER_CTX_set_key_length
-EVP_CipherFinal
 EVP_CIPHER_get_block_size
 EVP_CIPHER_get_flags
 EVP_CIPHER_get_iv_length
 EVP_CIPHER_get_key_length
+EVP_CipherFinal
 EVP_CipherUpdate
 EVP_DecryptInit_ex
-EVP_default_properties_is_fips_enabled
 EVP_DigestFinal_ex
 EVP_DigestInit_ex
 EVP_DigestSign
@@ -119,14 +108,19 @@ EVP_PKEY_new_raw_public_key
 EVP_PKEY_paramgen
 EVP_PKEY_paramgen_init
 EVP_PKEY_set1_encoded_public_key
+EVP_aes_128_ecb
+EVP_aes_128_gcm
+EVP_aes_256_ecb
+EVP_aes_256_gcm
+EVP_chacha20
+EVP_chacha20_poly1305
+EVP_default_properties_is_fips_enabled
 EVP_sha256
 EVP_sha384
 EVP_sha512
 GENERAL_NAME_free
 GENERAL_NAME_new
 GENERAL_NAME_set0_othername
-i2d_PUBKEY
-i2d_X509_NAME
 OBJ_dup
 OBJ_nid2sn
 OBJ_txt2obj
@@ -138,7 +132,6 @@ OPENSSL_sk_push
 OpenSSL_version_num
 PEM_read_bio_DHparams
 RAND_priv_bytes
-SSL_accept
 SSL_CTX_check_private_key
 SSL_CTX_ctrl
 SSL_CTX_free
@@ -153,15 +146,16 @@ SSL_CTX_set_ex_data
 SSL_CTX_set_options
 SSL_CTX_set_verify
 SSL_CTX_up_ref
-SSL_CTX_use_certificate
-SSL_CTX_use_certificate_chain_file
 SSL_CTX_use_PrivateKey
 SSL_CTX_use_PrivateKey_file
+SSL_CTX_use_certificate
+SSL_CTX_use_certificate_chain_file
+SSL_accept
 SSL_free
+SSL_get_SSL_CTX
 SSL_get_error
 SSL_get_ex_data
 SSL_get_rbio
-SSL_get_SSL_CTX
 SSL_new
 SSL_read_ex
 SSL_select_next_proto
@@ -170,14 +164,17 @@ SSL_set_ex_data
 SSL_shutdown
 SSL_write_ex
 TLS_method
-X509_add_ext
+X509V3_EXT_i2d
+X509V3_EXT_nconf_nid
+X509V3_set_ctx
 X509_EXTENSION_free
-X509_free
-X509_gmtime_adj
 X509_NAME_add_entry_by_txt
 X509_NAME_dup
 X509_NAME_free
 X509_NAME_new
+X509_add_ext
+X509_free
+X509_gmtime_adj
 X509_new
 X509_set1_notAfter
 X509_set1_notBefore
@@ -187,6 +184,9 @@ X509_set_serialNumber
 X509_set_subject_name
 X509_set_version
 X509_sign
-X509V3_EXT_i2d
-X509V3_EXT_nconf_nid
-X509V3_set_ctx
+d2i_ASN1_TYPE
+d2i_AutoPrivateKey
+d2i_PUBKEY
+d2i_X509_NAME
+i2d_PUBKEY
+i2d_X509_NAME
