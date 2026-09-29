@@ -10,8 +10,8 @@
 # Deprecated-in-3.0 symbols the binary still imports today; they are NOT part of
 # the generated list below and should be removed from here once the code no
 # longer calls them.
-DH_free
-PEM_read_bio_DHparams
+# DH_free
+# PEM_read_bio_DHparams
 # Real symbols below
 ACCESS_DESCRIPTION_free
 ACCESS_DESCRIPTION_it
