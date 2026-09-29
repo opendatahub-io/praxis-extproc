@@ -279,17 +279,19 @@ fn openssl_imports(report: &mut Report, data: &[u8]) {
 
 /// The base names (without the `@OPENSSL_3.0.0` suffix) of the undefined
 /// symbols the binary imports under the `OPENSSL_3.0.0` version.
+///
+/// Errors when the binary carries no GNU symbol version table: its imports
+/// would then be unversioned and slip past the allowlist unchecked, so the
+/// caller turns that into a finding rather than a silent pass.
 fn openssl_symbols(data: &[u8]) -> Result<BTreeSet<&str>, String> {
     let elf = ElfFile64::<Endianness>::parse(data).map_err(|err| err.to_string())?;
     let endian = elf.endian();
     let symbols = elf.elf_dynamic_symbol_table();
-    let Some(versions) = elf
+    let versions = elf
         .elf_section_table()
         .versions(endian, data)
         .map_err(|err| err.to_string())?
-    else {
-        return Ok(BTreeSet::new());
-    };
+        .ok_or("no GNU symbol version table (.gnu.version)")?;
     let mut imported = BTreeSet::new();
     for (index, symbol) in symbols.enumerate() {
         if !symbol.is_undefined(endian) {
@@ -353,11 +355,13 @@ fn unreadable_versions(reason: &str) -> Finding {
     Finding {
         title: format!("cannot read the binary's OpenSSL symbol versions ({reason})"),
         why:
-            "the @OPENSSL_3.0.0 allowlist check confirms the binary calls only reviewed OpenSSL functions; without it \
-              a new, unreviewed call could ship unnoticed"
+            "the @OPENSSL_3.0.0 allowlist check keys on each import's symbol version; without that data an unversioned \
+              OpenSSL import would slip past the allowlist and ship unchecked"
                 .to_owned(),
-        location: "the ELF dynamic symbol table and GNU version-requirement (.gnu.version_r) section".to_owned(),
-        fix: "assess a 64-bit ELF built by 'make release-fips'; keep .gnu.version_r (do not strip it)".to_owned(),
+        location: "the ELF dynamic symbol table and GNU version sections (.gnu.version / .gnu.version_r)".to_owned(),
+        fix: "assess a 64-bit ELF built by 'make release-fips'; keep the .gnu.version and .gnu.version_r sections (do \
+              not strip them)"
+            .to_owned(),
     }
 }
 
@@ -662,6 +666,16 @@ mod tests {
             finding.title.contains("EVP_brandnew"),
             "the finding names the offending symbol: {}",
             finding.title
+        );
+    }
+
+    #[test]
+    fn a_binary_without_readable_symbol_versions_is_a_finding_not_a_pass() {
+        let mut report = Report::default();
+        openssl_imports(&mut report, b"not an ELF file");
+        assert!(
+            report.has_finding("cannot read the binary's OpenSSL symbol versions"),
+            "unreadable version data fails the report instead of reporting zero imports as a pass"
         );
     }
 }
