@@ -64,25 +64,6 @@ pub(crate) fn e2e_kubectl_context() -> String {
     std::env::var("E2E_CONTEXT").unwrap_or_else(|_| "kind-praxis-e2e".to_owned())
 }
 
-/// Apply a kustomize overlay directory under the repo (`kubectl apply -k`).
-pub(crate) fn kubectl_apply_k(overlay: impl AsRef<Path>) -> std::io::Result<()> {
-    let overlay = overlay.as_ref();
-    let status = Command::new("kubectl")
-        .arg("--context")
-        .arg(e2e_kubectl_context())
-        .arg("apply")
-        .arg("-k")
-        .arg(overlay)
-        .status()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "kubectl apply -k {} failed with {status}",
-            overlay.display()
-        )));
-    }
-    Ok(())
-}
-
 /// Apply a flat manifest (`kubectl apply -f`).
 pub(crate) fn kubectl_apply_f(manifest: impl AsRef<Path>) -> std::io::Result<()> {
     let manifest = manifest.as_ref();
@@ -102,11 +83,16 @@ pub(crate) fn kubectl_apply_f(manifest: impl AsRef<Path>) -> std::io::Result<()>
     Ok(())
 }
 
-/// Poll until both ext-proc Deployments report Ready (best-effort rollout wait).
+/// Poll until both ext-proc Deployments report Ready.
+///
+/// # Panics
+///
+/// Panics if either Deployment is not Ready before `timeout`.
 pub(crate) async fn wait_ext_proc_rollout(timeout: Duration) {
     let ctx = e2e_kubectl_context();
     let deadline = tokio::time::Instant::now() + timeout;
     for deploy in ["payload-pre-processing", "payload-processing"] {
+        let mut ready = false;
         while tokio::time::Instant::now() < deadline {
             let ok = Command::new("kubectl")
                 .args([
@@ -122,10 +108,15 @@ pub(crate) async fn wait_ext_proc_rollout(timeout: Duration) {
                 .status()
                 .is_ok_and(|s| s.success());
             if ok {
+                ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
+        assert!(
+            ready,
+            "deployment/{deploy} not Ready within {timeout:?} (context={ctx})"
+        );
     }
 }
 
@@ -204,6 +195,9 @@ pub(crate) fn effective_idle_secs(cell: &IdleMatrixCell) -> u64 {
 }
 
 /// HTTP client with a single idle connection (connection-reuse experiments).
+///
+/// Disables reqwest's default 90s pool idle eviction so qualification cells
+/// that sleep `QUALIFICATION_IDLE_SECS` (default 300) can reuse one TCP conn.
 pub(crate) fn http_client_single_pool() -> reqwest::Client {
     use reqwest::header;
     let mut headers = HeaderMap::new();
@@ -214,6 +208,7 @@ pub(crate) fn http_client_single_pool() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(crate::fixtures::REQUEST_TIMEOUT)
         .pool_max_idle_per_host(1)
+        .pool_idle_timeout(None)
         .default_headers(headers)
         .build()
         .expect("failed to build single-pool HTTP client")
@@ -229,4 +224,142 @@ pub(crate) fn pool_settings_manifest(pool_settings_ref: &str) -> PathBuf {
 /// TLS scenario overlay directory (`deploy/overlays/e2e-extended/tls/<scenario>/`).
 pub(crate) fn tls_overlay_dir(scenario: &str) -> PathBuf {
     repo_root().join(format!("deploy/overlays/e2e-extended/tls/{scenario}"))
+}
+
+/// Parsed Envoy access-log connection identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionIds {
+    pub connection_id: String,
+    pub upstream_connection_id: String,
+}
+
+/// Gateway pod names selected for the e2e Gateway.
+pub(crate) fn gateway_pod_names() -> Vec<String> {
+    let ctx = e2e_kubectl_context();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            "istio-system",
+            "get",
+            "pods",
+            "-l",
+            "gateway.networking.k8s.io/gateway-name=e2e-gateway",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ])
+        .output()
+        .expect("kubectl get gateway pods");
+    assert!(
+        output.status.success(),
+        "kubectl get gateway pods failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Tail recent stdout logs from all gateway pods (joined).
+pub(crate) fn fetch_gateway_access_log_tail(tail_lines: u32) -> String {
+    let ctx = e2e_kubectl_context();
+    let mut combined = String::new();
+    for pod in gateway_pod_names() {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &ctx,
+                "-n",
+                "istio-system",
+                "logs",
+                &pod,
+                "--tail",
+                &tail_lines.to_string(),
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("kubectl logs {pod}: {error}"));
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        combined.push('\n');
+    }
+    combined
+}
+
+/// Parse `connection_id=` / `upstream_connection_id=` from an access-log line.
+pub(crate) fn parse_connection_ids(line: &str) -> Option<ConnectionIds> {
+    let connection_id = capture_field(line, "connection_id=")?;
+    let upstream_connection_id = capture_field(line, "upstream_connection_id=").unwrap_or_default();
+    Some(ConnectionIds {
+        connection_id,
+        upstream_connection_id,
+    })
+}
+
+fn capture_field(line: &str, key: &str) -> Option<String> {
+    let rest = line.split_once(key)?.1;
+    let value = rest.split([' ', '\n', '\t']).next()?.trim();
+    if value.is_empty() { None } else { Some(value.to_owned()) }
+}
+
+/// Latest access-log line that contains `connection_id=` (reuse overlay format).
+pub(crate) fn latest_connection_log_line(logs: &str) -> Option<&str> {
+    logs.lines().rev().find(|line| line.contains("connection_id="))
+}
+
+/// Latest access-log line with `details=` (TLS-negative overlay format).
+pub(crate) fn latest_details_log_line(logs: &str) -> Option<&str> {
+    logs.lines().rev().find(|line| line.contains("details="))
+}
+
+/// Assert negative TLS discrimination: 503, `ext_proc` details, no hop oracle headers.
+pub(crate) fn assert_negative_tls_response(headers: &HeaderMap, status: reqwest::StatusCode) {
+    assert_eq!(
+        status.as_u16(),
+        503,
+        "negative TLS cell must return HTTP 503, got {status}"
+    );
+    assert!(
+        headers.get(HOP_DIGEST_HEADER_1).is_none(),
+        "negative TLS must not include hop-1 oracle header"
+    );
+    assert!(
+        headers.get(HOP_DIGEST_HEADER_2).is_none(),
+        "negative TLS must not include hop-2 oracle header"
+    );
+}
+
+/// Assert access-log details mention `ext_proc` (not bare UF).
+pub(crate) fn assert_ext_proc_error_details(logs: &str) {
+    let line = logs
+        .lines()
+        .rev()
+        .find(|line| line.contains("code=503") && line.contains("details=") && line.contains("ext_proc"))
+        .or_else(|| latest_details_log_line(logs))
+        .expect("expected access-log line with details=");
+    let details = capture_field(line, "details=").unwrap_or_default();
+    let flags = capture_field(line, "flags=").unwrap_or_default();
+    assert!(
+        details.contains("ext_proc"),
+        "negative TLS details must mention ext_proc, got details={details:?} flags={flags:?} line={line}"
+    );
+    assert!(
+        !flags.contains("UF") || details.contains("ext_proc"),
+        "misclassified UF without ext_proc details: {line}"
+    );
+}
+
+/// Ensure certs exist, then apply a TLS scenario via the apply helper script.
+pub(crate) fn apply_tls_scenario_overlay(scenario: &str) -> std::io::Result<()> {
+    let status = Command::new("bash")
+        .arg(repo_root().join("hack/apply-e2e-extended-tls.sh"))
+        .arg(scenario)
+        .env("E2E_CONTEXT", e2e_kubectl_context())
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "apply-e2e-extended-tls.sh {scenario} failed with {status}"
+        )));
+    }
+    Ok(())
 }

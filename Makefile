@@ -338,10 +338,14 @@ e2e-test:
 # k8s-e2e so e2e_body_oracle is registered, applies e2e-extended overlay on
 # top of the baseline Forge e2e stack, then runs ignored extended tests.
 E2E_EXTENDED_FEATURES ?= responses,k8s-e2e
+# Keep the k8s-e2e/oracle image off the product :dev tag (CWE-489).
+E2E_EXTENDED_IMAGE ?= docker.io/library/praxis-extproc:e2e-extended
 
 e2e-setup-extended:
-	$(MAKE) e2e-setup FIPS_FEATURES="$(E2E_EXTENDED_FEATURES)"
+	$(MAKE) e2e-setup FIPS_FEATURES="$(E2E_EXTENDED_FEATURES)" EXTPROC_IMAGE="$(E2E_EXTENDED_IMAGE)"
+	bash hack/generate-e2e-extended-tls-certs.sh
 	kubectl --context kind-praxis-e2e apply -k deploy/overlays/e2e-extended/
+	bash hack/apply-e2e-extended-tls.sh positive
 
 test-e2e-extended:
 	bash hack/scripts/e2e-test-extended.sh $(if $(V),-- --nocapture,)

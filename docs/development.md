@@ -239,9 +239,17 @@ Long-running scenarios from
 These stay out of default PR CI.
 
 ```console
-make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay (image with k8s-e2e)
+make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay + TLS positive
 make test-e2e-extended    # cargo test --features k8s-e2e -- … extended --ignored
 ```
+
+`e2e-setup-extended` runs `hack/generate-e2e-extended-tls-certs.sh` (requires
+`openssl` on `PATH`) and applies the positive TLS overlay via
+`hack/apply-e2e-extended-tls.sh positive`. That helper mounts scenario Secrets,
+rewrites Praxis `provided` TLS ConfigMaps, and patches the live
+`EnvoyFilter/praxis-extproc` clusters to `VERIFY_TRUST_CHAIN` + trusted CA +
+explicit SAN match (`hack/patch-e2e-extended-upstream-tls.py`). Generated PEMs
+under `deploy/overlays/e2e-extended/tls/**/certs/` are gitignored.
 
 Environment knobs:
 

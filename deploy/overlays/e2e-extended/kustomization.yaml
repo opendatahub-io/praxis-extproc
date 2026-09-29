@@ -10,8 +10,7 @@ resources:
   - envoyfilter-pre-oracle-response-headers.yaml
   - access-log-reuse.yaml
   - access-log-tls-negative.yaml
-  - pool-configs/default_5min_keepalive.yaml
-  - pool-configs/aggressive_idle.yaml
+  # pool-configs/*.yaml are applied per idle-matrix cell (not both at once).
 
 patches:
   - path: workload/pre-processing-hop-index.yaml

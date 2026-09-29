@@ -35,6 +35,8 @@ profile, started, finished, outcome, envoy, istio, digest, chain, chain_reason =
 hops = 2 if profile == "maas_two_hop_fd_streamed" else 0
 path = Path("target/e2e-extended/report.json")
 idle_results = []
+tls_mode = "pending_idle_tls_tranche"
+tls_neg = None
 if path.exists():
     try:
         prior = json.loads(path.read_text())
@@ -42,6 +44,11 @@ if path.exists():
             chain = "executed"
             chain_reason = prior.get("chain_reason", chain_reason)
         idle_results = prior.get("idle_matrix_results", [])
+        # Preserve TLS fields written by idle_tls tests; do not clobber.
+        if prior.get("tls_validation_mode"):
+            tls_mode = prior["tls_validation_mode"]
+        if "tls_negative_scenario" in prior:
+            tls_neg = prior.get("tls_negative_scenario")
     except json.JSONDecodeError:
         pass
 report = {
@@ -52,8 +59,8 @@ report = {
   "envoy_version": envoy,
   "istio_version": istio,
   "praxis_extproc_image_digest": digest,
-  "tls_validation_mode": "pending_idle_tls_tranche",
-  "tls_negative_scenario": None,
+  "tls_validation_mode": tls_mode,
+  "tls_negative_scenario": tls_neg,
   "ext_proc_modes": {"request": "FULL_DUPLEX_STREAMED", "response": "FULL_DUPLEX_STREAMED"},
   "idle_matrix_results": idle_results,
   "started_at": started,

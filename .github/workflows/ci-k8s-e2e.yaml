@@ -89,7 +89,6 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-      actions: write
     needs: simulator-check
     if: >-
       needs.simulator-check.outputs.reachable == 'true' &&
