@@ -303,18 +303,23 @@ fn openssl_symbols(data: &[u8]) -> Result<BTreeSet<&str>, String> {
         if version.is_none_or(|version| version.name() != OPENSSL_3_0_0_VERSION) {
             continue;
         }
-        let name = symbol
-            .name(endian, symbols.strings())
-            .map_err(|err| format!("an @OPENSSL_3.0.0 import has an unreadable name: {err}"))?;
-        let name = std::str::from_utf8(name).map_err(|err| {
-            format!(
-                "an @OPENSSL_3.0.0 import has a non-UTF-8 name ({err}): {:?}",
-                String::from_utf8_lossy(name)
-            )
-        })?;
-        imported.insert(name);
+        imported.insert(import_name(symbol.name(endian, symbols.strings()))?);
     }
     Ok(imported)
+}
+
+/// The UTF-8 name of an `@OPENSSL_3.0.0` import from its raw string-table entry,
+/// or the reason it cannot be one. The allowlist holds only valid UTF-8, so a
+/// versioned OpenSSL import with an unreadable or non-UTF-8 name could never
+/// match it; failing here keeps such an import from slipping through unchecked.
+fn import_name(raw: Result<&[u8], object::read::Error>) -> Result<&str, String> {
+    let raw = raw.map_err(|err| format!("an @OPENSSL_3.0.0 import has an unreadable name: {err}"))?;
+    std::str::from_utf8(raw).map_err(|err| {
+        format!(
+            "an @OPENSSL_3.0.0 import has a non-UTF-8 name ({err}): {:?}",
+            String::from_utf8_lossy(raw)
+        )
+    })
 }
 
 /// The reviewed set of allowed `@OPENSSL_3.0.0` symbols, from the compiled-in
@@ -681,6 +686,21 @@ mod tests {
         assert!(
             report.has_finding("cannot inspect the binary's OpenSSL symbol imports"),
             "unreadable version data fails the report instead of reporting zero imports as a pass"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_openssl_import_name_is_an_error_not_a_dropped_symbol() {
+        assert_eq!(
+            import_name(Ok(b"EVP_sha256")),
+            Ok("EVP_sha256"),
+            "a valid name reads back"
+        );
+        let bad = import_name(Ok(&[b'E', b'V', b'P', 0xFF, 0xFE]));
+        let reason = bad.expect_err("a non-UTF-8 name is rejected, not silently dropped");
+        assert!(
+            reason.contains("non-UTF-8 name"),
+            "the reason names the problem so it becomes a finding: {reason}"
         );
     }
 }
