@@ -1,0 +1,35 @@
+# ServiceMonitor for payload-processing metrics scraping.
+#
+# Consumed by Prometheus (openshift-monitoring) directly and by
+# the OTel Collector Target Allocator (redhat-ods-monitoring).
+# The Target Allocator discovers this CR via the required
+# monitoring.opendatahub.io/scrape label.
+#
+# The scraper sends its projected ServiceAccount token as a
+# Bearer header; the metrics server validates it through the
+# Kubernetes TokenReview + SubjectAccessReview APIs (see
+# metrics-auth-clusterrole.yaml and metrics-reader-clusterrole.yaml).
+#
+# Ref: ODH-ADR-Operator-0010 — Observability component metrics scraping
+# https://github.com/opendatahub-io/architecture-decision-records/blob/main/architecture-decision-records/operator/ODH-ADR-Operator-0010-Observability-component%20metrics%20scraping.md
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payload-processing-metrics
+  labels:
+    app: payload-processing
+    app.opendatahub.io/modelsasservice: "true"
+    app.kubernetes.io/part-of: maas
+    app.kubernetes.io/component: monitoring
+    monitoring.opendatahub.io/scrape: "true"
+spec:
+  selector:
+    matchLabels:
+      app: payload-processing
+      app.kubernetes.io/component: monitoring
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
