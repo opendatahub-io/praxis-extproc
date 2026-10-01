@@ -33,8 +33,8 @@ use crate::{
         local_reply_passthrough,
     },
     metrics,
+    pipeline::acknowledge_trailers,
     protocol::{EosTracker, PhaseOrderTracker, ProtocolConfig, request_type_label, validate_body_message},
-    response,
 };
 
 // -----------------------------------------------------------------------------
@@ -294,8 +294,8 @@ async fn dispatch_request(
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,
-        processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
-        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestTrailers(_) => Ok(acknowledge_trailers(pipeline, state, true)),
+        processing_request::Request::ResponseTrailers(_) => Ok(acknowledge_trailers(pipeline, state, false)),
     }
 }
 

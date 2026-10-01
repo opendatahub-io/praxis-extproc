@@ -1017,6 +1017,117 @@ async fn request_headers_after_local_reply_rejected() {
 }
 
 #[tokio::test]
+async fn full_duplex_response_trailers_without_body_deliver_header_mutations() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(with_response_body_mode(
+        make_request_headers("GET", "/", true),
+        BodySendMode::FullDuplexStreamed,
+    ))
+    .await
+    .unwrap();
+    let _request_headers = next_full_duplex_msg(&mut stream).await;
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    tx.send(trailers(false)).await.unwrap();
+    let responses = vec![
+        next_full_duplex_msg(&mut stream).await,
+        next_full_duplex_msg(&mut stream).await,
+    ];
+
+    assert!(
+        matches!(
+            responses
+                .iter()
+                .map(|r| r.response.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [
+                Some(RespVariant::ResponseHeaders(_)),
+                Some(RespVariant::ResponseTrailers(_))
+            ]
+        ),
+        "trailers must release the held-back headers response first: {responses:?}"
+    );
+    assert!(
+        response_set_headers(&responses)
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case("x-resp") && h.value == "true"),
+        "the header phase's X-Resp mutation must be delivered: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_request_trailers_without_body_deliver_header_mutations() {
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(with_request_body_mode(
+        make_request_headers("POST", "/", false),
+        BodySendMode::FullDuplexStreamed,
+    ))
+    .await
+    .unwrap();
+    tx.send(trailers(true)).await.unwrap();
+    let responses = vec![
+        next_full_duplex_msg(&mut stream).await,
+        next_full_duplex_msg(&mut stream).await,
+    ];
+
+    assert!(
+        matches!(
+            responses
+                .iter()
+                .map(|r| r.response.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [
+                Some(RespVariant::RequestHeaders(_)),
+                Some(RespVariant::RequestTrailers(_))
+            ]
+        ),
+        "trailers must release the held-back headers response first: {responses:?}"
+    );
+    assert!(
+        extract_all_set_headers(&responses)
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case("x-test") && h.value == "extproc"),
+        "the header phase's X-Test mutation must be delivered: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_response_trailers_without_body_send_no_second_headers_response() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+
+    tx.send(with_response_body_mode(
+        make_request_headers("GET", "/", true),
+        BodySendMode::Buffered,
+    ))
+    .await
+    .unwrap();
+    let _request_headers = next_full_duplex_msg(&mut stream).await;
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    let _response_headers = next_full_duplex_msg(&mut stream).await;
+    tx.send(trailers(false)).await.unwrap();
+    drop(tx);
+    let responses = collect_responses(&mut stream).await;
+
+    assert!(
+        matches!(
+            responses
+                .iter()
+                .map(|r| r.response.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Some(RespVariant::ResponseTrailers(_))]
+        ),
+        "BUFFERED already answered the headers; trailers must not send a second headers response: {responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_non_eos_request_headers_rejected() {
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
 
@@ -2558,6 +2669,28 @@ fn with_response_body_mode(mut msg: ProcessingRequest, response_body_mode: BodyS
     msg
 }
 
+/// Attach a first-message `protocol_config` selecting `request_body_mode`.
+fn with_request_body_mode(mut msg: ProcessingRequest, request_body_mode: BodySendMode) -> ProcessingRequest {
+    msg.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        request_body_mode: request_body_mode as i32,
+        response_body_mode: BodySendMode::None as i32,
+        send_body_without_waiting_for_header_response: false,
+    });
+    msg
+}
+
+fn trailers(is_request: bool) -> ProcessingRequest {
+    let trailers = HttpTrailers { trailers: None };
+    ProcessingRequest {
+        request: Some(if is_request {
+            ReqVariant::RequestTrailers(trailers)
+        } else {
+            ReqVariant::ResponseTrailers(trailers)
+        }),
+        ..Default::default()
+    }
+}
+
 async fn open_stream(
     client: &mut ExtProcClient,
 ) -> (
@@ -2651,6 +2784,18 @@ fn has_request_headers_response(responses: &[ProcessingResponse]) -> bool {
     responses
         .iter()
         .any(|r| matches!(&r.response, Some(RespVariant::RequestHeaders(_))))
+}
+
+/// Set-header mutations carried by response-side `HeadersResponse` messages.
+fn response_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue> {
+    responses
+        .iter()
+        .filter_map(|r| match &r.response {
+            Some(RespVariant::ResponseHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
+            _ => None,
+        })
+        .flat_map(|m| m.set_headers.iter().filter_map(|hvo| hvo.header.clone()))
+        .collect()
 }
 
 fn extract_all_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue> {

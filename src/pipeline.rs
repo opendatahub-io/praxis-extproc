@@ -258,23 +258,58 @@ pub(crate) fn passthrough_chunk(
         response::response_body(body_data, None, mode, body.end_of_stream)
     };
 
-    if !state.header_state.take_first_chunk(is_request) {
+    let Some(headers) = take_deferred_headers(state, is_request) else {
         return body_responses;
-    }
-
-    let mutation = if is_request {
-        state.deferred_request_header_mutation.take()
-    } else {
-        state.deferred_response_header_mutation.take()
     };
-    let hdr = if is_request {
-        response::request_headers(mutation)
-    } else {
-        response::response_headers(mutation)
-    };
-    let mut responses = vec![hdr];
+    let mut responses = vec![headers];
     responses.extend(body_responses);
     responses
+}
+
+/// Acknowledge trailers, first releasing the `HeadersResponse` that
+/// `FULL_DUPLEX_STREAMED` passthrough holds back for a body chunk that never came.
+///
+/// Envoy is still waiting for that response: sending trailers leaves its
+/// callback state on headers, and a trailers response is accepted in any state
+/// in this mode. Without the release, the header phase's deferred mutations are
+/// silently dropped.
+///
+/// See: Envoy `Filter::sendTrailers` (`source/extensions/filters/http/ext_proc/ext_proc.cc`)
+/// and `ProcessorState::isValidTrailersCallbackState` (`processor_state.cc`).
+pub(crate) fn acknowledge_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Vec<ProcessingResponse> {
+    let caps = pipeline.body_capabilities();
+    let (mode, needs_body) = if is_request {
+        (state.protocol_config.request_body_mode, caps.needs_request_body)
+    } else {
+        (state.protocol_config.response_body_mode, caps.needs_response_body)
+    };
+    let mut responses = Vec::new();
+    if mode == BodyMode::FullDuplexStreamed && !needs_body {
+        responses.extend(take_deferred_headers(state, is_request));
+    }
+    responses.push(if is_request {
+        response::request_trailers()
+    } else {
+        response::response_trailers()
+    });
+    responses
+}
+
+/// Take the `HeadersResponse` held back for the first body chunk, carrying the
+/// header phase's deferred mutations; `None` once it has been sent.
+fn take_deferred_headers(state: &mut StreamState, is_request: bool) -> Option<ProcessingResponse> {
+    if !state.header_state.take_first_chunk(is_request) {
+        return None;
+    }
+    Some(if is_request {
+        response::request_headers(state.deferred_request_header_mutation.take())
+    } else {
+        response::response_headers(state.deferred_response_header_mutation.take())
+    })
 }
 
 /// Process a single body chunk in `STREAMED` mode.
