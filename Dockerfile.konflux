@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+
+# Multi-stage build for praxis-extproc (Konflux).
+#
+# Kept in sync with Containerfile for the FIPS product build (builder + runtime).
+# ODH Konflux (.tekton/) builds Containerfile; red-hat-data-services mirrors this
+# file for downstream Konflux. When digests, CARGO_FEATURES, or the auditable
+# SBOM recipe change, update both Containerfile and this file (and the Makefile).
+#
+# Unlike Containerfile there is no report stage; make fips-check still uses
+# Containerfile --target report. Builder and runtime match Containerfile.
+
+ARG UBI9_DIGEST=sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:154811228435396156662801174566829a2c27d8a0b0f9af6e6d6e76ddf87ffe
+
+# Mirrors FIPS_FEATURES in the Makefile and Containerfile.
+ARG CARGO_FEATURES="responses"
+ARG CARGO_PROFILE=release
+ARG CARGO_ARGS="--ignore-rust-version"
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS builder
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        rust-toolset openssl-devel gcc gcc-c++ cmake make \
+    && dnf clean all
+
+ENV OPENSSL_NO_VENDOR=1 \
+    CARGO_HOME=/cargo
+
+ARG CARGO_AUDITABLE_VERSION=0.7.6
+RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
+    cargo install cargo-auditable --version "${CARGO_AUDITABLE_VERSION}" --locked
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY proto proto
+COPY src src
+COPY xtask xtask
+
+ARG CARGO_FEATURES
+ARG CARGO_PROFILE
+ARG CARGO_ARGS
+
+RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
+    --mount=type=cache,id=praxis-extproc-target,target=/src/target \
+    set -eu; \
+    case "${CARGO_PROFILE}" in \
+      release) \
+        cargo clean --release -p praxis-extproc; \
+        RUSTC_BOOTSTRAP=1 CARGO_BUILD_SBOM=true \
+          cargo auditable -Zsbom \
+            --config 'env.RUSTC_BOOTSTRAP.value="-1"' \
+            --config 'env.RUSTC_BOOTSTRAP.force=true' \
+            build --release --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/release/praxis-extproc ;; \
+      debug) \
+        cargo build --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/debug/praxis-extproc ;; \
+      *) echo "unsupported CARGO_PROFILE=${CARGO_PROFILE}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out; \
+    cp "${BIN}" /out/praxis-extproc
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/opendatahub-io/praxis-extproc" \
+    org.opencontainers.image.description="Envoy ExtProc server for Praxis filter pipelines (FIPS build on UBI 9)" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /out/praxis-extproc /usr/local/bin/praxis-extproc
+
+USER 1001
+
+EXPOSE 50051 50052 9090
+
+ENTRYPOINT ["praxis-extproc"]
+CMD ["-c", "/etc/praxis/extproc.yaml"]

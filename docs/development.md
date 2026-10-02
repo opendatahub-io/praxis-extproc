@@ -207,8 +207,11 @@ Cargo is invoked with `--ignore-rust-version` because
 Red Hat's toolset trails the declared rust-version.
 Builds for the host architecture. The runtime image
 runs as UID 1001 (OpenShift-friendly numeric non-root
-user). Konflux (`.tekton/`) builds the same file with
+user). ODH Konflux (`.tekton/`) builds `Containerfile` with
 its defaults, which are the FIPS feature set.
+`Dockerfile.konflux` matches that builder and runtime for
+downstream Konflux; keep it in sync when you change the
+product image recipe (see [FIPS](fips.md#midstream-vs-downstream-container-files)).
 
 ## CI
 

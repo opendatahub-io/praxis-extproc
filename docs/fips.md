@@ -25,8 +25,9 @@ goes into it. How the build is checked and how the tooling works is in
 The `Containerfile` builds the FIPS feature set by default, on
 `ubi9/ubi` with Red Hat's `rust-toolset` and OpenSSL, and ships on
 `ubi9/ubi-minimal`; both bases are pinned by digest and their Red Hat
-signatures are verified before every podman build here. Konflux builds the
-same file. There is no separate FIPS tag: the image is the FIPS build.
+signatures are verified before every podman build here. ODH Konflux builds
+`Containerfile`; downstream mirrors `Dockerfile.konflux` (see below). There
+is no separate FIPS tag: the image is the FIPS build.
 
 The FIPS build differs from a plain `cargo build` only in its cargo features.
 It leaves out what is known to carry pure-Rust cryptography, so nobody has to
@@ -42,6 +43,30 @@ know which features to pick:
 
 `FIPS_FEATURES` is defined once, in the Makefile; the `Containerfile`'s
 `CARGO_FEATURES` default mirrors it.
+
+### Midstream vs downstream container files
+
+Open Data Hub Konflux (`.tekton/`) builds [`Containerfile`](../Containerfile).
+That file has three stages: builder, an optional `report` stage used only by
+`make fips-check`, and runtime.
+
+[`Dockerfile.konflux`](../Dockerfile.konflux) is the same FIPS builder and
+runtime as `Containerfile`, kept in the tree so
+[red-hat-data-services/praxis-extproc](https://github.com/red-hat-data-services/praxis-extproc)
+can mirror it for downstream Konflux with a small diff. It has no `report`
+stage; compliance reports still use `make fips-check`, which builds
+`Containerfile --target report`.
+
+When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe,
+or runtime layout, update **both** files and the Makefile digest variables.
+`make fips-verify-image` checks that `Containerfile` and `Dockerfile.konflux`
+default-pin the same `ubi9/ubi` builder digest (the Konflux runtime uses
+`ubi-minimal-pqc` on `registry.redhat.io`, verified separately when you bump
+that pin). To build the Konflux file locally:
+
+```console
+podman build -f Dockerfile.konflux .
+```
 
 ## What the FIPS build leaves out, in detail
 

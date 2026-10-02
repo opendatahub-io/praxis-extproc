@@ -64,7 +64,7 @@ const GUARDS: &[Guard] = &[
         pattern: "OPENSSL_STATIC",
         why: "statically linked libcrypto defines OPENSSL_* symbols in the binary and fails the symbol scan",
         fix: "remove OPENSSL_STATIC from build files",
-        paths: &["Containerfile", "Makefile", ".github"],
+        paths: &["Containerfile", "Dockerfile.konflux", "Makefile", ".github"],
     },
 ];
 

@@ -33,8 +33,8 @@
 #     -v $(pwd)/examples/praxis-extproc.yaml:/etc/praxis/extproc.yaml \
 #     praxis-extproc:dev -c /etc/praxis/extproc.yaml
 
-ARG UBI9_DIGEST=sha256:a4b9ec09b1e790a53ef25b7777c539976abe519248264298e5194dcbceac8c31
-ARG UBI9_MINIMAL_DIGEST=sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+ARG UBI9_DIGEST=sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c
+ARG UBI9_MINIMAL_DIGEST=sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 # Mirrors FIPS_FEATURES in the Makefile.
 ARG CARGO_FEATURES="responses,aws-sigv4"
