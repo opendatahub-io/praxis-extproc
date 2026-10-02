@@ -228,6 +228,41 @@ compliance report from a build on UBI 9, the product
 image, its smoke run, and Red Hat's scanner with
 warnings fatal.
 
+
+
+## Extended e2e qualification tier
+
+Long-running scenarios from
+[proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
+(`ai`/`opendatahub-io` issue
+[#27](https://github.com/opendatahub-io/praxis-extproc/issues/27)).
+These stay out of default PR CI.
+
+```console
+make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay + TLS positive
+make test-e2e-extended    # cargo test --features k8s-e2e -- … extended --ignored
+```
+
+`e2e-setup-extended` runs `hack/generate-e2e-extended-tls-certs.sh` (requires
+`openssl` on `PATH`) and applies the positive TLS overlay via
+`hack/apply-e2e-extended-tls.sh positive`. That helper mounts scenario Secrets,
+rewrites Praxis `provided` TLS ConfigMaps, and patches the live
+`EnvoyFilter/praxis-extproc` clusters to `VERIFY_TRUST_CHAIN` + trusted CA +
+explicit SAN match (`hack/patch-e2e-extended-upstream-tls.py`). Generated PEMs
+under `deploy/overlays/e2e-extended/tls/**/certs/` are gitignored.
+
+Environment knobs:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUALIFICATION_IDLE_SECS` | `300` | Default idle wait when a matrix cell omits `idle_secs` |
+| `E2E_EXTENDED_PROFILE` | `maas_two_hop_fd_streamed` | Topology inventory selection |
+| `GATEWAY_URL` | (auto) | Same as baseline k8s-e2e |
+
+Artifacts land under `target/e2e-extended/report.json`. Release runs use
+`workflow_dispatch` on `.github/workflows/ci-k8s-e2e.yaml` with
+`run_extended=true` (job timeout 120 minutes).
+
 ## FIPS Tooling
 
 Local, reproducible checks that the image is on the

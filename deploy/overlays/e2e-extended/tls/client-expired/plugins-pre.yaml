@@ -1,0 +1,24 @@
+# Pre-IPP: BBR + body oracle, provided TLS with client CA (mTLS).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-pre-processing-plugins
+  namespace: istio-system
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      tls:
+        mode: provided
+        cert_path: /etc/praxis-tls/tls.crt
+        key_path: /etc/praxis-tls/tls.key
+        ca_cert_path: /etc/praxis-tls/ca.crt
+
+    filter_chains:
+      - name: bbr
+        filters:
+          - filter: model_to_header
+            header: X-Gateway-Model-Name
+          - filter: e2e_body_oracle
