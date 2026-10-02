@@ -278,12 +278,19 @@ build, and `fips-report` runs the report against
 2. **Binary**: links the system `libcrypto.so.3`
    dynamically, defines no symbol of a bundled crypto
    backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
-   `OPENSSL_`), imports OpenSSL, carries the
-   cargo-auditable manifest (`.dep-v0`, built from
-   cargo's SBOM precursor, listing no denied crate) and
-   the rustc producer string. A binary that is missing,
-   unreadable or not an ELF file is a finding, not a
-   skipped check.
+   `OPENSSL_`), imports its cryptography from the system
+   OpenSSL and imports only reviewed OpenSSL symbols —
+   every `name@OPENSSL_version` symbol it imports is on
+   the reviewed allowlist in
+   `xtask/assets/fips/openssl-nondeprecated-symbols.txt`
+   (every non-deprecated libcrypto/libssl export through
+   OpenSSL 3.5), so an unlisted or deprecated versioned
+   OpenSSL import, or a binary with no GNU symbol-version
+   table, is a finding — carries the cargo-auditable
+   manifest (`.dep-v0`, built from cargo's SBOM
+   precursor, listing no denied crate) and the rustc
+   producer string. A binary that is missing, unreadable
+   or not an ELF file is a finding, not a skipped check.
 3. **Source guards**: the application never enables a
    FIPS provider itself, never uses OpenSSL's legacy
    (non-provider) digest API, never vendors or

@@ -3,13 +3,22 @@
 
 //! Binary section of the report: the shipped binary must link the system
 //! libcrypto dynamically, define no symbol of a bundled crypto backend, import
-//! OpenSSL, and carry the cargo-auditable manifest and the rustc producer
-//! string. A binary that is not given, cannot be read or is not an ELF file is
-//! a finding too, so the report never passes a build it did not inspect.
+//! only OpenSSL symbols on the reviewed allowlist (each `name@OPENSSL_version`),
+//! and carry the cargo-auditable manifest and the rustc producer string. A
+//! binary that is not given, cannot be read or is not an ELF file is a finding
+//! too, so the report never passes a build it did not inspect.
 
-use std::{collections::BTreeMap, io::Read as _, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read as _,
+    path::Path,
+    process::Command,
+};
 
-use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
+use object::{
+    Endianness, Object as _, ObjectSection as _, ObjectSymbol as _,
+    read::elf::{ElfFile64, Sym as _, Version},
+};
 
 use super::{
     graph::DENIED,
@@ -41,6 +50,7 @@ fn assess(report: &mut Report, binary: Option<&Path>) -> Result<(), Finding> {
     linkage(report, binary);
     defined_symbols(report, &file);
     imports(report, &file);
+    openssl_imports(report, &data);
     manifest(report, &file, binary);
     producer(report, &file);
     Ok(())
@@ -238,6 +248,146 @@ fn imports(report: &mut Report, file: &object::File<'_>) {
 }
 
 // -----------------------------------------------------------------------------
+// OpenSSL Symbol Allowlist
+// -----------------------------------------------------------------------------
+
+/// The prefix every OpenSSL symbol version node shares; only imports bound to
+/// one of these nodes are the OpenSSL symbols the allowlist governs.
+const OPENSSL_VERSION_PREFIX: &[u8] = b"OPENSSL_";
+
+/// Every OpenSSL symbol the binary imports, as `name@OPENSSL_x.y.z`, must be on
+/// the reviewed allowlist, so a deprecated or not-yet-vetted call into
+/// libcrypto/libssl is caught before it ships. The allowlist carries the
+/// version, so a symbol is matched by name and version together: any
+/// non-deprecated export (through OpenSSL 3.5) is accepted, whatever version
+/// node it binds to.
+fn openssl_imports(report: &mut Report, data: &[u8]) {
+    let imported = match openssl_symbols(data) {
+        Ok(imported) => imported,
+        Err(reason) => {
+            report.fail(uninspectable_imports(&reason));
+            return;
+        },
+    };
+    let allowed = allowlist();
+    let unexpected = unexpected_imports(&imported, &allowed);
+    if unexpected.is_empty() {
+        report.ok(&format!(
+            "every one of the {} OpenSSL symbols imported is on the reviewed allowlist",
+            imported.len()
+        ));
+    } else {
+        report.fail(unexpected_openssl(&unexpected));
+    }
+}
+
+/// The undefined OpenSSL symbols the binary imports, each as
+/// `name@OPENSSL_x.y.z` from its base name and GNU version node.
+///
+/// Errors when the binary carries no GNU symbol version table: its imports
+/// would then be unversioned and slip past the allowlist unchecked, so the
+/// caller turns that into a finding rather than a silent pass.
+fn openssl_symbols(data: &[u8]) -> Result<BTreeSet<String>, String> {
+    let elf = ElfFile64::<Endianness>::parse(data).map_err(|err| err.to_string())?;
+    let endian = elf.endian();
+    let symbols = elf.elf_dynamic_symbol_table();
+    let versions = elf
+        .elf_section_table()
+        .versions(endian, data)
+        .map_err(|err| err.to_string())?
+        .ok_or("no GNU symbol version table (.gnu.version)")?;
+    let mut imported = BTreeSet::new();
+    for (index, symbol) in symbols.enumerate() {
+        if !symbol.is_undefined(endian) {
+            continue;
+        }
+        let version = versions
+            .version(versions.version_index(endian, index))
+            .map_err(|err| err.to_string())?;
+        let Some(version) = version
+            .map(Version::name)
+            .filter(|name| name.starts_with(OPENSSL_VERSION_PREFIX))
+        else {
+            continue;
+        };
+        let name = import_name(symbol.name(endian, symbols.strings()))?;
+        imported.insert(versioned_name(name, version));
+    }
+    Ok(imported)
+}
+
+/// `name@OPENSSL_x.y.z` for an OpenSSL import, the exact form the allowlist
+/// holds: the UTF-8 base name joined to its version-node name.
+fn versioned_name(name: &str, version: &[u8]) -> String {
+    format!("{name}@{}", String::from_utf8_lossy(version))
+}
+
+/// The UTF-8 name of an OpenSSL import from its raw string-table entry, or the
+/// reason it cannot be one. The allowlist holds valid UTF-8, so an OpenSSL
+/// import with an unreadable or non-UTF-8 name could never match it; failing
+/// here keeps such an import from slipping through unchecked.
+fn import_name(raw: Result<&[u8], object::read::Error>) -> Result<&str, String> {
+    let raw = raw.map_err(|err| format!("an OpenSSL import has an unreadable name: {err}"))?;
+    std::str::from_utf8(raw).map_err(|err| {
+        format!(
+            "an OpenSSL import has a non-UTF-8 name ({err}): {:?}",
+            String::from_utf8_lossy(raw)
+        )
+    })
+}
+
+/// The reviewed set of allowed `name@OPENSSL_x.y.z` symbols, from the
+/// compiled-in asset.
+fn allowlist() -> BTreeSet<&'static str> {
+    super::assets::OPENSSL_NONDEPRECATED_SYMBOLS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+/// The imported symbols that are not on the allowlist, sorted.
+fn unexpected_imports<'a>(imported: &'a BTreeSet<String>, allowed: &BTreeSet<&str>) -> Vec<&'a str> {
+    imported
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !allowed.contains(name))
+        .collect()
+}
+
+/// The finding for a binary importing an OpenSSL symbol nobody reviewed.
+fn unexpected_openssl(symbols: &[&str]) -> Finding {
+    Finding {
+        title: format!("imports OpenSSL symbols not on the allowlist: {}", symbols.join(" ")),
+        why: "the allowlist is every non-deprecated OpenSSL export through 3.5, as name@OPENSSL_version; a symbol \
+              outside it is a deprecated or otherwise non-standard call into libcrypto/libssl that has not been \
+              reviewed for this FIPS build"
+            .to_owned(),
+        location: "xtask/assets/fips/openssl-nondeprecated-symbols.txt holds the allowed symbols".to_owned(),
+        fix: "prefer a non-deprecated replacement; if the call is appropriate for the FIPS build, add its \
+              name@OPENSSL_version to xtask/assets/fips/openssl-nondeprecated-symbols.txt"
+            .to_owned(),
+    }
+}
+
+/// The finding for a binary whose OpenSSL imports the check cannot inspect: not
+/// a 64-bit ELF, no symbol version table, or an OpenSSL import with an
+/// unreadable or non-UTF-8 name.
+fn uninspectable_imports(reason: &str) -> Finding {
+    Finding {
+        title: format!("cannot inspect the binary's OpenSSL symbol imports ({reason})"),
+        why: "the allowlist check reads the version and UTF-8 name of every OpenSSL import to match it; a versioned \
+              OpenSSL import it cannot read would otherwise slip past the allowlist and ship unchecked"
+            .to_owned(),
+        location: "the ELF dynamic symbol table and GNU version sections (.gnu.version / .gnu.version_r)".to_owned(),
+        fix: "assess a 64-bit ELF built by 'make release-fips', dynamically linked against the system OpenSSL so its \
+              imports carry versions; the .gnu.version/.gnu.version_r sections are load-bearing for the dynamic linker \
+              and survive 'strip', so do not disable stripping to keep them"
+            .to_owned(),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Manifest and Producer
 // -----------------------------------------------------------------------------
 
@@ -397,6 +547,9 @@ fn producer(report: &mut Report, file: &object::File<'_>) {
 mod tests {
     use std::{io::Write as _, path::PathBuf};
 
+    #[cfg(target_os = "linux")]
+    use openssl::hash::{MessageDigest, hash};
+
     use super::*;
 
     /// zlib-compress a manifest the way cargo-auditable stores it.
@@ -478,6 +631,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_test_binary_itself_is_a_rust_elf_and_the_symbol_scan_sees_what_it_links() {
         let me = std::env::current_exe().expect("the test binary has a path");
@@ -491,5 +645,115 @@ mod tests {
         let mut report = Report::default();
         producer(&mut report, &file);
         assert!(!report.failed(), "a rustc-built binary carries the producer string");
+        let digest = hash(MessageDigest::sha256(), b"praxis").expect("the test host has a working libcrypto");
+        assert_eq!(
+            digest.len(),
+            32,
+            "the SHA-256 that pulls EVP_sha256 into this binary actually ran"
+        );
+        let imported = openssl_symbols(&data).expect("the version scan reads a real ELF");
+        assert!(
+            imported.contains("EVP_sha256@OPENSSL_3.0.0"),
+            "this test hashes through openssl::hash, so the binary imports EVP_sha256 and the scan must find that exact \
+             name@version: {imported:?}"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_parses_symbols_and_ignores_comments_and_blank_lines() {
+        let allowed = allowlist();
+        assert!(
+            allowed.contains("EVP_sha256@OPENSSL_3.0.0")
+                && allowed.contains("SSL_new@OPENSSL_3.0.0")
+                && allowed.contains("X509_free@OPENSSL_3.0.0"),
+            "known OpenSSL symbols are on the list, carrying their version node"
+        );
+        assert!(
+            !allowed.iter().any(|line| line.is_empty() || line.starts_with('#')),
+            "comments and blank lines are not entries: {allowed:?}"
+        );
+        assert_eq!(
+            allowed.len(),
+            5446,
+            "every reviewed allowlist entry is loaded; update this count when the allowlist changes"
+        );
+    }
+
+    #[test]
+    fn unexpected_imports_are_only_the_symbols_off_the_allowlist() {
+        let allowed = allowlist();
+        let imported = BTreeSet::from([
+            "EVP_sha256@OPENSSL_3.0.0".to_owned(),
+            "EVP_brandnew@OPENSSL_3.9.0".to_owned(),
+            "SSL_new@OPENSSL_3.0.0".to_owned(),
+        ]);
+        assert_eq!(
+            unexpected_imports(&imported, &allowed),
+            ["EVP_brandnew@OPENSSL_3.9.0"],
+            "only the name@version the allowlist does not cover is reported"
+        );
+        let clean = BTreeSet::from([
+            "EVP_sha256@OPENSSL_3.0.0".to_owned(),
+            "SSL_new@OPENSSL_3.0.0".to_owned(),
+        ]);
+        assert!(
+            unexpected_imports(&clean, &allowed).is_empty(),
+            "an all-allowed set has no unexpected imports"
+        );
+        let finding = unexpected_openssl(&["EVP_brandnew@OPENSSL_3.9.0"]);
+        assert!(
+            finding.title.contains("EVP_brandnew@OPENSSL_3.9.0"),
+            "the finding names the offending symbol: {}",
+            finding.title
+        );
+    }
+
+    #[test]
+    fn a_newer_non_deprecated_symbol_is_allowed_but_a_deprecated_one_is_not() {
+        let allowed = allowlist();
+        assert!(
+            allowed.contains("BN_are_coprime@OPENSSL_3.1.0"),
+            "a non-deprecated symbol introduced after 3.0 is on the list, so a newer OpenSSL version is accepted"
+        );
+        assert!(
+            !allowed.contains("DH_free@OPENSSL_3.0.0"),
+            "a deprecated symbol is excluded, so importing it is reported as unexpected"
+        );
+    }
+
+    #[test]
+    fn an_import_is_rendered_name_at_version() {
+        assert_eq!(
+            versioned_name("EVP_sha256", b"OPENSSL_3.0.0"),
+            "EVP_sha256@OPENSSL_3.0.0",
+            "an import is listed as name@version, the exact form the allowlist holds"
+        );
+    }
+
+    #[test]
+    fn a_binary_without_readable_symbol_versions_is_a_finding_not_a_pass() {
+        let mut header = [0_u8; 64];
+        header[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        let mut report = Report::default();
+        openssl_imports(&mut report, &header);
+        assert!(
+            report.has_finding("no GNU symbol version table"),
+            "an ELF without .gnu.version fails the report instead of passing zero imports"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_openssl_import_name_is_an_error_not_a_dropped_symbol() {
+        assert_eq!(
+            import_name(Ok(b"EVP_sha256")),
+            Ok("EVP_sha256"),
+            "a valid name reads back"
+        );
+        let bad = import_name(Ok(&[b'E', b'V', b'P', 0xFF, 0xFE]));
+        let reason = bad.expect_err("a non-UTF-8 name is rejected, not silently dropped");
+        assert!(
+            reason.contains("non-UTF-8 name"),
+            "the reason names the problem so it becomes a finding: {reason}"
+        );
     }
 }

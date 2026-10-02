@@ -29,3 +29,12 @@ pub(crate) const FIPS_PROVIDER_CNF: &str = include_str!("../../assets/fips/fips-
 /// string the module reports, with their CMVP status and sources;
 /// `host-check` grades the module a host or an image carries against it.
 pub(crate) const CERTIFIED_MODULES: &str = include_str!("../../assets/fips/certified-modules.json");
+
+/// The OpenSSL symbols the shipped binary may import from the system
+/// libcrypto/libssl, each as `name@OPENSSL_version`: every non-deprecated
+/// libcrypto/libssl export through OpenSSL 3.5, one per line (blank lines and
+/// `#` comments ignored). `binary` fails the report on any imported OpenSSL
+/// symbol not on this list, so an import of a deprecated or otherwise unlisted
+/// OpenSSL function is caught before it ships.
+pub(crate) const OPENSSL_NONDEPRECATED_SYMBOLS: &str =
+    include_str!("../../assets/fips/openssl-nondeprecated-symbols.txt");
