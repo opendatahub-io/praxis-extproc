@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-pre-processing
+spec:
+  template:
+    spec:
+      containers:
+        - name: payload-pre-processing
+          env:
+            - name: BODY_ORACLE_HOP_INDEX
+              value: "1"

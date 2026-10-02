@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e2e-extended-tls-positive
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/component: e2e-extended
+    e2e-extended.tls-scenario: positive
+data:
+  tls_negative_scenario: "positive"
+  note: "Cert material and EnvoyFilter TLS context land with Idle/TLS tranche."

@@ -1,0 +1,12 @@
+# Default qualification profile (How? for opendatahub-io/praxis-extproc#27).
+name: maas_two_hop_fd_streamed
+ext_proc_hops: 2
+ext_proc_modes:
+  request: FULL_DUPLEX_STREAMED
+  response: FULL_DUPLEX_STREAMED
+tls: tls
+idle_matrix:
+  - idle_secs: 300
+    pool_settings_ref: default_5min_keepalive
+  - pool_settings_ref: aggressive_idle
+    # idle_secs omitted → QUALIFICATION_IDLE_SECS (default 300)

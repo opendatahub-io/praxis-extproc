@@ -506,7 +506,6 @@ mod tests {
 
     use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tonic::transport::server::Connected as _;
 
     use super::*;
 

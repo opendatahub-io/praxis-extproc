@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: istio-system
+
+resources:
+  - workload/payload-pre-processing-plugins.yaml
+  - workload/payload-processing-plugins.yaml
+  - envoyfilter-ext-proc-guard.yaml
+  - envoyfilter-pre-oracle-response-headers.yaml
+  - access-log-reuse.yaml
+  - access-log-tls-negative.yaml
+
+# Idle-matrix pool EnvoyFilters are applied per cell by the qualification tests
+# (see idle_tls.rs + pool-configs/); do not install both here.
+#
+# BODY_ORACLE_HOP_INDEX is patched onto the already-deployed e2e Deployments by
+# `make e2e-setup-extended` (kustomize cannot reach sibling overlay Deployments).

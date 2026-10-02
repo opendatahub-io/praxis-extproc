@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: e2e-extended-tls-server-wrong-san
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/component: e2e-extended
+    e2e-extended.tls-scenario: server-wrong-san
+data:
+  tls_negative_scenario: "server-wrong-san"
+  note: "Cert material and EnvoyFilter TLS context land with Idle/TLS tranche."
