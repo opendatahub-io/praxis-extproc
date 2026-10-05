@@ -249,6 +249,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+
     #[cfg(feature = "responses-store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
@@ -508,6 +509,27 @@ filter_chains:
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 1, "pipeline should have one AI filter");
+    }
+
+    #[test]
+    fn build_pipeline_defaults_private_upstreams_closed() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert!(
+            !pipeline.allow_private_upstreams(),
+            "private upstreams must stay closed unless explicitly opted in"
+        );
     }
 
     #[test]
