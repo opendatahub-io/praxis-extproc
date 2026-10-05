@@ -46,6 +46,7 @@ pub(crate) async fn run_request_pipeline(
     phase: RequestPhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
+    end_of_stream: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         metrics::record_invalid_argument("missing_headers", "request");
@@ -78,6 +79,7 @@ pub(crate) async fn run_request_pipeline(
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.request_body_mode,
+        end_of_stream,
     ))
 }
 
@@ -99,6 +101,7 @@ pub(crate) async fn run_response_pipeline(
     phase: ResponsePhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
+    end_of_stream: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         metrics::record_invalid_argument("missing_headers", "request");
@@ -149,6 +152,7 @@ pub(crate) async fn run_response_pipeline(
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.response_body_mode,
+        end_of_stream,
     ))
 }
 
@@ -199,40 +203,47 @@ fn with_content_length(
 }
 
 /// Build request-phase responses, prepending `HeadersResponse` in FDS mode.
+///
+/// `end_of_stream` marks the emitted body chunk final. It is `true` on the normal
+/// body-EOS path and `false` when trailers close the body (the trailers message
+/// ends the stream, and the proto forbids `end_of_stream=true` on a body response
+/// whose request chunk was not itself final).
 fn build_request_for_phase(
     phase: RequestPhase,
     mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
         (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::request_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::request_body(body, None, mode, true));
+            r.extend(response::request_body(body, None, mode, end_of_stream));
             r
         },
-        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, true),
+        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, end_of_stream),
     }
 }
 
 /// Build response-phase responses, prepending `ResponseHeadersResponse` in FDS mode.
+///
+/// See [`build_request_for_phase`] for the meaning of `end_of_stream`.
 fn build_response_for_phase(
     phase: ResponsePhase,
     mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (ResponsePhase::Headers, _) => vec![response::response_headers(mutation)],
         (ResponsePhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::response_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::response_body(body, None, mode, true));
+            r.extend(response::response_body(body, None, mode, end_of_stream));
             r
         },
-        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, true),
+        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, end_of_stream),
     }
 }
 
@@ -265,19 +276,27 @@ pub(crate) fn passthrough_chunk(
         return body_responses;
     }
 
+    let mut responses = vec![deferred_header_response(state, is_request)];
+    responses.extend(body_responses);
+    responses
+}
+
+/// Build a `HeadersResponse` carrying the deferred header-phase mutation.
+///
+/// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
+/// flush a header mutation that was held back to ride out on a body message but
+/// has not yet gone out.
+pub(crate) fn deferred_header_response(state: &mut StreamState, is_request: bool) -> ProcessingResponse {
     let mutation = if is_request {
         state.deferred_request_header_mutation.take()
     } else {
         state.deferred_response_header_mutation.take()
     };
-    let hdr = if is_request {
+    if is_request {
         response::request_headers(mutation)
     } else {
         response::response_headers(mutation)
-    };
-    let mut responses = vec![hdr];
-    responses.extend(body_responses);
-    responses
+    }
 }
 
 /// Process a single body chunk in `STREAMED` mode.
@@ -809,7 +828,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state).await;
+            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true).await;
             assert!(result.is_err(), "missing request headers must be rejected");
         }
         let count = snapshot_counter(
@@ -833,7 +852,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
+            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true).await;
             assert!(result.is_err(), "missing response headers must be rejected");
         }
         let count = snapshot_counter(
@@ -1045,7 +1064,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let responses = {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            run_request_pipeline(RequestPhase::Body, &pipeline, &mut state)
+            run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
                 .await
                 .expect("a body reject must produce an immediate response, not an error")
         };
@@ -1075,7 +1094,7 @@ mod tests {
         state.response = Some(adapter::envoy_headers_to_response(&[]));
         state.response_body = b"payload".to_vec();
 
-        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state)
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state, true)
             .await
             .expect("a body reject must produce an immediate response, not an error");
         assert!(
@@ -1096,7 +1115,7 @@ mod tests {
 
         // Run the headers phase first so the filter is marked executed and its
         // context carries into the trailer-close flush.
-        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true)
             .await
             .expect("headers phase must succeed");
 
@@ -1119,7 +1138,7 @@ mod tests {
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
         // request_body left empty, as when trailers close a body with no bytes.
-        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state)
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
             .await
             .expect("an empty-body reject must produce an immediate response, not an error");
         assert!(
@@ -1138,7 +1157,7 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
         state.response = Some(adapter::envoy_headers_to_response(&[]));
         // response_body left empty.
-        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state)
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state, true)
             .await
             .expect("an empty-body reject must produce an immediate response, not an error");
         assert!(
@@ -1159,7 +1178,7 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
         state.response = Some(adapter::envoy_headers_to_response(&[]));
         // response_body left empty: the response is headers-only.
-        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true)
             .await
             .expect("a headers-only response must pass through, not error");
         assert!(
@@ -1226,7 +1245,7 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
         // Request phase stores state; it must persist into StreamState.
-        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true)
             .await
             .unwrap();
         assert!(
@@ -1240,7 +1259,7 @@ mod tests {
 
         // Response phase restores state; the probe surfaces what it observed.
         state.response = Some(adapter::envoy_headers_to_response(&[]));
-        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true)
             .await
             .unwrap();
         assert_eq!(

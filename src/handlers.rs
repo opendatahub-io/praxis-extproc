@@ -20,9 +20,9 @@ use tracing::{debug, warn};
 use crate::{
     adapter, metrics,
     pipeline::{
-        MutationDelivery, RequestPhase, ResponsePhase, direction_label, flush_streamed_body_filters, passthrough_chunk,
-        process_streamed_body_chunk, run_request_header_filters_early, run_request_pipeline,
-        run_response_header_filters_early, run_response_pipeline,
+        MutationDelivery, RequestPhase, ResponsePhase, deferred_header_response, direction_label,
+        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk, run_request_header_filters_early,
+        run_request_pipeline, run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
@@ -165,7 +165,7 @@ pub(crate) async fn handle_request_headers(
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
+        return run_request_pipeline(RequestPhase::Headers, pipeline, state, true).await;
     }
 
     match state.protocol_config.request_body_mode {
@@ -222,7 +222,7 @@ async fn accumulate_request_body(
         return Ok(Vec::new());
     }
 
-    run_request_pipeline(RequestPhase::Body, pipeline, state).await
+    run_request_pipeline(RequestPhase::Body, pipeline, state, true).await
 }
 
 // -----------------------------------------------------------------------------
@@ -261,7 +261,7 @@ pub(crate) async fn handle_response_headers(
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
+        return run_response_pipeline(ResponsePhase::Headers, pipeline, state, true).await;
     }
 
     match state.protocol_config.response_body_mode {
@@ -318,7 +318,7 @@ async fn accumulate_response_body(
         return Ok(Vec::new());
     }
 
-    run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+    run_response_pipeline(ResponsePhase::Body, pipeline, state, true).await
 }
 
 // -----------------------------------------------------------------------------
@@ -363,18 +363,39 @@ async fn finalize_body_on_trailers(
 
     match mode {
         BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
-        // A BUFFERED body that never arrived (empty) still needs its pipeline run,
-        // but there is no body message to carry header/body mutations; only an
-        // immediate (rejection) applies.
+        BodyMode::FullDuplexStreamed if needs_body => run_trailing_body_pipeline(pipeline, state, is_request).await,
+        BodyMode::FullDuplexStreamed => Ok(flush_deferred_fds_headers(state, is_request)),
         BodyMode::Buffered => {
-            let responses = if is_request {
-                run_request_pipeline(RequestPhase::Body, pipeline, state).await?
-            } else {
-                run_response_pipeline(ResponsePhase::Body, pipeline, state).await?
-            };
+            let responses = run_trailing_body_pipeline(pipeline, state, is_request).await?;
             Ok(rejection_only(responses, is_request))
         },
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Run the body pipeline for one direction when trailers close the body.
+///
+/// The emitted body chunk carries `end_of_stream=false`: the trailers message,
+/// not the chunk, ends the stream.
+async fn run_trailing_body_pipeline(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if is_request {
+        run_request_pipeline(RequestPhase::Body, pipeline, state, false).await
+    } else {
+        run_response_pipeline(ResponsePhase::Body, pipeline, state, false).await
+    }
+}
+
+/// Flush an FDS passthrough header mutation deferred at header time, if no body
+/// chunk has yet carried it out.
+fn flush_deferred_fds_headers(state: &mut StreamState, is_request: bool) -> Vec<ProcessingResponse> {
+    if state.header_state.take_first_chunk(is_request) {
+        vec![deferred_header_response(state, is_request)]
+    } else {
+        Vec::new()
     }
 }
 

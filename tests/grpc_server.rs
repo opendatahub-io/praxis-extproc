@@ -355,6 +355,191 @@ async fn buffered_response_body_closed_by_trailers_acks() {
 }
 
 #[tokio::test]
+async fn fds_request_body_closed_by_trailers_runs_pipeline() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // FULL_DUPLEX_STREAMED request body announced by headers(EOS=false). A body
+    // chunk arrives but is NOT marked end_of_stream; trailers close the body.
+    // The held headers response and the accumulated body must be flushed and the
+    // body pipeline must run, rather than only the trailers ack going out.
+    let mut headers = make_request_headers("POST", "/api", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"hello".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    assert!(
+        has_request_headers_response(&responses),
+        "trailers closing an FDS body must flush the deferred headers response, got: {responses:?}"
+    );
+
+    let streamed_chunks: Vec<_> = responses
+        .iter()
+        .filter_map(|r| match &r.response {
+            Some(RespVariant::RequestBody(b)) => b
+                .response
+                .as_ref()
+                .and_then(|c| c.body_mutation.as_ref())
+                .and_then(|m| m.mutation.as_ref()),
+            _ => None,
+        })
+        .filter_map(|m| match m {
+            body_mutation::Mutation::StreamedResponse(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let streamed_body: Vec<u8> = streamed_chunks.iter().flat_map(|s| s.body.clone()).collect();
+    assert_eq!(
+        streamed_body, b"hello",
+        "trailers closing an FDS body must flush the accumulated body as a streamed chunk"
+    );
+    assert!(
+        streamed_chunks.iter().all(|s| !s.end_of_stream),
+        "trailers close the stream, so the body chunk must carry end_of_stream=false"
+    );
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestTrailers(_)))),
+        "the trailers must still be acknowledged, got: {responses:?}"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "clean content should not be rejected"
+    );
+}
+
+#[tokio::test]
+async fn fds_request_body_closed_by_trailers_rejects_blocked_content() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    let mut headers = make_request_headers("POST", "/api", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"DROP TABLE users".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send body");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "guardrails must run on an FDS body closed by trailers and reject, got: {responses:?}"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestTrailers(_)))),
+        "no trailers ack should follow an immediate response, got: {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn fds_passthrough_request_trailers_flush_deferred_headers() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // FDS with a headers-only (no body access) pipeline defers the header
+    // mutation, expecting to ride it out on the first body chunk. If trailers
+    // arrive before any chunk, the parked mutation must still be flushed.
+    let mut headers = make_request_headers("GET", "/", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    let mutations = extract_all_set_headers(&responses);
+    assert!(
+        mutations.iter().any(|h| h.key == "x-test" && h.value == "extproc"),
+        "trailers before any FDS chunk must still flush the deferred X-Test mutation, got: {responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestTrailers(_)))),
+        "the trailers must still be acknowledged, got: {responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn body_with_headers_deferred_response() {
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
 
