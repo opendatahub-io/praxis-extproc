@@ -273,6 +273,7 @@ pub(crate) async fn handle_response_headers(
             run_response_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
+        _ if pipeline.body_capabilities().needs_response_body => Ok(vec![response::response_headers(None)]),
         _ => run_response_header_filters_early(pipeline, state, MutationDelivery::DeferWithResponse).await,
     }
 }
@@ -570,6 +571,127 @@ mod tests {
         ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
             Ok(Box::new(Self))
         }
+    }
+
+    /// Response filter that upgrades the response body mode dynamically in
+    /// `on_response` (as `ai_guardrails` does) and only mutates the body in
+    /// `on_response_body` when it observes that upgrade. If the two hooks run on
+    /// different contexts, the upgrade is lost and the mutation never fires.
+    struct ResponseBodyBufferProbe;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ResponseBodyBufferProbe {
+        fn name(&self) -> &'static str {
+            "response_body_buffer_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.set_response_body_mode(praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) });
+            Ok(FilterAction::Continue)
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn on_response_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<bytes::Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if end_of_stream && matches!(ctx.response_body_mode, praxis_filter::BodyMode::StreamBuffer { .. }) {
+                *body = Some(bytes::Bytes::from_static(b"REPLACED"));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl ResponseBodyBufferProbe {
+        /// Registry factory for the buffered response-body regression test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Regression: under BUFFERED, a response filter that sets its body mode in
+    /// `on_response` must still have `on_response_body` observe it. The response
+    /// pipeline must therefore defer to body EOS (like the request side) rather than
+    /// run `on_response` early on a throwaway header-time context.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test exercises the full buffered response handoff"
+    )]
+    #[tokio::test]
+    async fn buffered_response_body_filter_runs_at_body_eos_with_dynamic_mode() {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: response_body_buffer_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "response_body_buffer_probe",
+                praxis_filter::http_builtin(ResponseBodyBufferProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Response headers (not EOS): the pipeline must be deferred, not run early.
+        handle_response_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !state.header_state.response_filters_executed,
+            "a body-dependent buffered response pipeline must defer to body EOS, not run filters at header time"
+        );
+
+        // Buffered body (EOS): on_response upgrades the mode and on_response_body,
+        // sharing the same context, replaces the body.
+        let body_responses = handle_response_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"original-upstream-body".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        let replaced = body_responses.iter().any(|r| {
+            matches!(
+                r.response.as_ref(),
+                Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseBody(b))
+                    if b.response.as_ref().and_then(|c| c.body_mutation.as_ref()).is_some_and(|m| matches!(
+                        &m.mutation,
+                        Some(praxis_proto::envoy::service::ext_proc::v3::body_mutation::Mutation::Body(bytes))
+                            if bytes.as_slice() == b"REPLACED"
+                    ))
+            )
+        });
+        assert!(
+            replaced,
+            "buffered response body filter must apply its mutation; the StreamBuffer upgrade was dropped: {body_responses:?}"
+        );
     }
 
     #[expect(
