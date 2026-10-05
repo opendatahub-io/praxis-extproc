@@ -118,6 +118,11 @@ spec:
           condition: available
           timeout: "120s"
         - type: wait
+          resource: deployment/nemo-mock
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: gateway/e2e-gateway
           namespace: istio-system
           condition: Programmed
