@@ -339,8 +339,10 @@ async fn perform_handshake(
 /// specifically because — unlike `mozilla_intermediate_v5` — it never sets
 /// finite-field DH params, so the binary does not import the OpenSSL 3.0
 /// deprecated `PEM_read_bio_DHparams`/`DH_free`, which are outside the FIPS
-/// symbol surface. TLS 1.2 is re-enabled with ECDHE suites (no `DHE-RSA-*`); the
-/// TLS 1.3 ciphersuites and default ECDH groups come from `mozilla_modern_v5`.
+/// symbol surface. TLS 1.2 is re-enabled with ECDHE suites (no `DHE-RSA-*`) and the
+/// TLS 1.3 ciphersuites come from `mozilla_modern_v5`. Only TLS 1.2 is held to ECDHE:
+/// groups stay at OpenSSL's defaults (crypto-policies on RHEL), which still allow
+/// FFDHE in TLS 1.3.
 fn ecdhe_acceptor() -> crate::error::Result<SslAcceptorBuilder> {
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls()).map_err(|e| cfg_err("SSL context", e))?;
     builder
