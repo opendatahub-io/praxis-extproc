@@ -540,6 +540,56 @@ async fn fds_passthrough_request_trailers_flush_deferred_headers() {
 }
 
 #[tokio::test]
+async fn fds_request_trailers_without_body_chunk_sends_no_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // FDS with a body-reading pipeline, headers(EOS=false), then trailers close the
+    // body with no body chunk ever arriving. The pipeline must still run (headers
+    // response, ack), but no empty body message should be emitted.
+    let mut headers = make_request_headers("POST", "/api", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    assert!(
+        has_request_headers_response(&responses),
+        "a trailer-only FDS request must still flush the headers response, got: {responses:?}"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestBody(_)))),
+        "no body chunk arrived, so no body message should be emitted, got: {responses:?}"
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestTrailers(_)))),
+        "the trailers must still be acknowledged, got: {responses:?}"
+    );
+}
+
+#[tokio::test]
 async fn body_with_headers_deferred_response() {
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
 

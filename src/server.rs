@@ -455,6 +455,10 @@ impl std::ops::DerefMut for HydratedContext<'_> {
 
 /// Per-stream state accumulated across ExtProc phases.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-stream flags, not a state machine"
+)]
 pub(crate) struct StreamState {
     /// Filter-context state carried across phase boundaries.
     ///
@@ -468,11 +472,17 @@ pub(crate) struct StreamState {
     /// Accumulated request body bytes.
     pub(crate) request_body: Vec<u8>,
 
+    /// Whether at least one request body message has been received.
+    pub(crate) request_body_chunk_seen: bool,
+
     /// Converted response from the response headers phase.
     pub(crate) response: Option<Response>,
 
     /// Accumulated response body bytes.
     pub(crate) response_body: Vec<u8>,
+
+    /// Whether at least one response body message has been received.
+    pub(crate) response_body_chunk_seen: bool,
 
     /// Header delivery tracking across phases.
     pub(crate) header_state: HeaderDeliveryState,
@@ -509,8 +519,10 @@ impl Default for StreamState {
             carried_context: Some(CarriedContext::default()),
             request: None,
             request_body: Vec::new(),
+            request_body_chunk_seen: false,
             response: None,
             response_body: Vec::new(),
+            response_body_chunk_seen: false,
             header_state: HeaderDeliveryState::default(),
             eos_tracker: EosTracker::default(),
             protocol_config: ProtocolConfig::default(),
@@ -533,6 +545,24 @@ impl StreamState {
         Self {
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
+        }
+    }
+
+    /// Record that a body message was received for a direction.
+    pub(crate) fn mark_body_chunk_seen(&mut self, is_request: bool) {
+        if is_request {
+            self.request_body_chunk_seen = true;
+        } else {
+            self.response_body_chunk_seen = true;
+        }
+    }
+
+    /// Whether any body message has been received for a direction.
+    pub(crate) fn body_chunk_seen(&self, is_request: bool) -> bool {
+        if is_request {
+            self.request_body_chunk_seen
+        } else {
+            self.response_body_chunk_seen
         }
     }
 
