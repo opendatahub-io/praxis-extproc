@@ -74,8 +74,11 @@ jobs:
         if: failure()
         run: |
           kubectl --context kind-praxis-e2e get pods -A
-          kubectl --context kind-praxis-e2e describe pods -n praxis-extproc
-          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100
+          kubectl --context kind-praxis-e2e describe pods -n istio-system
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-processing --tail=100
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-pre-processing --tail=100
           kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30
 
       - name: Teardown

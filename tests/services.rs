@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Red Hat, Inc.
 
 //! Tests for the health and metrics auxiliary services.
+//!
+//! Metrics authentication (`TokenReview` + SAR) requires a live
+//! Kubernetes API server and is covered by k8s-e2e tests instead.
+//! Tests here run with `metrics_auth.enabled: false`.
 
 #![allow(
     clippy::tests_outside_test_module,
@@ -24,8 +28,15 @@
 
 use std::time::Duration;
 
+use praxis_extproc::config::MetricsAuthConfig;
+
+/// Auth-disabled config for tests running outside Kubernetes.
+fn auth_disabled() -> MetricsAuthConfig {
+    MetricsAuthConfig { enabled: false }
+}
+
 // -----------------------------------------------------------------------------
-// Tests
+// Health Server
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -216,16 +227,23 @@ async fn health_reports_fips_service_status() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Metrics Server (auth disabled)
+// -----------------------------------------------------------------------------
+
 #[tokio::test]
 async fn metrics_server_starts_and_stops() {
     let addr = next_addr();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let handle =
-        tokio::spawn(async move { praxis_extproc::metrics::serve(addr, async { drop(shutdown_rx.await) }).await });
+    let auth = auth_disabled();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addr, &auth, ready_tx, async { drop(shutdown_rx.await) }).await
+    });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    ready_rx.await.expect("metrics server should start");
 
     drop(shutdown_tx);
 
@@ -242,12 +260,16 @@ async fn metrics_endpoint_returns_prometheus_format() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(async move { praxis_extproc::metrics::serve(addr, async { drop(shutdown_rx.await) }).await });
+    let auth = auth_disabled();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addr, &auth, ready_tx, async { drop(shutdown_rx.await) }).await
+    });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    ready_rx.await.expect("metrics server should start");
 
     let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/"))
+        .get(format!("http://{addr}/metrics"))
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -261,6 +283,52 @@ async fn metrics_record_functions_do_not_panic() {
     praxis_extproc::metrics::register();
     praxis_extproc::metrics::record_request(0.5);
     praxis_extproc::metrics::record_immediate_response();
+}
+
+#[tokio::test]
+async fn metrics_healthz_returns_200() {
+    let addr = next_addr();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let auth = auth_disabled();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addr, &auth, ready_tx, async { drop(shutdown_rx.await) }).await
+    });
+
+    ready_rx.await.expect("metrics server should start");
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/healthz"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status(), 200, "healthz should return 200");
+}
+
+#[tokio::test]
+async fn metrics_unknown_path_returns_404() {
+    let addr = next_addr();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let auth = auth_disabled();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addr, &auth, ready_tx, async { drop(shutdown_rx.await) }).await
+    });
+
+    ready_rx.await.expect("metrics server should start");
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/foobar"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status(), 404, "unknown path should return 404");
 }
 
 // -----------------------------------------------------------------------------

@@ -13,7 +13,8 @@ spec:
         app: payload-pre-processing
     spec:
       terminationGracePeriodSeconds: 30
-      automountServiceAccountToken: false
+      serviceAccountName: payload-processing
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
       containers:

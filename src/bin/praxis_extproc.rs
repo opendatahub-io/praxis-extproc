@@ -79,12 +79,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        if let Some(reason) = fips_refusal(&fips, &registry) {
-            return Err(reason.into());
-        }
-        pipeline?;
-        info!("configuration is valid");
-        return Ok(());
+        return validate_config(&fips, &registry, pipeline);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
@@ -94,7 +89,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // inspectable (health NotServing) but serves no traffic.
     if let Some(reason) = fips_refusal(&fips, &registry) {
         error!(error = %reason, "refusing to serve");
-        return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
+        return Box::pin(serve_unready(
+            addrs,
+            praxis_extproc::fips::active(&fips),
+            cfg.server.metrics_auth.clone(),
+        ))
+        .await;
     }
 
     Box::pin(serve_pipeline(
@@ -105,6 +105,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+/// Validate FIPS readiness and the configured filter pipeline, then exit.
+fn validate_config(
+    fips: &praxis_extproc::fips::Status,
+    registry: &praxis_filter::FilterRegistry,
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(reason) = fips_refusal(fips, registry) {
+        return Err(reason.into());
+    }
+    pipeline?;
+    info!("configuration is valid");
+    Ok(())
 }
 
 /// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
@@ -140,7 +154,7 @@ async fn serve_pipeline(
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
-            Box::pin(serve_unready(addrs, fips_active)).await
+            Box::pin(serve_unready(addrs, fips_active, server_cfg.metrics_auth.clone())).await
         },
     }
 }
@@ -153,9 +167,13 @@ async fn start_services(
     max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        true,
+        fips_active,
+        server_cfg.metrics_auth.clone(),
+        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx),
+    ))
     .await
 }
 
@@ -165,11 +183,18 @@ async fn start_services(
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, fips_active, |drain_rx| async move {
-        wait_drain(drain_rx).await;
-        Ok(())
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        false,
+        fips_active,
+        metrics_auth,
+        |drain_rx| async move {
+            wait_drain(drain_rx).await;
+            Ok(())
+        },
+    ))
     .await
 }
 
@@ -194,10 +219,15 @@ enum Selected {
 /// sidecar's bind failure) is returned as the originating error.
 ///
 /// [`watch::Receiver`]: tokio::sync::watch::Receiver
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential sidecar supervision; extraction would split related logic"
+)]
 async fn run_with_sidecars<F, Fut>(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     serving: bool,
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
     foreground: F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -214,8 +244,14 @@ where
     });
 
     let metrics_rx = shutdown_tx.subscribe();
-    let mut metrics =
-        tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
+    let (metrics_ready_tx, metrics_ready_rx) = tokio::sync::oneshot::channel();
+    let mut metrics = tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addrs.2, &metrics_auth, metrics_ready_tx, wait_broadcast(metrics_rx)).await
+    });
+
+    if metrics_ready_rx.await.is_err() {
+        return task_outcome(metrics.await);
+    }
 
     let foreground = foreground(drain_rx);
     tokio::pin!(foreground);
