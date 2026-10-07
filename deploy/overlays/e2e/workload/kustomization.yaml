@@ -5,6 +5,7 @@ namespace: istio-system
 
 resources:
   - ../../../base
+  - metrics-auth-rbac.yaml
   - pre-processing-configmap.yaml
   - pre-processing-deployment.yaml
   - pre-processing-service.yaml
