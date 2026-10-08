@@ -1,0 +1,31 @@
+# Qualification body oracle publishes digests from on_response. Baseline e2e
+# EnvoyFilter keeps pre-IPP response_header_mode: SKIP; flip to SEND so hop-1
+# headers reach the client (How? for #27 — two-hop oracle).
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: e2e-extended-pre-oracle-response-headers
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/component: e2e-extended
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: e2e-gateway
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.ext_proc.ipp-pre
+      patch:
+        operation: MERGE
+        value:
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+            processing_mode:
+              response_header_mode: SEND
