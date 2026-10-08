@@ -15,14 +15,14 @@ use praxis_proto::envoy::service::{
     ext_proc::v3::{ProcessingResponse, processing_request},
 };
 use tonic::Status;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     adapter, metrics,
     pipeline::{
-        MutationDelivery, RequestPhase, ResponsePhase, direction_label, flush_streamed_body_filters, passthrough_chunk,
-        process_streamed_body_chunk, run_request_header_filters_early, run_request_pipeline,
-        run_response_header_filters_early, run_response_pipeline,
+        MutationDelivery, RequestPhase, ResponsePhase, deferred_header_response, direction_label,
+        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk, run_request_header_filters_early,
+        run_request_pipeline, run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
@@ -165,7 +165,7 @@ pub(crate) async fn handle_request_headers(
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
+        return run_request_pipeline(RequestPhase::Headers, pipeline, state, true).await;
     }
 
     match state.protocol_config.request_body_mode {
@@ -188,6 +188,7 @@ pub(crate) async fn handle_request_body(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let mode = state.protocol_config.request_body_mode;
+    state.mark_body_chunk_seen(true);
 
     if let Some(response) = handle_body_redelivery(
         state
@@ -222,7 +223,7 @@ async fn accumulate_request_body(
         return Ok(Vec::new());
     }
 
-    run_request_pipeline(RequestPhase::Body, pipeline, state).await
+    run_request_pipeline(RequestPhase::Body, pipeline, state, true).await
 }
 
 // -----------------------------------------------------------------------------
@@ -261,7 +262,7 @@ pub(crate) async fn handle_response_headers(
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
+        return run_response_pipeline(ResponsePhase::Headers, pipeline, state, true).await;
     }
 
     match state.protocol_config.response_body_mode {
@@ -284,6 +285,7 @@ pub(crate) async fn handle_response_body(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let mode = state.protocol_config.response_body_mode;
+    state.mark_body_chunk_seen(false);
 
     if let Some(response) = handle_body_redelivery(
         state
@@ -318,7 +320,7 @@ async fn accumulate_response_body(
         return Ok(Vec::new());
     }
 
-    run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+    run_response_pipeline(ResponsePhase::Body, pipeline, state, true).await
 }
 
 // -----------------------------------------------------------------------------
@@ -363,18 +365,67 @@ async fn finalize_body_on_trailers(
 
     match mode {
         BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
-        // A BUFFERED body that never arrived (empty) still needs its pipeline run,
-        // but there is no body message to carry header/body mutations; only an
-        // immediate (rejection) applies.
+        BodyMode::FullDuplexStreamed if needs_body => run_trailing_fds_body(pipeline, state, is_request).await,
+        BodyMode::FullDuplexStreamed => Ok(flush_deferred_fds_headers(state, is_request)),
         BodyMode::Buffered => {
-            let responses = if is_request {
-                run_request_pipeline(RequestPhase::Body, pipeline, state).await?
-            } else {
-                run_response_pipeline(ResponsePhase::Body, pipeline, state).await?
-            };
+            let responses = run_trailing_body_pipeline(pipeline, state, is_request).await?;
             Ok(rejection_only(responses, is_request))
         },
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Run the FDS body pipeline when trailers close the body.
+///
+/// Emits the deferred headers response and the accumulated body as a streamed
+/// chunk. A trailer-only body (no chunk arrived and filters produced no bytes)
+/// has nothing to stream, so the empty body message is dropped to avoid a
+/// spurious chunk and only the headers response is sent.
+async fn run_trailing_fds_body(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let chunk_seen = state.body_chunk_seen(is_request);
+    let responses = run_trailing_body_pipeline(pipeline, state, is_request).await?;
+    let produced_body = if is_request {
+        !state.request_body.is_empty()
+    } else {
+        !state.response_body.is_empty()
+    };
+    if chunk_seen || produced_body {
+        return Ok(responses);
+    }
+    trace!(
+        direction = direction_label(is_request),
+        "trailers closed an FDS body with no body message received; emitting headers only"
+    );
+    Ok(responses.into_iter().filter(|r| !response::is_body(r)).collect())
+}
+
+/// Run the body pipeline for one direction when trailers close the body.
+///
+/// The emitted body chunk carries `end_of_stream=false`: the trailers message,
+/// not the chunk, ends the stream.
+async fn run_trailing_body_pipeline(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if is_request {
+        run_request_pipeline(RequestPhase::Body, pipeline, state, false).await
+    } else {
+        run_response_pipeline(ResponsePhase::Body, pipeline, state, false).await
+    }
+}
+
+/// Flush an FDS passthrough header mutation deferred at header time, if no body
+/// chunk has yet carried it out.
+fn flush_deferred_fds_headers(state: &mut StreamState, is_request: bool) -> Vec<ProcessingResponse> {
+    if state.header_state.take_first_chunk(is_request) {
+        vec![deferred_header_response(state, is_request)]
+    } else {
+        Vec::new()
     }
 }
 
@@ -572,6 +623,54 @@ mod tests {
         }
     }
 
+    /// A response filter that reads the response body (so the pipeline reports
+    /// `needs_response_body`) and sets a header in `on_response`.
+    struct ResponseBodyProbeFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ResponseBodyProbeFilter {
+        fn name(&self) -> &'static str {
+            "response_body_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if let Some(response) = ctx.response_header.as_mut() {
+                response.headers.insert("x-response-probe", "sent".parse().unwrap());
+            }
+            Ok(FilterAction::Continue)
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadOnly
+        }
+
+        fn on_response_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            _: &mut Option<bytes::Bytes>,
+            _: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl ResponseBodyProbeFilter {
+        /// Registry factory for the FDS response-trailers test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "protocol regression test deliberately exercises the complete handoff"
@@ -664,6 +763,102 @@ mod tests {
                         .as_ref()
                         .is_some_and(|header| header.key == "x-response-probe"))))
         ));
+    }
+
+    #[expect(clippy::too_many_lines, reason = "end-to-end response-side trailers regression test")]
+    #[tokio::test]
+    async fn fds_response_body_closed_by_trailers_streams_body_and_acks() {
+        use praxis_proto::envoy::service::ext_proc::v3::{body_mutation, processing_response::Response as R};
+
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: response_body_probe\n")
+                .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "response_body_probe",
+                praxis_filter::http_builtin(ResponseBodyProbeFilter::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // FDS response headers (EOS=false) with a body-reading filter: everything is
+        // deferred to the body phase, so nothing goes out yet.
+        let deferred = handle_response_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            deferred.is_empty(),
+            "FDS response headers with a body filter must defer"
+        );
+
+        // A body chunk arrives but is not end_of_stream; it accumulates silently.
+        let chunk = handle_response_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"hi".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            chunk.is_empty(),
+            "a non-final FDS body chunk accumulates without a response"
+        );
+
+        // Trailers close the body: flush headers + streamed body (eos=false) + ack.
+        let responses = handle_trailers(&pipeline, &mut state, false).await.unwrap();
+
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(&r.response, Some(R::ResponseHeaders(h))
+                if h.response.as_ref().is_some_and(|c| c.header_mutation.as_ref().is_some_and(|m| m
+                    .set_headers
+                    .iter()
+                    .any(|sh| sh.header.as_ref().is_some_and(|hv| hv.key == "x-response-probe")))))),
+            "the deferred response headers response with the filter mutation must be flushed: {responses:?}"
+        );
+        let streamed: Vec<_> = responses
+            .iter()
+            .filter_map(|r| match &r.response {
+                Some(R::ResponseBody(b)) => b
+                    .response
+                    .as_ref()
+                    .and_then(|c| c.body_mutation.as_ref())
+                    .and_then(|m| m.mutation.as_ref()),
+                _ => None,
+            })
+            .filter_map(|m| match m {
+                body_mutation::Mutation::StreamedResponse(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            streamed.len(),
+            1,
+            "exactly one streamed body chunk expected: {responses:?}"
+        );
+        assert!(
+            streamed.iter().all(|s| s.body == b"hi" && !s.end_of_stream),
+            "the accumulated body must stream once with end_of_stream=false: {responses:?}"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(&r.response, Some(R::ResponseTrailers(_)))),
+            "the trailers must still be acknowledged: {responses:?}"
+        );
     }
 
     #[test]

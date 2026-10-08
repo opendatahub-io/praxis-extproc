@@ -192,6 +192,16 @@ pub(crate) fn is_immediate(resp: &ProcessingResponse) -> bool {
     matches!(resp.response, Some(Response::ImmediateResponse(_)))
 }
 
+/// Whether a [`ProcessingResponse`] is a request or response body message.
+///
+/// [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
+pub(crate) fn is_body(resp: &ProcessingResponse) -> bool {
+    matches!(
+        resp.response,
+        Some(Response::RequestBody(_) | Response::ResponseBody(_))
+    )
+}
+
 // -----------------------------------------------------------------------------
 // Body Chunking
 // -----------------------------------------------------------------------------

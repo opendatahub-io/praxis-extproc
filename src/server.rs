@@ -357,6 +357,32 @@ impl HeaderDeliveryState {
     }
 }
 
+/// Tracks whether a body message has been received, per direction.
+#[derive(Debug, Default)]
+pub(crate) struct BodyReceiptTracker {
+    /// Whether a request body message has been received.
+    request: bool,
+
+    /// Whether a response body message has been received.
+    response: bool,
+}
+
+impl BodyReceiptTracker {
+    /// Record that a body message was received for a direction.
+    pub(crate) fn mark_seen(&mut self, is_request: bool) {
+        if is_request {
+            self.request = true;
+        } else {
+            self.response = true;
+        }
+    }
+
+    /// Whether a body message has been received for a direction.
+    pub(crate) fn seen(&self, is_request: bool) -> bool {
+        if is_request { self.request } else { self.response }
+    }
+}
+
 /// Cross-phase filter-context state parked between ExtProc phases.
 ///
 /// A fresh [`HttpFilterContext`] is built per phase, so these fields cross the
@@ -474,6 +500,9 @@ pub(crate) struct StreamState {
     /// Accumulated response body bytes.
     pub(crate) response_body: Vec<u8>,
 
+    /// Whether a body message has been received, per direction.
+    pub(crate) body_receipt: BodyReceiptTracker,
+
     /// Header delivery tracking across phases.
     pub(crate) header_state: HeaderDeliveryState,
 
@@ -511,6 +540,7 @@ impl Default for StreamState {
             request_body: Vec::new(),
             response: None,
             response_body: Vec::new(),
+            body_receipt: BodyReceiptTracker::default(),
             header_state: HeaderDeliveryState::default(),
             eos_tracker: EosTracker::default(),
             protocol_config: ProtocolConfig::default(),
@@ -534,6 +564,16 @@ impl StreamState {
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
         }
+    }
+
+    /// Record that a body message was received for a direction.
+    pub(crate) fn mark_body_chunk_seen(&mut self, is_request: bool) {
+        self.body_receipt.mark_seen(is_request);
+    }
+
+    /// Whether any body message has been received for a direction.
+    pub(crate) fn body_chunk_seen(&self, is_request: bool) -> bool {
+        self.body_receipt.seen(is_request)
     }
 
     /// Whether a direction's body phase is still open — headers were received but
