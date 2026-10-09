@@ -5,4 +5,5 @@ resources:
   - gateway.yaml
   - envoyfilter.yaml
   - internal-model.yaml
+  - nemo-mock.yaml
   - local-reply-policy.yaml

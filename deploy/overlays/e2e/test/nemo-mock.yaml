@@ -1,0 +1,148 @@
+# Mock NeMo Guardrails service for the ai_guardrails e2e tests.
+#
+# The ai_guardrails filter POSTs to this service at /v1/checks (one call per
+# target message) and maps the JSON verdict onto an action. This WireMock stub
+# is content-keyword driven so a single service drives every case and leaves
+# all other e2e traffic undisturbed:
+#
+#   * default                                 -> {"status":"passed"}      (pass)
+#   * rail_types=input  + __GUARD_BLOCK_IN__  -> {"status":"blocked"}     (403 at request)
+#   * rail_types=output + __GUARD_BLOCK_OUT__ -> {"status":"blocked"}     (200 + error body at response)
+#   * rail_types=output + __GUARD_FAIL_OUT__  -> HTTP 500                 (fail-closed at response)
+#
+# Keying the block/fail stubs on rail_types (not just the token) lets a token
+# that the echo backend reflects into its answer pass the request phase and only
+# trip on the response phase.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemo-mock-mappings
+  namespace: llm
+data:
+  default-pass.json: |
+    {
+      "priority": 10,
+      "request": { "method": "POST", "urlPath": "/v1/checks" },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "passed", "content": "" }
+      }
+    }
+  block-input.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_BLOCK_IN__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "input" } }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "blocked", "content": "", "rail": "pii-input-guard" }
+      }
+    }
+  block-output.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_BLOCK_OUT__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "output" } }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "blocked", "content": "", "rail": "toxicity-output-guard" }
+      }
+    }
+  fail-output.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_FAIL_OUT__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "output" } }
+        ]
+      },
+      "response": {
+        "status": 500,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "error": "simulated nemo outage" }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nemo-mock
+  namespace: llm
+  labels:
+    app: nemo-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nemo-mock
+  template:
+    metadata:
+      labels:
+        app: nemo-mock
+    spec:
+      containers:
+        - name: wiremock
+          image: wiremock/wiremock:3.9.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port
+            - "8080"
+            - --no-request-journal
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          volumeMounts:
+            - name: mappings
+              mountPath: /home/wiremock/mappings
+          readinessProbe:
+            httpGet:
+              path: /__admin/mappings
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /__admin/mappings
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: mappings
+          configMap:
+            name: nemo-mock-mappings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nemo-mock
+  namespace: llm
+  labels:
+    app: nemo-mock
+spec:
+  selector:
+    app: nemo-mock
+  ports:
+    - port: 8080
+      targetPort: 8080

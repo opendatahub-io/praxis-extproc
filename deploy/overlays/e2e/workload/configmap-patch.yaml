@@ -15,10 +15,28 @@ data:
       tls:
         mode: self_signed
 
+    # The ai_guardrails callout dials the in-cluster mock NeMo service, whose
+    # ClusterIP is a private address; opt in so the runtime SSRF guard permits it.
+    insecure_options:
+      allow_private_upstreams: true
+
+    # Pure OpenAI Chat Completions chain. ai_guardrails is OpenAI-only and its
+    # response phase is global (not path-scopable), so it cannot share a chain
+    # with the bidirectional anthropic_messages_to_chat_completions converter;
+    # testing the converter alongside guardrails needs a separate ext-proc lane.
     filter_chains:
       - name: ai-filters
         filters:
-          - filter: anthropic_messages_to_chat_completions
+          # Request + response phases both evaluate against the mock NeMo service;
+          # a "passed" verdict forwards traffic unchanged, so the rest of the
+          # e2e suite is undisturbed.
+          - filter: ai_guardrails
+            provider:
+              type: nemo
+              endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
+            phase:
+              request: true
+              response: true
           - filter: json_body
             request_extract:
               - pointer: /model

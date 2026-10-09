@@ -44,4 +44,5 @@ mod completions;
 mod direct;
 mod errors;
 mod filters;
+mod guardrails;
 mod routing;
