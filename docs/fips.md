@@ -50,15 +50,18 @@ Open Data Hub Konflux (`.tekton/`) builds [`Containerfile`](../Containerfile).
 That file has three stages: builder, an optional `report` stage used only by
 `make fips-check`, and runtime.
 
-[`Dockerfile.konflux`](../Dockerfile.konflux) is the same FIPS builder and
-runtime as `Containerfile`, kept in the tree so
+[`Dockerfile.konflux`](../Dockerfile.konflux) matches `Containerfile` for digests,
+`CARGO_FEATURES`, and runtime layout, kept in the tree so
 [red-hat-data-services/praxis-extproc](https://github.com/red-hat-data-services/praxis-extproc)
-can mirror it for downstream Konflux with a small diff. It has no `report`
-stage; compliance reports still use `make fips-check`, which builds
-`Containerfile --target report`.
+can mirror it for downstream Konflux. Release builds use plain `cargo` (no
+`cargo-auditable`) so hermetic Konflux does not fetch the tool from crates.io;
+embed the crate manifest via `Containerfile` or `make release-fips` when you need
+check-payload evidence. It has no `report` stage; compliance reports still use
+`make fips-check`, which builds `Containerfile --target report`.
 
-When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe,
-or runtime layout, update **both** files and the Makefile digest variables.
+When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe
+in `Containerfile`, or runtime layout, update `Containerfile`, `Dockerfile.konflux`
+(where applicable), and the Makefile digest variables.
 `make fips-verify-image` checks that `Containerfile` and `Dockerfile.konflux`
 default-pin the same `ubi9/ubi` builder digest (the Konflux runtime uses
 `ubi-minimal-pqc` on `registry.redhat.io`, verified separately when you bump
