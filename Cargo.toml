@@ -44,17 +44,17 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-# praxis-ai at its v0.4.1 release, where the larger capabilities are opt-in
-# features; the [features] above choose which ones this server builds in.
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false, optional = true }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", default-features = false }
+# praxis-ai at its v0.6.0 release; the [features] above choose which filter
+# groups this server builds in.
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
 # types unify (praxis-ai pins the same 0.7 from crates.io). No default
 # features: praxis-filter's default turns on the policy engine, whose
 # plugins carry pure-Rust cryptography; the policy-engine feature above
 # opts back in.
-praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter", default-features = false }
+praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -68,7 +68,7 @@ openssl = "0.10.81"
 # never with `vendored`), whose provider module src/fips.rs delegates to;
 # rustls itself arrives transitively with its default features (aws-lc-rs)
 # kept off by every praxis crate.
-praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 thiserror = "2.0.18"

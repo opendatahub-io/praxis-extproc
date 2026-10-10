@@ -147,9 +147,10 @@ fn handle_body_redelivery(
 /// For `FDS` passthrough, runs header filters early, defers mutations to first chunk.
 ///
 /// [`Request`]: praxis_filter::Request
+#[expect(clippy::too_many_lines, reason = "dispatch covers each supported request body mode")]
 pub(crate) async fn handle_request_headers(
     pipeline: &FilterPipeline,
-    headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
+    headers: &praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     if state
@@ -161,20 +162,30 @@ pub(crate) async fn handle_request_headers(
         return Err(duplicate_after_eos(ProtocolPhase::RequestHeaders));
     }
 
-    let envoy_headers = extract_header_list(&headers);
+    let envoy_headers = extract_header_list(headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
+        return Box::pin(run_request_pipeline(RequestPhase::Headers, pipeline, state)).await;
     }
 
     match state.protocol_config.request_body_mode {
         BodyMode::None | BodyMode::Streamed => {
             state.header_state.request_headers_sent = true;
-            run_request_header_filters_early(pipeline, state, MutationDelivery::Send).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::Send,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
-            run_request_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::DeferSilent,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
         _ => Ok(vec![response::request_headers(None)]),
@@ -595,7 +606,7 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
         let responses = handle_request_headers(
             &pipeline,
-            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
             &mut state,
         )
         .await
