@@ -311,7 +311,7 @@ async fn dispatch_request(
     }
 
     match req {
-        processing_request::Request::RequestHeaders(h) => handle_request_headers(pipeline, h, state).await,
+        processing_request::Request::RequestHeaders(h) => handle_request_headers(pipeline, &h, state).await,
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,

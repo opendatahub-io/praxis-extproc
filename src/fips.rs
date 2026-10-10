@@ -75,9 +75,9 @@ pub fn install() -> Result<Status, ExtProcError> {
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on `aws-lc-rs` (through `jsonwebtoken`) and its `OAuth`
 ///   and Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the store is compiled in (feature `responses-store`), whose
+/// - `openai_responses_store`: registered exactly when the store is compiled in (feature `responses-store`), whose
 ///   `sqlx` brings `sha2`. Everything on the store (`responses-full`) implies it, so this one name covers them all.
-const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_responses_store"];
 
 /// Why this binary cannot honor [`REQUIRE_FIPS_ENV`], if it cannot.
 ///
@@ -244,7 +244,7 @@ mod tests {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
             if cfg!(feature = "responses-store") {
-                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(reason.contains("`openai_responses_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
