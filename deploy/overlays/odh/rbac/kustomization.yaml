@@ -5,3 +5,5 @@ resources:
   - serviceaccount.yaml
   - clusterrole.yaml
   - clusterrolebinding.yaml
+  - metrics-auth-clusterrole.yaml
+  - metrics-reader-clusterrole.yaml

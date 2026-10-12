@@ -5,7 +5,8 @@ metadata:
 spec:
   template:
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: payload-processing
+      automountServiceAccountToken: true
       containers:
         - name: payload-processing
           imagePullPolicy: Never
