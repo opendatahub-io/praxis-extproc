@@ -133,6 +133,10 @@ the request and response phases so that filters like
 branch chains maintain correct state across the full
 request lifecycle.
 
+Stored non-streaming Responses JSON requests a `BUFFERED` body-mode override
+at response headers. Envoy gathers the complete JSON body before persistence
+and release; SSE retains its configured streaming mode.
+
 [`FilterPipeline`]: https://docs.rs/praxis-proxy-filter/latest/praxis_filter/struct.FilterPipeline.html
 [`HttpFilterContext`]: https://docs.rs/praxis-proxy-filter/latest/praxis_filter/struct.HttpFilterContext.html
 

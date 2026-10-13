@@ -112,6 +112,30 @@ see [FIPS](fips.md).
 [Praxis filter documentation]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md
 [Praxis AI filter documentation]: https://github.com/praxis-proxy/ai/blob/main/docs/filters/README.md
 
+### Stored Responses JSON capture
+
+Stored, non-streaming Responses JSON selects Envoy `BUFFERED` response-body
+processing through a response-header `mode_override`. Persistence completes before
+the body is released. SSE, `store:false`, upstream errors and unrelated traffic
+keep their configured transport. Request extensions survive all ExtProc phases.
+
+Compatibility change: the Envoy filter must allow mode overrides, wait for header
+responses (`send_body_without_waiting_for_header_response: false`) and fail closed
+on ExtProc errors. Eager body delivery or partial body messages after the override
+are rejected. JSON accumulation is capped at 64 MiB or the lower
+`server.max_body_bytes`, even with `allow_unbounded_body`; Envoy/gRPC limits may be
+lower. These checks do not qualify native SSE persistence.
+
+Local capture regression tests use an explicitly initialized in-memory store:
+
+```console
+cargo test --no-default-features --features responses-full --test native_capture
+```
+
+The `native_capture` integration target exercises the gRPC boundary with a
+simulated upstream: JSON capture, persistence failure, body limits and
+incremental SSE transport. It makes no inference requests.
+
 ### Branch Chains
 
 Filter chains support conditional branching via the
@@ -174,7 +198,7 @@ server:
 | `health_address`              | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`             | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
  | `shutdown_drain_timeout_secs` | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
-| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before a stream is rejected with `RESOURCE_EXHAUSTED`. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely |
+| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before `RESOURCE_EXHAUSTED`. Must be positive. `allow_unbounded_body` lifts this limit, but stored non-streaming Responses JSON remains capped at 64 MiB |
 | `tls`                         | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
 ### Graceful shutdown
@@ -289,7 +313,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes` |
+| `allow_unbounded_body` | bool | `false` | Lift `server.max_body_bytes`; stored non-streaming Responses JSON remains capped at 64 MiB |
 
 ```yaml
 insecure_options:
@@ -387,9 +411,9 @@ At runtime:
 - **Body too large**: exceeding the
   `server.max_body_bytes` accumulation limit
   (10 MiB by default) produces a gRPC
-  `RESOURCE_EXHAUSTED` status. The limit is lifted
-  entirely when `insecure_options.allow_unbounded_body`
-  is set.
+  `RESOURCE_EXHAUSTED` status. `insecure_options.allow_unbounded_body`
+  lifts this limit; stored non-streaming Responses JSON
+  still has a 64 MiB ceiling.
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.

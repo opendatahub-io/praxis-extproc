@@ -14,8 +14,8 @@ use std::mem;
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
-use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingResponse};
+use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response, body::MAX_JSON_BODY_BYTES};
+use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingMode, ProcessingResponse};
 use tonic::Status;
 use tracing::warn;
 
@@ -495,9 +495,94 @@ pub(crate) async fn run_response_header_filters_early(
 
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    let buffer_native_json = should_buffer_native_json(&ctx);
     ctx.dehydrate(&mut state.carried_context)?;
 
-    Ok(delivery.deliver_response(mutation, state))
+    finish_response_headers(delivery, mutation, buffer_native_json, state)
+}
+
+/// Apply the selected transport mode to the header acknowledgement.
+fn finish_response_headers(
+    delivery: MutationDelivery,
+    mutation: Option<HeaderMutation>,
+    buffer_native_json: bool,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = delivery.deliver_response(mutation, state);
+    if buffer_native_json {
+        select_buffered_response(state, &mut responses)?;
+    }
+    Ok(responses)
+}
+
+/// Only stored, successful, non-streaming Responses JSON needs a complete body.
+#[cfg(feature = "responses-store")]
+fn should_buffer_native_json(ctx: &HttpFilterContext<'_>) -> bool {
+    use praxis_ai_apis::store::{DEFAULT_STORE_NAME, ResponseStoreRegistry};
+
+    ctx.request.method == http::Method::POST
+        && matches!(ctx.request.uri.path(), "/v1/responses" | "/v1/responses/")
+        && ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+        && ctx.get_metadata("openai_responses_request.stream") != Some("true")
+        && ctx.get_metadata("openai_responses_request.store") != Some("false")
+        && ctx
+            .extensions
+            .get::<ResponseStoreRegistry>()
+            .is_some_and(|registry| registry.contains(DEFAULT_STORE_NAME))
+        && ctx.response_header.as_ref().is_some_and(|response| {
+            response.status.is_success()
+                && response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .eq_ignore_ascii_case("application/json")
+                    })
+        })
+}
+
+/// Without store support no response needs persistence buffering.
+#[cfg(not(feature = "responses-store"))]
+const fn should_buffer_native_json(_ctx: &HttpFilterContext<'_>) -> bool {
+    false
+}
+
+/// Envoy's `ProcessingResponse.mode_override` applies only to header responses.
+fn select_buffered_response(state: &mut StreamState, responses: &mut [ProcessingResponse]) -> Result<(), Status> {
+    if !matches!(
+        state.protocol_config.response_body_mode,
+        BodyMode::Streamed | BodyMode::Buffered
+    ) {
+        return Ok(());
+    }
+    if state.protocol_config.response_body_mode == BodyMode::Streamed {
+        if state.protocol_config.send_body_without_waiting {
+            return Err(Status::failed_precondition(
+                "stored JSON requires header-time mode overrides",
+            ));
+        }
+        let response = responses
+            .first_mut()
+            .ok_or_else(|| Status::internal("response headers missing for mode override"))?;
+        response.mode_override = Some(ProcessingMode {
+            request_body_mode: state.protocol_config.request_body_mode as i32,
+            response_body_mode: BodyMode::Buffered as i32,
+            ..Default::default()
+        });
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.header_state.buffered_response_override = true;
+    }
+    state.max_body_accumulation = Some(
+        state
+            .max_body_accumulation
+            .map_or(MAX_JSON_BODY_BYTES, |limit| limit.min(MAX_JSON_BODY_BYTES)),
+    );
+    Ok(())
 }
 
 /// Capture response headers before filter execution.
@@ -719,6 +804,72 @@ mod tests {
 
     use super::*;
     use crate::test_support::snapshot_counter;
+
+    #[test]
+    fn ext_proc_header_mode_override_buffers_json_and_preserves_request_mode() {
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.response_body_mode = BodyMode::Streamed;
+        state.max_body_accumulation = None;
+        let mut responses = vec![response::response_headers(None)];
+        select_buffered_response(&mut state, &mut responses).unwrap();
+        let mode = responses.first().unwrap().mode_override.as_ref().unwrap();
+        assert_eq!(mode.request_body_mode, 1, "override preserves request transport");
+        assert_eq!(mode.response_body_mode, 2, "JSON is buffered before release");
+        assert_eq!(
+            mode.response_header_mode, 0,
+            "DEFAULT leaves header processing unchanged"
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+        assert!(state.header_state.buffered_response_override);
+        assert_eq!(
+            state.max_body_accumulation,
+            Some(MAX_JSON_BODY_BYTES),
+            "insecure unbounded mode cannot disable the JSON ceiling"
+        );
+    }
+
+    #[test]
+    fn buffered_json_keeps_stricter_server_limit_without_override() {
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.max_body_accumulation = Some(128);
+        let mut responses = vec![response::response_headers(None)];
+        select_buffered_response(&mut state, &mut responses).unwrap();
+        assert_eq!(state.max_body_accumulation, Some(128), "never raise the server ceiling");
+        assert!(responses.first().unwrap().mode_override.is_none());
+        assert!(!state.header_state.buffered_response_override);
+    }
+
+    #[test]
+    fn ext_proc_mode_override_rejects_eager_body_delivery() {
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        let mut responses = vec![response::response_headers(None)];
+        let error = select_buffered_response(&mut state, &mut responses).unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "Envoy ignores mode overrides with eager body delivery"
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Streamed);
+        assert!(responses.first().unwrap().mode_override.is_none());
+    }
+
+    #[test]
+    fn json_mode_selection_does_not_change_none_or_full_duplex_transport() {
+        for mode in [BodyMode::None, BodyMode::FullDuplexStreamed] {
+            let mut state = StreamState::new();
+            state.protocol_config.response_body_mode = mode;
+            let limit = state.max_body_accumulation;
+            let mut responses = vec![response::response_headers(None)];
+            select_buffered_response(&mut state, &mut responses).unwrap();
+            assert_eq!(state.protocol_config.response_body_mode, mode);
+            assert_eq!(state.max_body_accumulation, limit);
+            assert!(responses.first().unwrap().mode_override.is_none());
+        }
+    }
 
     /// Read the `content-length` value from a header mutation, if present.
     fn content_length_of(mutation: &Option<HeaderMutation>) -> Option<String> {

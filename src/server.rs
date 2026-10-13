@@ -331,6 +331,9 @@ async fn dispatch_request(
     reason = "independent per-direction flags, not a state machine"
 )]
 pub(crate) struct HeaderDeliveryState {
+    /// A stored JSON response requested a header-time BUFFERED mode override.
+    pub(crate) buffered_response_override: bool,
+
     /// Whether response-phase filters already ran at header time.
     pub(crate) response_filters_executed: bool,
 

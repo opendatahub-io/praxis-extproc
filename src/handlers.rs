@@ -292,6 +292,11 @@ pub(crate) async fn handle_response_body(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let mode = state.protocol_config.response_body_mode;
+    if state.header_state.buffered_response_override && !body.end_of_stream {
+        return Err(Status::failed_precondition(
+            "Envoy did not honor the stored JSON BUFFERED mode override",
+        ));
+    }
 
     if let Some(response) = handle_body_redelivery(
         state
@@ -462,6 +467,306 @@ mod tests {
 
     use super::*;
     use crate::test_support::counter_value;
+
+    #[tokio::test]
+    async fn ext_proc_unhonored_buffered_override_rejects_before_body_processing() {
+        let pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.header_state.buffered_response_override = true;
+        let body = praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: b"incomplete".to_vec(),
+            end_of_stream: false,
+        };
+        let error = handle_response_body(&pipeline, body, &mut state).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "a client ignoring the override must not release an unpersisted JSON body"
+        );
+        assert!(state.response_body.is_empty());
+        assert!(state.carried_context.is_some(), "rejection must not drain filter state");
+    }
+
+    #[cfg(feature = "responses-full")]
+    #[expect(clippy::too_many_lines, reason = "capture regression tests")]
+    mod native_capture {
+        use std::sync::Arc;
+
+        use praxis_ai_apis::{
+            StateOwner,
+            store::{DEFAULT_STORE_NAME, ResponseStoreRegistry, SqliteResponseStore},
+        };
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders};
+        use serde_json::json;
+
+        use super::*;
+
+        const JSON_BODY: &[u8] = br#"{"id":"resp_capture","object":"response","created_at":1,"model":"test","status":"completed","output":[],"store":true}"#;
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn native_json_is_stored_before_body_acknowledgement() {
+            for mode in [BodyMode::Buffered, BodyMode::Streamed] {
+                let (pipeline, store, registry) = capture_pipeline().await;
+                let mut state = request_state(&pipeline, mode, "/v1/responses", true, false).await;
+                let headers = handle_response_headers(
+                    &pipeline,
+                    headers(&[(":status", "200"), ("content-type", "application/json")]),
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                let override_mode = headers.first().unwrap().mode_override.as_ref();
+                if mode == BodyMode::Streamed {
+                    assert_eq!(override_mode.unwrap().response_body_mode, BodyMode::Buffered as i32);
+                } else {
+                    assert!(override_mode.is_none());
+                }
+
+                let owner = StateOwner::from_trusted_parts("tenant", "test", "alice").unwrap();
+                let scoped = registry.get_scoped(DEFAULT_STORE_NAME, &owner).unwrap();
+                assert!(scoped.get_response("resp_capture").await.unwrap().is_none());
+                // Envoy buffers data chunks and empty EOS into one final body message.
+                let (first, second) = JSON_BODY.split_at(JSON_BODY.len() / 2);
+                let body = [first, second, &[]].concat();
+                let replies = handle_response_body(
+                    &pipeline,
+                    HttpBody {
+                        body,
+                        end_of_stream: true,
+                    },
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                let stored = scoped.get_response("resp_capture").await.unwrap().unwrap();
+                assert_eq!(stored.input, json!("hello"));
+                assert_eq!(
+                    stored.response_object,
+                    serde_json::from_slice::<serde_json::Value>(JSON_BODY).unwrap()
+                );
+                assert_eq!(acknowledged_body(replies.first().unwrap()), JSON_BODY);
+                let foreign = StateOwner::from_trusted_parts("tenant", "test", "bob").unwrap();
+                assert!(
+                    registry
+                        .get_scoped(DEFAULT_STORE_NAME, &foreign)
+                        .unwrap()
+                        .get_response("resp_capture")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                store.close().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn native_json_storage_failure_returns_no_success_acknowledgement() {
+            let (pipeline, store, _) = capture_pipeline().await;
+            let mut state = request_state(&pipeline, BodyMode::Streamed, "/v1/responses", true, false).await;
+            handle_response_headers(
+                &pipeline,
+                headers(&[(":status", "200"), ("content-type", "application/json")]),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            store.close().await;
+            let error = handle_response_body(
+                &pipeline,
+                HttpBody {
+                    body: JSON_BODY.to_vec(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Internal);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn native_json_limit_rejects_before_persistence() {
+            let (pipeline, store, registry) = capture_pipeline().await;
+            let mut state = request_state(&pipeline, BodyMode::Streamed, "/v1/responses", true, false).await;
+            state.max_body_accumulation = Some(64);
+            handle_response_headers(
+                &pipeline,
+                headers(&[(":status", "200"), ("content-type", "application/json")]),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            let error = handle_response_body(
+                &pipeline,
+                HttpBody {
+                    body: JSON_BODY.to_vec(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            let owner = StateOwner::from_trusted_parts("tenant", "test", "alice").unwrap();
+            assert!(
+                registry
+                    .get_scoped(DEFAULT_STORE_NAME, &owner)
+                    .unwrap()
+                    .get_response("resp_capture")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            store.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn nonpersistable_traffic_keeps_streamed_transport() {
+            for (path, store_response, stream, status, content_type) in [
+                ("/v1/responses", false, false, "200", "application/json"),
+                ("/v1/responses", true, false, "400", "application/json"),
+                ("/v1/responses", true, false, "200", "text/plain"),
+                ("/v1/chat/completions", true, false, "200", "application/json"),
+                ("/v1/responses", true, true, "200", "text/event-stream"),
+            ] {
+                let (pipeline, store, _) = capture_pipeline().await;
+                let mut state = request_state(&pipeline, BodyMode::Streamed, path, store_response, stream).await;
+                let replies = handle_response_headers(
+                    &pipeline,
+                    headers(&[(":status", status), ("content-type", content_type)]),
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                assert!(replies.iter().all(|reply| reply.mode_override.is_none()));
+                assert_eq!(state.protocol_config.response_body_mode, BodyMode::Streamed);
+                if stream {
+                    let chunk = b": keep-alive\n\n";
+                    let replies = handle_response_body(
+                        &pipeline,
+                        HttpBody {
+                            body: chunk.to_vec(),
+                            end_of_stream: false,
+                        },
+                        &mut state,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(acknowledged_body(replies.first().unwrap()), chunk);
+                }
+                store.close().await;
+            }
+        }
+
+        async fn capture_pipeline() -> (FilterPipeline, Arc<SqliteResponseStore>, ResponseStoreRegistry) {
+            let store = Arc::new(
+                SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
+                    .await
+                    .unwrap(),
+            );
+            let registry = ResponseStoreRegistry::new();
+            registry
+                .register(
+                    &Arc::from(DEFAULT_STORE_NAME),
+                    Arc::<SqliteResponseStore>::clone(&store),
+                )
+                .unwrap();
+            registry.mark_ready();
+            let mut entries: Vec<praxis_core::config::FilterEntry> = serde_yaml::from_str(
+                "- filter: state_owner
+  mode: trusted_headers
+  tenant: {static: tenant}
+  issuer: {static: test}
+  subject: {header: x-test-user}
+- filter: ai_operation
+- filter: openai_responses_request
+- filter: openai_responses_store
+  backend: sqlite
+  database_url: 'sqlite::memory:'
+  responses_table: responses
+  conversations_table: conversations
+- filter: openai_responses_rehydrate
+- filter: openai_responses_proxy
+",
+            )
+            .unwrap();
+            let mut pipeline = FilterPipeline::build(&mut entries, &praxis_ai_filters::build_ai_registry()).unwrap();
+            pipeline.add_pipeline_extension(Box::new(registry.clone()));
+            (pipeline, store, registry)
+        }
+
+        async fn request_state(
+            pipeline: &FilterPipeline,
+            response_mode: BodyMode,
+            path: &str,
+            store: bool,
+            stream: bool,
+        ) -> StreamState {
+            let mut state = StreamState::new();
+            state.protocol_config.request_body_mode = BodyMode::Buffered;
+            state.protocol_config.response_body_mode = response_mode;
+            let replies = handle_request_headers(
+                pipeline,
+                headers(&[
+                    (":method", "POST"),
+                    (":path", path),
+                    ("x-test-user", "alice"),
+                    ("content-type", "application/json"),
+                ]),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(replies.iter().all(|reply| !response::is_immediate(reply)));
+            let input = if path == "/v1/chat/completions" {
+                json!({"model":"test", "messages":[{"role":"user", "content":"hello"}]})
+            } else {
+                json!({"model":"test", "input":"hello", "store":store, "stream":stream})
+            };
+            let replies = handle_request_body(
+                pipeline,
+                HttpBody {
+                    body: serde_json::to_vec(&input).unwrap(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(replies.iter().all(|reply| !response::is_immediate(reply)));
+            state
+        }
+
+        fn headers(values: &[(&str, &str)]) -> HttpHeaders {
+            HttpHeaders {
+                headers: Some(praxis_proto::envoy::service::ext_proc::v3::HeaderMap {
+                    headers: values
+                        .iter()
+                        .map(|(key, value)| HeaderValue {
+                            key: (*key).to_owned(),
+                            value: (*value).to_owned(),
+                            raw_value: Vec::new(),
+                        })
+                        .collect(),
+                }),
+                end_of_stream: false,
+            }
+        }
+
+        fn acknowledged_body(reply: &ProcessingResponse) -> &[u8] {
+            use praxis_proto::envoy::service::ext_proc::v3::{body_mutation, processing_response};
+
+            let Some(processing_response::Response::ResponseBody(body)) = &reply.response else {
+                unreachable!("expected response body acknowledgement");
+            };
+            let mutation = body.response.as_ref().unwrap().body_mutation.as_ref().unwrap();
+            let Some(body_mutation::Mutation::Body(bytes)) = &mutation.mutation else {
+                unreachable!("expected complete response body");
+            };
+            bytes
+        }
+    }
 
     #[test]
     fn handle_body_redelivery_ignores_only_fds_duplicates() {
