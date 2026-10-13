@@ -36,6 +36,7 @@ ENV OPENSSL_NO_VENDOR=1 \
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
 COPY proto proto
 COPY src src
 COPY xtask xtask
