@@ -38,6 +38,7 @@ know which features to pick:
 | `responses`: the OpenAI Responses filters | yes | yes |
 | `responses-store`: the response store the Responses filters keep state in | yes | yes: through `store-postgres-cert-auth` below -- the praxis-proxy `sqlx` fork it builds on compiles no `sha2` migration checksums |
 | `store-postgres-cert-auth`: the certificate-only (mTLS) Postgres store backend | no (the default takes `responses-full`'s backends) | yes: SQL transport and the client-certificate handshake run through the system OpenSSL, and it compiles no SCRAM, migration-checksum or advisory-lock crypto |
+| `conversations`: the locally served Conversations API | yes (through `responses-full`) | yes: uses the certificate-only Postgres backend; no tools or compaction |
 | `responses-full`: the rest of what Praxis AI offers on that store (the password-auth Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: the SQLite and password-auth backends bring `sqlx`'s `sha2` and SCRAM's `md-5`/`hmac`/`sha2`/`hkdf`, and the MCP tools pull `aws-lc-rs` |
 | `aws-sigv4`: the `aws_sigv4_sign` filter | yes | yes: signs through the system OpenSSL (praxis-ai moved it off `sha2`/`hmac`; the `aws-sigv4` crate is only its test oracle) |
 | `policy-engine`: the praxis `policy` filter (the Praxis Policy Engine) | yes | no: its runtime and plugins carry `aws-lc-rs`, `sha2` and `hmac` |
@@ -96,13 +97,15 @@ A request that reaches `openai_responses_rehydrate` with no store configured is
 still rejected with a 500 ("response store is not available"); with the shipped
 certificate-only store it is served.
 
-**The rest of what rides on the store** (`responses-full`). The Conversations
-API (`openai_conversations`), context compaction (`openai_responses_compact`),
+**The other optional store features** (`responses-full`). Context compaction (`openai_responses_compact`),
 MCP tool resolution and dispatch (`rmcp`, whose HTTP transport is reqwest
 with its `rustls` feature, which compiles in `aws-lc-rs`), and the file
 resolver (`openai_file_resolve`, the same reqwest). All of them need the
 store, so they go with it; a configuration naming one of those filters is
 rejected at startup by the image. No shipped configuration does.
+
+Conversations (`openai_conversations`) ships separately through the `conversations`
+feature, using the certificate-only Postgres backend rather than `responses-full`.
 
 **The `aws_sigv4_sign` filter** (`aws-sigv4`) is in the FIPS build. AWS
 Signature V4 request signing for Bedrock-style backends. It used to be

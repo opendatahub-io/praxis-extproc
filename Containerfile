@@ -39,7 +39,7 @@ ARG UBI9_DIGEST=sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e5
 ARG UBI9_MINIMAL_DIGEST=sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 # Mirrors FIPS_FEATURES in the Makefile.
-ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
+ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth,conversations"
 # release (the product image, with the embedded crate manifest) or debug (the
 # edit-compile loop; make container).
 ARG CARGO_PROFILE=release

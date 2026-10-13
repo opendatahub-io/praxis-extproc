@@ -29,9 +29,11 @@ policy-engine = ["praxis-ai-filters/policy-engine"]
 # The OpenAI Responses filters.
 responses = ["praxis-ai-filters/openai-responses"]
 # The response store the Responses filters keep state in (previous_response_id
-# chaining), registered as a pipeline extension. It is built on sqlx, whose
-# migration checksums carry sha2, so the FIPS build leaves it out.
+# chaining), registered as a pipeline extension. Select a storage backend
+# separately; the release image uses certificate-only Postgres.
 responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis"]
+# Conversations API without tools, compaction or a storage backend selection.
+conversations = ["responses-store", "praxis-ai-filters/openai-conversations"]
 # Everything else praxis-ai offers for Responses, all of it on the store: the
 # Postgres and SQLite backends, Conversations, context compaction, MCP tools
 # and the file resolver. What the previous praxis-ai pin built in.
@@ -341,5 +343,3 @@ inherits = "release"
 debug = 2
 strip = false
 lto = false
-
-

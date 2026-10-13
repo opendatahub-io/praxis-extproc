@@ -449,6 +449,20 @@ server:
         );
     }
 
+    #[cfg(feature = "conversations")]
+    #[test]
+    fn conversations_profile_registers_stateful_filters() {
+        let registry = praxis_ai_filters::build_ai_registry();
+        let available = registry.available_filters();
+        for name in [
+            "openai_conversations",
+            "openai_responses_store",
+            "openai_responses_rehydrate",
+        ] {
+            assert!(available.contains(&name), "missing filter: {name}");
+        }
+    }
+
     #[test]
     fn build_pipeline_with_builtins() {
         let cfg: ExtProcConfig = serde_yaml::from_str(

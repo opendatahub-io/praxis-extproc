@@ -66,7 +66,7 @@ const TEST_FILTER: &str = "listener_";
 /// The feature set the FIPS build ships (the Makefile's `FIPS_FEATURES`), so
 /// the probes compile the suite exactly as `make test-fips` does and share
 /// its build cache.
-const FIPS_FEATURES: &str = "responses,aws-sigv4";
+const FIPS_FEATURES: &str = "responses,aws-sigv4,store-postgres-cert-auth,conversations";
 
 // -----------------------------------------------------------------------------
 // CLI Arguments
