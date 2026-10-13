@@ -25,5 +25,8 @@ pub mod response;
 pub mod server;
 pub mod tls;
 
+#[cfg(feature = "k8s-e2e")]
+pub mod e2e;
+
 #[cfg(test)]
 mod test_support;

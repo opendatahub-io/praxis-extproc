@@ -1,0 +1,28 @@
+# Strategic-merge replacement for payload-processing-plugins (extended tier).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-processing-plugins
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      tls:
+        mode: self_signed
+
+    filter_chains:
+      - name: ai-filters
+        filters:
+          - filter: anthropic_messages_to_chat_completions
+          - filter: model_to_header
+            header: X-Model-Name
+          - filter: headers
+            request_add:
+              - name: X-Praxis-Processed
+                value: "true"
+            response_set:
+              - name: X-Praxis-Version
+                value: "e2e"
+          - filter: e2e_body_oracle

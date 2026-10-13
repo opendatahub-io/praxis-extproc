@@ -1,0 +1,37 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: e2e-extended-access-log-tls-negative
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/component: e2e-extended
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: e2e-gateway
+  configPatches:
+    - applyTo: NETWORK_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: MERGE
+        value:
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+            access_log:
+              - name: envoy.access_loggers.stdout
+                filter:
+                  status_code_filter:
+                    comparison:
+                      op: GE
+                      value:
+                        default_value: 400
+                        runtime_key: unused
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                  log_format:
+                    text_format: "[%START_TIME%] code=%RESPONSE_CODE% details=%RESPONSE_CODE_DETAILS% flags=%RESPONSE_FLAGS%\n"
