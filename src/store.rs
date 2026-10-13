@@ -3,10 +3,12 @@
 
 //! Serving-runtime initialization of persisted-state stores.
 
+mod binding;
 mod plan;
 
 use std::sync::Arc;
 
+pub(crate) use binding::resolve_config;
 use praxis_ai_apis::store::ResponseStoreRegistry;
 use praxis_ai_store::{StoreBackendFactory, StoreRegistry};
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, StoreRef};

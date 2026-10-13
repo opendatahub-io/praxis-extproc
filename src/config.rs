@@ -232,6 +232,10 @@ impl ExtProcConfig {
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
+    #[cfg(feature = "responses-store")]
+    let resolved = crate::store::resolve_config(config)?;
+    #[cfg(feature = "responses-store")]
+    let config = &resolved;
     let pipeline = build_filter_pipeline(config, registry)?;
 
     #[cfg(feature = "responses-store")]
@@ -257,6 +261,8 @@ pub async fn build_initialized_pipeline(
     config: &ExtProcConfig,
     registry: &FilterRegistry,
 ) -> Result<(Arc<FilterPipeline>, praxis_ai_store_lifecycle::BackendLease)> {
+    let resolved = crate::store::resolve_config(config)?;
+    let config = &resolved;
     let mut pipeline = build_filter_pipeline(config, registry)?;
     let bootstrap = crate::store::StoreBootstrap::new(config)?;
     let lease = bootstrap.provision().await?;

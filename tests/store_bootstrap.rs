@@ -5,7 +5,12 @@
 
 #[cfg(feature = "responses-full")]
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::too_many_lines, reason = "integration tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "integration tests"
+)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
@@ -121,6 +126,40 @@ mod tests {
         );
         let result = config::build_initialized_pipeline(&config, &praxis_ai_filters::build_ai_registry()).await;
         assert!(result.is_err(), "unavailable storage must prevent serving a pipeline");
+    }
+
+    #[tokio::test]
+    async fn url_file_binding_is_resolved_before_validation_and_provisioning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("DB_CONNECTION_URL");
+        std::fs::write(&path, "sqlite::memory:\n").unwrap();
+        let mut config = store_config("unused");
+        for entry in &mut config.filter_chains[0].filters {
+            if matches!(
+                entry.filter_type.as_str(),
+                "openai_responses_store" | "openai_conversations"
+            ) {
+                let mapping = entry.config.as_mapping_mut().unwrap();
+                mapping.remove("database_url");
+                mapping.insert("database_url_file".into(), path.to_str().unwrap().into());
+            }
+        }
+        let filters = praxis_ai_filters::build_ai_registry();
+        let offline = config::build_pipeline(&config, &filters).unwrap();
+        assert!(!registry(&offline).is_ready(), "validation must not provision storage");
+        let (pipeline, lease) = config::build_initialized_pipeline(&config, &filters).await.unwrap();
+        let registry = registry(&pipeline);
+        assert!(registry.is_ready());
+        assert!(registry.contains(DEFAULT_STORE_NAME));
+        assert!(registry.contains(CONVERSATIONS_STORE_NAME));
+        for entry in &config.filter_chains[0].filters {
+            assert!(
+                entry.config.get("database_url").is_none(),
+                "original config must remain reference-only"
+            );
+        }
+        drop(pipeline);
+        lease.release().await;
     }
 
     /// Stateful configuration without inference or external network requests.

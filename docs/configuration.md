@@ -134,6 +134,16 @@ Discovery, normalization, backend sharing and schema compatibility checks use
 Praxis AI's shared `praxis_ai_apis::store::plan` API. ExtProc supplies one registry
 plan spanning its concatenated chains and owns serving-runtime initialization.
 
+Store filters can select `database_url_file` instead of `database_url`. ExtProc
+loads one literal UTF-8 URL (at most 16 KiB) before validation/provisioning,
+including stores in nested chains and iterative steps. Missing, empty, oversized
+or ambiguous sources fail closed. There is no environment or YAML interpolation.
+The original configuration retains only the file reference, and URL contents are
+not included in file-loading errors. `--validate` reads the file but stays offline.
+
+For Kubernetes mTLS bindings, mount CA/certificate files and copy the Secret's
+root-owned private key into a dedicated writable volume as the serving UID with
+mode 0600 before startup. Mount the copied key read-only in the serving container.
 Use a gRPC readiness probe for `envoy.service.ext_proc.v3.ExternalProcessor` on
 the health port: a TCP probe cannot distinguish `Serving` from `NotServing`.
 
