@@ -222,13 +222,51 @@ impl ExtProcConfig {
 ///
 /// Concatenates all chains in order, builds via the registry, and
 /// applies body limits and insecure options.
+/// Store configuration is validated offline; use `build_initialized_pipeline`
+/// to provision stores before serving when `responses-store` is enabled.
 ///
 /// # Errors
 ///
-/// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails.
+/// Returns [`ExtProcError::Pipeline`] if filter instantiation or validation fails,
+/// or [`ExtProcError::Config`] if store configuration is invalid.
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<Arc<FilterPipeline>> {
+    let pipeline = build_filter_pipeline(config, registry)?;
+
+    #[cfg(feature = "responses-store")]
+    let pipeline = {
+        let mut pipeline = pipeline;
+        crate::store::StoreBootstrap::new(config)?.attach(&mut pipeline);
+        pipeline
+    };
+
+    Ok(Arc::new(pipeline))
+}
+
+/// Build and provision stores before admitting request traffic.
+///
+/// Call on the runtime that will serve the pipeline. Release the returned
+/// lease only after serving and in-flight requests have stopped.
+///
+/// # Errors
+///
+/// Returns an error if filters or stores are invalid or provisioning fails.
+#[cfg(feature = "responses-store")]
+pub async fn build_initialized_pipeline(
+    config: &ExtProcConfig,
+    registry: &FilterRegistry,
+) -> Result<(Arc<FilterPipeline>, praxis_ai_store_lifecycle::BackendLease)> {
+    let mut pipeline = build_filter_pipeline(config, registry)?;
+    let bootstrap = crate::store::StoreBootstrap::new(config)?;
+    let lease = bootstrap.provision().await?;
+    bootstrap.attach(&mut pipeline);
+
+    Ok((Arc::new(pipeline), lease))
+}
+
+/// Build filters without a store extension.
+fn build_filter_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Result<FilterPipeline> {
     validate_chain_names(&config.filter_chains)?;
 
     let chains: std::collections::HashMap<&str, &[_]> = config
@@ -249,11 +287,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
-
-    #[cfg(feature = "responses-store")]
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-
-    Ok(Arc::new(pipeline))
+    Ok(pipeline)
 }
 
 // -----------------------------------------------------------------------------

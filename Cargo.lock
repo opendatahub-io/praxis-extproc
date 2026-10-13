@@ -3211,6 +3211,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "praxis-ai-store-lifecycle"
+version = "0.6.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.6.0#75e8662d8a4705391e7cce6e79c08e4e9cd826a0"
+dependencies = [
+ "dashmap",
+ "praxis-ai-store",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "praxis-extproc"
 version = "0.1.0"
 dependencies = [
@@ -3228,6 +3239,8 @@ dependencies = [
  "openssl",
  "praxis-ai-apis",
  "praxis-ai-filters",
+ "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-proto",

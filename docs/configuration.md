@@ -112,6 +112,35 @@ see [FIPS](fips.md).
 [Praxis filter documentation]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md
 [Praxis AI filter documentation]: https://github.com/praxis-proxy/ai/blob/main/docs/filters/README.md
 
+### Store initialization
+
+ExtProc discovers `openai_responses_store` and `openai_conversations` in
+configured chains, inline branches and iterative-router steps. Compatible
+Responses and Conversations configurations share one backend. Conflicting
+registry bindings and incompatible SQL object names fail configuration checks.
+
+The server opens and registers all configured backends on its serving runtime
+before starting the ExtProc listener or reporting `Serving`. Provisioning errors
+leave only health (`NotServing`) and metrics available. Backend leases are
+released after serving stops and requests drain. No store is required by ordinary
+Chat Completions configurations.
+
+`--validate` checks filter and backend configuration without connecting to the
+database. Library callers must use `build_initialized_pipeline` to serve stores;
+`build_pipeline` alone installs an unprovisioned registry and is for offline
+validation. Stored-content requests without a provisioned store fail closed.
+
+Discovery, normalization, backend sharing and schema compatibility checks use
+Praxis AI's shared `praxis_ai_apis::store::plan` API. ExtProc supplies one registry
+plan spanning its concatenated chains and owns serving-runtime initialization.
+
+Use a gRPC readiness probe for `envoy.service.ext_proc.v3.ExternalProcessor` on
+the health port: a TCP probe cannot distinguish `Serving` from `NotServing`.
+
+Startup behavior changes for stateful configurations: unavailable databases no
+longer produce a ready ExtProc listener, and conflicting store bindings are
+rejected. Chat Completions configurations without stores are unchanged.
+
 ### Stored Responses JSON capture
 
 Stored, non-streaming Responses JSON selects Envoy `BUFFERED` response-body
@@ -135,6 +164,14 @@ cargo test --no-default-features --features responses-full --test native_capture
 The `native_capture` integration target exercises the gRPC boundary with a
 simulated upstream: JSON capture, persistence failure, body limits and
 incremental SSE transport. It makes no inference requests.
+
+### Store provisioning tests
+
+Local SQLite/gRPC coverage:
+
+```console
+cargo test --no-default-features --features responses-full --test store_bootstrap
+```
 
 ### Branch Chains
 

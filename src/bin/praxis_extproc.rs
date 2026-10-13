@@ -76,13 +76,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
         if let Some(reason) = fips_refusal(&fips, &registry) {
             return Err(reason.into());
         }
-        pipeline?;
+        config::build_pipeline(&cfg, &registry)?;
         info!("configuration is valid");
         return Ok(());
     }
@@ -97,14 +96,57 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
     }
 
-    Box::pin(serve_pipeline(
+    Box::pin(serve_config(
+        addrs,
+        &cfg,
+        &registry,
+        praxis_extproc::fips::active(&fips),
+    ))
+    .await
+}
+
+/// Provision on this runtime before serving, and retire stores after drain.
+async fn serve_config(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+    cfg: &ExtProcConfig,
+    registry: &praxis_filter::FilterRegistry,
+    fips_active: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "responses-store")]
+    let (pipeline, lease) = match config::build_initialized_pipeline(cfg, registry).await {
+        Ok((pipeline, lease)) => (Ok(pipeline), Some(lease)),
+        Err(error) => (Err(error), None),
+    };
+    #[cfg(not(feature = "responses-store"))]
+    let pipeline = config::build_pipeline(cfg, registry);
+    #[cfg(feature = "responses-store")]
+    let draining_pipeline = pipeline.as_ref().ok().map(std::sync::Arc::downgrade);
+
+    let result = Box::pin(serve_pipeline(
         addrs,
         pipeline,
         &cfg.server,
         cfg.max_body_accumulation(),
-        praxis_extproc::fips::active(&fips),
+        fips_active,
     ))
-    .await
+    .await;
+    #[cfg(feature = "responses-store")]
+    retire_store(lease, draining_pipeline).await;
+    result
+}
+
+/// Keep pooled backends alive until the server and stream tasks release the pipeline.
+#[cfg(feature = "responses-store")]
+async fn retire_store(
+    lease: Option<praxis_ai_store_lifecycle::BackendLease>,
+    pipeline: Option<std::sync::Weak<praxis_filter::FilterPipeline>>,
+) {
+    if let Some(lease) = lease {
+        while pipeline.as_ref().is_some_and(|pipeline| pipeline.strong_count() > 0) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        lease.release().await;
+    }
 }
 
 /// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
@@ -504,6 +546,31 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[cfg(feature = "responses-store")]
+    #[tokio::test]
+    async fn store_retirement_waits_for_pipeline_owners() {
+        let cfg: ExtProcConfig = serde_yaml::from_str("filter_chains: []").unwrap();
+        let (pipeline, lease) = config::build_initialized_pipeline(&cfg, &praxis_ai_filters::build_ai_registry())
+            .await
+            .unwrap();
+        let weak = std::sync::Arc::downgrade(&pipeline);
+        let retirement = retire_store(Some(lease), Some(std::sync::Weak::clone(&weak)));
+        tokio::pin!(retirement);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+                .await
+                .is_err(),
+            "retirement must wait while a stream holds the pipeline"
+        );
+        drop(pipeline);
+        tokio::time::timeout(Duration::from_secs(1), retirement).await.unwrap();
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "all request-held pipeline references must drain"
+        );
+    }
 
     /// A hung serving future (graceful drain that never completes, e.g. a
     /// non-reading client holding a connection open) must still be abandoned

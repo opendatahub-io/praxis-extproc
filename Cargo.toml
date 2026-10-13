@@ -31,7 +31,7 @@ responses = ["praxis-ai-filters/openai-responses"]
 # The response store the Responses filters keep state in (previous_response_id
 # chaining), registered as a pipeline extension. Select a storage backend
 # separately; the release image uses certificate-only Postgres.
-responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis"]
+responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis", "dep:praxis-ai-store", "dep:praxis-ai-store-lifecycle", "dep:serde_json"]
 # Conversations API without tools, compaction or a storage backend selection.
 conversations = ["responses-store", "praxis-ai-filters/openai-conversations"]
 # Everything else praxis-ai offers for Responses, all of it on the store: the
@@ -59,6 +59,8 @@ http = "1.4.0"
 # features; the [features] above choose which ones this server builds in.
 praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false }
+praxis-ai-store = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
+praxis-ai-store-lifecycle = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
 # types unify (praxis-ai pins the same 0.7 from crates.io). No default
 # features: praxis-filter's default turns on the policy engine, whose
@@ -82,6 +84,7 @@ openssl = "0.10.81"
 praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
+serde_json = { version = "1.0.151", optional = true }
 thiserror = "2.0.18"
 tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-openssl = "0.6.5"
