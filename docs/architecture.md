@@ -122,7 +122,9 @@ runs two phases:
 
 1. **Request phase**: `execute_http_request` runs
    request filters, then `execute_http_request_body`
-   runs body filters if body data is present.
+   runs body filters. For accumulated `BUFFERED` and
+   `FULL_DUPLEX_STREAMED` requests, the selected-upstream
+   body hooks run last, before outbound mutations are returned.
 2. **Response phase**: `execute_http_response` runs
    response filters, then `execute_http_response_body`
    runs response body filters.

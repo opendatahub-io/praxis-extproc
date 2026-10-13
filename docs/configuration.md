@@ -147,23 +147,36 @@ mode 0600 before startup. Mount the copied key read-only in the serving containe
 Use a gRPC readiness probe for `envoy.service.ext_proc.v3.ExternalProcessor` on
 the health port: a TCP probe cannot distinguish `Serving` from `NotServing`.
 
-Startup behavior changes for stateful configurations: unavailable databases no
-longer produce a ready ExtProc listener, and conflicting store bindings are
-rejected. Chat Completions configurations without stores are unchanged.
+### Responses request rehydration
+
+For local history, configure `openai_responses_request`, `openai_responses_store`,
+`openai_responses_rehydrate` and `openai_responses_proxy` in that order, with
+`ai_operation` and `state_owner` before them. The store must be provisioned as
+described above.
+
+Set Envoy's request-body mode to `BUFFERED` or `FULL_DUPLEX_STREAMED` so the
+complete request is available for rehydration. Local `conversation` and
+`previous_response_id` selectors are replaced with their stored history before
+forwarding. Chunk-at-a-time `STREAMED` requests do not support this rewrite.
+Keep filter failures closed and set Envoy's `failure_mode_allow: false` to prevent
+forwarding when ExtProc fails.
+
+Envoy owns routing. ExtProc does not supply selected provider/protocol metadata;
+filters that require that metadata need it supplied by the configured pipeline.
 
 ### Stored Responses JSON capture
 
 Stored, non-streaming Responses JSON selects Envoy `BUFFERED` response-body
 processing through a response-header `mode_override`. Persistence completes before
 the body is released. SSE, `store:false`, upstream errors and unrelated traffic
-keep their configured transport. Request extensions survive all ExtProc phases.
+keep their configured transport.
 
-Compatibility change: the Envoy filter must allow mode overrides, wait for header
-responses (`send_body_without_waiting_for_header_response: false`) and fail closed
-on ExtProc errors. Eager body delivery or partial body messages after the override
-are rejected. JSON accumulation is capped at 64 MiB or the lower
+Configure the Envoy ExtProc filter with `allow_mode_override: true`,
+`send_body_without_waiting_for_header_response: false` and `failure_mode_allow: false`.
+Eager body delivery or partial body messages after the override are rejected.
+JSON accumulation is capped at 64 MiB or the lower
 `server.max_body_bytes`, even with `allow_unbounded_body`; Envoy/gRPC limits may be
-lower. These checks do not qualify native SSE persistence.
+lower.
 
 Local capture regression tests use an explicitly initialized in-memory store:
 
@@ -173,7 +186,8 @@ cargo test --no-default-features --features responses-full --test native_capture
 
 The `native_capture` integration target exercises the gRPC boundary with a
 simulated upstream: JSON capture, persistence failure, body limits and
-incremental SSE transport. It makes no inference requests.
+incremental SSE transport, plus local selector rewriting and original-input
+preservation. It makes no inference requests.
 
 ### Store provisioning tests
 

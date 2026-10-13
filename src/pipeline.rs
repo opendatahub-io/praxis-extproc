@@ -643,8 +643,32 @@ async fn run_request_body_filters_at_eos(
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     match phase {
         RequestPhase::Headers => Ok(None),
-        RequestPhase::Body => run_body_filters(pipeline, ctx, request_body, true).await,
+        RequestPhase::Body => run_complete_request_body_filters(pipeline, ctx, request_body).await,
     }
+}
+
+/// Envoy owns the upstream call, so complete its outbound body before releasing it.
+async fn run_complete_request_body_filters(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    body_buf: &mut Vec<u8>,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    let mut body = Some(Bytes::from(mem::take(body_buf)));
+    let action = pipeline
+        .execute_http_request_body(ctx, &mut body, true)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(immediate) = immediate_from_action(action) {
+        return Ok(Some(immediate));
+    }
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(ctx, &mut body)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(b) = body {
+        *body_buf = b.to_vec();
+    }
+    Ok(immediate_from_action(action))
 }
 
 /// Run request body filters if the pipeline has body capabilities.
@@ -1179,6 +1203,209 @@ mod tests {
         let mut registry = FilterRegistry::with_builtins();
         registry.register(name, praxis_filter::http_builtin(factory)).unwrap();
         crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// Outcomes exercised at the final outbound body boundary.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SelectedBodyAction {
+        Rewrite,
+        Reject,
+        Error,
+        PreReject,
+    }
+
+    /// Probe that requires pre-read processing before its selected body hook.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SelectedBodyFilter {
+        action: SelectedBodyAction,
+    }
+
+    impl SelectedBodyFilter {
+        /// Registry factory for the outbound body probe.
+        fn from_config(
+            config: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(praxis_filter::parse_filter_config::<Self>(
+                "selected_body",
+                config,
+            )?))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for SelectedBodyFilter {
+        fn name(&self) -> &'static str {
+            "selected_body"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn selected_upstream_request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn request_body_mode(&self) -> praxis_filter::BodyMode {
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            assert!(end_of_stream, "complete body is required");
+            if matches!(self.action, SelectedBodyAction::PreReject) {
+                return Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)));
+            }
+            *body = Some(Bytes::from_static(b"pre-read"));
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_selected_upstream_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+        ) -> Result<praxis_filter::SelectedUpstreamBodyOutcome, praxis_filter::FilterError> {
+            assert_eq!(body.as_deref(), Some(b"pre-read".as_slice()), "pre-read must run first");
+            match self.action {
+                SelectedBodyAction::Rewrite => {
+                    *body = Some(Bytes::from_static(b"outbound"));
+                    ctx.request_headers_to_set
+                        .push(("x-selected".parse().unwrap(), "yes".parse().unwrap()));
+                    Ok(praxis_filter::SelectedUpstreamBodyOutcome::Continue)
+                },
+                SelectedBodyAction::Reject => Ok(praxis_filter::SelectedUpstreamBodyOutcome::Reject(
+                    praxis_filter::Rejection::status(403),
+                )),
+                SelectedBodyAction::Error => Err("selected body failed".into()),
+                SelectedBodyAction::PreReject => Err("selected hook ran after pre-read rejection".into()),
+            }
+        }
+    }
+
+    /// Build a probe pipeline without changing the production filter registry.
+    fn selected_body_pipeline(action: &str, path: &str) -> Arc<FilterPipeline> {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(&format!(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: selected_body\n        action: {action}\n        conditions: [{{when: {{path_prefix: {path}}}}}]\n"
+        ))
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "selected_body",
+                praxis_filter::http_builtin(SelectedBodyFilter::from_config),
+            )
+            .unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "assert body and header mutations across both buffered transports"
+    )]
+    async fn selected_body_rewrite_updates_buffered_and_fds_mutations() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ExtProcResponse;
+
+        for mode in [BodyMode::Buffered, BodyMode::FullDuplexStreamed] {
+            let pipeline = selected_body_pipeline("rewrite", "/");
+            let mut state = StreamState::new();
+            state.protocol_config.request_body_mode = mode;
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            let first = crate::handlers::handle_request_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"in".to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(first.is_empty(), "selected phase must wait for the complete body");
+            let responses = crate::handlers::handle_request_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"put".to_vec(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state.request_body, b"outbound",
+                "selected body must replace the forwarded bytes"
+            );
+            let headers: Vec<_> = responses
+                .iter()
+                .filter_map(|reply| match &reply.response {
+                    Some(ExtProcResponse::RequestHeaders(headers)) => headers.response.as_ref(),
+                    Some(ExtProcResponse::RequestBody(body)) => body.response.as_ref(),
+                    _ => None,
+                })
+                .filter_map(|common| common.header_mutation.as_ref())
+                .flat_map(|mutation| &mutation.set_headers)
+                .filter_map(|option| option.header.as_ref())
+                .collect();
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header.key == "x-selected" && header.value == "yes"),
+                "selected-phase headers must be delivered"
+            );
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header.key == "content-length" && header.value == "8"),
+                "rewritten length must match outbound bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_body_rejection_and_error_fail_closed() {
+        for action in ["reject", "error", "pre_reject"] {
+            let pipeline = selected_body_pipeline(action, "/");
+            let mut state = StreamState::new();
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            state.request_body = b"original".to_vec();
+            let result = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state).await;
+            if action == "error" {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+            } else {
+                let responses = result.unwrap();
+                assert_eq!(responses.len(), 1, "rejection must withhold upstream body");
+                let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+                    immediate,
+                )) = &responses.first().unwrap().response
+                else {
+                    unreachable!("expected immediate rejection");
+                };
+                assert_eq!(immediate.status.as_ref().unwrap().code, 403);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_body_hook_skips_unmatched_filters_and_headers_only_requests() {
+        for (path, phase) in [("/other", RequestPhase::Body), ("/", RequestPhase::Headers)] {
+            let pipeline = selected_body_pipeline("error", path);
+            let mut state = StreamState::new();
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            state.request_body = b"original".to_vec();
+            run_request_pipeline(phase, &pipeline, &mut state).await.unwrap();
+            assert_eq!(state.request_body, b"original", "no selected-phase work is permitted");
+        }
     }
 
     /// A reject from a request-body filter must short-circuit with an immediate

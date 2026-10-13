@@ -23,6 +23,7 @@ mod tests {
         StateOwner,
         store::{DEFAULT_STORE_NAME, ResponseStoreRegistry, SqliteResponseStore},
     };
+    use praxis_ai_store::{ConversationRecord, ResponseRecord};
     use praxis_extproc::server::PraxisExtProc;
     use praxis_filter::FilterPipeline;
     use praxis_proto::envoy::service::ext_proc::v3::{
@@ -102,6 +103,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn native_rehydration_rewrites_local_selectors() {
+        for selector in [
+            json!({"conversation": "conv_local"}),
+            json!({"conversation": {"id": "conv_local"}}),
+            json!({"previous_response_id": "resp_local"}),
+        ] {
+            let (pipeline, store, registry) = capture_pipeline().await;
+            let owner = StateOwner::from_trusted_parts("tenant", "test", "alice").unwrap();
+            let scoped = registry.get_scoped(DEFAULT_STORE_NAME, &owner).unwrap();
+            let messages = json!([{"role": "user", "content": "remember this"}]);
+            scoped
+                .upsert_conversation(&ConversationRecord {
+                    conversation_id: "conv_local".to_owned(),
+                    owner: owner.clone(),
+                    created_at: 1,
+                    metadata: json!({}),
+                    messages: messages.clone(),
+                })
+                .await
+                .unwrap();
+            scoped
+                .upsert_response(&ResponseRecord {
+                    id: "resp_local".to_owned(),
+                    owner,
+                    created_at: 1,
+                    model: "test".to_owned(),
+                    response_object: json!({"id": "resp_local", "object": "response", "status": "completed"}),
+                    input: json!("remember this"),
+                    messages,
+                })
+                .await
+                .unwrap();
+            let (mut client, shutdown, task) = start_service(PraxisExtProc::new(pipeline)).await;
+            let mut request = json!({"model": "test", "input": "hello", "store": true});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(selector.as_object().unwrap().clone());
+            let mut phases = native_capture_phases(true);
+            phases[1] = Request::RequestBody(HttpBody {
+                body: serde_json::to_vec(&request).unwrap(),
+                end_of_stream: true,
+            });
+            let replies = native_exchange(&mut client, 1, phases).await.unwrap();
+            let outbound: serde_json::Value = serde_json::from_slice(body_bytes(&replies[1])).unwrap();
+            assert!(
+                outbound.get("conversation").is_none(),
+                "local Conversation ID must be consumed"
+            );
+            assert!(
+                outbound.get("previous_response_id").is_none(),
+                "local Response ID must be consumed"
+            );
+            assert_eq!(
+                outbound["input"].as_array().unwrap().len(),
+                2,
+                "history must precede current input"
+            );
+            assert_eq!(outbound["input"][0]["content"], "remember this");
+            assert_eq!(outbound["input"][1]["content"], "hello");
+            assert_eq!(
+                scoped.get_response("resp_native_test").await.unwrap().unwrap().input,
+                json!("hello")
+            );
+            shutdown.send(()).unwrap();
+            task.await.unwrap().unwrap();
+            store.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn failed_storage_prevents_success_body_release() {
         let (pipeline, store, _) = capture_pipeline().await;
         let (mut client, shutdown, task) = start_service(PraxisExtProc::new(pipeline)).await;
@@ -177,12 +249,11 @@ mod tests {
     }
 
     fn body_bytes(reply: &ProcessingResponse) -> &[u8] {
-        let Some(Response::ResponseBody(body)) = &reply.response else {
-            unreachable!("expected body acknowledgement");
+        let body = match &reply.response {
+            Some(Response::ResponseBody(body) | Response::RequestBody(body)) => body.response.as_ref(),
+            _ => unreachable!("expected body acknowledgement"),
         };
         match body
-            .response
-            .as_ref()
             .unwrap()
             .body_mutation
             .as_ref()
