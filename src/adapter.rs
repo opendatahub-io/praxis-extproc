@@ -128,6 +128,8 @@ pub fn build_filter_context<'a>(
     trust_forwarded_for: bool,
 ) -> HttpFilterContext<'a> {
     let client_addr = extract_client_addr(request, trust_forwarded_for);
+    let mut extensions = RequestExtensions::default();
+    pipeline.prepare_extensions(&mut extensions);
 
     HttpFilterContext {
         buffered_request_body: None,
@@ -139,7 +141,7 @@ pub fn build_filter_context<'a>(
         downstream_tls: false,
         metrics_route: None,
         peer_identity: None,
-        extensions: RequestExtensions::default(),
+        extensions,
         executed_branch_filters: Vec::new(),
         executed_filter_indices: Vec::new(),
         extra_request_headers: Vec::new(),

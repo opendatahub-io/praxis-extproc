@@ -1604,6 +1604,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_hydration_preserves_pipeline_extensions() {
+        struct Extension;
+
+        impl praxis_filter::PipelineExtension for Extension {
+            fn prepare(&self, extensions: &mut praxis_filter::RequestExtensions) {
+                extensions.insert(Probe(PROBE_VALUE));
+            }
+        }
+
+        let mut pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        pipeline.add_pipeline_extension(Box::new(Extension));
+        let request = adapter::envoy_headers_to_request(&[]);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let hydrated = HydratedContext::hydrate(Some(crate::server::CarriedContext::default()), ctx).unwrap();
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
+    }
+
+    #[test]
+    fn carried_context_debug_omits_extension_contents() {
+        let mut extensions = praxis_filter::RequestExtensions::default();
+        extensions.insert("secret-extension-contents");
+        let carried = crate::server::CarriedContext {
+            extensions: Some(extensions),
+            ..Default::default()
+        };
+        let debug = format!("{carried:?}");
+        assert!(debug.contains("extensions_initialized: true"));
+        assert!(!debug.contains("secret-extension-contents"));
+    }
+
     /// Completeness guard: every carried field survives a round trip.
     #[expect(
         clippy::too_many_lines,
@@ -1622,6 +1653,7 @@ mod tests {
         let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
         hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
         hydrated.executed_filter_indices = vec![true, false, true];
+        hydrated.extensions.insert(Probe(PROBE_VALUE));
         hydrated
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
@@ -1637,11 +1669,13 @@ mod tests {
         let CarriedContext {
             branch_iterations,
             executed_filter_indices,
+            extensions,
             filter_metadata,
             filter_state,
         } = &carried;
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
+        assert_eq!(extensions.as_ref().unwrap().get::<Probe>(), Some(&Probe(PROBE_VALUE)));
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
 
@@ -1651,6 +1685,7 @@ mod tests {
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
         assert_eq!(hydrated.get_metadata("carry.meta"), Some("kept"));
         let restored = hydrated
             .filter_state

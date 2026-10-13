@@ -128,7 +128,7 @@ runs two phases:
    runs response body filters.
 
 Filter execution state (executed filter indices,
-branch iteration counters) is preserved between
+branch iteration counters) and request extensions are preserved between
 the request and response phases so that filters like
 branch chains maintain correct state across the full
 request lifecycle.
