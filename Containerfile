@@ -35,7 +35,7 @@
 #     -v $(pwd)/examples/praxis-extproc.yaml:/etc/praxis/extproc.yaml \
 #     praxis-extproc:dev -c /etc/praxis/extproc.yaml
 
-ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7
+ARG UBI9_DIGEST=sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
 ARG UBI9_MINIMAL_DIGEST=sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 # Mirrors FIPS_FEATURES in the Makefile.

@@ -12,8 +12,8 @@
 # Unlike Containerfile there is no report stage; make fips-check still uses
 # Containerfile --target report. Builder and runtime match Containerfile.
 
-ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7
-ARG UBI9_MINIMAL_PQC_DIGEST=sha256:db10c80537d786068c7c911d7ef6ea103315d0615fa4b39b5946f7976563a8d7
+ARG UBI9_DIGEST=sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
 
 # Mirrors FIPS_FEATURES in the Makefile and Containerfile.
 ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
