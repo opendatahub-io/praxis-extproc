@@ -130,9 +130,10 @@ async fn provider_failure_fails_closed_on_response() {
 /// model output reaches the client ungated — a real guardrails bypass, not an
 /// accepted limitation. Until streaming evaluation lands (praxis-proxy/ai#1108),
 /// the proxy should reject the request up front instead of serving unvetted
-/// content. Tracked upstream: <https://github.com/praxis-proxy/ai/issues/1604>.
+/// content. Fixed upstream in praxis-ai 0.7.0: the filter now rejects a
+/// streaming request with a 422 before the upstream is reached when a response
+/// guardrail is active (<https://github.com/praxis-proxy/ai/issues/1604>).
 #[tokio::test]
-#[ignore = "blocked on praxis-proxy/ai#1604: ai_guardrails doesn't fail closed for streaming responses yet"]
 async fn streaming_request_rejected_when_response_guardrails_enabled() {
     ensure_gateway_ready().await;
     let client = http_client();
@@ -150,14 +151,11 @@ async fn streaming_request_rejected_when_response_guardrails_enabled() {
         .expect("request failed");
 
     let status = resp.status();
-    assert!(
-        status.is_client_error(),
-        "streaming requests must be rejected while response guardrails can't evaluate SSE bodies \
-         (praxis-proxy/ai#1604), got {status}"
+    assert_eq!(
+        status, 422,
+        "ai_guardrails must fail closed on a streaming request with 422 while it cannot \
+         evaluate SSE response bodies (praxis-proxy/ai#1604), got {status}"
     );
-    assert_ne!(status, 401, "401 is an auth failure, not a guardrail rejection");
-    assert_ne!(status, 404, "404 is a routing failure, not a guardrail rejection");
-    assert_ne!(status, 429, "429 is rate limiting, not a guardrail rejection");
 
     let body = resp.text().await.expect("failed to read body");
     assert!(
