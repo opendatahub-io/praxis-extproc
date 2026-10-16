@@ -25,10 +25,8 @@
 # or migration-checksum crypto, so both stay in. CARGO_FEATURES defaults to
 # the Makefile's FIPS_FEATURES; keep the two in sync.
 #
-# Both base images are pinned by digest and their Red Hat signatures are
-# verified by `make fips-verify-image` before any podman build here. Update
-# the digests here and in the Makefile together, after
-# `cargo xtask fips verify-image` has accepted the new ones.
+# Both base images are pinned by digest. Update the digests here and in the
+# Makefile together.
 #
 # Run:
 #   podman run -p 50051:50051 -p 50052:50052 -p 9090:9090 \

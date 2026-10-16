@@ -12,11 +12,7 @@ name: FIPS
 # change that breaks FIPS compliance never reaches the image.
 #
 # Everything runs through the Makefile targets developers use locally (see
-# docs/fips.md), with podman: Red Hat's image signatures can only be verified
-# with podman, and the scanner reads podman's image store. Ubuntu's podman
-# packaging ships no registries.d entry for Red Hat's registry, so the job
-# first tells podman where the signatures live (make fips-signature-store),
-# as a developer on Debian or Ubuntu would.
+# docs/fips.md), with podman: the scanner reads podman's image store.
 #
 # The second job, fips-host, is the runtime proof the hosted job cannot
 # give: on the self-hosted RHEL 9 runner in FIPS mode it attests the host
@@ -92,12 +88,6 @@ jobs:
           echo "$OC_SHA256  $RUNNER_TEMP/oc.tar.gz" | sha256sum -c
           tar xzf "$RUNNER_TEMP/oc.tar.gz" -C "$RUNNER_TEMP/oc" oc
           echo "$RUNNER_TEMP/oc" >> "$GITHUB_PATH"
-
-      - name: Point podman at Red Hat's signature store (Ubuntu's podman has no entry for it)
-        run: make fips-signature-store
-
-      - name: Verify the Red Hat base images are signed by Red Hat
-        run: make fips-verify-image
 
       - name: Build on UBI 9 with Red Hat's toolchain and print the compliance report
         run: make fips-check

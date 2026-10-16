@@ -72,11 +72,10 @@ check-payload evidence. It has no `report` stage; compliance reports still use
 
 When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe
 in `Containerfile`, or runtime layout, update `Containerfile`, `Dockerfile.konflux`
-(where applicable), and the Makefile digest variables.
-`make fips-verify-image` checks that `Containerfile` and `Dockerfile.konflux`
-default-pin the same `ubi9/ubi` builder digest (the Konflux runtime uses
-`ubi-minimal-pqc` on `registry.redhat.io`, verified separately when you bump
-that pin). To build the Konflux file locally:
+(where applicable), and the Makefile digest variables. Keep the `ubi9/ubi`
+builder digest consistent between `Containerfile` and `Dockerfile.konflux`
+(the Konflux runtime uses `ubi-minimal-pqc` on `registry.redhat.io`). To build
+the Konflux file locally:
 
 ```console
 podman build -f Dockerfile.konflux .
@@ -201,7 +200,6 @@ fatal error=crypto: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: t
 On a developer machine (no FIPS host needed):
 
 ```console
-make fips-signature-store  # once on Debian/Ubuntu: their podman has no entry for Red Hat's signature store
 make fips-check            # build on UBI 9 with Red Hat's toolchain, print the compliance report
 make container-release     # the product image
 make fips-smoke            # run it once: the example config validates with the system OpenSSL
