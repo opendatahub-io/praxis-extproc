@@ -21,7 +21,13 @@ filter_chains:
 
   - name: ai
     filters:
+      # `unless` trusts an existing X-Model (which the resolver below routes on).
+      # For untrusted ingress, drop it and strip the header with
+      # `headers request_remove` before json_body.
       - filter: json_body
+        conditions:
+          - unless:
+              headers_present: ["X-Model"]
         request_extract:
           - pointer: /model
             header: X-Model

@@ -16,10 +16,13 @@ data:
     filter_chains:
       - name: bbr
         filters:
-          - filter: headers
-            request_remove:
-              - X-Gateway-Model-Name
+          # Promote body "model" into X-Gateway-Model-Name; `unless` trusts an
+          # existing header. For untrusted ingress, drop it and strip the header
+          # with `headers request_remove` before json_body.
           - filter: json_body
+            conditions:
+              - unless:
+                  headers_present: ["X-Gateway-Model-Name"]
             request_extract:
               - pointer: /model
                 header: X-Gateway-Model-Name

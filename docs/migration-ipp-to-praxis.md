@@ -93,12 +93,16 @@ filter_chains:
       #    semantics tracked in #5.
       - filter: headers
         request_remove:
-          - X-MaaS-Internal   # strip inbound MaaS-owned headers
+          - X-MaaS-Internal                 # strip inbound MaaS-owned headers
 
       # 2. body-field-to-header (model-extractor)
       #    ->  json_body request_extract (full parity;
-      #    see the promotion-header note below)
+      #    see the promotion-header and spoofing notes below)
       - filter: json_body
+        conditions:
+          - unless:                         # skip extraction when a prior hop
+              headers_present:              #   already set the routing header
+                - X-Gateway-Model-Name
         request_extract:
           - pointer: /model                 # IPP fieldName: model
             header: X-Gateway-Model-Name    # IPP headerName
@@ -188,6 +192,41 @@ filter_chains:
   controller renders these configs, it must not emit a
   `header` that targets a transport, credential, or
   `x-praxis-*` name.
+
+  **\*Spoofing and the trust boundary.** The
+  `unless: headers_present` condition above skips extraction
+  when `X-Gateway-Model-Name` is already set, trusting a
+  value a prior hop in the chain placed there. Core
+  `json_body` otherwise only *writes* the header when the
+  pointer resolves: when `/model` is absent it skips
+  extraction, and with `on_invalid: continue` an unparseable
+  body passes through untouched — so it never *adds* the
+  header for an absent or invalid body, matching the old
+  `model_to_header` filter. Unlike `model_to_header`,
+  however, core `json_body` does **not** strip an inbound
+  client copy on its own.
+
+  If the request reaching this chain is not trusted, prevent
+  spoofing by dropping the condition and stripping the
+  header first with a `headers` filter
+  (`request_remove: [X-Gateway-Model-Name]`) immediately
+  before `json_body`:
+
+  ```yaml
+  - filter: headers
+    request_remove:
+      - X-Gateway-Model-Name
+  - filter: json_body
+    request_extract:
+      - pointer: /model
+        header: X-Gateway-Model-Name
+    on_invalid: continue
+  ```
+
+  Whichever you choose is a trust-boundary decision, not an
+  absolute guarantee: within a chain any filter can modify
+  both the header and the body, so place the strip where the
+  boundary actually is.
 - **`maas-headers-guard` → `headers`.** IPP captures
   inbound `x-maas-*` headers into request state for
   downstream plugins and guards them from
