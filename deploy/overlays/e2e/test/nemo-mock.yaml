@@ -5,14 +5,21 @@
 # is content-keyword driven so a single service drives every case and leaves
 # all other e2e traffic undisturbed:
 #
-#   * default                                 -> {"status":"passed"}      (pass)
-#   * rail_types=input  + __GUARD_BLOCK_IN__  -> {"status":"blocked"}     (403 at request)
-#   * rail_types=output + __GUARD_BLOCK_OUT__ -> {"status":"blocked"}     (200 + error body at response)
-#   * rail_types=output + __GUARD_FAIL_OUT__  -> HTTP 500                 (fail-closed at response)
+#   * default                                    -> {"status":"passed"}   (pass)
+#   * rail_types=input  + __GUARD_BLOCK_IN__     -> {"status":"blocked"}  (403 at request)
+#   * rail_types=input  + __GUARD_FAIL_IN__      -> HTTP 500              (fail-closed at request)
+#   * rail_types=output + __GUARD_BLOCK_OUT__    -> {"status":"blocked"}  (200 + error body at response)
+#   * rail_types=output + __GUARD_FAIL_OUT__     -> HTTP 500              (fail-closed at response)
+#   * rail_types=output + __GUARD_TIMEOUT_OUT__  -> delayed passed       (fail-closed: callout timeout)
+#   * rail_types=output + __GUARD_MALFORMED_OUT__-> unparseable body     (fail-closed: malformed response)
+#   * rail_types=output + __GUARD_UNKNOWN_OUT__  -> {"status":"frobnicate"} (fail-closed: unknown status)
 #
 # Keying the block/fail stubs on rail_types (not just the token) lets a token
 # that the echo backend reflects into its answer pass the request phase and only
-# trip on the response phase.
+# trip on the response phase. The *_IN_ stubs trip on the request phase; the
+# *_OUT_ stubs pass the request phase (default) and trip on the response phase.
+# The output-phase failure stubs (timeout / malformed / unknown) all drive the
+# filter into a fail-closed FilterError, so a client never sees unvetted output.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -78,6 +85,75 @@ data:
         "status": 500,
         "headers": { "Content-Type": "application/json" },
         "jsonBody": { "error": "simulated nemo outage" }
+      }
+    }
+  fail-input.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_FAIL_IN__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "input" } }
+        ]
+      },
+      "response": {
+        "status": 500,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "error": "simulated nemo outage (input phase)" }
+      }
+    }
+  timeout-output.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_TIMEOUT_OUT__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "output" } }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "passed", "content": "" },
+        "fixedDelayMilliseconds": 4000
+      }
+    }
+  malformed-output.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_MALFORMED_OUT__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "output" } }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "body": "{ \"status\": \"blocked\", not valid json"
+      }
+    }
+  unknown-output.json: |
+    {
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/v1/checks",
+        "bodyPatterns": [
+          { "contains": "__GUARD_UNKNOWN_OUT__" },
+          { "matchesJsonPath": { "expression": "$.guardrails.rail_types[0]", "equalTo": "output" } }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "status": "frobnicate", "content": "" }
       }
     }
 ---

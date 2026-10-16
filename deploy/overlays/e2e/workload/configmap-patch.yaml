@@ -34,6 +34,11 @@ data:
             provider:
               type: nemo
               endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
+              # Short per-callout deadline so the timeout fail-closed case
+              # (__GUARD_TIMEOUT_OUT__, delayed 4s by the mock) trips quickly
+              # instead of waiting out the 10s default; the mock's default-pass
+              # replies instantly, so normal traffic stays well under this.
+              timeout_ms: 2000
             phase:
               request: true
               response: true

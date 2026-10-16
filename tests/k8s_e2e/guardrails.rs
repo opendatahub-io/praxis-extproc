@@ -58,6 +58,21 @@ async fn malicious_prompt_blocked_at_request() {
     );
 }
 
+/// A request-phase callout failure must fail closed: the mock returns 5xx on the
+/// input rail and the request is rejected, so the client gets a server error
+/// instead of a pass-through.
+#[tokio::test]
+async fn provider_failure_fails_closed_at_request() {
+    ensure_gateway_ready().await;
+    let resp = chat_completion("granite-8b", "Please answer __GUARD_FAIL_IN__ now").await;
+
+    assert!(
+        resp.status().is_server_error(),
+        "a request-phase callout failure must fail closed as a server error, got {}",
+        resp.status()
+    );
+}
+
 /// Story: unsafe model output is caught and the user never sees it.
 ///
 /// The token passes the request phase (input rail) but the echo backend
@@ -94,32 +109,68 @@ async fn unsafe_response_blocked_with_error_body() {
     );
 }
 
-/// Story: if the guardrail service is down, we fail closed, not open.
-///
-/// The mock returns 5xx on the response-phase callout. The filter must not leak
-/// the (unvetted) upstream body: it replaces it with an evaluation-failure error
-/// payload, status 200.
-#[tokio::test]
-async fn provider_failure_fails_closed_on_response() {
+/// Drive a response-phase callout failure for `token` and assert boundary 2
+/// (buffered output is gated before client release): the committed status stays
+/// 200, the body is replaced with an `evaluation_failed` payload, and the
+/// unvetted model output (`token`) never leaks into what the client receives.
+async fn assert_response_fails_closed(token: &str) {
     ensure_gateway_ready().await;
-    let content = format!("{PADDING}{PADDING}{PADDING}__GUARD_FAIL_OUT__{PADDING}{PADDING}");
+    let content = format!("{PADDING}{PADDING}{PADDING}{token}{PADDING}{PADDING}");
     let resp = chat_completion("granite-8b", &content).await;
 
     assert_eq!(
         resp.status(),
         200,
-        "a response-phase provider failure fails closed with a committed 200"
+        "a response-phase callout failure fails closed with a committed 200"
     );
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse error JSON");
     assert_eq!(
         body["error"]["code"], "evaluation_failed",
-        "a provider failure must fail closed with an evaluation_failed body, got {body:?}"
+        "a response-phase callout failure must fail closed with an evaluation_failed body, got {body:?}"
     );
     assert!(
-        !body.to_string().contains("__GUARD_FAIL_OUT__"),
+        !body.to_string().contains(token),
         "the unvetted model output must not leak into the error body, got {body:?}"
     );
+}
+
+/// Story: if the guardrail service is down, we fail closed, not open.
+///
+/// The mock returns 5xx on the response-phase callout; the filter replaces the
+/// unvetted upstream body with an evaluation-failure payload.
+#[tokio::test]
+async fn provider_failure_fails_closed_on_response() {
+    assert_response_fails_closed("__GUARD_FAIL_OUT__").await;
+}
+
+/// Story: a guardrail callout that times out fails closed, not open.
+///
+/// The mock delays the response-phase callout past the filter's `timeout_ms`, so
+/// the per-callout deadline trips. An unresolved check must not release the
+/// (unvetted) model output.
+#[tokio::test]
+async fn provider_timeout_fails_closed_on_response() {
+    assert_response_fails_closed("__GUARD_TIMEOUT_OUT__").await;
+}
+
+/// Story: a malformed guardrail response fails closed, not open.
+///
+/// The mock returns an unparseable body on the response-phase callout. A verdict
+/// the filter cannot parse must fail closed, not pass the output through.
+#[tokio::test]
+async fn provider_malformed_response_fails_closed_on_response() {
+    assert_response_fails_closed("__GUARD_MALFORMED_OUT__").await;
+}
+
+/// Story: an unknown guardrail verdict fails closed, not open.
+///
+/// The mock returns a status the filter does not recognize (`frobnicate`) on the
+/// response-phase callout. An unknown verdict must fail closed, not be treated as
+/// a pass.
+#[tokio::test]
+async fn provider_unknown_status_fails_closed_on_response() {
+    assert_response_fails_closed("__GUARD_UNKNOWN_OUT__").await;
 }
 
 /// Story: a streaming request must fail closed when response guardrails are enabled.
