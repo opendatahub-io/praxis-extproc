@@ -176,6 +176,7 @@ pub fn build_filter_context<'a>(
         attempted_endpoints: Vec::new(),
         retry_policy: None,
         route_retry_policy: None,
+        hedge_policy: None,
         cluster_retry_state: None,
         cluster_retry_state_released: false,
         endpoint_reselector: None,
@@ -817,6 +818,7 @@ mod tests {
             collect_request_header_mutations(&ctx).is_none(),
             "no mutations when empty"
         );
+        assert!(ctx.hedge_policy.is_none(), "Envoy owns upstream attempts");
     }
 
     #[test]
