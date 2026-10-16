@@ -23,6 +23,8 @@ mod pipeline;
 mod protocol;
 pub mod response;
 pub mod server;
+#[cfg(feature = "responses-store")]
+mod store;
 pub mod tls;
 
 #[cfg(test)]

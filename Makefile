@@ -180,7 +180,7 @@ images: container-release
 # attestation and the runtime probe are `cargo xtask fips` commands
 # (xtask/src/fips/). See docs/fips.md.
 
-FIPS_FEATURES           := responses,aws-sigv4,store-postgres-cert-auth
+FIPS_FEATURES           := responses,aws-sigv4,store-postgres-cert-auth,conversations
 # Overridable so the FIPS host run can point the whole recursion at a
 # container volume (see test-fips-host).
 FIPS_TARGET_DIR         ?= target/fips

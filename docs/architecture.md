@@ -122,16 +122,22 @@ runs two phases:
 
 1. **Request phase**: `execute_http_request` runs
    request filters, then `execute_http_request_body`
-   runs body filters if body data is present.
+   runs body filters. For accumulated `BUFFERED` and
+   `FULL_DUPLEX_STREAMED` requests, the selected-upstream
+   body hooks run last, before outbound mutations are returned.
 2. **Response phase**: `execute_http_response` runs
    response filters, then `execute_http_response_body`
    runs response body filters.
 
 Filter execution state (executed filter indices,
-branch iteration counters) is preserved between
+branch iteration counters) and request extensions are preserved between
 the request and response phases so that filters like
 branch chains maintain correct state across the full
 request lifecycle.
+
+Stored non-streaming Responses JSON requests a `BUFFERED` body-mode override
+at response headers. Envoy gathers the complete JSON body before persistence
+and release; SSE retains its configured streaming mode.
 
 [`FilterPipeline`]: https://docs.rs/praxis-proxy-filter/latest/praxis_filter/struct.FilterPipeline.html
 [`HttpFilterContext`]: https://docs.rs/praxis-proxy-filter/latest/praxis_filter/struct.HttpFilterContext.html

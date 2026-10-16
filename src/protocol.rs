@@ -34,8 +34,7 @@ pub(crate) struct ProtocolConfig {
     /// modes. `FULL_DUPLEX_STREAMED` inherently streams body without waiting.
     ///
     /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
-    #[expect(dead_code, reason = "captured for future STREAMED delayed-response implementation")]
-    send_body_without_waiting: bool,
+    pub(crate) send_body_without_waiting: bool,
 }
 
 impl TryFrom<ProtocolConfiguration> for ProtocolConfig {

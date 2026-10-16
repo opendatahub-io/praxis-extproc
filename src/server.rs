@@ -17,7 +17,7 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
 
-use praxis_filter::{FilterPipeline, HttpFilterContext, Request, Response};
+use praxis_filter::{FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
 use praxis_proto::envoy::service::ext_proc::v3::{
     ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
     processing_request,
@@ -331,6 +331,9 @@ async fn dispatch_request(
     reason = "independent per-direction flags, not a state machine"
 )]
 pub(crate) struct HeaderDeliveryState {
+    /// A stored JSON response requested a header-time BUFFERED mode override.
+    pub(crate) buffered_response_override: bool,
+
     /// Whether response-phase filters already ran at header time.
     pub(crate) response_filters_executed: bool,
 
@@ -368,7 +371,7 @@ impl HeaderDeliveryState {
 /// error instead of silently carrying an empty context. `#[must_use]` flags parked
 /// state that is dropped instead of hydrated.
 #[must_use = "parked cross-phase state must be hydrated into a context"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct CarriedContext {
     /// Branch re-entrance counters.
     pub(super) branch_iterations: HashMap<Arc<str>, u32>,
@@ -376,11 +379,26 @@ pub(super) struct CarriedContext {
     /// Filter indices executed in earlier phases.
     pub(super) executed_filter_indices: Vec<bool>,
 
+    /// Request-scoped extensions, initialized by the pipeline on the first phase.
+    pub(super) extensions: Option<RequestExtensions>,
+
     /// Flat string metadata.
     pub(super) filter_metadata: HashMap<String, String>,
 
     /// Typed per-filter state.
     pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CarriedContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarriedContext")
+            .field("branch_iterations", &self.branch_iterations)
+            .field("executed_filter_indices", &self.executed_filter_indices)
+            .field("extensions_initialized", &self.extensions.is_some())
+            .field("filter_metadata", &self.filter_metadata)
+            .field("filter_state", &self.filter_state)
+            .finish()
+    }
 }
 
 /// A context holding hydrated cross-phase state.
@@ -408,6 +426,9 @@ impl<'a> HydratedContext<'a> {
         ctx.executed_filter_indices = carried.executed_filter_indices;
         ctx.filter_metadata = carried.filter_metadata;
         ctx.filter_state = carried.filter_state;
+        if let Some(extensions) = carried.extensions {
+            ctx.extensions = extensions;
+        }
         Ok(Self { ctx })
     }
 
@@ -432,6 +453,7 @@ impl<'a> HydratedContext<'a> {
         *slot = Some(CarriedContext {
             branch_iterations: self.ctx.branch_iterations,
             executed_filter_indices: self.ctx.executed_filter_indices,
+            extensions: Some(self.ctx.extensions),
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
         });

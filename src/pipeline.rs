@@ -14,8 +14,8 @@ use std::mem;
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
-use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingResponse};
+use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response, body::MAX_JSON_BODY_BYTES};
+use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingMode, ProcessingResponse};
 use tonic::Status;
 use tracing::warn;
 
@@ -495,9 +495,94 @@ pub(crate) async fn run_response_header_filters_early(
 
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    let buffer_native_json = should_buffer_native_json(&ctx);
     ctx.dehydrate(&mut state.carried_context)?;
 
-    Ok(delivery.deliver_response(mutation, state))
+    finish_response_headers(delivery, mutation, buffer_native_json, state)
+}
+
+/// Apply the selected transport mode to the header acknowledgement.
+fn finish_response_headers(
+    delivery: MutationDelivery,
+    mutation: Option<HeaderMutation>,
+    buffer_native_json: bool,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = delivery.deliver_response(mutation, state);
+    if buffer_native_json {
+        select_buffered_response(state, &mut responses)?;
+    }
+    Ok(responses)
+}
+
+/// Only stored, successful, non-streaming Responses JSON needs a complete body.
+#[cfg(feature = "responses-store")]
+fn should_buffer_native_json(ctx: &HttpFilterContext<'_>) -> bool {
+    use praxis_ai_apis::store::{DEFAULT_STORE_NAME, ResponseStoreRegistry};
+
+    ctx.request.method == http::Method::POST
+        && matches!(ctx.request.uri.path(), "/v1/responses" | "/v1/responses/")
+        && ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+        && ctx.get_metadata("openai_responses_request.stream") != Some("true")
+        && ctx.get_metadata("openai_responses_request.store") != Some("false")
+        && ctx
+            .extensions
+            .get::<ResponseStoreRegistry>()
+            .is_some_and(|registry| registry.contains(DEFAULT_STORE_NAME))
+        && ctx.response_header.as_ref().is_some_and(|response| {
+            response.status.is_success()
+                && response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or_default()
+                            .trim()
+                            .eq_ignore_ascii_case("application/json")
+                    })
+        })
+}
+
+/// Without store support no response needs persistence buffering.
+#[cfg(not(feature = "responses-store"))]
+const fn should_buffer_native_json(_ctx: &HttpFilterContext<'_>) -> bool {
+    false
+}
+
+/// Envoy's `ProcessingResponse.mode_override` applies only to header responses.
+fn select_buffered_response(state: &mut StreamState, responses: &mut [ProcessingResponse]) -> Result<(), Status> {
+    if !matches!(
+        state.protocol_config.response_body_mode,
+        BodyMode::Streamed | BodyMode::Buffered
+    ) {
+        return Ok(());
+    }
+    if state.protocol_config.response_body_mode == BodyMode::Streamed {
+        if state.protocol_config.send_body_without_waiting {
+            return Err(Status::failed_precondition(
+                "stored JSON requires header-time mode overrides",
+            ));
+        }
+        let response = responses
+            .first_mut()
+            .ok_or_else(|| Status::internal("response headers missing for mode override"))?;
+        response.mode_override = Some(ProcessingMode {
+            request_body_mode: state.protocol_config.request_body_mode as i32,
+            response_body_mode: BodyMode::Buffered as i32,
+            ..Default::default()
+        });
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.header_state.buffered_response_override = true;
+    }
+    state.max_body_accumulation = Some(
+        state
+            .max_body_accumulation
+            .map_or(MAX_JSON_BODY_BYTES, |limit| limit.min(MAX_JSON_BODY_BYTES)),
+    );
+    Ok(())
 }
 
 /// Capture response headers before filter execution.
@@ -558,8 +643,32 @@ async fn run_request_body_filters_at_eos(
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     match phase {
         RequestPhase::Headers => Ok(None),
-        RequestPhase::Body => run_body_filters(pipeline, ctx, request_body, true).await,
+        RequestPhase::Body => run_complete_request_body_filters(pipeline, ctx, request_body).await,
     }
+}
+
+/// Envoy owns the upstream call, so complete its outbound body before releasing it.
+async fn run_complete_request_body_filters(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    body_buf: &mut Vec<u8>,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    let mut body = Some(Bytes::from(mem::take(body_buf)));
+    let action = pipeline
+        .execute_http_request_body(ctx, &mut body, true)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(immediate) = immediate_from_action(action) {
+        return Ok(Some(immediate));
+    }
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(ctx, &mut body)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(b) = body {
+        *body_buf = b.to_vec();
+    }
+    Ok(immediate_from_action(action))
 }
 
 /// Run request body filters if the pipeline has body capabilities.
@@ -719,6 +828,72 @@ mod tests {
 
     use super::*;
     use crate::test_support::snapshot_counter;
+
+    #[test]
+    fn ext_proc_header_mode_override_buffers_json_and_preserves_request_mode() {
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+        state.protocol_config.response_body_mode = BodyMode::Streamed;
+        state.max_body_accumulation = None;
+        let mut responses = vec![response::response_headers(None)];
+        select_buffered_response(&mut state, &mut responses).unwrap();
+        let mode = responses.first().unwrap().mode_override.as_ref().unwrap();
+        assert_eq!(mode.request_body_mode, 1, "override preserves request transport");
+        assert_eq!(mode.response_body_mode, 2, "JSON is buffered before release");
+        assert_eq!(
+            mode.response_header_mode, 0,
+            "DEFAULT leaves header processing unchanged"
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+        assert!(state.header_state.buffered_response_override);
+        assert_eq!(
+            state.max_body_accumulation,
+            Some(MAX_JSON_BODY_BYTES),
+            "insecure unbounded mode cannot disable the JSON ceiling"
+        );
+    }
+
+    #[test]
+    fn buffered_json_keeps_stricter_server_limit_without_override() {
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.max_body_accumulation = Some(128);
+        let mut responses = vec![response::response_headers(None)];
+        select_buffered_response(&mut state, &mut responses).unwrap();
+        assert_eq!(state.max_body_accumulation, Some(128), "never raise the server ceiling");
+        assert!(responses.first().unwrap().mode_override.is_none());
+        assert!(!state.header_state.buffered_response_override);
+    }
+
+    #[test]
+    fn ext_proc_mode_override_rejects_eager_body_delivery() {
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Streamed;
+        state.protocol_config.send_body_without_waiting = true;
+        let mut responses = vec![response::response_headers(None)];
+        let error = select_buffered_response(&mut state, &mut responses).unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "Envoy ignores mode overrides with eager body delivery"
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Streamed);
+        assert!(responses.first().unwrap().mode_override.is_none());
+    }
+
+    #[test]
+    fn json_mode_selection_does_not_change_none_or_full_duplex_transport() {
+        for mode in [BodyMode::None, BodyMode::FullDuplexStreamed] {
+            let mut state = StreamState::new();
+            state.protocol_config.response_body_mode = mode;
+            let limit = state.max_body_accumulation;
+            let mut responses = vec![response::response_headers(None)];
+            select_buffered_response(&mut state, &mut responses).unwrap();
+            assert_eq!(state.protocol_config.response_body_mode, mode);
+            assert_eq!(state.max_body_accumulation, limit);
+            assert!(responses.first().unwrap().mode_override.is_none());
+        }
+    }
 
     /// Read the `content-length` value from a header mutation, if present.
     fn content_length_of(mutation: &Option<HeaderMutation>) -> Option<String> {
@@ -1028,6 +1203,209 @@ mod tests {
         let mut registry = FilterRegistry::with_builtins();
         registry.register(name, praxis_filter::http_builtin(factory)).unwrap();
         crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// Outcomes exercised at the final outbound body boundary.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SelectedBodyAction {
+        Rewrite,
+        Reject,
+        Error,
+        PreReject,
+    }
+
+    /// Probe that requires pre-read processing before its selected body hook.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SelectedBodyFilter {
+        action: SelectedBodyAction,
+    }
+
+    impl SelectedBodyFilter {
+        /// Registry factory for the outbound body probe.
+        fn from_config(
+            config: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(praxis_filter::parse_filter_config::<Self>(
+                "selected_body",
+                config,
+            )?))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for SelectedBodyFilter {
+        fn name(&self) -> &'static str {
+            "selected_body"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn selected_upstream_request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn request_body_mode(&self) -> praxis_filter::BodyMode {
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            assert!(end_of_stream, "complete body is required");
+            if matches!(self.action, SelectedBodyAction::PreReject) {
+                return Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)));
+            }
+            *body = Some(Bytes::from_static(b"pre-read"));
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_selected_upstream_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+        ) -> Result<praxis_filter::SelectedUpstreamBodyOutcome, praxis_filter::FilterError> {
+            assert_eq!(body.as_deref(), Some(b"pre-read".as_slice()), "pre-read must run first");
+            match self.action {
+                SelectedBodyAction::Rewrite => {
+                    *body = Some(Bytes::from_static(b"outbound"));
+                    ctx.request_headers_to_set
+                        .push(("x-selected".parse().unwrap(), "yes".parse().unwrap()));
+                    Ok(praxis_filter::SelectedUpstreamBodyOutcome::Continue)
+                },
+                SelectedBodyAction::Reject => Ok(praxis_filter::SelectedUpstreamBodyOutcome::Reject(
+                    praxis_filter::Rejection::status(403),
+                )),
+                SelectedBodyAction::Error => Err("selected body failed".into()),
+                SelectedBodyAction::PreReject => Err("selected hook ran after pre-read rejection".into()),
+            }
+        }
+    }
+
+    /// Build a probe pipeline without changing the production filter registry.
+    fn selected_body_pipeline(action: &str, path: &str) -> Arc<FilterPipeline> {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(&format!(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: selected_body\n        action: {action}\n        conditions: [{{when: {{path_prefix: {path}}}}}]\n"
+        ))
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "selected_body",
+                praxis_filter::http_builtin(SelectedBodyFilter::from_config),
+            )
+            .unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "assert body and header mutations across both buffered transports"
+    )]
+    async fn selected_body_rewrite_updates_buffered_and_fds_mutations() {
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ExtProcResponse;
+
+        for mode in [BodyMode::Buffered, BodyMode::FullDuplexStreamed] {
+            let pipeline = selected_body_pipeline("rewrite", "/");
+            let mut state = StreamState::new();
+            state.protocol_config.request_body_mode = mode;
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            let first = crate::handlers::handle_request_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"in".to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(first.is_empty(), "selected phase must wait for the complete body");
+            let responses = crate::handlers::handle_request_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"put".to_vec(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state.request_body, b"outbound",
+                "selected body must replace the forwarded bytes"
+            );
+            let headers: Vec<_> = responses
+                .iter()
+                .filter_map(|reply| match &reply.response {
+                    Some(ExtProcResponse::RequestHeaders(headers)) => headers.response.as_ref(),
+                    Some(ExtProcResponse::RequestBody(body)) => body.response.as_ref(),
+                    _ => None,
+                })
+                .filter_map(|common| common.header_mutation.as_ref())
+                .flat_map(|mutation| &mutation.set_headers)
+                .filter_map(|option| option.header.as_ref())
+                .collect();
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header.key == "x-selected" && header.value == "yes"),
+                "selected-phase headers must be delivered"
+            );
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header.key == "content-length" && header.value == "8"),
+                "rewritten length must match outbound bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_body_rejection_and_error_fail_closed() {
+        for action in ["reject", "error", "pre_reject"] {
+            let pipeline = selected_body_pipeline(action, "/");
+            let mut state = StreamState::new();
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            state.request_body = b"original".to_vec();
+            let result = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state).await;
+            if action == "error" {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+            } else {
+                let responses = result.unwrap();
+                assert_eq!(responses.len(), 1, "rejection must withhold upstream body");
+                let Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+                    immediate,
+                )) = &responses.first().unwrap().response
+                else {
+                    unreachable!("expected immediate rejection");
+                };
+                assert_eq!(immediate.status.as_ref().unwrap().code, 403);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_body_hook_skips_unmatched_filters_and_headers_only_requests() {
+        for (path, phase) in [("/other", RequestPhase::Body), ("/", RequestPhase::Headers)] {
+            let pipeline = selected_body_pipeline("error", path);
+            let mut state = StreamState::new();
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            state.request_body = b"original".to_vec();
+            run_request_pipeline(phase, &pipeline, &mut state).await.unwrap();
+            assert_eq!(state.request_body, b"original", "no selected-phase work is permitted");
+        }
     }
 
     /// A reject from a request-body filter must short-circuit with an immediate
@@ -1604,6 +1982,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_hydration_preserves_pipeline_extensions() {
+        struct Extension;
+
+        impl praxis_filter::PipelineExtension for Extension {
+            fn prepare(&self, extensions: &mut praxis_filter::RequestExtensions) {
+                extensions.insert(Probe(PROBE_VALUE));
+            }
+        }
+
+        let mut pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        pipeline.add_pipeline_extension(Box::new(Extension));
+        let request = adapter::envoy_headers_to_request(&[]);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let hydrated = HydratedContext::hydrate(Some(crate::server::CarriedContext::default()), ctx).unwrap();
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
+    }
+
+    #[test]
+    fn carried_context_debug_omits_extension_contents() {
+        let mut extensions = praxis_filter::RequestExtensions::default();
+        extensions.insert("secret-extension-contents");
+        let carried = crate::server::CarriedContext {
+            extensions: Some(extensions),
+            ..Default::default()
+        };
+        let debug = format!("{carried:?}");
+        assert!(debug.contains("extensions_initialized: true"));
+        assert!(!debug.contains("secret-extension-contents"));
+    }
+
     /// Completeness guard: every carried field survives a round trip.
     #[expect(
         clippy::too_many_lines,
@@ -1622,6 +2031,7 @@ mod tests {
         let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
         hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
         hydrated.executed_filter_indices = vec![true, false, true];
+        hydrated.extensions.insert(Probe(PROBE_VALUE));
         hydrated
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
@@ -1637,11 +2047,13 @@ mod tests {
         let CarriedContext {
             branch_iterations,
             executed_filter_indices,
+            extensions,
             filter_metadata,
             filter_state,
         } = &carried;
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
+        assert_eq!(extensions.as_ref().unwrap().get::<Probe>(), Some(&Probe(PROBE_VALUE)));
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
 
@@ -1651,6 +2063,7 @@ mod tests {
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
         assert_eq!(hydrated.get_metadata("carry.meta"), Some("kept"));
         let restored = hydrated
             .filter_state

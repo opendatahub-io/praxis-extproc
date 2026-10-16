@@ -29,9 +29,11 @@ policy-engine = ["praxis-ai-filters/policy-engine"]
 # The OpenAI Responses filters.
 responses = ["praxis-ai-filters/openai-responses"]
 # The response store the Responses filters keep state in (previous_response_id
-# chaining), registered as a pipeline extension. It is built on sqlx, whose
-# migration checksums carry sha2, so the FIPS build leaves it out.
-responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis"]
+# chaining), registered as a pipeline extension. Select a storage backend
+# separately; the release image uses certificate-only Postgres.
+responses-store = ["responses", "praxis-ai-filters/store", "dep:praxis-ai-apis", "dep:praxis-ai-store", "dep:praxis-ai-store-lifecycle", "dep:serde_json"]
+# Conversations API without tools, compaction or a storage backend selection.
+conversations = ["responses-store", "praxis-ai-filters/openai-conversations"]
 # Everything else praxis-ai offers for Responses, all of it on the store: the
 # Postgres and SQLite backends, Conversations, context compaction, MCP tools
 # and the file resolver. What the previous praxis-ai pin built in.
@@ -53,17 +55,18 @@ async-trait = "0.1.89"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 http = "1.4.0"
-# praxis-ai at its v0.6.0 release, where the larger capabilities are opt-in
-# features; the [features] above choose which ones this server builds in.
-praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false, optional = true }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.6.0", default-features = false }
+# praxis-ai with shared store planning; features above select capabilities.
+praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", rev = "b60d9cda1da9e597b0e65d41943cda4a65a4b4c9", default-features = false, optional = true }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "b60d9cda1da9e597b0e65d41943cda4a65a4b4c9", default-features = false }
+praxis-ai-store = { git = "https://github.com/praxis-proxy/ai.git", rev = "b60d9cda1da9e597b0e65d41943cda4a65a4b4c9", default-features = false, optional = true }
+praxis-ai-store-lifecycle = { git = "https://github.com/praxis-proxy/ai.git", rev = "b60d9cda1da9e597b0e65d41943cda4a65a4b4c9", default-features = false, optional = true }
 # The praxis version must match praxis-ai's pin so the PipelineExtension
 # types unify (praxis-ai pins the same 0.7 from crates.io). No default
 # features: praxis-filter's default turns on the policy engine, whose
 # plugins carry pure-Rust cryptography; the policy-engine feature above
 # opts back in.
-praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false }
+praxis-core = { version = "0.7.4", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.4", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "proto", package = "praxis-proxy-proto" }
 hyper = { version = "1.9.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -77,9 +80,10 @@ openssl = "0.10.81"
 # never with `vendored`), whose provider module src/fips.rs delegates to;
 # rustls itself arrives transitively with its default features (aws-lc-rs)
 # kept off by every praxis crate.
-praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
+praxis-tls = { version = "0.7.4", package = "praxis-proxy-tls" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
+serde_json = { version = "1.0.151", optional = true }
 thiserror = "2.0.18"
 tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-openssl = "0.6.5"
@@ -100,6 +104,7 @@ metrics-util = { version = "0.19", default-features = false, features = ["debugg
 rcgen = "0.13.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "json"] }
 serde_json = "1.0.151"
+tempfile = "3.27.0"
 tokio = { version = "1.52.2", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 
@@ -341,5 +346,3 @@ inherits = "release"
 debug = 2
 strip = false
 lto = false
-
-

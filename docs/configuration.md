@@ -105,11 +105,97 @@ Responses API (the response store with its Postgres and
 SQLite backends, Conversations, context compaction, MCP
 tools, the file resolver), as it did before those
 features existed. The FIPS build, which is the image,
-carries only the Responses filters; see [FIPS](fips.md).
+carries Responses, Conversations, certificate-only Postgres storage and SigV4;
+see [FIPS](fips.md).
 
 [Praxis AI]: https://github.com/praxis-proxy/ai
 [Praxis filter documentation]: https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md
 [Praxis AI filter documentation]: https://github.com/praxis-proxy/ai/blob/main/docs/filters/README.md
+
+### Store initialization
+
+ExtProc discovers `openai_responses_store` and `openai_conversations` in
+configured chains, inline branches and iterative-router steps. Compatible
+Responses and Conversations configurations share one backend. Conflicting
+registry bindings and incompatible SQL object names fail configuration checks.
+
+The server opens and registers all configured backends on its serving runtime
+before starting the ExtProc listener or reporting `Serving`. Provisioning errors
+leave only health (`NotServing`) and metrics available. Backend leases are
+released after serving stops and requests drain. No store is required by ordinary
+Chat Completions configurations.
+
+`--validate` checks filter and backend configuration without connecting to the
+database. Library callers must use `build_initialized_pipeline` to serve stores;
+`build_pipeline` alone installs an unprovisioned registry and is for offline
+validation. Stored-content requests without a provisioned store fail closed.
+
+Discovery, normalization, backend sharing and schema compatibility checks use
+Praxis AI's shared `praxis_ai_apis::store::plan` API. ExtProc supplies one registry
+plan spanning its concatenated chains and owns serving-runtime initialization.
+
+Store filters can select `database_url_file` instead of `database_url`. ExtProc
+loads one literal UTF-8 URL (at most 16 KiB) before validation/provisioning,
+including stores in nested chains and iterative steps. Missing, empty, oversized
+or ambiguous sources fail closed. There is no environment or YAML interpolation.
+The original configuration retains only the file reference, and URL contents are
+not included in file-loading errors. `--validate` reads the file but stays offline.
+
+For Kubernetes mTLS bindings, mount CA/certificate files and copy the Secret's
+root-owned private key into a dedicated writable volume as the serving UID with
+mode 0600 before startup. Mount the copied key read-only in the serving container.
+Use a gRPC readiness probe for `envoy.service.ext_proc.v3.ExternalProcessor` on
+the health port: a TCP probe cannot distinguish `Serving` from `NotServing`.
+
+### Responses request rehydration
+
+For local history, configure `openai_responses_request`, `openai_responses_store`,
+`openai_responses_rehydrate` and `openai_responses_proxy` in that order, with
+`ai_operation` and `state_owner` before them. The store must be provisioned as
+described above.
+
+Set Envoy's request-body mode to `BUFFERED` or `FULL_DUPLEX_STREAMED` so the
+complete request is available for rehydration. Local `conversation` and
+`previous_response_id` selectors are replaced with their stored history before
+forwarding. Chunk-at-a-time `STREAMED` requests do not support this rewrite.
+Keep filter failures closed and set Envoy's `failure_mode_allow: false` to prevent
+forwarding when ExtProc fails.
+
+Envoy owns routing. ExtProc does not supply selected provider/protocol metadata;
+filters that require that metadata need it supplied by the configured pipeline.
+
+### Stored Responses JSON capture
+
+Stored, non-streaming Responses JSON selects Envoy `BUFFERED` response-body
+processing through a response-header `mode_override`. Persistence completes before
+the body is released. SSE, `store:false`, upstream errors and unrelated traffic
+keep their configured transport.
+
+Configure the Envoy ExtProc filter with `allow_mode_override: true`,
+`send_body_without_waiting_for_header_response: false` and `failure_mode_allow: false`.
+Eager body delivery or partial body messages after the override are rejected.
+JSON accumulation is capped at 64 MiB or the lower
+`server.max_body_bytes`, even with `allow_unbounded_body`; Envoy/gRPC limits may be
+lower.
+
+Local capture regression tests use an explicitly initialized in-memory store:
+
+```console
+cargo test --no-default-features --features responses-full --test native_capture
+```
+
+The `native_capture` integration target exercises the gRPC boundary with a
+simulated upstream: JSON capture, persistence failure, body limits and
+incremental SSE transport, plus local selector rewriting and original-input
+preservation. It makes no inference requests.
+
+### Store provisioning tests
+
+Local SQLite/gRPC coverage:
+
+```console
+cargo test --no-default-features --features responses-full --test store_bootstrap
+```
 
 ### Branch Chains
 
@@ -173,7 +259,7 @@ server:
 | `health_address`              | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`             | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
  | `shutdown_drain_timeout_secs` | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
-| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before a stream is rejected with `RESOURCE_EXHAUSTED`. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely |
+| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before `RESOURCE_EXHAUSTED`. Must be positive. `allow_unbounded_body` lifts this limit, but stored non-streaming Responses JSON remains capped at 64 MiB |
 | `tls`                         | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
 ### Graceful shutdown
@@ -288,7 +374,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes` |
+| `allow_unbounded_body` | bool | `false` | Lift `server.max_body_bytes`; stored non-streaming Responses JSON remains capped at 64 MiB |
 
 ```yaml
 insecure_options:
@@ -386,9 +472,9 @@ At runtime:
 - **Body too large**: exceeding the
   `server.max_body_bytes` accumulation limit
   (10 MiB by default) produces a gRPC
-  `RESOURCE_EXHAUSTED` status. The limit is lifted
-  entirely when `insecure_options.allow_unbounded_body`
-  is set.
+  `RESOURCE_EXHAUSTED` status. `insecure_options.allow_unbounded_body`
+  lifts this limit; stored non-streaming Responses JSON
+  still has a 64 MiB ceiling.
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.
