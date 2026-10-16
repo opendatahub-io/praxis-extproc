@@ -42,6 +42,55 @@ data:
     filter_chains:
       - name: ipp
         filters:
+          # Port of legacy IPP maas-headers-guard: keep internal MaaS identity
+          # headers and caller credentials off the upstream model. Mirrors
+          # ai-gateway-controller/pkg/tenant/extproc_headers.go
+          # GuardedRequestHeaders -- keep both lists in lockstep.
+          #
+          # This chain also carries non-inference maas-api traffic (the
+          # EnvoyFilter ext_proc.ipp per-route disable at
+          # deploy/overlays/odh/envoy-filter.yaml is meant to keep it off
+          # this chain entirely, but is not a complete guarantee -- e.g. a
+          # route-name mismatch leaves it on-path). Scope the guard itself to
+          # inference requests with `unless path_prefix`, so maas-api calls
+          # keep their own authorization / x-maas-* headers even if that
+          # per-route disable does not apply. Keep this prefix list identical
+          # to the deny-all-by-default exclusion in
+          # models-as-a-service/deployment/base/maas-controller/policies/gateway-default-deny.yaml.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+            request_remove:
+              - authorization
+              - x-api-key
+              - x-origin-cluster
+              - x-maas-username
+              - x-maas-username-oc
+              - x-maas-username-token
+              - x-maas-group
+              - x-maas-group-oc
+              - x-maas-group-token
+              - x-maas-keyname
+              - x-maas-key-id
+              - x-maas-subscription
+              - x-maas-subscription-rate-limit-id
+              - x-maas-cost-center
+              - x-maas-organization-id
+              - x-maas-identity
+              - x-maas-admin-scope
+              - x-maas-tenant
+              - x-maas-invocation-mode
+              - x-maas-policy-revision
+              - x-maas-responses-owner
+              - x-maas-return-all-models
+              - x-maas-model
           - filter: request_id
 
     insecure_options:
