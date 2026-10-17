@@ -1,0 +1,25 @@
+name: Setup e2e tools
+description: Install kind, istioctl, and praxis-forge for k8s e2e jobs
+
+runs:
+  using: composite
+  steps:
+    - name: Install kind
+      shell: bash
+      run: |
+        curl -fsSL -o kind "https://github.com/kubernetes-sigs/kind/releases/download/v0.29.0/kind-linux-amd64"
+        echo "c72eda46430f065fb45c5f70e7c957cc9209402ef309294821978677c8fb3284  kind" | sha256sum -c
+        chmod +x kind
+        sudo mv kind /usr/local/bin/kind
+
+    - name: Install istioctl
+      shell: bash
+      run: |
+        curl -fsSL -o istio.tar.gz "https://github.com/istio/istio/releases/download/1.29.2/istio-1.29.2-linux-amd64.tar.gz"
+        echo "904bbf1b917dd0135aa55b99cbfa34edd0a188fdeeeef09bb995d8e8e3165112  istio.tar.gz" | sha256sum -c
+        tar -xzf istio.tar.gz
+        echo "$PWD/istio-1.29.2/bin" >> "$GITHUB_PATH"
+
+    - name: Install praxis-forge
+      shell: bash
+      run: cargo install --git https://github.com/praxis-proxy/forge.git --rev 9abe12be9cf51e6384d3e8bc5ba6a0539be466b5 forge --locked

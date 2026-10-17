@@ -68,6 +68,24 @@ async fn main() {
 // Startup
 // -----------------------------------------------------------------------------
 
+/// Build the AI filter registry (and e2e helpers when `k8s-e2e` is enabled).
+#[cfg(feature = "k8s-e2e")]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    praxis_extproc::e2e::register_e2e_filters(&mut registry)?;
+    Ok(registry)
+}
+
+/// Build the AI filter registry (default features — no e2e helpers).
+#[cfg(not(feature = "k8s-e2e"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same Result signature as the k8s-e2e registry builder"
+)]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(praxis_ai_filters::build_ai_registry())
+}
+
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before anything that builds a filter registry, a subrequest client or a
@@ -75,7 +93,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fips = praxis_extproc::fips::install()?;
 
     let cfg = load_config(&cli.config)?;
-    let registry = praxis_ai_filters::build_ai_registry();
+    let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
