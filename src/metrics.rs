@@ -317,7 +317,7 @@ fn serve_connection(stream: tokio::net::TcpStream, handle: PrometheusHandle, kub
 /// Route an incoming HTTP request to the appropriate handler.
 ///
 /// - `/healthz` — unauthenticated health probe (always 200).
-/// - `/metrics` — Prometheus render, gated by `TokenReview` + SAR when configured.
+/// - `/metrics` — `GET` only; Prometheus render, gated by `TokenReview` + SAR when configured.
 /// - Any other path — 404 Not Found.
 ///
 /// Generic over the body type because only the URI and headers are
@@ -329,7 +329,8 @@ async fn route_request<B: Sync>(
 ) -> Response<Full<Bytes>> {
     match req.uri().path() {
         "/healthz" => response_with_status(StatusCode::OK, "ok"),
-        "/metrics" => serve_metrics(req, handle, kube_client).await,
+        "/metrics" if req.method() == hyper::Method::GET => serve_metrics(req, handle, kube_client).await,
+        "/metrics" => response_with_status(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => response_with_status(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -552,6 +553,25 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "metrics without auth configured should return 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_metrics_non_get_returns_405_before_auth() {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/metrics")
+            .header("Authorization", "Bearer secret")
+            .body(())
+            .unwrap();
+
+        let resp = route_request(&req, &handle, None).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "non-GET /metrics should return 405 without checking auth"
         );
     }
 
