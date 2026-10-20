@@ -157,7 +157,7 @@ async fn authenticate_token(client: &kube::Client, token: &str) -> AuthnOutcome 
 
     let review = TokenReview {
         spec: k8s_openapi::api::authentication::v1::TokenReviewSpec {
-            token: Some(token.to_owned()),
+            token: token.to_owned(),
             ..Default::default()
         },
         ..Default::default()
