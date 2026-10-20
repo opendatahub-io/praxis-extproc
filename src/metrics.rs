@@ -173,15 +173,17 @@ async fn authenticate_token(client: &kube::Client, token: &str) -> AuthnOutcome 
         return AuthnOutcome::ApiError("TokenReview response missing status".to_owned());
     };
 
-    if !status.authenticated.unwrap_or(false) {
-        return AuthnOutcome::NotAuthenticated;
+    match status.authenticated {
+        Some(true) => {
+            let user = status.user.unwrap_or_default();
+            AuthnOutcome::Authenticated(TokenReviewResult {
+                username: user.username.unwrap_or_default(),
+                groups: user.groups.unwrap_or_default(),
+            })
+        },
+        Some(false) => AuthnOutcome::NotAuthenticated,
+        None => AuthnOutcome::ApiError("TokenReview response missing authenticated".to_owned()),
     }
-
-    let user = status.user.unwrap_or_default();
-    AuthnOutcome::Authenticated(TokenReviewResult {
-        username: user.username.unwrap_or_default(),
-        groups: user.groups.unwrap_or_default(),
-    })
 }
 
 /// Result of a successful `TokenReview`: the identity behind the token.
