@@ -7,6 +7,7 @@
 //! shipped binary does not register these filters.
 
 pub mod body_oracle;
+pub mod header_oracle;
 
 use praxis_filter::FilterRegistry;
 
@@ -19,6 +20,10 @@ pub fn register_e2e_filters(registry: &mut FilterRegistry) -> Result<(), praxis_
     registry.register(
         "e2e_body_oracle",
         praxis_filter::http_builtin(body_oracle::BodyOracleFilter::from_config),
+    )?;
+    registry.register(
+        "e2e_header_oracle",
+        praxis_filter::http_builtin(header_oracle::HeaderOracleFilter::from_config),
     )?;
     Ok(())
 }
