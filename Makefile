@@ -459,21 +459,53 @@ FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONT
 
 # ext-proc body mode under test: fds (default) or buffered.
 MODE             ?= fds
+# e2e profile: conformance (production-faithful baseline) or integrity (the
+# instrumented oracle lane with identity_header_guard + e2e_*_oracle, #165).
+PROFILE          ?= conformance
+# Kustomize overlay reconciled after forge to pin the selected profile's chains:
+# conformance uses the forge baseline workload; integrity layers the
+# instrumented overlay on top.
+ifeq ($(PROFILE),integrity)
+E2E_PROFILE_PATH := deploy/overlays/e2e/ext-proc/profiles/integrity
+else
+E2E_PROFILE_PATH := deploy/overlays/e2e/ext-proc
+endif
 E2E_KIND_CONTEXT ?= kind-praxis-e2e
 
 e2e-setup:
 	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
+	@case "$(PROFILE)" in conformance|integrity) ;; *) echo "PROFILE must be conformance or integrity (got '$(PROFILE)')"; exit 1;; esac
 	$(MAKE) container-release FIPS_FEATURES="$(FIPS_FEATURES),k8s-e2e"
 	$(FORGE_CMD) cluster create e2e
 	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
 	$(FORGE_CMD) stack apply e2e
-	kubectl --context "$(E2E_KIND_CONTEXT)" apply -k "deploy/overlays/e2e/test/modes/$(MODE)"
+	kubectl --context "$(E2E_KIND_CONTEXT)" apply -k "deploy/overlays/e2e/environment/modes/$(MODE)"
+	# The integrity profile's hop-1 oracles publish response headers, so the
+	# pre-processing ext-proc (configPatches[0]) must receive the response phase.
+	# Conformance stays production-faithful (SKIP, from the base EnvoyFilter).
+	@if [ "$(PROFILE)" = "integrity" ]; then \
+		kubectl --context "$(E2E_KIND_CONTEXT)" -n istio-system patch envoyfilter praxis-extproc-ext-proc --type json \
+			-p '[{"op":"replace","path":"/spec/configPatches/0/patch/value/typed_config/processing_mode/response_header_mode","value":"SEND"}]'; \
+	fi
+	# Reconcile the selected profile's chains and restart the ext-procs so that
+	# switching PROFILE on a shared cluster always converges to the right config
+	# (a ConfigMap change alone does not restart the pods).
+	kubectl --context "$(E2E_KIND_CONTEXT)" apply -k "$(E2E_PROFILE_PATH)"
+	kubectl --context "$(E2E_KIND_CONTEXT)" -n istio-system rollout restart deploy/payload-pre-processing deploy/payload-processing
+	kubectl --context "$(E2E_KIND_CONTEXT)" -n istio-system rollout status deploy/payload-pre-processing --timeout=120s
+	kubectl --context "$(E2E_KIND_CONTEXT)" -n istio-system rollout status deploy/payload-processing --timeout=120s
 
 e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
 
-e2e-test:
-	bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
+# Depends on e2e-setup so the deployed profile always matches the tested one:
+# `make e2e-test PROFILE=integrity` deploys the integrity chains, then tests
+# them. forge is idempotent, so on an existing cluster this only rebuilds the
+# (layer-cached) image and reconciles + restarts the ext-procs. For a test-only
+# iteration loop against an already-correct deployment, run
+# `bash hack/scripts/e2e-test.sh` directly.
+e2e-test: e2e-setup
+	PROFILE="$(PROFILE)" bash hack/scripts/e2e-test.sh $(if $(V),--nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
