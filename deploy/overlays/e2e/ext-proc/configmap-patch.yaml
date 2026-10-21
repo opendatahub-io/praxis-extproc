@@ -54,4 +54,3 @@ data:
             response_set:
               - name: X-Praxis-Version
                 value: "e2e"
-          - filter: e2e_body_oracle
