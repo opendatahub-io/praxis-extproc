@@ -19,6 +19,8 @@
 //! the request headers and pending mutations are visible) and emitted during
 //! `on_response`; metadata survives ExtProc phase boundaries (`CarriedContext`).
 
+use std::fmt;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -27,20 +29,38 @@ use praxis_filter::{
 use serde::Deserialize;
 use tracing::debug;
 
-use super::body_oracle::HOP_INDEX_ENV;
-
-/// Response value when the header is stripped before reaching upstream.
-const STATE_STRIPPED: &str = "stripped";
-/// Response value when the header is neither present nor added.
-const STATE_ABSENT: &str = "absent";
 /// Response value when the effective value cannot be determined unambiguously.
 const STATE_AMBIGUOUS: &str = "ambiguous";
-/// Response value when `on_request` state never reached `on_response`.
+/// Response value when the request-phase snapshot never reached `on_response`.
 const STATE_MISSING: &str = "state-missing";
-/// Prefix marking a value that would be forwarded upstream: `fwd:<value>`.
-const FWD_PREFIX: &str = "fwd:";
 /// Metadata key prefix stashing per-header state between phases.
 const META_PREFIX: &str = "e2e_header_oracle.";
+
+/// Effective state of a watched header at this hop, as published to tests.
+///
+/// One owner of the wire vocabulary: the `Display` impl is the single
+/// serialization the tests parse.
+enum ForwardedState {
+    /// Reaches upstream with this value (serialized as `fwd:<value>`).
+    Forwarded(String),
+    /// Removed by an earlier filter before reaching upstream.
+    Stripped,
+    /// Neither present on the request nor added by a filter.
+    Absent,
+    /// Non-text or contested value.
+    Ambiguous,
+}
+
+impl fmt::Display for ForwardedState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Forwarded(value) => write!(f, "fwd:{value}"),
+            Self::Stripped => f.write_str("stripped"),
+            Self::Absent => f.write_str("absent"),
+            Self::Ambiguous => f.write_str(STATE_AMBIGUOUS),
+        }
+    }
+}
 
 /// Deserialized YAML config for the header oracle.
 #[derive(Debug, Deserialize)]
@@ -71,16 +91,7 @@ impl HeaderOracleFilter {
         if cfg.watch.is_empty() {
             return Err(FilterError::from("e2e_header_oracle: watch must not be empty"));
         }
-        let hop_index = std::env::var(HOP_INDEX_ENV)
-            .ok()
-            .map(|raw| {
-                raw.parse::<u32>().map_err(|error| {
-                    FilterError::from(format!(
-                        "e2e_header_oracle: {HOP_INDEX_ENV}={raw:?} is not a u32: {error}"
-                    ))
-                })
-            })
-            .transpose()?;
+        let hop_index = super::hop_index_from_env()?;
         Ok(Box::new(Self {
             watch: cfg.watch.iter().map(|h| h.to_lowercase()).collect(),
             hop_index,
@@ -105,7 +116,7 @@ impl HeaderOracleFilter {
         let states: Vec<(String, String)> = self
             .watch
             .iter()
-            .map(|name| (name.clone(), forwarded_state(ctx, name)))
+            .map(|name| (name.clone(), forwarded_state(ctx, name).to_string()))
             .collect();
         for (name, state) in states {
             ctx.set_metadata(format!("{META_PREFIX}{name}"), state);
@@ -118,30 +129,30 @@ impl HeaderOracleFilter {
 /// `fwd:<value>` when the header reaches upstream, [`STATE_STRIPPED`] when an
 /// earlier filter removed it, [`STATE_ABSENT`] when it is neither present nor
 /// added, and [`STATE_AMBIGUOUS`] when the value is non-text or contested.
-fn forwarded_state(ctx: &HttpFilterContext<'_>, name: &str) -> String {
+fn forwarded_state(ctx: &HttpFilterContext<'_>, name: &str) -> ForwardedState {
     let Ok(header) = http::HeaderName::try_from(name) else {
-        return STATE_AMBIGUOUS.to_owned();
+        return ForwardedState::Ambiguous;
     };
     // Pending mutations first: an identity_header_guard removal surfaces as
     // `Removed` (stripped); an explicit set/add surfaces as `Value`.
     match ctx.pending_header_value(&header) {
-        Ok(PendingHeaderResult::Value(value)) => return format!("{FWD_PREFIX}{value}"),
-        Ok(PendingHeaderResult::Removed) => return STATE_STRIPPED.to_owned(),
+        Ok(PendingHeaderResult::Value(value)) => return ForwardedState::Forwarded(value),
+        Ok(PendingHeaderResult::Removed) => return ForwardedState::Stripped,
         Ok(PendingHeaderResult::Absent) => {},
-        Err(_) => return STATE_AMBIGUOUS.to_owned(),
+        Err(_) => return ForwardedState::Ambiguous,
     }
     // Trusted routing mutations (e.g. json_body -> X-Gateway-Model-Name).
     match ctx.resolve_trusted_header(&header) {
-        Ok(Some(value)) => return format!("{FWD_PREFIX}{value}"),
+        Ok(Some(value)) => return ForwardedState::Forwarded(value),
         Ok(None) => {},
-        Err(_) => return STATE_AMBIGUOUS.to_owned(),
+        Err(_) => return ForwardedState::Ambiguous,
     }
     // Otherwise the original client header passes through unchanged.
     match ctx.request.headers.get(&header) {
-        Some(value) => value
-            .to_str()
-            .map_or_else(|_| STATE_AMBIGUOUS.to_owned(), |text| format!("{FWD_PREFIX}{text}")),
-        None => STATE_ABSENT.to_owned(),
+        Some(value) => value.to_str().map_or(ForwardedState::Ambiguous, |text| {
+            ForwardedState::Forwarded(text.to_owned())
+        }),
+        None => ForwardedState::Absent,
     }
 }
 
@@ -157,10 +168,11 @@ impl HttpFilter for HeaderOracleFilter {
         BodyAccess::ReadOnly
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // Header-phase view (strips + client-supplied headers); a fallback for
-        // bodyless requests. The authoritative snapshot is taken at body EOS.
-        self.snapshot(ctx);
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The single authoritative snapshot is taken at request-body EOS, once
+        // every request-side mutation is visible: header-phase strips persist to
+        // EOS, and body-phase additions (e.g. json_body's routing header) are set
+        // by then. This phase only observes; see `on_request_body`.
         Ok(FilterAction::Continue)
     }
 
@@ -199,7 +211,7 @@ impl HttpFilter for HeaderOracleFilter {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "tests")]
+#[expect(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -248,5 +260,151 @@ mod tests {
     #[test]
     fn filter_reports_its_name() {
         assert_eq!(filter("watch: [x-maas-tenant]").name(), "e2e_header_oracle");
+    }
+
+    // -------------------------------------------------------------------------
+    // Debugger walkthrough
+    //
+    // A self-contained reproduction that builds a real `HttpFilterContext` and
+    // drives the filter end-to-end, with no cluster. Set breakpoints in
+    // `forwarded_state`, `snapshot`, and `on_response` and step through it:
+    //
+    //   cargo test --features k8s-e2e --lib \
+    //     e2e::header_oracle::tests::debugger_walkthrough --no-run
+    //   rust-lldb target/debug/deps/praxis_extproc-<hash> \
+    //     -o 'b praxis_extproc::e2e::header_oracle::forwarded_state' -o run
+    //
+    // (or set a gutter breakpoint and Debug the test in your IDE.)
+    // -------------------------------------------------------------------------
+
+    use std::{collections::HashMap, sync::LazyLock, time::Instant};
+
+    use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+    use praxis_core::{id::IdGenerator, time::SystemTimeSource};
+    use praxis_filter::{BodyMode, Request, RequestExtensions, Response, SubRequestResponseMode};
+
+    /// Deterministic id generator for the test context.
+    static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
+
+    /// Build a minimal `HttpFilterContext` borrowing `req` (mirrors the fields of
+    /// the filter SDK's own test helper; everything empty/default).
+    fn test_ctx(req: &Request) -> HttpFilterContext<'_> {
+        HttpFilterContext {
+            buffered_request_body: None,
+            body_done_indices: Vec::new(),
+            branch_iterations: HashMap::new(),
+            grpc_completion: None,
+            client_addr: None,
+            cluster: None,
+            current_filter_id: None,
+            downstream_tls: false,
+            extensions: RequestExtensions::default(),
+            executed_branch_filters: Vec::new(),
+            executed_filter_indices: Vec::new(),
+            extra_request_headers: Vec::new(),
+            request_headers_to_remove: Vec::new(),
+            request_headers_to_set: Vec::new(),
+            filter_metadata: HashMap::new(),
+            prior_pre_read_mutations: Vec::new(),
+            pre_read_mutations: Vec::new(),
+            structured_metadata: HashMap::new(),
+            filter_results: HashMap::new(),
+            filter_state: HashMap::new(),
+            health_registry: None,
+            id_generator: &TEST_ID_GENERATOR,
+            kv_stores: None,
+            session_stores: None,
+            metrics_route: None,
+            peer_identity: None,
+            subrequest_client: None,
+            subrequest_response_mode: SubRequestResponseMode::Buffered,
+            request: req,
+            request_body_bytes: 0,
+            request_body_mode: BodyMode::Stream,
+            request_start: Instant::now(),
+            response_body_bytes: 0,
+            response_body_mode: BodyMode::Stream,
+            response_header: None,
+            response_headers_modified: false,
+            upstream_reached: false,
+            rewritten_path: None,
+            selected_endpoint_index: None,
+            attempted_endpoints: Vec::new(),
+            retry_policy: None,
+            route_retry_policy: None,
+            hedge_policy: None,
+            cluster_retry_state: None,
+            cluster_retry_state_released: false,
+            endpoint_reselector: None,
+            pinned_endpoint_address: None,
+            time_source: &SystemTimeSource,
+            upstream: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn debugger_walkthrough() {
+        // A request carrying a spoofed identity header and a benign one.
+        let mut req = Request {
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().expect("uri"),
+            headers: HeaderMap::new(),
+        };
+        req.headers
+            .insert("x-maas-tenant", HeaderValue::from_static("spoofed-by-client"));
+        req.headers.insert("x-keep", HeaderValue::from_static("keepme"));
+
+        let mut response = Response {
+            headers: HeaderMap::new(),
+            status: StatusCode::OK,
+        };
+
+        let mut ctx = test_ctx(&req);
+        // Simulate identity_header_guard stripping the spoofed header (→ stripped).
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static("x-maas-tenant"));
+        // Simulate json_body injecting the routing header from the body (→ fwd:).
+        ctx.request_headers_to_set.push((
+            HeaderName::from_static("x-gateway-model-name"),
+            HeaderValue::from_static("granite-8b"),
+        ));
+
+        // Watch one header per forwarded_state branch:
+        //   x-maas-tenant        → pending Removed      → "stripped"
+        //   x-gateway-model-name → pending Value        → "fwd:granite-8b"
+        //   x-keep               → original passthrough → "fwd:keepme"
+        //   x-absent             → nothing              → "absent"
+        let filter = HeaderOracleFilter {
+            watch: vec![
+                "x-maas-tenant".to_owned(),
+                "x-gateway-model-name".to_owned(),
+                "x-keep".to_owned(),
+                "x-absent".to_owned(),
+            ],
+            hop_index: Some(1),
+        };
+
+        drop(filter.on_request(&mut ctx).await.expect("on_request"));
+        drop(
+            filter
+                .on_request_body(&mut ctx, &mut None, true)
+                .await
+                .expect("on_request_body"),
+        );
+        ctx.response_header = Some(&mut response);
+        drop(filter.on_response(&mut ctx).await.expect("on_response"));
+
+        let headers = &ctx.response_header.as_ref().expect("response set").headers;
+        let fwd = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        assert_eq!(
+            fwd("x-qualification-fwd-x-maas-tenant-hop-1").as_deref(),
+            Some("stripped")
+        );
+        assert_eq!(
+            fwd("x-qualification-fwd-x-gateway-model-name-hop-1").as_deref(),
+            Some("fwd:granite-8b")
+        );
+        assert_eq!(fwd("x-qualification-fwd-x-keep-hop-1").as_deref(), Some("fwd:keepme"));
+        assert_eq!(fwd("x-qualification-fwd-x-absent-hop-1").as_deref(), Some("absent"));
     }
 }
