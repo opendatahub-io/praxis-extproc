@@ -12,7 +12,7 @@
 
 use reqwest::header::HeaderMap;
 
-use crate::fixtures::{self, gateway_url, http_client};
+use crate::fixtures::{ensure_gateway_ready, gateway_url, http_client};
 
 /// Read a `x-qualification-fwd-*` oracle header value.
 fn fwd(headers: &HeaderMap, name: &str) -> String {
@@ -41,7 +41,7 @@ async fn chat_with_headers(model: &str, extra: &[(&str, &str)]) -> reqwest::Resp
 /// A client-spoofed `x-maas-*` identity header is stripped at hop 1.
 #[tokio::test]
 async fn spoofed_x_maas_header_stripped_at_hop1() {
-    fixtures::ensure_gateway_ready().await;
+    ensure_gateway_ready().await;
     let resp = chat_with_headers("granite-8b", &[("x-maas-tenant", "spoofed-by-client")]).await;
     assert_eq!(
         fwd(resp.headers(), "x-qualification-fwd-x-maas-tenant-hop-1"),
@@ -53,7 +53,7 @@ async fn spoofed_x_maas_header_stripped_at_hop1() {
 /// The spoofed identity header does not survive to hop 2 as a trusted value.
 #[tokio::test]
 async fn spoofed_x_maas_header_does_not_cross_to_hop2() {
-    fixtures::ensure_gateway_ready().await;
+    ensure_gateway_ready().await;
     let resp = chat_with_headers("granite-8b", &[("x-maas-tenant", "spoofed-by-client")]).await;
     let got = fwd(resp.headers(), "x-qualification-fwd-x-maas-tenant-hop-2");
     assert!(
@@ -65,7 +65,7 @@ async fn spoofed_x_maas_header_does_not_cross_to_hop2() {
 /// The routing header is injected from the body and forwarded at hop 1.
 #[tokio::test]
 async fn routing_header_injected_and_forwarded_at_hop1() {
-    fixtures::ensure_gateway_ready().await;
+    ensure_gateway_ready().await;
     let resp = chat_with_headers("granite-8b", &[]).await;
     assert_eq!(
         fwd(resp.headers(), "x-qualification-fwd-x-gateway-model-name-hop-1"),
@@ -77,7 +77,7 @@ async fn routing_header_injected_and_forwarded_at_hop1() {
 /// The IPP `headers` filter adds `X-Praxis-Processed` at hop 2.
 #[tokio::test]
 async fn praxis_processed_header_added_at_hop2() {
-    fixtures::ensure_gateway_ready().await;
+    ensure_gateway_ready().await;
     let resp = chat_with_headers("granite-8b", &[]).await;
     assert_eq!(
         fwd(resp.headers(), "x-qualification-fwd-x-praxis-processed-hop-2"),
@@ -89,7 +89,7 @@ async fn praxis_processed_header_added_at_hop2() {
 /// A non-identity header the client supplies is left intact (no over-stripping).
 #[tokio::test]
 async fn non_identity_header_is_not_stripped() {
-    fixtures::ensure_gateway_ready().await;
+    ensure_gateway_ready().await;
     // X-Gateway-Model-Name is client-supplied here: identity_header_guard
     // (prefix x-maas-) must not touch it, and json_body's `unless
     // headers_present` must leave the client value intact.
