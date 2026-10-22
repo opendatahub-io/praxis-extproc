@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-pre-processing
+spec:
+  template:
+    spec:
+      containers:
+        - name: payload-pre-processing
+          volumeMounts:
+            - name: plugins-config-volume
+              mountPath: /etc/praxis
+              readOnly: true
+            - name: tls-certs
+              mountPath: /etc/praxis-tls
+              readOnly: true
+      volumes:
+        - name: plugins-config-volume
+          configMap:
+            name: payload-pre-processing-plugins
+        - name: tls-certs
+          secret:
+            secretName: e2e-extended-tls-server
