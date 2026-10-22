@@ -118,6 +118,11 @@ spec:
           condition: available
           timeout: "120s"
         - type: wait
+          resource: deployment/echo-backend
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: deployment/nemo-mock
           namespace: llm
           condition: available

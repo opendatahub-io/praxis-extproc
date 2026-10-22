@@ -3,6 +3,7 @@
 //! mechanics it validates. Run with `PROFILE=integrity`
 //! (`cargo test --test k8s_e2e integrity`).
 
+mod backend_ground_truth;
 mod chained_oracle;
 mod fd_streamed_oracle;
 mod header_protection;
