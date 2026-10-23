@@ -248,6 +248,20 @@ registered only under that feature), and `make e2e-test` exercises it through
 TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
 in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 
+### Profiles (conformance / integrity)
+
+`make e2e-setup` takes `PROFILE=conformance` (default) or `PROFILE=integrity`,
+orthogonal to `MODE=fds|buffered`. `conformance` runs the production-faithful
+chain (`ai_guardrails` + routing); `integrity` is an instrumented, non-production
+lane (`identity_header_guard` + `e2e_header_oracle` + `e2e_body_oracle`, no
+guardrails) for header trust-boundary and streaming coverage
+(issue [#165](https://github.com/opendatahub-io/praxis-extproc/issues/165)).
+Every test lives in the `conformance::` or `integrity::` test module and the
+runner selects a lane by name filter (`cargo test --test k8s_e2e <profile>`), so
+a test's module is its profile gate. See
+[`deploy/overlays/e2e/ext-proc/profiles/README.md`](../deploy/overlays/e2e/ext-proc/profiles/README.md)
+for the chains and the response-guardrails-vs-streaming invariant.
+
 ## FIPS Tooling
 
 Local, reproducible checks that the image is on the

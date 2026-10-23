@@ -15,6 +15,19 @@ NS="${E2E_GATEWAY_NS:-istio-system}"
 SVC="${E2E_GATEWAY_SVC:-e2e-gateway-istio}"
 PORT="${E2E_PORT:-18080}"
 
+# Profile under test (conformance | integrity). Exported so the test binary can
+# skip tests that do not belong to the active lane.
+PROFILE="${PROFILE:-conformance}"
+echo "e2e: profile=${PROFILE}"
+
+# Gating is by module: every test lives in the `conformance::` or `integrity::`
+# module, and the run selects a lane with a name filter (the profile name). A
+# test's module is its profile gate — nothing to track here.
+case "$PROFILE" in
+  conformance|integrity) ;;
+  *) echo "unknown PROFILE='$PROFILE' (expected conformance|integrity)" >&2; exit 1 ;;
+esac
+
 # Any HTTP response (even 404) means the endpoint is reachable.
 reachable() { curl -s -o /dev/null --max-time 5 "$1" 2>/dev/null; }
 
@@ -50,4 +63,6 @@ else
   echo "e2e: serializing tests over the port-forward (RUST_TEST_THREADS=${RUST_TEST_THREADS})"
 fi
 
-cargo test --features k8s-e2e --test k8s_e2e "$@"
+# The profile name is a cargo-side test-name filter (before `--`); any caller
+# flags (e.g. --nocapture) are test-binary args (after `--`).
+cargo test --features k8s-e2e --test k8s_e2e "$PROFILE" -- "$@"

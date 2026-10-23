@@ -7,7 +7,7 @@
 //! praxis-ai repo.
 //!
 //! The in-cluster mock `NeMo` service (`WireMock`, see
-//! `deploy/overlays/e2e/test/nemo-mock.yaml`) is content-keyword driven and
+//! `deploy/overlays/e2e/environment/nemo-mock.yaml`) is content-keyword driven and
 //! defaults to a "passed" verdict, so unmarked traffic flows through untouched.
 
 use crate::fixtures::{assert_praxis_mutations, chat_completion, ensure_gateway_ready, gateway_url, http_client};

@@ -87,7 +87,7 @@ spec:
             - kubectl
             - apply
             - -k
-            - deploy/overlays/e2e/workload
+            - deploy/overlays/e2e/ext-proc
             - --context
             - kind-praxis-{{ cluster.name }}
         - type: wait
@@ -109,11 +109,16 @@ spec:
             - kubectl
             - apply
             - -k
-            - deploy/overlays/e2e/test
+            - deploy/overlays/e2e/environment
             - --context
             - kind-praxis-{{ cluster.name }}
         - type: wait
           resource: deployment/internal-model
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/echo-backend
           namespace: llm
           condition: available
           timeout: "120s"
