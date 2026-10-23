@@ -1,0 +1,27 @@
+# Grants GET access to the /metrics non-resource URL so the
+# monitoring ServiceAccount passes the SubjectAccessReview check
+# performed by praxis-extproc.
+#
+# The ClusterRoleBinding below uses the default RHOAI monitoring
+# namespace and ServiceAccount. Adjust the subject to match your
+# monitoring deployment if they differ.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payload-processing-metrics-reader
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: payload-processing-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-k8s
+    namespace: redhat-ods-monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: payload-processing-metrics-reader

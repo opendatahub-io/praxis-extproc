@@ -1,0 +1,32 @@
+# Metrics authentication creates cluster-scoped TokenReview and
+# SubjectAccessReview objects during a scrape. The e2e configuration keeps
+# metrics_auth enabled, so both ExtProc deployments need this identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payload-processing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: e2e-payload-processing-metrics-auth
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: e2e-payload-processing-metrics-auth
+subjects:
+  - kind: ServiceAccount
+    name: payload-processing
+    namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: e2e-payload-processing-metrics-auth

@@ -485,9 +485,19 @@ async fn extproc_health_status(port: u16) -> i32 {
 /// Write a minimal serving config on free ports; the caller removes it.
 fn write_server_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
     let yaml = format!(
-        "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
-         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: main\n    \
-         filters:\n      - filter: request_id\n"
+        r#"server:
+  grpc_address: "127.0.0.1:{grpc}"
+  health_address: "127.0.0.1:{health}"
+  metrics_address: "127.0.0.1:{metrics}"
+  metrics_auth:
+    enabled: false
+  tls:
+    mode: none
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+"#
     );
     let path = std::env::temp_dir().join(format!("praxis-extproc-fips-{}-{grpc}.yaml", std::process::id()));
     std::fs::write(&path, yaml).expect("write server config");
