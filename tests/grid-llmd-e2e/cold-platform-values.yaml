@@ -1,0 +1,75 @@
+# RHOAI 3.5 MaaS profile for an isolated qualification cluster.
+skipCrdCheck: true
+profile: maas
+operator:
+  enabled: false
+  type: rhoai
+components:
+  kueue:
+    dsc:
+      managementState: Removed
+  aigateway:
+    dependencies:
+      leaderWorkerSet: false
+    dsc:
+      managementState: Managed
+      modelsAsAService:
+        managementState: Managed
+    modelsAsAService:
+      gateway:
+        create: true
+        spec:
+          listeners:
+            - name: https
+              port: 443
+              protocol: HTTPS
+              allowedRoutes:
+                namespaces:
+                  from: Selector
+                  selector:
+                    matchLabels:
+                      maas-gateway-access: "true"
+  kserve:
+    dependencies:
+      # This qualification uses ordinary IPP/InferencePool inference, not JobSet workloads or WideEP.
+      # Keep the dependency disabled so the unused 500m controller does not consume scarce dev capacity.
+      jobSet: false
+    dsc:
+      managementState: Managed
+    gateway:
+      create: true
+      spec:
+        listeners:
+          - name: https
+            port: 443
+            protocol: HTTPS
+            allowedRoutes:
+              namespaces:
+                from: Selector
+                selector:
+                  matchLabels:
+                    inference-gateway-access: "true"
+services:
+  monitoring:
+    dsci:
+      managementState: Managed
+      metrics:
+        replicas: 1
+        storage:
+          size: 5Gi
+          retention: 24h
+dependencies:
+  rhcl:
+    config:
+      tlsEnabled: true
+      authorinoSpec:
+        replicas: 1
+        clusterWide: true
+        listener:
+          tls:
+            enabled: true
+            certSecretRef:
+              name: authorino-server-cert
+        oidcServer:
+          tls:
+            enabled: false
