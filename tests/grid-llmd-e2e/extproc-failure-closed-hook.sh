@@ -65,7 +65,12 @@ done
   exit 2
 }
 [[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || { printf 'timeout must be 1..9999 seconds\n' >&2; exit 2; }
-[[ ! -e "$EVIDENCE_DIR" ]] || { printf 'evidence directory already exists\n' >&2; exit 2; }
+[[ -d "$EVIDENCE_DIR" && ! -L "$EVIDENCE_DIR" ]] || {
+  printf 'runner evidence directory must already exist and cannot be a symlink\n' >&2
+  exit 2
+}
+EVIDENCE_DIR="$EVIDENCE_DIR/failure-closed"
+[[ ! -e "$EVIDENCE_DIR" ]] || { printf 'failure-closed evidence directory already exists\n' >&2; exit 2; }
 mkdir -p "$EVIDENCE_DIR"
 chmod 0700 "$EVIDENCE_DIR"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/grid-llmd-fail-closed.XXXXXX")"
@@ -317,8 +322,13 @@ set -e
 [[ "$CURL_STATUS" == 0 ]] || { sed -E 's/(authorization|token):.*/\1: [REDACTED]/I' "$TEMP_DIR/curl-error.txt" >&2; log 'Gateway request failed before an HTTP response'; exit 1; }
 [[ "$HTTP_STATUS" =~ ^[0-9]{3}$ ]] || { log 'Gateway returned no parseable HTTP status'; exit 1; }
 RESPONSE_REQUEST_ID="$(awk 'BEGIN{IGNORECASE=1} /^x-request-id:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/\r$/,""); value=$0} END{print value}' "$TEMP_DIR/response-headers.txt")"
-[[ "$RESPONSE_REQUEST_ID" == "$REQUEST_ID" ]] || { log 'response did not echo the unique request ID'; exit 1; }
 REQUEST_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+jq -n --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
+  --arg observedAt "$REQUEST_FINISHED" --argjson status "$HTTP_STATUS" \
+  '{requestId:$requestId,responseRequestId:$responseRequestId,status:$status,observedAt:$observedAt}' \
+  >"$EVIDENCE_DIR/request-correlation.json"
+chmod 0600 "$EVIDENCE_DIR/request-correlation.json"
+[[ "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { log 'response did not return a safe correlated Envoy request ID'; exit 1; }
 
 AFTER_STATS="$(read_proxy_stats)"
 printf '%s\n' "$BEFORE_STATS" | jq -S . >"$EVIDENCE_DIR/proxy-counters-before.json"
@@ -339,10 +349,11 @@ EXTPROC_FAILURE_OBSERVED="$(jq -n --argjson before "$BEFORE_STATS" --argjson aft
 }
 
 jq -n --arg schema "praxis-extproc.grid-llmd-failure-closed/v1" --arg resource "deployment/$DEPLOYMENT_NAME" \
-  --arg requestId "$REQUEST_ID" --arg started "$REQUEST_STARTED" --arg finished "$REQUEST_FINISHED" \
+  --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
+  --arg started "$REQUEST_STARTED" --arg finished "$REQUEST_FINISHED" \
   --argjson apiCaVerified "$API_TLS_VERIFIED" --argjson status "$HTTP_STATUS" \
   --argjson extprocFailureObserved "$EXTPROC_FAILURE_OBSERVED" --argjson backendRequestCount "$BACKEND_REQUESTS" \
-  '{schema:$schema,apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$started,requestFinished:$finished,responseRequestIdMatched:true}' \
+  '{schema:$schema,apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,responseRequestId:$responseRequestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$started,requestFinished:$finished}' \
   >"$EVIDENCE_DIR/failure-closed-report.json"
 chmod 0600 "$EVIDENCE_DIR/failure-closed-report.json"
 
@@ -354,10 +365,11 @@ jq -e --arg run "$RUN_LABEL" --argjson replicas "$ORIGINAL_REPLICAS" '
   .status.observedGeneration==.metadata.generation and (.status.readyReplicas//0)==$replicas and
   (.status.availableReplicas//0)==$replicas
 ' <<<"$RESTORED_DEPLOYMENT" >/dev/null || { log 'ExtProc did not return to the original ready state'; exit 1; }
-jq -n --arg requestId "$REQUEST_ID" --arg requestStarted "$REQUEST_STARTED" --arg requestFinished "$REQUEST_FINISHED" \
+jq -n --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
+  --arg requestStarted "$REQUEST_STARTED" --arg requestFinished "$REQUEST_FINISHED" \
   --argjson status "$HTTP_STATUS" --argjson extprocFailureObserved "$EXTPROC_FAILURE_OBSERVED" \
   --argjson backendRequestCount "$BACKEND_REQUESTS" --argjson apiCaVerified "$API_TLS_VERIFIED" \
   --arg resource "deployment/$DEPLOYMENT_NAME" \
-  '{schema:"praxis-extproc.grid-llmd-failure-closed/v1",apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$requestStarted,requestFinished:$requestFinished}' \
+  '{schema:"praxis-extproc.grid-llmd-failure-closed/v1",apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,responseRequestId:$responseRequestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$requestStarted,requestFinished:$requestFinished}' \
   | tee "$EVIDENCE_DIR/hook-result.json"
 chmod 0600 "$EVIDENCE_DIR/hook-result.json"

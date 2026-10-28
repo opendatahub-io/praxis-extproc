@@ -100,6 +100,9 @@ jq -e --arg revision "$EXPECTED_REVISION" '
 ' <<<"$config_map_json" >/dev/null || { printf 'Grid overlay ConfigMap does not contain the current expected revision and digest\n' >&2; exit 2; }
 network_name="$(jq -er '.metadata.labels["grid.praxis.fast/network"]' <<<"$config_map_json")"
 
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/grid-gateway-revision.XXXXXX")"
+chmod 0700 "$tmp_dir"
+trap 'rm -rf "$tmp_dir"' EXIT
 app_pods="$(oc get pods -n "$NAMESPACE" -l app.kubernetes.io/instance=grid-gateway,app.kubernetes.io/name=praxis-gateway -o json)"
 app_pod="$(jq -er '
   [.items[] | select(.status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))]
@@ -107,79 +110,106 @@ app_pod="$(jq -er '
 ' <<<"$app_pods")"
 app_pod_uid="$(jq -er --arg name "$app_pod" '.items[]|select(.metadata.name==$name)|.metadata.uid' <<<"$app_pods")"
 app_pod_json="$(jq -ce --arg name "$app_pod" '.items[]|select(.metadata.name==$name)' <<<"$app_pods")"
-praxis_gateway_name="$(jq -er '.metadata.labels["app.kubernetes.io/instance"]' <<<"$app_pod_json")"
-serving_config_path="$(jq -er '
-  [.spec.containers[]?|select(.name=="praxis")|.env[]?|select(.name=="GRID_SERVING_CONFIG")|.value]
-  | unique | if length==1 then .[0] else error("expected one GRID_SERVING_CONFIG path") end
+praxis_gateway_name="$(jq -er '.metadata.labels["grid.praxis.fast/gateway"]' <<<"$config_map_json")"
+deployment_json="$(oc get deployment "$praxis_gateway_name" -n "$NAMESPACE" -o json)"
+deployment_generation="$(jq -er '.metadata.generation' <<<"$deployment_json")"
+network_json="$(oc get gridnetwork "$network_name" -o json)"
+praxis_config_volume="$(jq -er '
+  [.spec.containers[]?|select(.name=="praxis")|.volumeMounts[]?|select(.mountPath=="/etc/praxis")|.name]
+  | unique | if length==1 then .[0] else error("expected one /etc/praxis ConfigMap mount") end
 ' <<<"$app_pod_json")"
-[[ "$serving_config_path" == /* && "$serving_config_path" != *".."* && "${serving_config_path##*/}" == serving-config.json ]] || {
-  printf 'task Gateway GRID_SERVING_CONFIG path is invalid\n' >&2
-  exit 2
-}
-serving_mount_path="${serving_config_path%/*}"
-serving_volume="$(jq -er --arg mount "$serving_mount_path" '
-  [.spec.containers[]?|select(.name=="praxis")|.volumeMounts[]?|select(.mountPath==$mount)|.name]
-  | unique | if length==1 then .[0] else error("GRID_SERVING_CONFIG has no unique directory mount") end
-' <<<"$app_pod_json")"
-serving_config_map="$(jq -er --arg volume "$serving_volume" '
+praxis_config_map="$(jq -er --arg volume "$praxis_config_volume" '
   [.spec.volumes[]?|select(.name==$volume)|.configMap.name]
-  | unique | if length==1 then .[0] else error("GRID_SERVING_CONFIG mount is not a ConfigMap") end
+  | unique | if length==1 then .[0] else error("/etc/praxis mount is not backed by one ConfigMap") end
 ' <<<"$app_pod_json")"
-serving_config_map_json="$(oc get configmap "$serving_config_map" -n "$NAMESPACE" -o json)"
-jq -e --arg network "$network_name" --arg gateway "$praxis_gateway_name" '
-  .metadata.labels["grid.praxis.fast/network"]==$network
-  and .metadata.labels["grid.praxis.fast/gateway"]==$gateway
-  and (.data["serving-config.json"]|type)=="string"
-  and (.metadata.annotations["grid.praxis.fast/serving-digest"]|type)=="string"
-' <<<"$serving_config_map_json" >/dev/null || { printf 'operator serving ConfigMap identity or digest metadata is invalid\n' >&2; exit 2; }
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/grid-gateway-revision.XXXXXX")"
-chmod 0700 "$tmp_dir"
-trap 'rm -rf "$tmp_dir"' EXIT
-jq -j '.data["routing-overlay.json"]' <<<"$config_map_json" >"$tmp_dir/routing-overlay.json"
-jq -j '.data["serving-config.json"]' <<<"$serving_config_map_json" >"$tmp_dir/serving-config.expected.json"
-oc exec "$app_pod" -n "$NAMESPACE" -c praxis -- cat "$serving_config_path" >"$tmp_dir/serving-config.mounted.json"
-serving_verification="$(python3 - "$tmp_dir/routing-overlay.json" "$tmp_dir/serving-config.expected.json" "$tmp_dir/serving-config.mounted.json" \
-  "$(jq -er '.metadata.annotations["grid.praxis.fast/serving-digest"]' <<<"$serving_config_map_json")" "$EXPECTED_REVISION" <<'PY'
+praxis_config_map_json="$(oc get configmap "$praxis_config_map" -n "$NAMESPACE" -o json)"
+overlay_volume="$(jq -er '
+  [.spec.containers[]?|select(.name=="praxis")|.volumeMounts[]?|select(.mountPath=="/etc/praxis/routing")|.name]
+  | unique | if length==1 then .[0] else error("expected one direct Grid overlay mount at /etc/praxis/routing") end
+' <<<"$app_pod_json")"
+mounted_overlay_map="$(jq -er --arg volume "$overlay_volume" '
+  [.spec.volumes[]?|select(.name==$volume)|.configMap.name]
+  | unique | if length==1 then .[0] else error("Grid overlay mount is not backed by one ConfigMap") end
+' <<<"$app_pod_json")"
+[[ "$mounted_overlay_map" == "$CONFIG_MAP" ]] || { printf 'Gateway does not directly mount the expected Grid overlay ConfigMap\n' >&2; exit 2; }
+jq -j '.data["routing-overlay.json"]' <<<"$config_map_json" >"$tmp_dir/routing-overlay.expected.json"
+jq -j '.data["praxis.yaml"]' <<<"$praxis_config_map_json" >"$tmp_dir/praxis.expected.yaml"
+oc exec "$app_pod" -n "$NAMESPACE" -c praxis -- cat /etc/praxis/routing/routing-overlay.json >"$tmp_dir/routing-overlay.mounted.json"
+oc exec "$app_pod" -n "$NAMESPACE" -c praxis -- cat /etc/praxis/praxis.yaml >"$tmp_dir/praxis.mounted.yaml"
+printf '%s\n' "$network_json" >"$tmp_dir/gridnetwork.json"
+printf '%s\n' "$deployment_json" >"$tmp_dir/deployment.json"
+printf '%s\n' "$praxis_config_map_json" >"$tmp_dir/praxis-configmap.json"
+printf '%s\n' "$config_map_json" >"$tmp_dir/overlay-configmap.json"
+serving_verification="$(python3 - "$tmp_dir" "$EXPECTED_REVISION" "$praxis_gateway_name" "$NAMESPACE" "$deployment_generation" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
 
-overlay_path, expected_path, mounted_path, expected_serving_digest, expected_revision = sys.argv[1:]
-overlay = json.loads(pathlib.Path(overlay_path).read_text())
-expected_bytes = pathlib.Path(expected_path).read_bytes()
-mounted_bytes = pathlib.Path(mounted_path).read_bytes()
-serving = json.loads(expected_bytes)
-envelope_revision = overlay.get("revision", {}).get("value")
-if envelope_revision != expected_revision:
-    raise SystemExit("Grid overlay revision changed during the Gateway check")
-serving_digest = hashlib.sha256(expected_bytes).hexdigest()
-if serving_digest != expected_serving_digest:
-    raise SystemExit("operator serving ConfigMap digest does not match its data")
-if mounted_bytes != expected_bytes:
-    raise SystemExit("Gateway mounted serving config differs from the operator ConfigMap")
+root = pathlib.Path(sys.argv[1])
+expected_revision, gateway_name, namespace, deployment_generation = sys.argv[2:]
+deployment_generation = int(deployment_generation)
 
-def identities(candidates):
-    rows = []
-    for candidate in candidates:
-        rows.append({key: candidate.get(key) for key in ("stable_id", "kind", "name", "site", "cluster")})
-    return sorted(rows, key=lambda row: (str(row["stable_id"]), str(row["name"]), str(row["cluster"])))
+def load(name):
+    return json.loads((root / name).read_text())
 
-overlay_candidates = identities(overlay.get("overlay", {}).get("candidates", []))
-serving_candidates = identities(serving.get("candidates", []))
-if not overlay_candidates or overlay_candidates != serving_candidates:
-    raise SystemExit("Gateway serving candidate identities do not match the current Grid overlay")
-print(json.dumps({
-    "revision": envelope_revision,
-    "servingConfigDigest": serving_digest,
-    "mountedServingConfigMatches": True,
-    "overlayCandidateIdentitiesMatch": True,
-    "overlayCandidateCount": len(overlay_candidates),
-}, separators=(",", ":")))
+network = load("gridnetwork.json")
+deployment = load("deployment.json")
+praxis_cm = load("praxis-configmap.json")
+overlay_cm = load("overlay-configmap.json")
+network_generation = network.get("metadata", {}).get("generation")
+network_namespace = network.get("metadata", {}).get("namespace")
+if network_namespace not in (None, "", namespace):
+    raise SystemExit("GridNetwork is outside the task namespace")
+gateway = next((item for item in network.get("spec", {}).get("consumerGateways", []) if item.get("name") == gateway_name and item.get("namespace", namespace) == namespace), None)
+if not gateway:
+    raise SystemExit("GridNetwork does not declare the mounted Praxis Gateway")
+praxis_spec = gateway.get("praxisConfig", {})
+base_name = praxis_spec.get("configMapName")
+if praxis_spec.get("generate") is not True or not base_name:
+    raise SystemExit("GridNetwork is not configured for generated Praxis consumer config")
+alternate_name = "grid-consumer-config-" + hashlib.sha256(base_name.encode()).hexdigest()[:16]
+if praxis_cm.get("metadata", {}).get("name") not in (base_name, alternate_name):
+    raise SystemExit("mounted Praxis ConfigMap is neither the configured base nor its rollout-safe alternate")
+labels = praxis_cm.get("metadata", {}).get("labels", {})
+if labels.get("app.kubernetes.io/managed-by") != "grid-operator" or labels.get("grid.praxis.fast/network") != network.get("metadata", {}).get("name") or labels.get("grid.praxis.fast/gateway") != gateway_name:
+    raise SystemExit("mounted Praxis ConfigMap is not owned by the current GridNetwork Gateway")
+praxis_bytes = (praxis_cm.get("data") or {}).get("praxis.yaml", "").encode()
+if not praxis_bytes or (root / "praxis.mounted.yaml").read_bytes() != praxis_bytes:
+    raise SystemExit("Gateway mounted Praxis config differs from the operator-owned ConfigMap")
+praxis_digest = hashlib.sha256(praxis_bytes).hexdigest()
+statuses = network.get("status", {}).get("praxisConfigStatus", [])
+if not any(item.get("gatewayName") == gateway_name and item.get("namespace") == namespace and item.get("configMapName") == base_name and item.get("phase") == "Rendered" and item.get("observedGeneration") == network_generation for item in statuses):
+    raise SystemExit("operator Praxis ConfigMap is not Rendered at the current GridNetwork generation")
+mounts = network.get("status", {}).get("mountReconciliationStatus", [])
+if not any(item.get("gatewayName") == gateway_name and item.get("namespace") == namespace and item.get("deploymentName") == deployment.get("metadata", {}).get("name") and item.get("phase") == "Ready" and item.get("observedGeneration") == network_generation and item.get("deploymentGeneration") == deployment_generation and item.get("appliedRevision") == praxis_digest for item in mounts):
+    raise SystemExit("operator Praxis mount reconciliation is not Ready for the mounted config and current Deployment generation")
+if deployment.get("status", {}).get("observedGeneration") != deployment_generation or (deployment.get("status", {}).get("readyReplicas") or 0) < 1:
+    raise SystemExit("Gateway Deployment has not observed its current generation")
+
+overlay_bytes = (overlay_cm.get("data") or {}).get("routing-overlay.json", "").encode()
+if not overlay_bytes or (root / "routing-overlay.mounted.json").read_bytes() != overlay_bytes:
+    raise SystemExit("Gateway mounted Grid overlay differs from the current ConfigMap")
+envelope = json.loads(overlay_bytes)
+revision = envelope.get("revision", {}).get("value")
+content_digest = envelope.get("content_digest", {}).get("value")
+annotations = overlay_cm.get("metadata", {}).get("annotations", {})
+overlay_labels = overlay_cm.get("metadata", {}).get("labels", {})
+if revision != expected_revision or annotations.get("grid.praxis.fast/overlay-revision") != revision or annotations.get("grid.praxis.fast/overlay-content-digest") != content_digest:
+    raise SystemExit("mounted Grid overlay revision or content digest is not the expected Distributed revision")
+if overlay_labels.get("grid.praxis.fast/network") != network.get("metadata", {}).get("name") or overlay_labels.get("grid.praxis.fast/gateway") != gateway_name:
+    raise SystemExit("mounted Grid overlay is not owned by the expected GridNetwork Gateway")
+routing = next((item for item in network.get("status", {}).get("routingMapStatus", []) if item.get("gatewayName") == gateway_name and item.get("namespace") == namespace), None)
+if not routing or routing.get("phase") != "Distributed" or routing.get("observedGeneration") != network_generation or routing.get("distributedRevision") != revision or routing.get("configMapName") != overlay_cm.get("metadata", {}).get("name"):
+    raise SystemExit("GridNetwork does not report this overlay as Distributed at the current generation")
+candidates = envelope.get("overlay", {}).get("candidates", [])
+if len(candidates) != 2 or len({item.get("stable_id") for item in candidates}) != 2:
+    raise SystemExit("Gateway overlay does not contain exactly two distinct candidates")
+print(json.dumps({"revision": revision, "praxisConfigDigest": praxis_digest, "mountedPraxisConfigMatches": True, "overlayCandidateIdentitiesMatch": True, "overlayCandidateCount": len(candidates)}, separators=(",", ":")))
 PY
 )"
 mounted_revision="$(jq -er '.revision' <<<"$serving_verification")"
-serving_config_digest="$(jq -er '.servingConfigDigest' <<<"$serving_verification")"
+praxis_config_digest="$(jq -er '.praxisConfigDigest' <<<"$serving_verification")"
 overlay_candidate_count="$(jq -er '.overlayCandidateCount' <<<"$serving_verification")"
 [[ "$mounted_revision" == "$EXPECTED_REVISION" && "$overlay_candidate_count" == 2 ]] || {
   printf 'Gateway mounted serving config does not represent the expected two-candidate Grid overlay\n' >&2
@@ -238,12 +268,12 @@ print(json.dumps(values, separators=(",", ":")))
 
 jq -n \
   --arg revision "$mounted_revision" --arg podUid "$app_pod_uid" --arg proxyPodUid "$proxy_pod_uid" \
-  --arg clusterSha256 "$route_cluster_sha256" --arg servingConfigDigest "$serving_config_digest" --arg phase "$PHASE" \
+  --arg clusterSha256 "$route_cluster_sha256" --arg praxisConfigDigest "$praxis_config_digest" --arg phase "$PHASE" \
   --argjson apiCaVerified "$api_ca_verified" --argjson retryLimit "$(jq -r '.retryLimit' <<<"$route")" \
   --argjson backendCount "$backend_count" --argjson candidateCount "$overlay_candidate_count" --argjson counters "$counter_json" \
   '{schema:"praxis-extproc.grid-llmd-gateway-revision/v1",phase:$phase,revision:$revision,podUid:$podUid,proxyPodUid:$proxyPodUid,
     apiCaVerified:$apiCaVerified,routeRetryLimit:$retryLimit,routeBackendCount:$backendCount,routeClusterSha256:$clusterSha256,
-    routeBackendServiceMatches:true,servingConfigDigest:$servingConfigDigest,mountedServingConfigMatches:true,
+    routeBackendServiceMatches:true,praxisConfigDigest:$praxisConfigDigest,mountedPraxisConfigMatches:true,
     overlayCandidateIdentitiesMatch:true,overlayCandidateCount:$candidateCount,
     retryAttempts:$counters.retryAttempts,upstreamRequests:$counters.upstreamRequests,
     retryCounterPresent:$counters.retryCounterPresent,requestCounterPresent:$counters.requestCounterPresent,

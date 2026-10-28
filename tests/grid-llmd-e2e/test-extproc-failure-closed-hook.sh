@@ -28,6 +28,10 @@ required = {
     "only task ExtProc scale-down": 'oc scale "deployment/$DEPLOYMENT_NAME" -n "$NAMESPACE" --replicas=0',
     "restoration trap": 'trap cleanup EXIT',
     "unique correlated request": '--header "x-request-id: $REQUEST_ID"',
+    "response Envoy request ID is retained": '--arg responseRequestId "$RESPONSE_REQUEST_ID"',
+    "response request ID validation": '[[ "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]',
+    "request and response correlation IDs captured": 'request-correlation.json',
+    "runner evidence directory gets an isolated child": 'EVIDENCE_DIR="$EVIDENCE_DIR/failure-closed"',
     "application TLS verification": '--cacert "$GATEWAY_CA_FILE"',
     "optional TLS-preserving connect mapping": 'GATEWAY_CONNECT_TO="${GRID_LLMD_GATEWAY_CONNECT_TO:-}"',
     "connect mapping preserves route hostname": '[[ "$CONNECT_URL_HOST" == "$URL_HOST" && "$CONNECT_URL_PORT" == "$URL_PORT" ]]',
@@ -44,6 +48,7 @@ required = {
 }
 missing = [label for label, fragment in required.items() if fragment not in source]
 forbidden = [fragment for fragment in ("oc delete", "oc patch", "oc apply", "oc replace") if fragment in source]
+forbidden += ["[[ \"$RESPONSE_REQUEST_ID\" == \"$REQUEST_ID\" ]]" ] if '[[ "$RESPONSE_REQUEST_ID" == "$REQUEST_ID" ]]' in source else []
 if missing:
     raise SystemExit("failure-closed hook contract is missing: " + ", ".join(missing))
 if forbidden:

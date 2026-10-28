@@ -807,7 +807,10 @@ struct Check {
 struct Probe {
     phase: String,
     observed_epoch_seconds: u64,
+    /// Client-generated ID sent to the task Gateway. Envoy may replace it.
     request_id: String,
+    /// ID returned by the backend-facing Gateway response and used for simulator receipt matching.
+    backend_request_id: Option<String>,
     expected_pool: String,
     model_header: String,
     status_code: Option<u16>,
@@ -818,7 +821,7 @@ struct Probe {
     body_oracle_match: bool,
     request_oracle_match: Option<bool>,
     simulator_identity_match: bool,
-    simulator_request_id_echo_match: bool,
+    backend_request_id_present: bool,
     simulator_receipt_match: bool,
     gateway_upstream_request_delta: Option<u64>,
     gateway_retry_attempt_delta: Option<u64>,
@@ -889,6 +892,7 @@ struct ExtProcFailureClosedReport {
     task_owned: bool,
     resource: String,
     request_id: String,
+    response_request_id: String,
     request_status_code: u16,
     extproc_failure_observed: bool,
     failure_closed: bool,
@@ -975,8 +979,8 @@ struct GatewayRevisionRecord {
     route_backend_count: usize,
     route_cluster_sha256: String,
     route_backend_service_matches: bool,
-    serving_config_digest: String,
-    mounted_serving_config_matches: bool,
+    praxis_config_digest: String,
+    mounted_praxis_config_matches: bool,
     overlay_candidate_identities_match: bool,
     overlay_candidate_count: usize,
     retry_attempts: Option<u64>,
@@ -998,8 +1002,8 @@ struct GatewayRevisionHookObservation {
     route_backend_count: usize,
     route_cluster_sha256: String,
     route_backend_service_matches: bool,
-    serving_config_digest: String,
-    mounted_serving_config_matches: bool,
+    praxis_config_digest: String,
+    mounted_praxis_config_matches: bool,
     overlay_candidate_identities_match: bool,
     overlay_candidate_count: usize,
     retry_attempts: Option<u64>,
@@ -2033,6 +2037,7 @@ fn run_extproc_failure_closed_test(
         && result.task_owned
         && resource.namespace == args.namespace
         && !result.request_id.is_empty()
+        && !result.response_request_id.is_empty()
         && result.request_status_code >= 500
         && result.extproc_failure_observed
         && result.failure_closed
@@ -2061,6 +2066,7 @@ fn run_extproc_failure_closed_test(
             "taskOwned": result.task_owned,
             "resource": format!("{}/{}/{}", resource.namespace, resource.kind, resource.name),
             "requestId": result.request_id,
+            "responseRequestId": result.response_request_id,
             "requestStatusCode": result.request_status_code,
             "extprocFailureObserved": result.extproc_failure_observed,
             "failureClosed": result.failure_closed,
@@ -3444,6 +3450,36 @@ fn pool_resource_name(reference: &str) -> String {
         .to_owned()
 }
 
+fn simulator_pool_label_for_resource(
+    selected_pool: &str,
+    pool_resources: &[String],
+    pool_model_resources: &[String],
+    default_namespace: &str,
+) -> Result<String, String> {
+    if pool_resources.len() != pool_model_resources.len() {
+        return Err("simulator receipt requires one model-resource mapping per InferencePool".to_owned());
+    }
+    let matches = pool_resources
+        .iter()
+        .zip(pool_model_resources)
+        .filter(|(pool, _)| pool_resource_name(pool) == selected_pool)
+        .collect::<Vec<_>>();
+    let [(_, model_resource)] = matches.as_slice() else {
+        return Err(format!(
+            "selected InferencePool {selected_pool:?} has no unique model-resource mapping"
+        ));
+    };
+    let model_resource = model_resource.split('#').next().unwrap_or(model_resource);
+    let model_resource = parse_resource_ref(model_resource, default_namespace)?;
+    if !is_resource_kind(&model_resource.kind, &["llminferenceservice", "llminferenceservices"]) {
+        return Err(format!(
+            "simulator receipt model mapping must identify an LLMInferenceService, got {:?}",
+            model_resource.kind
+        ));
+    }
+    Ok(model_resource.name)
+}
+
 fn candidate_matches_pool(candidate: &str, pool: &str) -> bool {
     let candidate = candidate.rsplit('/').next().unwrap_or(candidate);
     candidate == pool || candidate.strip_prefix("provider:") == Some(pool)
@@ -4095,12 +4131,12 @@ fn wait_for_gateway_revision(
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
                 && observation.route_backend_service_matches
-                && observation.serving_config_digest.len() == 64
+                && observation.praxis_config_digest.len() == 64
                 && observation
-                    .serving_config_digest
+                    .praxis_config_digest
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                && observation.mounted_serving_config_matches
+                && observation.mounted_praxis_config_matches
                 && observation.overlay_candidate_identities_match
                 && observation.overlay_candidate_count == 2
                 && observation.request_counter_present
@@ -4117,8 +4153,8 @@ fn wait_for_gateway_revision(
                     route_backend_count: observation.route_backend_count,
                     route_cluster_sha256: observation.route_cluster_sha256,
                     route_backend_service_matches: observation.route_backend_service_matches,
-                    serving_config_digest: observation.serving_config_digest,
-                    mounted_serving_config_matches: observation.mounted_serving_config_matches,
+                    praxis_config_digest: observation.praxis_config_digest,
+                    mounted_praxis_config_matches: observation.mounted_praxis_config_matches,
                     overlay_candidate_identities_match: observation.overlay_candidate_identities_match,
                     overlay_candidate_count: observation.overlay_candidate_count,
                     retry_attempts: observation.retry_attempts,
@@ -4136,10 +4172,10 @@ fn wait_for_gateway_revision(
                     &format!("gateway/{phase}-revision-consumed"),
                     true,
                     format!(
-                        "serving Gateway consumed {}, serving digest={} (mounted match={}), overlay candidate identity match={} (count={}), task backend match={}, route cluster hash recorded, hook API CA verified={}, runner API mode={}, one backend={}, retry limit={}, retry counter present={}, retry attempts={:?}, upstream attempts={} (counter source={}, request counter present={}), Gateway and proxy Pod identities recorded",
+                        "serving Gateway consumed {}, Praxis config digest={} (mounted match={}), overlay candidate identity match={} (count={}), task backend match={}, route cluster hash recorded, hook API CA verified={}, runner API mode={}, one backend={}, retry limit={}, retry counter present={}, retry attempts={:?}, upstream attempts={} (counter source={}, request counter present={}), Gateway and proxy Pod identities recorded",
                         record.revision,
-                        record.serving_config_digest,
-                        record.mounted_serving_config_matches,
+                        record.praxis_config_digest,
+                        record.mounted_praxis_config_matches,
                         record.overlay_candidate_identities_match,
                         record.overlay_candidate_count,
                         record.route_backend_service_matches,
@@ -6597,19 +6633,30 @@ fn check_grid_operator_contract(
     Ok(())
 }
 
+fn grid_operator_manages_consumer_config(network: &Value, gateway_name: &str) -> bool {
+    let consumer_gateway = network["spec"]["consumerGateways"].as_array().is_some_and(|gateways| {
+        gateways.iter().any(|gateway| {
+            gateway["name"].as_str() == Some(gateway_name)
+                && gateway["praxisConfig"]["generate"].as_bool() == Some(true)
+        })
+    });
+    let gateway_ref = network["spec"]["gatewayRefs"].as_array().is_some_and(|gateways| {
+        gateways.iter().any(|gateway| {
+            gateway["name"].as_str() == Some(gateway_name)
+                && (gateway["consumerConfig"]["enabled"].as_bool() == Some(true)
+                    || gateway["praxisConfig"]["generate"].as_bool() == Some(true))
+        })
+    });
+    consumer_gateway || gateway_ref
+}
+
 /// If the GridNetwork opts into operator-managed consumer Praxis config, make
 /// sure its status says that config was rendered. Otherwise record the
 /// intentional boundary: the deployment-supplied Praxis/ExtProc config owns
 /// the consumer path for this suite.
 fn check_optional_consumer_config(report: &mut Report, network: &Value, overlay_status: &Value) {
     let gateway_name = overlay_status["gatewayName"].as_str();
-    let gateway_ref = network["spec"]["gatewayRefs"]
-        .as_array()
-        .and_then(|refs| refs.iter().find(|gateway| gateway["name"].as_str() == gateway_name));
-    let enabled = gateway_ref.is_some_and(|gateway| {
-        gateway["consumerConfig"]["enabled"].as_bool() == Some(true)
-            || gateway["praxisConfig"]["generate"].as_bool() == Some(true)
-    });
+    let enabled = gateway_name.is_some_and(|name| grid_operator_manages_consumer_config(network, name));
     if !enabled {
         report.checks.push(Check {
             name: "grid-operator/consumer-config".to_owned(),
@@ -8163,8 +8210,6 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         &args.prompt,
     );
     write_private(&headers_path, headers.as_bytes())?;
-    let simulator_receipt_match =
-        collect_simulator_receipt(args, report, evidence_dir, phase, &expected_pool, &request_id)?;
     let response_body = fs::read_to_string(&response_path).unwrap_or_default();
     let response_body = redact_probe_text(
         &response_body,
@@ -8175,6 +8220,15 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
     );
     let response_body = sanitize_capture_text(&response_body);
     write_private(&response_path, response_body.as_bytes())?;
+    let backend_request_id = response_request_id(&headers);
+    let simulator_receipt_match = collect_simulator_receipt(
+        args,
+        report,
+        evidence_dir,
+        phase,
+        &expected_pool,
+        backend_request_id.as_deref(),
+    )?;
     let provider_attribution = header_value(&headers, &args.provider_header);
     let backend_attribution = header_value(&headers, &args.backend_header);
     let expected_attribution = configured_pool_attribution_for_name(args, &expected_pool);
@@ -8203,8 +8257,7 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         .map(|oracle| response_body.contains(oracle));
     let expected_simulator_identity = configured_pool_response_oracle(args, &expected_pool);
     let simulator_identity_match = expected_simulator_identity.is_none_or(|oracle| response_body.contains(oracle));
-    let simulator_request_id_echo_match =
-        header_value(&headers, "x-request-id").as_deref() == Some(request_id.as_str());
+    let backend_request_id_present = backend_request_id.is_some();
     let extproc_proof = if args.extproc_headers.is_empty() {
         body_oracle_match
     } else {
@@ -8219,13 +8272,14 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         && attribution_matches
         && extproc_proof
         && (args.extproc_body_oracle.is_none() || body_oracle_match)
-        && simulator_request_id_echo_match
+        && backend_request_id_present
         && simulator_receipt_match;
     let passed = passed && request_oracle_match.unwrap_or(true) && simulator_identity_match && no_retry_attribution;
     let probe = Probe {
         phase: phase.to_owned(),
         observed_epoch_seconds: epoch_seconds(),
         request_id,
+        backend_request_id,
         expected_pool: expected_pool.clone(),
         model_header: args.model_header.clone(),
         status_code,
@@ -8236,7 +8290,7 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         body_oracle_match,
         request_oracle_match,
         simulator_identity_match,
-        simulator_request_id_echo_match,
+        backend_request_id_present,
         simulator_receipt_match,
         gateway_upstream_request_delta: upstream_request_delta,
         gateway_retry_attempt_delta: retry_attempt_delta,
@@ -8246,7 +8300,7 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         passed,
     };
     let detail = format!(
-        "status={:?}, expected_pool={}, provider={:?}, backend={:?}, attribution_matches_expected={}, extproc_markers={:?}, request_body_sha256={}, body_oracle_match={}, request_oracle={:?}, simulator_identity={}, simulator_request_id_echo={}, simulator_log_receipt={}, upstream_request_delta={:?}, retry_attempt_delta={:?}",
+        "status={:?}, expected_pool={}, provider={:?}, backend={:?}, attribution_matches_expected={}, extproc_markers={:?}, request_body_sha256={}, body_oracle_match={}, request_oracle={:?}, simulator_identity={}, client_request_id={}, backend_request_id={:?}, backend_request_id_present={}, simulator_log_receipt={}, upstream_request_delta={:?}, retry_attempt_delta={:?}",
         probe.status_code,
         probe.expected_pool,
         probe.provider_attribution,
@@ -8257,7 +8311,9 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         probe.body_oracle_match,
         probe.request_oracle_match,
         probe.simulator_identity_match,
-        probe.simulator_request_id_echo_match,
+        probe.request_id,
+        probe.backend_request_id,
+        probe.backend_request_id_present,
         probe.simulator_receipt_match,
         probe.gateway_upstream_request_delta,
         probe.gateway_retry_attempt_delta
@@ -8278,7 +8334,7 @@ fn collect_simulator_receipt(
     evidence_dir: &Path,
     phase: &str,
     pool: &str,
-    request_id: &str,
+    backend_request_id: Option<&str>,
 ) -> Result<bool, String> {
     let context = args.context.as_deref().unwrap_or_default();
     let expected_simulator_image = parse_image_pins(&args.image_pins)
@@ -8286,6 +8342,8 @@ fn collect_simulator_receipt(
         .get("llm-d-sim")
         .cloned()
         .ok_or_else(|| "the immutable llm-d-sim image pin is missing".to_owned())?;
+    let simulator_pool_label =
+        simulator_pool_label_for_resource(pool, &args.pool_resources, &args.pool_model_resources, &args.namespace)?;
     let mut pod_args = vec![
         "--context".to_owned(),
         context.to_owned(),
@@ -8294,7 +8352,7 @@ fn collect_simulator_receipt(
         "get".to_owned(),
         "pods".to_owned(),
         "-l".to_owned(),
-        format!("praxis.fast/simulator-pool={pool}"),
+        format!("praxis.fast/simulator-pool={simulator_pool_label}"),
         "-o".to_owned(),
         "json".to_owned(),
     ];
@@ -8316,7 +8374,8 @@ fn collect_simulator_receipt(
                     })
                 });
                 ready
-                    && pod["metadata"]["labels"]["praxis.fast/simulator-pool"].as_str() == Some(pool)
+                    && pod["metadata"]["labels"]["praxis.fast/simulator-pool"].as_str()
+                        == Some(simulator_pool_label.as_str())
                     && pod["spec"]["containers"].as_array().is_some_and(|containers| {
                         containers
                             .iter()
@@ -8336,7 +8395,7 @@ fn collect_simulator_receipt(
                 .and_then(|container| container["name"].as_str())
                 .unwrap_or_default()
                 .to_owned();
-            if !pod_name.is_empty() && !container_name.is_empty() {
+            if backend_request_id.is_some() && !pod_name.is_empty() && !container_name.is_empty() {
                 pod_args = vec![
                     "--context".to_owned(),
                     context.to_owned(),
@@ -8349,7 +8408,8 @@ fn collect_simulator_receipt(
                     "--since=5m".to_owned(),
                 ];
                 let logs = run_command_owned("kubectl", &pod_args)?;
-                receipt_match = logs.success() && simulator_completion_log_matches(&logs.stdout(), request_id);
+                receipt_match = logs.success()
+                    && simulator_completion_log_matches(&logs.stdout(), backend_request_id.unwrap_or_default());
             }
         }
     }
@@ -8360,7 +8420,7 @@ fn collect_simulator_receipt(
         "podName": pod_name,
         "podUid": pod_uid,
         "container": container_name,
-        "requestId": request_id,
+        "backendRequestId": backend_request_id,
         "completionLogMatched": receipt_match,
         "rawSimulatorLogsPersisted": false,
     });
@@ -8373,19 +8433,32 @@ fn collect_simulator_receipt(
         &format!("simulator/{phase}-independent-receipt"),
         receipt_match,
         format!(
-            "pinned Ready simulator target {}/{} emitted a request-completion record correlated to the unique request ID; raw logs were not saved",
+            "pinned Ready simulator target {}/{} emitted a request-completion record correlated to the backend-visible request ID {}; raw logs were not saved",
             args.namespace,
             if pod_name.is_empty() {
                 "<unresolved>"
             } else {
                 pod_name.as_str()
-            }
+            },
+            backend_request_id.unwrap_or("<missing>")
         ),
     );
     Ok(receipt_match)
 }
 
+fn response_request_id(headers: &str) -> Option<String> {
+    header_value(headers, "x-request-id").filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.trim() == value
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
 fn simulator_completion_log_matches(logs: &str, request_id: &str) -> bool {
+    if request_id.is_empty() {
+        return false;
+    }
     logs.lines()
         .any(|line| line.contains("Finished processing request") && line.contains(request_id))
 }
@@ -8806,9 +8879,10 @@ fn write_bug_capture(evidence_dir: &Path, report: &Report) -> Result<(), String>
         .iter()
         .map(|probe| {
             format!(
-                "- `{}` request ID `{}` observed at epoch `{}`; response files `{}` and `{}`",
+                "- `{}` client request ID `{}`; backend request ID `{}`; observed at epoch `{}`; response files `{}` and `{}`",
                 probe.phase,
                 probe.request_id,
+                probe.backend_request_id.as_deref().unwrap_or("<missing>"),
                 probe.observed_epoch_seconds,
                 Path::new(&probe.headers_file)
                     .file_name()
@@ -9061,6 +9135,24 @@ mod tests {
             "I1028 16:00:00 http.go:394] Received new HTTP req=grid-llmd-1234-5678-baseline",
             request_id
         ));
+        assert!(!simulator_completion_log_matches(
+            "I1028 16:00:00 simulator.go:401] Finished processing request id=anything",
+            ""
+        ));
+    }
+
+    #[test]
+    fn simulator_receipt_uses_the_backend_visible_response_request_id() {
+        let response_headers = "HTTP/2 200\r\nx-request-id: d27ffa03-2cdd-4331-b913-565b233de79c\r\n";
+        assert_eq!(
+            response_request_id(response_headers).as_deref(),
+            Some("d27ffa03-2cdd-4331-b913-565b233de79c")
+        );
+        assert_eq!(
+            response_request_id("HTTP/2 200\r\ncontent-type: application/json\r\n"),
+            None
+        );
+        assert_eq!(response_request_id("x-request-id: bad value\n"), None);
     }
 
     #[test]
@@ -9112,8 +9204,8 @@ mod tests {
             route_backend_count: 1,
             route_cluster_sha256: "a".repeat(64),
             route_backend_service_matches: true,
-            serving_config_digest: "b".repeat(64),
-            mounted_serving_config_matches: true,
+            praxis_config_digest: "b".repeat(64),
+            mounted_praxis_config_matches: true,
             overlay_candidate_identities_match: true,
             overlay_candidate_count: 2,
             retry_attempts: None,
@@ -10026,6 +10118,39 @@ mod tests {
     }
 
     #[test]
+    fn consumer_config_gate_recognizes_current_consumer_gateways_schema() {
+        let current = serde_json::json!({
+            "spec": {
+                "consumerGateways": [{
+                    "name": "grid-gateway",
+                    "praxisConfig": {"generate": true}
+                }]
+            }
+        });
+        let legacy = serde_json::json!({
+            "spec": {
+                "gatewayRefs": [{
+                    "name": "grid-gateway",
+                    "consumerConfig": {"enabled": true}
+                }]
+            }
+        });
+        let disabled = serde_json::json!({
+            "spec": {
+                "consumerGateways": [{
+                    "name": "grid-gateway",
+                    "praxisConfig": {"generate": false}
+                }]
+            }
+        });
+
+        assert!(grid_operator_manages_consumer_config(&current, "grid-gateway"));
+        assert!(grid_operator_manages_consumer_config(&legacy, "grid-gateway"));
+        assert!(!grid_operator_manages_consumer_config(&current, "other-gateway"));
+        assert!(!grid_operator_manages_consumer_config(&disabled, "grid-gateway"));
+    }
+
+    #[test]
     fn runtime_condition_requires_observed_generation() {
         let ready_without_generation =
             r#"{"metadata":{"generation":1},"status":{"conditions":[{"type":"Ready","status":"True"}]}}"#;
@@ -10113,6 +10238,27 @@ mod tests {
             pool_backend_identity_separation(&missing_identity),
             PoolBackendIdentityCheck::Incomplete(_)
         ));
+    }
+
+    #[test]
+    fn simulator_receipt_uses_model_service_name_for_simulator_label() {
+        let pools = vec![
+            "grid-task/inferencepool/pool-a-inference-pool".to_owned(),
+            "grid-task/inferencepool/pool-b-inference-pool".to_owned(),
+        ];
+        let models = vec![
+            "grid-task/llminferenceservice/pool-a".to_owned(),
+            "grid-task/llminferenceservice/pool-b".to_owned(),
+        ];
+        assert_eq!(
+            simulator_pool_label_for_resource("pool-a-inference-pool", &pools, &models, "grid-task").unwrap(),
+            "pool-a"
+        );
+        assert_eq!(
+            simulator_pool_label_for_resource("pool-b-inference-pool", &pools, &models, "grid-task").unwrap(),
+            "pool-b"
+        );
+        assert!(simulator_pool_label_for_resource("missing-pool", &pools, &models, "grid-task").is_err());
     }
 
     fn serving_pool_record(pool: &str, backend_ready_pod_uids: &[&str]) -> ServingPoolRecord {

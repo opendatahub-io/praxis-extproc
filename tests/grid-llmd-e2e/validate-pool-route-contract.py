@@ -26,6 +26,35 @@ def get_json(context, namespace, *args):
     return json.loads(kubectl(context, namespace, *args, "-o", "json"))
 
 
+def validate_operator_config_map_mount(network, gateway_ref, mounted_name, config_map, applied_revision):
+    """Validate the operator's active base/alternate Praxis config slot and revision."""
+    praxis = gateway_ref.get("praxisConfig", {})
+    base_name = praxis.get("configMapName")
+    if not base_name:
+        raise RuntimeError("GridNetwork does not declare the operator Praxis ConfigMap name")
+    alternate_name = f"grid-consumer-config-{hashlib.sha256(base_name.encode()).hexdigest()[:16]}"
+    if mounted_name not in (base_name, alternate_name):
+        raise RuntimeError("Gateway /etc/praxis volume does not mount the current operator-generated Praxis ConfigMap")
+
+    metadata = config_map.get("metadata", {})
+    labels = metadata.get("labels", {})
+    expected_labels = {
+        "app.kubernetes.io/managed-by": "grid-operator",
+        "grid.praxis.fast/network": network.get("metadata", {}).get("name"),
+        "grid.praxis.fast/gateway": gateway_ref.get("name"),
+    }
+    if metadata.get("name") != mounted_name or any(labels.get(key) != value for key, value in expected_labels.items()):
+        raise RuntimeError("mounted Praxis ConfigMap is not owned by the current GridNetwork Gateway reconciliation")
+
+    content = (config_map.get("data") or {}).get("praxis.yaml")
+    if not content:
+        raise RuntimeError("mounted Gateway ConfigMap has no praxis.yaml key")
+    content_revision = hashlib.sha256(content.encode()).hexdigest()
+    if praxis.get("mountReconciliation", {}).get("enabled") is True and applied_revision != content_revision:
+        raise RuntimeError("mounted operator Praxis ConfigMap digest does not match the current reconciliation appliedRevision")
+    return content, content_revision
+
+
 def model_extraction_matches(config, requested_header, model):
     chains = config.get("filter_chains", [])
     for chain in chains:
@@ -484,12 +513,20 @@ def main():
             raise RuntimeError("Gateway deployment does not mount Praxis config at /etc/praxis")
         volume = next((item for item in template.get("volumes", []) if item.get("name") == mount_point.get("name")), None)
         config_map_name = ((volume or {}).get("configMap") or {}).get("name")
-        if config_map_name != praxis_config.get("configMapName"):
-            raise RuntimeError("Gateway /etc/praxis volume does not mount the current operator-generated Praxis ConfigMap")
         config_map = get_json(args.context, gateway_namespace, "get", "configmap", config_map_name)
-        expected_config = (config_map.get("data") or {}).get("praxis.yaml")
-        if not expected_config:
-            raise RuntimeError("mounted Gateway ConfigMap has no praxis.yaml key")
+        applied_revision = next(
+            (
+                item.get("appliedRevision")
+                for item in mount_status
+                if item.get("deploymentName") == deployment_name
+                and item.get("phase") == "Ready"
+                and item.get("deploymentGeneration") == deployment.get("metadata", {}).get("generation")
+            ),
+            None,
+        )
+        expected_config, config_sha = validate_operator_config_map_mount(
+            network, gateway_ref, config_map_name, config_map, applied_revision
+        )
 
         selector = deployment.get("spec", {}).get("selector", {}).get("matchLabels", {})
         selector_arg = ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
@@ -516,7 +553,6 @@ def main():
             "cat",
             "/etc/praxis/praxis.yaml",
         )
-        config_sha = hashlib.sha256(mounted_config.encode()).hexdigest()
         if mounted_config != expected_config:
             raise RuntimeError("Gateway Pod's mounted praxis.yaml differs from its declared ConfigMap")
         config = yaml.safe_load(mounted_config)
