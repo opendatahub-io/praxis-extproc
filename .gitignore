@@ -31,3 +31,7 @@ target
 deploy/testdata/tls/tls.crt
 deploy/testdata/tls/tls.key
 deploy/overlays/**/tls-secret.yaml
+
+# Python tests and helper imports
+__pycache__/
+*.py[cod]
