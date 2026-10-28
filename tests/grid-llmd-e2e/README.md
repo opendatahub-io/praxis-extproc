@@ -10,11 +10,12 @@ Client with verified TLS
   -> Praxis ExtProc request/response filters
   -> intelligent_route reads the current Distributed Grid overlay
   -> mTLS provider hop to the selected pool Gateway
-  -> provider_route validates the selected candidate and owns provider attribution
+  -> provider_route validates the selected candidate, removes client-supplied credentials, and owns provider attribution
+  -> credential_inject sends a short-lived, audience-scoped projected task ServiceAccount token to the pool AuthPolicy
   -> pool HTTPRoute -> LLMInferenceService / InferencePool -> EPP -> llm-d-sim
 ~~~
 
-The Grid operator collects authenticated EPP metrics and publishes candidate scores, ranks, and a versioned overlay. Praxis selects according to that overlay. Each provider hop uses mTLS and a provider-local provider_route; the provider proxy writes trusted response attribution after removing peer-supplied attribution. The harness independently correlates each request with the selected simulator’s completion log. A response body or an HTTP 200 alone is not routing proof.
+The Grid operator collects authenticated EPP metrics and publishes candidate scores, ranks, and a versioned overlay. Praxis selects according to that overlay. Each provider hop uses mTLS and a provider-local provider_route; the provider proxy writes trusted response attribution after removing peer-supplied attribution and client credentials. The task-scoped client ServiceAccount is explicitly projected into each provider proxy with the pool AuthPolicy audience and a bounded lifetime; `credential_inject` reads the projected token at request time, and automount remains disabled. Token bytes are never written to Praxis config, manifests, or evidence. The harness independently correlates each request with the selected simulator’s completion log. A response body or an HTTP 200 alone is not routing proof.
 
 During initial Gateway installation, `GRID_GATEWAY_BOOTSTRAP_MODE=true` permits only the checked static 503 startup responder while mounting the current Grid overlay. Normal BYO configs must consume `/etc/praxis/routing/routing-overlay.json`. Keep inference traffic disabled until the final operator-generated config and overlay revision pass the pretraffic checks.
 
@@ -28,7 +29,7 @@ Every run uses a new UTC run ID, explicit Kubernetes context, private kubeconfig
 
 ## Inputs and profiles
 
-Required local tools include oc, kubectl, helm, jq, Python 3, Cargo, a container engine, and skopeo. Non-plan commands require an explicit context and kubeconfig. Configure KUBE_CONTEXT, KUBECONFIG, and EXPECTED_API_SERVER; use KUBE_CA_FILE when API CA verification is available.
+Required local tools include oc, kubectl, helm, jq, Python 3, Cargo, a container engine, and skopeo. Non-plan commands require an explicit context and kubeconfig. Configure KUBE_CONTEXT, KUBECONFIG, EXPECTED_API_SERVER, and the exact `GRID_RUN_LABEL` used on run-owned namespace/resources; use KUBE_CA_FILE when API CA verification is available.
 
 The development smoke uses:
 
@@ -118,12 +119,12 @@ A baseline passes only with all of the following in one request:
 - HTTP 200, a unique request ID, no retry, and the selected pool matching live overlay rank.
 - ExtProc response marker and request-body SHA-256 oracle matching the exact serialized request.
 - Trusted provider/backend attribution and the expected simulator response identity.
-- The selected pinned simulator Pod echoes the request ID and emits a correlated Finished processing request log record. Raw simulator logs are not persisted.
+- The runner keeps the unique client request ID and records the response `x-request-id` separately. Envoy may replace the client ID; the pinned simulator's `Finished processing request` log must match the backend-visible response ID. Raw simulator logs are not persisted.
 - Gateway upstream request evidence and exact Grid/Gateway revision evidence.
 
 After baseline passes, the pressure hook changes only the selected simulator’s supported /admin/config signal through the run-owned control ConfigMap. Require simulator control, authenticated EPP sample, score/rank reversal, a new Distributed overlay, Gateway consumption, and an independent receipt from the other pool. Recovery restores the original metric/control and proves the same chain returns to the baseline-ranked pool. Run ExtProc failure-closed last; require a correlated 5xx and zero backend receipts, then verify ExtProc recovery.
 
-A failed baseline stops before pressure. The runner captures diagnostics before cleanup. A run is PASS only when baseline, pressure reroute, recovery, and failure-closed all pass in the same run. An HTTP 200 without simulator receipt, attribution, ExtProc proof, or matching rank is a failure.
+A failed baseline stops before pressure. The runner captures diagnostics before cleanup. A run is PASS only when baseline, pressure reroute, recovery, and failure-closed all pass in the same run. An HTTP 200 without simulator receipt, attribution, ExtProc proof, or matching rank is a failure. The failure-closed hook writes into a fresh `failure-closed/` child of the runner evidence directory. It records the unique client request ID and returned Envoy `x-request-id` separately because Envoy can replace the client value.
 
 ## xtask configuration
 
@@ -134,7 +135,7 @@ Pass repeated values as comma-separated GRID_LLMD_* environment values or repeat
 - Two GRID_LLMD_POOL_RESOURCES, matching GRID_LLMD_POOL_MODEL_RESOURCES and GRID_LLMD_POOL_BACKEND_SERVICES; explicit GRID_LLMD_IPP_STATE and named IPP resources when present.
 - Both provider names and expected provider/backend attribution values, exact pool response oracles, the ExtProc body-digest header, ExtProc marker/filter resources, and the pool route-contract hook.
 - Two authenticated EPP metrics services with pool labels, the EPP sampler hook/account, metric name, queue capacity, and scoreFirst overlay evidence.
-- Two simulator control ConfigMaps tagged @<InferencePool-name>, plus the simulator pressure/recovery, Gateway revision, and ExtProc failure-closed hooks.
+- Two simulator control ConfigMaps tagged @<InferencePool-name>, plus the simulator pressure/recovery, Gateway revision, and ExtProc failure-closed hooks. The signal hook maps each logical InferencePool name to its LLMInferenceService label through `GRID_LLMD_POOL_MODEL_RESOURCES`.
 - Complete GRID_LLMD_SOURCE_REVISIONS, GRID_LLMD_IMAGE_PINS, and GRID_LLMD_RUNTIME_IMAGE_DIGESTS from the current run locks.
 
 A typical invocation is:

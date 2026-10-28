@@ -35,7 +35,7 @@ def utc_now() -> str:
 
 
 def digest(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def safe_name(value: str) -> str:
@@ -98,8 +98,43 @@ def parse_control_reference(raw: str, namespace: str) -> dict[str, str]:
     }
 
 
-def parse_control_list(raw: str, namespace: str) -> list[dict[str, str]]:
+def simulator_label_for_pool(pool: str, raw_model_resources: str, namespace: str) -> str:
+    """Map a logical InferencePool name to the model Service label used by simulator Pods."""
+    matches: list[str] = []
+    for item in raw_model_resources.split(","):
+        name, separator, resource = item.strip().partition("=")
+        if not separator or name != pool:
+            continue
+        resource = resource.split("#", 1)[0]
+        parts = resource.split("/")
+        if len(parts) == 3:
+            resource_namespace, kind, service_name = parts
+        elif len(parts) == 2:
+            resource_namespace, kind, service_name = namespace, parts[0], parts[1]
+        else:
+            raise HookError(f"model mapping for {pool} has an invalid resource reference")
+        if resource_namespace != namespace or kind.lower() not in ("llminferenceservice", "llminferenceservices"):
+            raise HookError(f"model mapping for {pool} must identify a task-owned LLMInferenceService")
+        if not service_name:
+            raise HookError(f"model mapping for {pool} has no Service name")
+        matches.append(service_name)
+    if not matches:
+        # Older/simple fixtures use the same name for both the logical pool and
+        # simulator label. Live E2E runs provide the explicit model mapping.
+        return pool
+    if len(matches) != 1:
+        raise HookError(f"model mapping for {pool} is not unique")
+    return matches[0]
+
+
+def parse_control_list(
+    raw: str,
+    namespace: str,
+    raw_model_resources: str = "",
+) -> list[dict[str, str]]:
     controls = [parse_control_reference(item.strip(), namespace) for item in raw.split(",") if item.strip()]
+    for control in controls:
+        control["simulatorPool"] = simulator_label_for_pool(control["pool"], raw_model_resources, namespace)
     if len(controls) < 2 or len({item["pool"] for item in controls}) != len(controls):
         raise HookError("signal qualification requires one distinct simulator control per pool")
     if len({item["identity"] for item in controls}) != len(controls):
@@ -260,7 +295,10 @@ def read_control(context: str, reference: dict[str, str], run_label: str) -> dic
     labels = metadata.get("labels", {})
     if any(labels.get(key) != value for key, value in OWNER_LABELS.items()):
         raise HookError(f"simulator control {reference['name']} is not task-owned")
-    if labels.get("praxis.fast/qualification-run") != run_label or labels.get("praxis.fast/simulator-pool") != reference["pool"]:
+    if (
+        labels.get("praxis.fast/qualification-run") != run_label
+        or labels.get("praxis.fast/simulator-pool") != reference["simulatorPool"]
+    ):
         raise HookError(f"simulator control {reference['name']} run/pool labels do not match")
     config = obj.get("data", {}).get(reference["dataKey"])
     if not isinstance(config, str):
@@ -347,7 +385,7 @@ def simulator_pods(context: str, namespace: str, reference: dict[str, str], run_
         labels = metadata.get("labels", {})
         if (
             labels.get("praxis.fast/qualification-run") != run_label
-            or labels.get("praxis.fast/simulator-pool") != reference["pool"]
+            or labels.get("praxis.fast/simulator-pool") != reference["simulatorPool"]
         ):
             raise HookError(f"Pod mounting {reference['name']} is not owned by this run and pool")
         container = next((item for item in spec.get("containers", []) if item.get("name") == "main"), None)
@@ -452,7 +490,11 @@ def execute(phase: str, args: argparse.Namespace) -> dict[str, Any]:
     evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(evidence, 0o700)
     server, api_ca_verified, run_label = verify_api(args.context, args.namespace, evidence)
-    references = parse_control_list(os.environ.get("GRID_LLMD_SIMULATOR_CONTROL_RESOURCES", ""), args.namespace)
+    references = parse_control_list(
+        os.environ.get("GRID_LLMD_SIMULATOR_CONTROL_RESOURCES", ""),
+        args.namespace,
+        os.environ.get("GRID_LLMD_POOL_MODEL_RESOURCES", ""),
+    )
     target_pool = os.environ.get("GRID_LLMD_PRESSURE_POOL", "")
     target = next((item for item in references if item["pool"] == target_pool), None)
     if target is None:
