@@ -46,13 +46,13 @@ ALLOW_INSECURE_DEV_API=true is permitted only for a disposable development API w
 
 Resolve sources once per run with tests/shared/resolve_sources.py. main mode resolves moving refs to immutable SHAs; the resulting source-locks.json is the source of truth for that run. It includes the remote, resolved SHA, clean detached worktree, and build-context hash. Preserve the caller checkout and build from the resolved worktrees, not from a dirty working tree.
 
-Build and push images with tests/shared/build_and_push.sh. It verifies the clean source lock before building, applies OCI source/revision/build-context labels, pushes the image, resolves the immutable digest, and verifies the registry manifest. For ExtProc, include the qualification filter feature:
+Build and push the Grid Gateway, downstream ODH Grid operator, Praxis AI provider proxy, Praxis ExtProc, and EPP images with tests/shared/build_and_push.sh. It verifies the clean source lock before building, applies OCI source/revision/build-context labels, pushes the image, resolves the immutable digest, and verifies the registry manifest. For ExtProc, include the qualification filter feature:
 
 ~~~text
 EXT_PROC_CARGO_FEATURES=responses,aws-sigv4,store-postgres-cert-auth,k8s-e2e
 ~~~
 
-The k8s-e2e feature is qualification-only and must not be included in release or FIPS images. Record the Containerfile hash, feature list, image digest, architecture, OCI labels, and deployed runtime image IDs. Build/verify the Grid Gateway, downstream ODH Grid operator, Praxis AI provider proxy, Praxis ExtProc, EPP, and llm-d-sim from the same run’s source locks. Do not use floating image tags or historical digest defaults as provenance.
+The k8s-e2e feature is qualification-only and must not be included in release or FIPS images. Record the Containerfile hash, feature list, image digest, architecture, OCI labels, and deployed runtime image IDs. Build llm-d-sim with `SERVING_POOLS_MODE=build` in the run-owned task namespace. That helper creates the owned ImageStream/BuildConfig, checks the locked Git revision and image labels, and records the immutable digest used by both pools. Do not push directly to its ImageStream name before running that helper; an integrated-registry push may create an ImageStream without the run ownership labels. Do not use floating image tags or historical digest defaults as provenance.
 
 Example for one component, with registry auth and trust material kept outside the evidence tree:
 
@@ -100,6 +100,7 @@ Relevant helpers are cold-deploy.sh, deploy-grid-operator.sh, configure-grid-sit
 The required deployment order is to apply both serving pools, register and verify both providers, then run inference qualification. With the run-specific environment above already exported, the exact helper entry points are:
 
 ~~~bash
+SERVING_POOLS_MODE=build bash tests/grid-llmd-e2e/deploy-serving-pools.sh
 SERVING_POOLS_MODE=apply bash tests/grid-llmd-e2e/deploy-serving-pools.sh
 GRID_PROVIDERS_MODE=apply bash tests/grid-llmd-e2e/deploy-grid-providers.sh
 cargo run --locked -p xtask -- e2e grid-llmd --mode preflight
