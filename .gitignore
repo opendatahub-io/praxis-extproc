@@ -25,3 +25,7 @@ target
 
 # Personal notes
 .docs/**
+
+# Python tests and helper imports
+__pycache__/
+*.py[cod]
