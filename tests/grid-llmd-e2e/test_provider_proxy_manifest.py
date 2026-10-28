@@ -23,6 +23,8 @@ config_text = PROXY.make_provider_config(
     "/publishers/grid-task/models/grid-test-model/v1/chat/completions",
     "pool-a",
     "pool-a-gateway.grid-task.svc.cluster.local:8080",
+    "grid-task",
+    "grid-llmd-client",
 )
 config = yaml.safe_load(config_text)
 filters = config["filter_chains"][0]["filters"]
@@ -39,11 +41,26 @@ assert route["routes"] == [
         "model": "grid-test-model",
         "paths": ["/publishers/grid-task/models/grid-test-model/v1/chat/completions"],
         "cluster": "pool-a-backend",
+        "credential": {
+            "strategy": "bearer_token",
+            "secretRef": {"name": "grid-llmd-client", "namespace": "grid-task", "key": "token"},
+        },
     }
 ]
+credential_inject = next(item for item in filters if item["filter"] == "credential_inject")
+assert credential_inject["credentials"] == [
+    {
+        "name": "grid-llmd-client",
+        "namespace": "grid-task",
+        "key": "token",
+        "strategy": "bearer_token",
+        "file": "/var/run/grid-llmd-client/token",
+    }
+]
+assert [item["filter"] for item in filters].index("provider_route") < [item["filter"] for item in filters].index("credential_inject") < [item["filter"] for item in filters].index("load_balancer")
 backend = next(item for item in filters if item["filter"] == "load_balancer")["clusters"][0]
 assert backend["endpoints"] == ["pool-a-gateway.grid-task.svc.cluster.local:8080"]
-assert not any("credential" in key.lower() for key in config)
+assert "provider-secret" not in config_text
 
 resources = PROXY.resources(
     "run-20261027",
@@ -54,12 +71,14 @@ resources = PROXY.resources(
     "grid-site-identity",
     "grid-ca",
     config_text,
+    "grid-llmd-client",
 )
 config_map, deployment, service = resources
 assert config_map["metadata"]["labels"]["praxis.fast/component"] == "provider-proxy"
 assert deployment["spec"]["replicas"] == 1
 pod_spec = deployment["spec"]["template"]["spec"]
 assert pod_spec["automountServiceAccountToken"] is False
+assert pod_spec["serviceAccountName"] == "grid-llmd-client"
 assert deployment["spec"]["template"]["metadata"]["annotations"]["praxis.fast/config-sha256"] == hashlib.sha256(config_text.encode()).hexdigest()
 container = pod_spec["containers"][0]
 assert container["image"].endswith("@sha256:" + "a" * 64)
@@ -68,6 +87,16 @@ assert container["readinessProbe"]["exec"]["command"][-1] == "http://127.0.0.1:9
 mounts = {item["name"]: item["mountPath"] for item in container["volumeMounts"]}
 assert mounts["ca"] == "/etc/praxis/ca-source"
 assert pod_spec["volumes"][2]["secret"]["secretName"] == "grid-ca"
+provider_token = next(item for item in pod_spec["volumes"] if item["name"] == "provider-token")["projected"]
+assert provider_token["defaultMode"] == 420
+assert provider_token["sources"] == [
+    {"serviceAccountToken": {"audience": "https://kubernetes.default.svc", "expirationSeconds": 3600, "path": "token"}}
+]
+assert {item["name"]: item for item in container["volumeMounts"]}["provider-token"] == {
+    "name": "provider-token",
+    "mountPath": "/var/run/grid-llmd-client",
+    "readOnly": True,
+}
 assert service["spec"]["ports"][0]["port"] == 8443
 
 print("Provider proxy mTLS, candidate, backend, attribution, and image-pin contract passed")

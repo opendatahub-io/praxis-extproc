@@ -81,7 +81,20 @@ fake-metrics:
         "grid-llmd-e2e/configmap/pool-b-simulator-control#config.yaml@pool-b",
         "grid-llmd-e2e",
     )
+    assert controls[0]["identity"] == "grid-llmd-e2e/configmap/pool-a-simulator-control#config.yaml"
+    assert HOOK.digest("config") == "sha256:b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"
     assert [item["pool"] for item in controls] == ["pool-a", "pool-b"]
+    mapped_controls = HOOK.parse_control_list(
+        "grid-llmd-e2e/configmap/pool-a-simulator-control#config.yaml@pool-a-inference-pool,"
+        "grid-llmd-e2e/configmap/pool-b-simulator-control#config.yaml@pool-b-inference-pool",
+        "grid-llmd-e2e",
+        "pool-a-inference-pool=grid-llmd-e2e/llminferenceservice/pool-a,"
+        "pool-b-inference-pool=grid-llmd-e2e/llminferenceservice/pool-b",
+    )
+    assert [(item["pool"], item["simulatorPool"]) for item in mapped_controls] == [
+        ("pool-a-inference-pool", "pool-a"),
+        ("pool-b-inference-pool", "pool-b"),
+    ]
     for raw in (
         "other/configmap/pool-a#config.yaml@pool-a",
         "grid-llmd-e2e/configmap/pool-a#config.yaml",
@@ -103,6 +116,16 @@ fake-metrics:
         pass
     else:
         raise AssertionError("duplicate pool mapping accepted")
+    try:
+        HOOK.simulator_label_for_pool(
+            "pool-a-inference-pool",
+            "pool-a-inference-pool=other/llminferenceservice/pool-a",
+            "grid-llmd-e2e",
+        )
+    except HOOK.HookError:
+        pass
+    else:
+        raise AssertionError("cross-namespace model mapping accepted")
     print("simulator runtime signal hook parsing and metric contract: PASS")
 
 

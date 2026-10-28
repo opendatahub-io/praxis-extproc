@@ -16,6 +16,10 @@ from pathlib import Path
 
 import yaml
 
+CLIENT_TOKEN_AUDIENCE = "https://kubernetes.default.svc"
+CLIENT_TOKEN_DIRECTORY = "/var/run/grid-llmd-client"
+CLIENT_TOKEN_PATH = f"{CLIENT_TOKEN_DIRECTORY}/token"
+
 
 def run_oc(context: str, *args: str, stdin: str | None = None) -> str:
     command = ["oc", f"--context={context}", *args]
@@ -107,7 +111,17 @@ def gateway_backend(context: str, namespace: str, gateway_name: str, pool: str) 
     return f"{service['metadata']['name']}.{namespace}.svc.cluster.local:{port}"
 
 
-def make_provider_config(site_name: str, provider: str, candidate_id: str, model: str, request_path: str, pool: str, backend: str) -> str:
+def make_provider_config(
+    site_name: str,
+    provider: str,
+    candidate_id: str,
+    model: str,
+    request_path: str,
+    pool: str,
+    backend: str,
+    credential_namespace: str,
+    credential_name: str,
+) -> str:
     config = {
         "insecure_options": {"allow_private_endpoints": True, "allow_private_upstreams": True},
         "listeners": [
@@ -139,6 +153,26 @@ def make_provider_config(site_name: str, provider: str, candidate_id: str, model
                                 "model": model,
                                 "paths": [request_path],
                                 "cluster": f"{pool}-backend",
+                                "credential": {
+                                    "strategy": "bearer_token",
+                                    "secretRef": {
+                                        "name": credential_name,
+                                        "namespace": credential_namespace,
+                                        "key": "token",
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "filter": "credential_inject",
+                        "credentials": [
+                            {
+                                "name": credential_name,
+                                "namespace": credential_namespace,
+                                "key": "token",
+                                "strategy": "bearer_token",
+                                "file": CLIENT_TOKEN_PATH,
                             }
                         ],
                     },
@@ -155,7 +189,17 @@ def make_provider_config(site_name: str, provider: str, candidate_id: str, model
     return yaml.safe_dump(config, sort_keys=False)
 
 
-def resources(run_label: str, namespace: str, pool: str, provider: str, image: str, identity_secret: str, ca_secret: str, config_text: str) -> list[dict]:
+def resources(
+    run_label: str,
+    namespace: str,
+    pool: str,
+    provider: str,
+    image: str,
+    identity_secret: str,
+    ca_secret: str,
+    config_text: str,
+    client_service_account: str,
+) -> list[dict]:
     name = f"praxis-provider-{pool}"
     service_name = name
     labels = {
@@ -189,6 +233,7 @@ def resources(run_label: str, namespace: str, pool: str, provider: str, image: s
                 },
                 "spec": {
                     "automountServiceAccountToken": False,
+                    "serviceAccountName": client_service_account,
                     "containers": [
                         {
                             "name": "praxis-ai",
@@ -205,6 +250,7 @@ def resources(run_label: str, namespace: str, pool: str, provider: str, image: s
                                 {"name": "config", "mountPath": "/etc/praxis/praxis.yaml", "subPath": "praxis.yaml", "readOnly": True},
                                 {"name": "identity", "mountPath": "/etc/praxis/tls", "readOnly": True},
                                 {"name": "ca", "mountPath": "/etc/praxis/ca-source", "readOnly": True},
+                                {"name": "provider-token", "mountPath": CLIENT_TOKEN_DIRECTORY, "readOnly": True},
                             ],
                         }
                     ],
@@ -212,6 +258,21 @@ def resources(run_label: str, namespace: str, pool: str, provider: str, image: s
                         {"name": "config", "configMap": {"name": name, "defaultMode": 292}},
                         {"name": "identity", "secret": {"secretName": identity_secret, "defaultMode": 292, "items": [{"key": "tls.crt", "path": "tls.crt"}, {"key": "tls.key", "path": "tls.key"}]}},
                         {"name": "ca", "secret": {"secretName": ca_secret, "defaultMode": 292, "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+                        {
+                            "name": "provider-token",
+                            "projected": {
+                                "defaultMode": 420,
+                                "sources": [
+                                    {
+                                        "serviceAccountToken": {
+                                            "audience": CLIENT_TOKEN_AUDIENCE,
+                                            "expirationSeconds": 3600,
+                                            "path": "token",
+                                        }
+                                    }
+                                ],
+                            },
+                        },
                     ],
                 },
             },
@@ -230,13 +291,45 @@ def resources(run_label: str, namespace: str, pool: str, provider: str, image: s
     return [cm, deployment, service]
 
 
-def check_live_deployment(context: str, namespace: str, pool: str, provider: str, run_label: str, image: str, config_text: str, evidence: Path) -> dict:
+def check_live_deployment(
+    context: str,
+    namespace: str,
+    pool: str,
+    provider: str,
+    run_label: str,
+    image: str,
+    config_text: str,
+    client_service_account: str,
+    evidence: Path,
+) -> dict:
     name = f"praxis-provider-{pool}"
     deployment = get_json(context, "-n", namespace, "get", "deployment", name)
     require_owned(deployment, run_label, f"Deployment/{name}")
     generation = deployment.get("metadata", {}).get("generation")
     if deployment.get("status", {}).get("observedGeneration") != generation or deployment.get("status", {}).get("updatedReplicas") != 1 or deployment.get("status", {}).get("availableReplicas") != 1:
         raise RuntimeError(f"provider proxy Deployment/{name} has not converged to one available replica")
+    pod_spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
+    projected_token = [
+        source.get("serviceAccountToken", {})
+        for volume in pod_spec.get("volumes", [])
+        if volume.get("name") == "provider-token"
+        for source in volume.get("projected", {}).get("sources", [])
+    ]
+    token_mounts = [
+        mount
+        for container in pod_spec.get("containers", [])
+        for mount in container.get("volumeMounts", [])
+        if mount.get("name") == "provider-token"
+    ]
+    if (
+        pod_spec.get("automountServiceAccountToken") is not False
+        or pod_spec.get("serviceAccountName") != client_service_account
+        or projected_token != [{"audience": CLIENT_TOKEN_AUDIENCE, "expirationSeconds": 3600, "path": "token"}]
+        or len(token_mounts) != 1
+        or token_mounts[0].get("mountPath") != CLIENT_TOKEN_DIRECTORY
+        or token_mounts[0].get("readOnly") is not True
+    ):
+        raise RuntimeError(f"provider proxy {pool} does not use the scoped read-only TokenRequest projection")
     pods = get_json(context, "-n", namespace, "get", "pods", "-l", f"app.kubernetes.io/name=praxis-provider-proxy,praxis.fast/provider-pool={pool}").get("items", [])
     active = [pod for pod in pods if not pod.get("metadata", {}).get("deletionTimestamp")]
     if len(active) != 1 or active[0].get("status", {}).get("phase") != "Running":
@@ -284,6 +377,9 @@ def main() -> int:
     parser.add_argument("--site-server-name", required=True)
     parser.add_argument("--identity-secret", default="grid-site-identity")
     parser.add_argument("--ca-secret", default="grid-ca")
+    parser.add_argument("--client-service-account", default=os.environ.get("GRID_CLIENT_SERVICE_ACCOUNT", "grid-llmd-client"))
+    parser.add_argument("--client-role", default=os.environ.get("GRID_CLIENT_ROLE_NAME", "grid-llmd-client-inference-read"))
+    parser.add_argument("--client-role-binding", default=os.environ.get("GRID_CLIENT_ROLE_BINDING_NAME", "grid-llmd-client-inference-read"))
     parser.add_argument("--provider-prefix", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-namespace", required=True)
@@ -305,6 +401,23 @@ def main() -> int:
         raise RuntimeError("explicit API identity or /readyz check failed")
     namespace = get_json(args.context, "get", "namespace", args.namespace)
     require_owned(namespace, args.run_label, f"Namespace/{args.namespace}")
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", args.client_service_account):
+        raise RuntimeError("client ServiceAccount name is not DNS-safe")
+    client_identity = get_json(args.context, "-n", args.namespace, "get", "serviceaccount", args.client_service_account)
+    require_owned(client_identity, args.run_label, f"ServiceAccount/{args.client_service_account}")
+    if client_identity.get("automountServiceAccountToken") is not False:
+        raise RuntimeError("client ServiceAccount must keep automount disabled; only explicit token projection is allowed")
+    role_binding = get_json(args.context, "-n", args.namespace, "get", "rolebinding", args.client_role_binding)
+    require_owned(role_binding, args.run_label, f"RoleBinding/{args.client_role_binding}")
+    client_role = get_json(args.context, "-n", args.namespace, "get", "role", args.client_role)
+    require_owned(client_role, args.run_label, f"Role/{args.client_role}")
+    subjects = role_binding.get("subjects", [])
+    if (
+        role_binding.get("roleRef", {}).get("kind") != "Role"
+        or role_binding.get("roleRef", {}).get("name") != args.client_role
+        or subjects != [{"kind": "ServiceAccount", "name": args.client_service_account, "namespace": args.namespace}]
+    ):
+        raise RuntimeError("client ServiceAccount does not have the expected task-scoped RoleBinding")
     task_secret_meta = []
     for secret_name, required_keys in ((args.identity_secret, {"tls.crt", "tls.key"}), (args.ca_secret, {"ca.crt"})):
         secret = get_json(args.context, "-n", args.namespace, "get", "secret", secret_name)
@@ -342,8 +455,28 @@ def main() -> int:
     summaries = []
     for provider, pool in provider_to_pool.items():
         candidate = candidates[provider]
-        config_text = make_provider_config(args.site, provider, candidate["stable_id"], args.model, request_path, pool, backends[pool])
-        manifest = resources(args.run_label, args.namespace, pool, provider, args.image, args.identity_secret, args.ca_secret, config_text)
+        config_text = make_provider_config(
+            args.site,
+            provider,
+            candidate["stable_id"],
+            args.model,
+            request_path,
+            pool,
+            backends[pool],
+            args.namespace,
+            args.client_service_account,
+        )
+        manifest = resources(
+            args.run_label,
+            args.namespace,
+            pool,
+            provider,
+            args.image,
+            args.identity_secret,
+            args.ca_secret,
+            config_text,
+            args.client_service_account,
+        )
         manifest_path = evidence / f"provider-proxy-{pool}.yaml"
         manifest_path.write_text("---\n".join(yaml.safe_dump(item, sort_keys=False) for item in manifest), encoding="utf-8")
         os.chmod(manifest_path, 0o600)
@@ -359,7 +492,17 @@ def main() -> int:
                     require_owned(existing, args.run_label, f"{kind}/{name}")
             run_oc(args.context, "apply", "-f", str(manifest_path))
             run_oc(args.context, "-n", args.namespace, "rollout", "status", "deployment", f"praxis-provider-{pool}", "--timeout=300s")
-            live = check_live_deployment(args.context, args.namespace, pool, provider, args.run_label, args.image, config_text, evidence)
+            live = check_live_deployment(
+                args.context,
+                args.namespace,
+                pool,
+                provider,
+                args.run_label,
+                args.image,
+                config_text,
+                args.client_service_account,
+                evidence,
+            )
         else:
             live = {"pool": pool, "provider": provider, "deployment": f"praxis-provider-{pool}", "apply": False}
         summaries.append(
@@ -371,6 +514,7 @@ def main() -> int:
                 "requestPath": request_path,
                 "providerResponseHeader": "x-ai-demo-provider-gateway",
                 "backendResponseHeader": "x-ai-inference-provider",
+                "backendAuth": "projected task ServiceAccount TokenRequest; token bytes not recorded",
             }
         )
     report = {
