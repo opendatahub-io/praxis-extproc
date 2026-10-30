@@ -48,10 +48,7 @@ async fn ensure_gateway_ready_at(ready: &'static tokio::sync::OnceCell<bool>, ur
 ///
 /// Exercises BBR pre-processing (`json_body` → `X-Gateway-Model-Name`) for
 /// OpenAI-style paths other than chat completions.
-pub(crate) async fn json_bbr_post(
-    path_suffix: &str,
-    body: &serde_json::Value,
-) -> reqwest::Response {
+pub(crate) async fn json_bbr_post(path_suffix: &str, body: &serde_json::Value) -> reqwest::Response {
     let suffix = path_suffix.trim_start_matches('/');
     let url = format!("{}/v1/{}", gateway_url(), suffix);
     http_client()

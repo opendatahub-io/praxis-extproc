@@ -10,9 +10,7 @@
 //! CI exercises `/v1/embeddings` against the inference sim; fill the spike matrix
 //! for other suffixes on a MaaS+Praxis cluster.
 
-use crate::fixtures::{
-    assert_praxis_mutations, ensure_gateway_ready, json_bbr_post,
-};
+use crate::fixtures::{assert_praxis_mutations, ensure_gateway_ready, json_bbr_post};
 
 #[tokio::test]
 async fn granite_8b_bbr_embeddings_not_gateway_404() {

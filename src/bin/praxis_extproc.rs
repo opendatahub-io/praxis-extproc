@@ -107,7 +107,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
 }
 
-
 /// Build the AI filter registry, plus the k8s e2e body-oracle when
 /// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
 /// never enables that feature).

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Red Hat, Inc.
 
-
 //! Request-body SHA-256 oracle filter for k8s e2e qualification.
 //!
 //! Non-production: compiled only with `--features k8s-e2e` and registered on
