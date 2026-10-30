@@ -1,7 +1,4 @@
-use crate::fixtures::{
-    assert_praxis_mutations, chat_completion, ensure_gateway_ready, ensure_streaming_gateway_ready, gateway_url,
-    http_client, streaming_gateway_url,
-};
+use crate::fixtures::{assert_praxis_mutations, chat_completion, ensure_gateway_ready, gateway_url, http_client};
 
 #[tokio::test]
 async fn smoke_200() {
@@ -36,44 +33,6 @@ async fn response_has_valid_structure() {
         assert!(body["usage"]["input_tokens"].is_number());
         assert!(body["usage"]["output_tokens"].is_number());
     }
-}
-
-#[tokio::test]
-async fn streaming() {
-    // The primary E2E Gateway enables response guardrails, which correctly
-    // reject stream=true before the upstream is called. This dedicated test
-    // Gateway keeps request guardrails while exercising ExtProc SSE pass-through.
-    ensure_streaming_gateway_ready().await;
-    let client = http_client();
-    let url = format!("{}/v1/chat/completions", streaming_gateway_url());
-
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": true
-        }))
-        .send()
-        .await
-        .expect("request failed");
-
-    assert_eq!(resp.status(), 200);
-    assert_praxis_mutations(&resp);
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .expect("missing content-type")
-        .to_str()
-        .unwrap();
-    assert!(
-        content_type.contains("text/event-stream"),
-        "expected text/event-stream, got {content_type}"
-    );
-
-    let body = resp.text().await.expect("failed to read body");
-    assert!(body.contains("data: "), "body should contain SSE data lines");
 }
 
 #[tokio::test]

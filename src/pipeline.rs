@@ -2564,6 +2564,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_response_body_bytes_accumulate_across_chunks() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpBody;
+
+        let pipeline = carry_probe_pipeline();
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+
+        let mut total = 0_u64;
+        for (size, end_of_stream) in [(1000, false), (7, true)] {
+            process_streamed_body_chunk(
+                &pipeline,
+                HttpBody {
+                    body: vec![b'x'; size],
+                    end_of_stream,
+                },
+                &mut state,
+                false,
+            )
+            .await
+            .unwrap();
+            total += size as u64;
+            assert_eq!(
+                state.carried_context.as_ref().unwrap().response_body_bytes,
+                total,
+                "streamed response byte counts must accumulate across chunks"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn carried_state_survives_early_header_phases() {
         let pipeline = carry_probe_pipeline();
         let mut state = StreamState::new();
@@ -2679,6 +2710,8 @@ mod tests {
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
         hydrated.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) };
+        hydrated.request_body_bytes = 101;
+        hydrated.response_body_bytes = 202;
 
         // Capture (`dehydrate`) must move every field into the empty slot.
         let mut slot = None;
@@ -2694,6 +2727,8 @@ mod tests {
             filter_metadata,
             filter_state,
             response_body_mode,
+            request_body_bytes,
+            response_body_bytes,
         } = &carried;
         assert!(
             matches!(
@@ -2707,6 +2742,8 @@ mod tests {
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
+        assert_eq!(*request_body_bytes, 101);
+        assert_eq!(*response_body_bytes, 202);
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
@@ -2720,6 +2757,8 @@ mod tests {
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
         assert_eq!(hydrated.get_metadata("carry.meta"), Some("kept"));
+        assert_eq!(hydrated.request_body_bytes, 101);
+        assert_eq!(hydrated.response_body_bytes, 202);
         let restored = hydrated
             .filter_state
             .get(&7)

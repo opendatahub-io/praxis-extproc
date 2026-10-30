@@ -14,7 +14,10 @@
 //! If FDS deferral is broken, ipp-pre's header mutation is silently dropped
 //! by Envoy. Without `X-Gateway-Model-Name`, no route matches → 404.
 //!
-//! Run: `make e2e-test` or `cargo test --features k8s-e2e --test k8s_e2e -- --nocapture`
+//! Run one mode at a time through the Makefile, which skips tests that are
+//! incompatible with the selected Envoy body mode:
+//! `make e2e-test MODE=buffered V=1`
+//! `make e2e-test MODE=fds V=1`
 
 #![cfg(feature = "k8s-e2e")]
 #![allow(
@@ -45,6 +48,7 @@ mod completions;
 mod direct;
 mod errors;
 mod fd_streamed_oracle;
+mod fds_mode;
 mod filters;
 mod guardrails;
 mod oracle_helpers;

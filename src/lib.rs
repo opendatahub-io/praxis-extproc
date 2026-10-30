@@ -23,6 +23,7 @@ pub mod metrics;
 mod pipeline;
 mod protocol;
 pub mod response;
+pub mod response_mode;
 pub mod server;
 pub mod tls;
 

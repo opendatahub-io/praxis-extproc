@@ -70,6 +70,8 @@ pub struct PraxisExtProc {
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
     trust_forwarded_for: bool,
+    /// Per-request response mode selector for generated guardrail filters.
+    response_mode_selector: crate::response_mode::ResponseModeSelector,
 }
 
 impl PraxisExtProc {
@@ -88,6 +90,7 @@ impl PraxisExtProc {
             force_shutdown: rx,
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             trust_forwarded_for: false,
+            response_mode_selector: crate::response_mode::ResponseModeSelector::default(),
         }
     }
 
@@ -115,6 +118,13 @@ impl PraxisExtProc {
     #[must_use]
     pub fn with_trust_forwarded_for(mut self, trust: bool) -> Self {
         self.trust_forwarded_for = trust;
+        self
+    }
+
+    /// Install the configured response body mode selector.
+    #[must_use]
+    pub fn with_response_mode_selector(mut self, selector: crate::response_mode::ResponseModeSelector) -> Self {
+        self.response_mode_selector = selector;
         self
     }
 }
@@ -158,12 +168,13 @@ impl ExternalProcessor for PraxisExtProc {
         let force = self.force_shutdown.clone();
         let max_body = self.max_body_accumulation;
         let trust_forwarded_for = self.trust_forwarded_for;
+        let response_mode_selector = self.response_mode_selector.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
             tokio::select! {
-                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for)) => {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for, response_mode_selector)) => {
                     if let Err(e) = r {
                         error!(error = %e, "stream processing failed");
                         drop(tx.send(Err(e)).await);
@@ -193,17 +204,23 @@ impl ExternalProcessor for PraxisExtProc {
 ///
 /// Accumulates request/response body chunks and runs the Praxis filter
 /// pipeline at the appropriate phase boundaries.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream setup passes independent server options"
+)]
 async fn handle_stream(
     pipeline: &FilterPipeline,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     max_body: Option<usize>,
     trust_forwarded_for: bool,
+    response_mode_selector: crate::response_mode::ResponseModeSelector,
 ) -> Result<(), Status> {
     let start = Instant::now();
     let mut stream_state = StreamState::new();
     stream_state.max_body_accumulation = max_body;
     stream_state.trust_forwarded_for = trust_forwarded_for;
+    stream_state.response_mode_selector = response_mode_selector;
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -445,6 +462,12 @@ pub(super) struct CarriedContext {
 
     /// Response buffering requested by filters during the headers phase.
     pub(super) response_body_mode: Option<praxis_filter::BodyMode>,
+
+    /// Accumulated request body bytes seen across phases and streamed chunks.
+    pub(super) request_body_bytes: u64,
+
+    /// Accumulated response body bytes seen across phases and streamed chunks.
+    pub(super) response_body_bytes: u64,
 }
 
 /// A context holding hydrated cross-phase state.
@@ -476,6 +499,8 @@ impl<'a> HydratedContext<'a> {
         if let Some(mode) = carried.response_body_mode {
             ctx.response_body_mode = mode;
         }
+        ctx.request_body_bytes = carried.request_body_bytes;
+        ctx.response_body_bytes = carried.response_body_bytes;
         Ok(Self { ctx })
     }
 
@@ -504,6 +529,8 @@ impl<'a> HydratedContext<'a> {
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
             response_body_mode: Some(self.ctx.response_body_mode),
+            request_body_bytes: self.ctx.request_body_bytes,
+            response_body_bytes: self.ctx.response_body_bytes,
         });
         Ok(())
     }
@@ -580,6 +607,9 @@ pub(crate) struct StreamState {
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
     pub(crate) trust_forwarded_for: bool,
+
+    /// Response mode selection derived from the loaded filter configuration.
+    pub(crate) response_mode_selector: crate::response_mode::ResponseModeSelector,
 }
 
 impl Default for StreamState {
@@ -604,6 +634,7 @@ impl Default for StreamState {
             max_body_accumulation: None,
             buffered_request_body_processed: false,
             trust_forwarded_for: false,
+            response_mode_selector: crate::response_mode::ResponseModeSelector::default(),
         }
     }
 }

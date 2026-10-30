@@ -106,6 +106,14 @@ struct Prepared {
     limits: BodyLimits,
 }
 
+/// Log invalid guardrail response-mode configuration once during startup.
+fn warn_invalid_response_mode_config(selector: &praxis_extproc::response_mode::ResponseModeSelector) {
+    if let Some(reason) = selector.invalid_reason() {
+        warn!(reason = %reason, "invalid guardrail response-mode configuration; keeping buffered mode and rejecting FDS");
+    }
+}
+
+
 /// Install the crypto provider, load config, and build the pipeline.
 ///
 /// The provider is installed before the registry, a subrequest client, or a
@@ -135,6 +143,9 @@ fn prepare(config_path: &str) -> Result<Prepared, Box<dyn std::error::Error + Se
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prepared = prepare(&cli.config)?;
+    let response_mode_selector =
+        praxis_extproc::response_mode::ResponseModeSelector::from_config(&prepared.cfg.filter_chains);
+    warn_invalid_response_mode_config(&response_mode_selector);
 
     if cli.validate {
         return validate_prepared(&cli, prepared);
@@ -160,6 +171,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         prepared.pipeline,
         &prepared.cfg.server,
         prepared.limits,
+        response_mode_selector,
         praxis_extproc::fips::active(&prepared.fips),
     ))
     .await
@@ -231,7 +243,6 @@ fn warn_if_buffered_body_cannot_fit_recv(limits: BodyLimits) {
     );
 }
 
-
 /// Build the AI filter registry, plus the k8s e2e body-oracle when
 /// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
 /// never enables that feature).
@@ -267,11 +278,13 @@ fn fips_refusal(fips: &praxis_extproc::fips::Status, registry: &praxis_filter::F
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -281,7 +294,15 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, limits, fips_active)).await
+            Box::pin(start_services(
+                addrs,
+                pipeline,
+                server_cfg,
+                limits,
+                response_mode_selector,
+                fips_active,
+            ))
+            .await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -291,11 +312,13 @@ async fn serve_pipeline(
 }
 
 /// Start gRPC, health (`Serving`), and metrics servers concurrently.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(
@@ -303,7 +326,7 @@ async fn start_services(
         true,
         fips_active,
         server_cfg.metrics_auth.clone(),
-        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx),
+        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, limits, response_mode_selector, drain_rx),
     ))
     .await
 }
@@ -434,11 +457,13 @@ where
 }
 
 /// Start the main gRPC ExtProc server.
+#[expect(clippy::too_many_arguments, reason = "gRPC setup passes independent server options")]
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
@@ -458,6 +483,7 @@ async fn serve_grpc(
         PraxisExtProc::new(pipeline)
             .with_max_body_accumulation(limits.max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
+            .with_response_mode_selector(response_mode_selector)
             .with_force_shutdown(force_rx.clone()),
         limits.max_recv,
     );
