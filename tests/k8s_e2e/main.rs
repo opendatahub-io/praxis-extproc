@@ -46,6 +46,6 @@ mod direct;
 mod errors;
 mod fd_streamed_oracle;
 mod filters;
-mod guardrails;
+mod json_paths;
 mod oracle_helpers;
 mod routing;

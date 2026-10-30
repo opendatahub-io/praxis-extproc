@@ -52,11 +52,7 @@ async fn fd_streamed_multi_chunk_request_oracle() {
     assert_hop_digests(&digest, resp.headers());
 }
 
-/// Streaming chat (`stream: true`) conflicts with `ai_guardrails` response-phase
-/// on the shared e2e chain (fail-closed 422). Re-enable when oracle coverage
-/// moves to a separate lane/tier without response guardrails.
 #[tokio::test]
-#[ignore = "blocked: streaming + ai_guardrails response-phase on shared e2e chain (follow-up issue)"]
 async fn fd_streamed_response_first_chunk_before_eos() {
     ensure_gateway_ready().await;
     let client = http_client();

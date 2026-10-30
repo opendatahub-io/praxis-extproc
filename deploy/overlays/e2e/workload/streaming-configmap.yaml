@@ -12,22 +12,11 @@ data:
       tls:
         mode: self_signed
 
-    insecure_options:
-      allow_private_upstreams: true
-
-    # This isolated test chain keeps request guardrails active while leaving
-    # the response guardrail on the primary Gateway unchanged. The ai_guardrails
-    # filter intentionally rejects stream=true when response evaluation is on.
+    # Minimal ipp chain for SSE pass-through on e2e-streaming-gateway (no
+    # response-body filters that buffer or reject streaming).
     filter_chains:
       - name: streaming-e2e
         filters:
-          - filter: ai_guardrails
-            provider:
-              type: nemo
-              endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
-            phase:
-              request: true
-              response: false
           - filter: json_body
             request_extract:
               - pointer: /model

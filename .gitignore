@@ -23,5 +23,8 @@ target
 # Forge state
 .forge/
 
+# Local istio download for e2e (make e2e-setup docs)
+istio-*/
+
 # Personal notes
 .docs/**
