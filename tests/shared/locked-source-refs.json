@@ -1,0 +1,46 @@
+{
+  "schema": "praxis-extproc.source-locks/v1",
+  "components": {
+    "aigc": {
+      "repository": "https://github.com/opendatahub-io/ai-gateway-controller.git",
+      "ref": "634fe51f1faf280663d6df0195f9309bbdffb833"
+    },
+    "maas": {
+      "repository": "https://github.com/opendatahub-io/models-as-a-service.git",
+      "ref": "ccce7752af146eb3de9e99df107c26f414878726"
+    },
+    "extproc": {
+      "repository": "https://github.com/opendatahub-io/praxis-extproc.git",
+      "ref": "e20c802675f549c56bd23d29bc64c2fb2fdc895c"
+    },
+    "praxis-ai": {
+      "repository": "https://github.com/praxis-proxy/ai.git",
+      "ref": "c39f7198932d408b12f35cd57a2457067e67d0cf"
+    },
+    "grid": {
+      "repository": "https://github.com/praxis-proxy/grid.git",
+      "ref": "33cb906be2bb0ebdbaf253bd307939a44f41b37b"
+    },
+    "grid-operator": {
+      "repository": "https://github.com/opendatahub-io/praxis-ai-grid-operator.git",
+      "ref": "ed60534100b4b0ee986b6714d1e7cb6d685b7236"
+    },
+    "gitops": {
+      "repository": "https://github.com/hexfusion/odh-gitops.git",
+      "ref": "1106cd57746be7be9a37805d9f48e48518cc31b9"
+    },
+    "kuadrant": {
+      "repository": "https://github.com/Kuadrant/kuadrant-operator.git",
+      "ref": "5e27050a588c80145b67cfe5165fd2183b2a3697",
+      "release": "v1.4.2"
+    },
+    "epp": {
+      "repository": "https://github.com/llm-d/llm-d-router.git",
+      "ref": "b9393d1a9f1d5a72ecd86f8d2b643ab54c2a9b92"
+    },
+    "llm-d-sim": {
+      "repository": "https://github.com/llm-d/llm-d-inference-sim.git",
+      "ref": "bca276ef64263e214b4822940bb1e58d018cbf9d"
+    }
+  }
+}
