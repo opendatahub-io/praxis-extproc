@@ -2,7 +2,7 @@
 # rerank, images/generations, etc.). BBR e2e uses model id `bbr-path-stub` so
 # X-Gateway-Model-Name routes here while json_body still exercises the pre-chain.
 #
-# Sim-supported paths (chat, completions, embeddings, responses) stay on
+# Sim-supported paths (chat, completions, embeddings) stay on
 # internal-model / granite-8b — see examples/bbr-json-paths/README.md.
 apiVersion: v1
 kind: ConfigMap
@@ -14,7 +14,7 @@ data:
     {
       "request": {
         "method": "POST",
-        "urlPathPattern": "/v1/(moderations|rerank|ocr|extraction|decisions|images/generations|audio/voices|search/.*)"
+        "urlPathPattern": "/v1/(moderations|rerank|responses|ocr|extraction|decisions|images/generations|audio/voices|search/.*)"
       },
       "response": {
         "status": 200,

@@ -17,6 +17,8 @@ data:
 
     insecure_options:
       allow_unbounded_body: true
+      # ai_guardrails callout to in-cluster nemo-mock (private ClusterIP).
+      allow_private_upstreams: true
 
     # Production-parity ipp chain (see deploy/base/config/configmap.yaml) plus
     # e2e-only markers (X-Guard-Applied, X-Praxis-Version, e2e_body_oracle).

@@ -1,7 +1,7 @@
 //! BBR routing for non-chat JSON OpenAI paths (same pre-chain as chat).
 //!
 //! Two backends in Kind e2e:
-//! - **`granite-8b`** → `llm-d-inference-sim` (`/v1/completions`, `/v1/embeddings`, `/v1/responses`, …)
+//! - **`granite-8b`** → `llm-d-inference-sim` (`/v1/completions`, `/v1/embeddings`, …)
 //! - **`bbr-path-stub`** → WireMock (`/v1/moderations`, `/v1/rerank`, …) for paths the sim does not serve
 //!
 //! See `examples/bbr-json-paths/README.md` for curl examples.
@@ -65,11 +65,11 @@ async fn granite_8b_bbr_completions_routes() {
 }
 
 #[tokio::test]
-async fn granite_8b_bbr_responses_routes() {
+async fn stub_model_bbr_responses_routes() {
     assert_bbr_reaches_backend(
         "responses",
         serde_json::json!({
-            "model": SIM_MODEL,
+            "model": STUB_MODEL,
             "input": "hello"
         }),
     )

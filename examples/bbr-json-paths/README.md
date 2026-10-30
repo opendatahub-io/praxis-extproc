@@ -15,7 +15,6 @@ Simulator HTTP surface ([upstream docs](https://github.com/llm-d/llm-d-inference
 | `POST /v1/chat/completions` | `{"model":"granite-8b","messages":[{"role":"user","content":"hi"}]}` |
 | `POST /v1/completions` | `{"model":"granite-8b","prompt":"hi","max_tokens":8}` |
 | `POST /v1/embeddings` | `{"model":"granite-8b","input":"hello"}` |
-| `POST /v1/responses` | `{"model":"granite-8b","input":"hello"}` |
 
 Expect **HTTP 200** and Praxis headers (`X-Praxis-Version`, etc.).
 
@@ -25,6 +24,7 @@ Paths the sim **does not** implement but RHAIRFE lists for JSON BBR qualificatio
 
 | Path | Example body |
 |------|----------------|
+| `POST /v1/responses` | `{"model":"bbr-path-stub","input":"hello"}` |
 | `POST /v1/moderations` | `{"model":"bbr-path-stub","input":"test"}` |
 | `POST /v1/rerank` | `{"model":"bbr-path-stub","query":"q","documents":["a","b"]}` |
 | `POST /v1/images/generations` | `{"model":"bbr-path-stub","prompt":"circle","n":1}` |
