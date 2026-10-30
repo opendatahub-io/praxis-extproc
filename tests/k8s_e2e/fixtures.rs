@@ -44,20 +44,31 @@ async fn ensure_gateway_ready_at(ready: &'static tokio::sync::OnceCell<bool>, ur
     assert!(*ready, "gateway not ready after {GATEWAY_READY_TIMEOUT:?}");
 }
 
-/// Send a chat completion request with the given model and content.
-pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Response {
-    let client = http_client();
-    let url = format!("{}/v1/chat/completions", gateway_url());
-
-    client
+/// POST `{gateway}/v1/{path_suffix}` with a JSON body that includes `"model"`.
+///
+/// Exercises BBR pre-processing (`json_body` → `X-Gateway-Model-Name`) for
+/// OpenAI-style paths other than chat completions.
+pub(crate) async fn json_bbr_post(path_suffix: &str, body: &serde_json::Value) -> reqwest::Response {
+    let suffix = path_suffix.trim_start_matches('/');
+    let url = format!("{}/v1/{}", gateway_url(), suffix);
+    http_client()
         .post(&url)
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": content}]
-        }))
+        .json(body)
         .send()
         .await
         .expect("request failed")
+}
+
+/// Send a chat completion request with the given model and content.
+pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Response {
+    json_bbr_post(
+        "chat/completions",
+        &serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": content}]
+        }),
+    )
+    .await
 }
 
 /// Assert that IPP response mutations are present.

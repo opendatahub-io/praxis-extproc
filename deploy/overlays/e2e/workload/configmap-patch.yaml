@@ -15,27 +15,14 @@ data:
       tls:
         mode: self_signed
 
-    # The ai_guardrails callout dials the in-cluster mock NeMo service, whose
-    # ClusterIP is a private address; opt in so the runtime SSRF guard permits it.
     insecure_options:
-      allow_private_upstreams: true
+      allow_unbounded_body: true
 
-    # Pure OpenAI Chat Completions chain. ai_guardrails is OpenAI-only and its
-    # response phase is global (not path-scopable), so it cannot share a chain
-    # with the bidirectional anthropic_messages_to_chat_completions converter;
-    # testing the converter alongside guardrails needs a separate ext-proc lane.
+    # Production-parity ipp chain (see deploy/base/config/configmap.yaml) plus
+    # e2e-only markers (X-Guard-Applied, X-Praxis-Version, e2e_body_oracle).
     filter_chains:
-      - name: ai-filters
+      - name: ipp
         filters:
-          # Mirrors the `ipp` chain's guard filter
-          # (../../../base/config/configmap.yaml) for maas-headers-guard
-          # regression coverage. Two e2e-only additions: a `when
-          # path_prefix: /direct/internal` condition, so the strip never
-          # hits gpt-4/llm-katan's shared /v1/chat/completions (which needs
-          # its real Authorization header); and an unconditional
-          # response_add marker so tests can observe this filter's own
-          # conditions matching -- see tests/k8s_e2e/filters.rs for why a
-          # later-filter canary can't do that instead.
           - filter: headers
             conditions:
               - unless:
@@ -77,30 +64,22 @@ data:
             response_add:
               - name: X-Guard-Applied
                 value: "true"
-          # Request + response phases both evaluate against the mock NeMo service;
-          # a "passed" verdict forwards traffic unchanged, so the rest of the
-          # e2e suite is undisturbed.
+          # E2e-only NeMo guardrails (not on deploy/base production ipp). Scoped to
+          # chat completions so JSON BBR paths (/v1/embeddings, /v1/completions,
+          # …) are not evaluated as OpenAI chat by ai_guardrails.
           - filter: ai_guardrails
+            conditions:
+              - when:
+                  path_prefix: /v1/chat/completions
             provider:
               type: nemo
               endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
-              # Short per-callout deadline so the timeout fail-closed case
-              # (__GUARD_TIMEOUT_OUT__, delayed 4s by the mock) trips quickly
-              # instead of waiting out the 10s default; the mock's default-pass
-              # replies instantly, so normal traffic stays well under this.
               timeout_ms: 2000
             phase:
               request: true
               response: true
-          - filter: json_body
-            request_extract:
-              - pointer: /model
-                header: X-Model-Name
-            on_invalid: continue
+          - filter: request_id
           - filter: headers
-            request_add:
-              - name: X-Praxis-Processed
-                value: "true"
             response_set:
               - name: X-Praxis-Version
                 value: "e2e"

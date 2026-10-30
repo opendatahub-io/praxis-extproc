@@ -40,9 +40,8 @@ async fn response_has_valid_structure() {
 
 #[tokio::test]
 async fn streaming() {
-    // The primary E2E Gateway enables response guardrails, which correctly
-    // reject stream=true before the upstream is called. This dedicated test
-    // Gateway keeps request guardrails while exercising ExtProc SSE pass-through.
+    // SSE pass-through uses e2e-streaming-gateway (minimal ipp chain, no
+    // response-body buffering).
     ensure_streaming_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", streaming_gateway_url());

@@ -26,6 +26,9 @@ spec:
             - "8080"
             - --mode
             - echo
+            # Full OpenAI surface (/v1/embeddings, etc.); mirrors MaaS e2e
+            # fixtures/embedding/llm/llmis.yaml (--no-mm-encoder-only).
+            - --no-mm-encoder-only
           ports:
             - containerPort: 8080
               name: http
