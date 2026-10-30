@@ -89,6 +89,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
 
     let cfg = load_config(&cli.config)?;
+    let response_mode_selector = praxis_extproc::response_mode::ResponseModeSelector::from_config(&cfg.filter_chains);
     let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
 
@@ -115,6 +116,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pipeline,
         &cfg.server,
         limits,
+        response_mode_selector,
         praxis_extproc::fips::active(&fips),
     ))
     .await
@@ -138,7 +140,6 @@ fn validate_config(
     );
     Ok(())
 }
-
 
 /// Build the AI filter registry, plus the k8s e2e body-oracle when
 /// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
@@ -175,11 +176,13 @@ fn fips_refusal(fips: &praxis_extproc::fips::Status, registry: &praxis_filter::F
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -189,7 +192,15 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, limits, fips_active)).await
+            Box::pin(start_services(
+                addrs,
+                pipeline,
+                server_cfg,
+                limits,
+                response_mode_selector,
+                fips_active,
+            ))
+            .await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -199,15 +210,17 @@ async fn serve_pipeline(
 }
 
 /// Start gRPC, health (`Serving`), and metrics servers concurrently.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx)
+        serve_grpc(addrs.0, pipeline, server_cfg, limits, response_mode_selector, drain_rx)
     }))
     .await
 }
@@ -320,11 +333,13 @@ where
 }
 
 /// Start the main gRPC ExtProc server.
+#[expect(clippy::too_many_arguments, reason = "gRPC setup passes independent server options")]
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
@@ -342,6 +357,7 @@ async fn serve_grpc(
         PraxisExtProc::new(pipeline)
             .with_max_body_accumulation(limits.max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
+            .with_response_mode_selector(response_mode_selector)
             .with_force_shutdown(force_rx.clone()),
         limits.max_recv,
     );

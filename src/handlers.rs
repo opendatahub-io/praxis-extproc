@@ -149,6 +149,10 @@ fn handle_body_redelivery(
 /// For `FDS` passthrough, runs header filters early, defers mutations to first chunk.
 ///
 /// [`Request`]: praxis_filter::Request
+#[expect(
+    clippy::too_many_lines,
+    reason = "body-mode and guardrail admission checks stay together"
+)]
 pub(crate) async fn handle_request_headers(
     pipeline: &FilterPipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
@@ -166,20 +170,52 @@ pub(crate) async fn handle_request_headers(
     let envoy_headers = extract_header_list(&headers);
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
-    if headers.end_of_stream {
-        return handle_end_stream_request_headers(pipeline, state).await;
-    }
-
-    if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
-        && pipeline.body_capabilities().needs_selected_upstream_request_body
+    if (state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        || state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed)
+        && state.response_mode_selector.has_selected_guardrail(&envoy_headers)
     {
-        warn!("selected-upstream request-body hook cannot run in FULL_DUPLEX_STREAMED mode");
+        warn!("selected guardrails cannot be enforced in FULL_DUPLEX_STREAMED mode");
         return Ok(vec![request_processing_rejection(
-            b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
+            b"selected guardrails are not supported in FULL_DUPLEX_STREAMED mode",
         )]);
     }
 
-    handle_request_headers_with_body(pipeline, state).await
+    let mut responses = if headers.end_of_stream {
+        handle_end_stream_request_headers(pipeline, state).await?
+    } else {
+        if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+            && pipeline.body_capabilities().needs_selected_upstream_request_body
+        {
+            warn!("selected-upstream request-body hook cannot run in FULL_DUPLEX_STREAMED mode");
+            return Ok(vec![request_processing_rejection(
+                b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
+            )]);
+        }
+
+        handle_request_headers_with_body(pipeline, state).await?
+    };
+
+    apply_response_mode_override(&mut responses, state, &envoy_headers);
+    Ok(responses)
+}
+
+/// Apply the request-specific response mode selected by generated guardrail headers.
+fn apply_response_mode_override(
+    responses: &mut [ProcessingResponse],
+    state: &mut StreamState,
+    envoy_headers: &[HeaderValue],
+) {
+    if state.response_mode_selector.should_stream(envoy_headers) {
+        let mut override_applied = false;
+        for response in responses {
+            override_applied |= response::set_response_mode_streamed(response);
+        }
+        if override_applied {
+            state.protocol_config.response_body_mode = BodyMode::Streamed;
+        } else {
+            warn!("response mode override skipped because no request-headers response was emitted");
+        }
+    }
 }
 
 /// Run selected-upstream body validation for a request that ended with headers.
@@ -617,11 +653,230 @@ fn check_body_limit(current: usize, incoming: usize, limit: Option<usize>) -> Re
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::indexing_slicing, reason = "tests assert the single response")]
+#[expect(clippy::too_many_lines, reason = "tests construct full protocol requests")]
 mod tests {
     use praxis_filter::{FilterAction, HttpFilterContext};
+    use praxis_proto::envoy::service::ext_proc::v3::{
+        BodySendMode as ExtProcBodySendMode, HeaderMap as ExtProcHeaderMap, HttpHeaders as ExtProcHttpHeaders,
+    };
 
     use super::*;
     use crate::test_support::counter_value;
+
+    #[tokio::test]
+    async fn request_headers_stream_response_when_no_output_guardrail_is_selected() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].mode_override.as_ref().map(|mode| mode.response_body_mode),
+            Some(ExtProcBodySendMode::Streamed.into())
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Streamed);
+    }
+
+    #[tokio::test]
+    async fn request_headers_keep_buffered_response_when_output_guardrail_is_selected() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-output".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[test]
+    fn response_mode_override_does_not_change_state_without_a_response() {
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let mut responses = Vec::new();
+        apply_response_mode_override(
+            &mut responses,
+            &mut state,
+            &[HeaderValue {
+                key: "x-aigateway-guardrail-input".to_owned(),
+                value: "true".to_owned(),
+                raw_value: Vec::new(),
+            }],
+        );
+
+        assert!(responses.is_empty());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[tokio::test]
+    async fn selected_guardrail_is_rejected_before_body_processing_in_fds() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(responses.first().is_some_and(response::is_immediate));
+    }
+
+    #[tokio::test]
+    async fn unselected_guardrail_is_allowed_in_fds() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "false".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(!responses.iter().any(response::is_immediate));
+    }
 
     #[test]
     fn handle_body_redelivery_ignores_only_fds_duplicates() {
