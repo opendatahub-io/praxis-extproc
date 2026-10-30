@@ -7,4 +7,5 @@ resources:
   - envoyfilter.yaml
   - internal-model.yaml
   - nemo-mock.yaml
+  - openai-path-stub.yaml
   - local-reply-policy.yaml

@@ -1,0 +1,86 @@
+# Stub OpenAI HTTP paths that llm-d-inference-sim does not implement (moderations,
+# rerank, images/generations, etc.). BBR e2e uses model id `bbr-path-stub` so
+# X-Gateway-Model-Name routes here while json_body still exercises the pre-chain.
+#
+# Sim-supported paths (chat, completions, embeddings, responses) stay on
+# internal-model / granite-8b — see examples/bbr-json-paths/README.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openai-path-stub-mappings
+  namespace: llm
+data:
+  bbr-stub.json: |
+    {
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/v1/(moderations|rerank|ocr|extraction|decisions|images/generations|audio/voices|search/.*)"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "object": "bbr-path-stub",
+          "ok": true
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openai-path-stub
+  namespace: llm
+  labels:
+    app: openai-path-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openai-path-stub
+  template:
+    metadata:
+      labels:
+        app: openai-path-stub
+    spec:
+      containers:
+        - name: wiremock
+          image: docker.io/wiremock/wiremock:3.9.1
+          args:
+            - --global-response-templating
+            - --disable-gzip
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: mappings
+              mountPath: /home/wiremock/mappings
+          readinessProbe:
+            httpGet:
+              path: /__admin/health
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: mappings
+          configMap:
+            name: openai-path-stub-mappings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openai-path-stub
+  namespace: llm
+  labels:
+    app: openai-path-stub
+spec:
+  selector:
+    app: openai-path-stub
+  ports:
+    - port: 8080
+      targetPort: 8080

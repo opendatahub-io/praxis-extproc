@@ -104,6 +104,16 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
+    # RHAIRFE JSON paths not implemented by inference-sim (WireMock stubs).
+    - matches:
+        - headers:
+            - name: X-Gateway-Model-Name
+              type: Exact
+              value: bbr-path-stub
+      backendRefs:
+        - name: openai-path-stub
+          namespace: llm
+          port: 8080
 ---
 # Direct path-based routes: no BBR header matching required.
 # /direct/external/v1/... and /direct/internal/v1/... are rewritten
