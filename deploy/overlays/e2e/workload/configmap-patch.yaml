@@ -64,6 +64,20 @@ data:
             response_add:
               - name: X-Guard-Applied
                 value: "true"
+          # E2e-only NeMo guardrails (not on deploy/base production ipp). Scoped to
+          # chat completions so JSON BBR paths (/v1/embeddings, /v1/completions,
+          # …) are not evaluated as OpenAI chat by ai_guardrails.
+          - filter: ai_guardrails
+            conditions:
+              - when:
+                  path_prefix: /v1/chat/completions
+            provider:
+              type: nemo
+              endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
+              timeout_ms: 2000
+            phase:
+              request: true
+              response: true
           - filter: request_id
           - filter: headers
             response_set:
