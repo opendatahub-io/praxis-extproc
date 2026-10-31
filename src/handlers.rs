@@ -246,7 +246,7 @@ fn request_headers_without_body_filter(state: &mut StreamState) -> Vec<Processin
     vec![response::request_headers(None)]
 }
 
-/// Reject a selected route in NONE or STREAMED mode; pass unselected routes through.
+/// Reject unsupported body modes before forwarding, including Envoy-routed requests.
 async fn handle_unsupported_selected_request_headers(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -260,19 +260,9 @@ async fn handle_unsupported_selected_request_headers(
     if responses.first().is_some_and(response::is_immediate) {
         return Ok(responses);
     }
-    if state
-        .carried_context
-        .as_ref()
-        .is_some_and(|context| context.cluster.is_some())
-    {
-        warn!("selected-upstream request-body hook requires BUFFERED mode");
-        return Ok(vec![request_processing_rejection(
-            b"selected-upstream request-body processing requires BUFFERED mode",
-        )]);
-    }
-    state.header_state.request_headers_sent = true;
-    Ok(vec![response::request_headers(
-        state.deferred_request_header_mutation.take(),
+    warn!("selected-upstream request-body hook requires BUFFERED mode");
+    Ok(vec![request_processing_rejection(
+        b"selected-upstream request-body processing requires BUFFERED mode",
     )])
 }
 

@@ -155,6 +155,25 @@ protobuf types and Praxis filter types:
 Routing fields (`cluster`, `upstream`) default to
 `None` because Envoy owns routing decisions.
 
+In BUFFERED mode, ExtProc runs selected-upstream
+request-body hooks after the request-header filters,
+including when those routing fields remain unset.
+Envoy can route directly to a Kubernetes Service
+without a Praxis routing filter. Such a request
+still needs its configured body transformations;
+for example, an Anthropic Messages request needs
+body conversion as well as a path rewrite before
+it reaches an OpenAI-compatible backend.
+
+The pipeline retains request-phase condition
+tracking, so a translator skipped for an OpenAI
+request does not run in the later body phase.
+Input limits and the server's rewritten-body ceiling
+also apply when Envoy owns routing. Chains with
+selected-upstream body participants require BUFFERED
+mode; NONE, STREAMED, and FULL_DUPLEX_STREAMED cannot
+safely forward these requests without the full body.
+
 ## Body Chunking
 
 Envoy enforces a ~64 KiB limit per body chunk in

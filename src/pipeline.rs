@@ -93,7 +93,7 @@ async fn run_request_pipeline_inner(
         return Ok(vec![response::immediate(immediate)]);
     }
 
-    if selected_input_exceeds_limit(phase, pipeline, &ctx, state.request_body.len()) {
+    if selected_input_exceeds_limit(phase, pipeline, state.request_body.len()) {
         return Ok(vec![selected_input_limit_rejection()]);
     }
 
@@ -122,15 +122,9 @@ async fn run_request_pipeline_inner(
 }
 
 /// Check the selected input before a body filter can shrink or rewrite it.
-fn selected_input_exceeds_limit(
-    phase: RequestPhase,
-    pipeline: &FilterPipeline,
-    ctx: &HttpFilterContext<'_>,
-    body_len: usize,
-) -> bool {
+fn selected_input_exceeds_limit(phase: RequestPhase, pipeline: &FilterPipeline, body_len: usize) -> bool {
     matches!(phase, RequestPhase::Body)
         && pipeline.body_capabilities().needs_selected_upstream_request_body
-        && (ctx.cluster.is_some() || ctx.upstream.is_some())
         && body_len > pipeline.selected_upstream_request_body_limit()
 }
 
@@ -741,7 +735,7 @@ async fn run_body_filters(
     Ok(immediate_from_action(action))
 }
 
-/// Run selected-upstream body filters after request headers have selected a logical provider.
+/// Run selected-upstream body filters after request headers, including Envoy-routed requests.
 ///
 /// The filter's request limit is checked against the incoming body before this hook. Rewritten
 /// output uses the server accumulation ceiling so translation overhead does not consume the
@@ -752,9 +746,7 @@ async fn run_selected_upstream_body_filters(
     body_buf: &mut Vec<u8>,
     max_body_accumulation: Option<usize>,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if !pipeline.body_capabilities().needs_selected_upstream_request_body
-        || (ctx.cluster.is_none() && ctx.upstream.is_none())
-    {
+    if !pipeline.body_capabilities().needs_selected_upstream_request_body {
         return Ok(None);
     }
 
@@ -1584,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn unselected_request_skips_selected_upstream_hook() {
+    async fn envoy_routed_request_runs_selected_upstream_hook() {
         let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
         let mut state = StreamState::new();
         state.request = Some(adapter::envoy_headers_to_request(&[]));
@@ -1592,42 +1584,44 @@ mod tests {
 
         let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
             .await
-            .expect("request without selection should pass through");
-        assert_eq!(immediate_status(&responses), None);
+            .expect("Envoy-routed request should run the configured body hook");
+        assert_eq!(immediate_status(&responses), Some(422));
         assert_eq!(state.request_body, b"unchanged");
     }
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
-    async fn unselected_streamed_request_does_not_defer_headers_or_body() {
-        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as Payload;
+    async fn envoy_routed_body_hook_rejects_unsupported_request_modes() {
+        let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
+        for mode in [BodyMode::None, BodyMode::Streamed, BodyMode::FullDuplexStreamed] {
+            let mut state = StreamState::new();
+            state.protocol_config.request_body_mode = mode;
+            let headers = crate::handlers::handle_request_headers(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+                &mut state,
+            )
+            .await
+            .expect("unsupported body mode should produce a local rejection");
+            assert_eq!(
+                immediate_status(&headers),
+                Some(500),
+                "mode {mode:?} must reject before forwarding"
+            );
+        }
+    }
 
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn envoy_routed_body_hook_enforces_input_limit() {
         let pipeline = single_filter_pipeline("unselected_body", UnselectedBodyFilter::from_config);
         let mut state = StreamState::new();
-        state.protocol_config.request_body_mode = BodyMode::Streamed;
-        let headers = crate::handlers::handle_request_headers(
-            &pipeline,
-            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
-            &mut state,
-        )
-        .await
-        .expect("unselected headers should be acknowledged");
-        assert!(matches!(
-            headers.first().and_then(|item| item.response.as_ref()),
-            Some(Payload::RequestHeaders(_))
-        ));
-
-        let body = crate::handlers::handle_request_body(
-            &pipeline,
-            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
-                body: b"plain".to_vec(),
-                end_of_stream: true,
-            },
-            &mut state,
-        )
-        .await
-        .expect("unselected body should pass through");
-        assert_eq!(body.first().and_then(emitted_request_body), Some(&b"plain"[..]));
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = vec![b' '; pipeline.selected_upstream_request_body_limit() + 1];
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("oversized Envoy-routed request should produce a local rejection");
+        assert_eq!(immediate_status(&responses), Some(413));
     }
 
     #[tokio::test]
