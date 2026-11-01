@@ -885,4 +885,210 @@ ca_cert_path: /etc/tls/ca.pem
             "acceptor should reject missing client certificate"
         );
     }
+
+    /// Write PEMs under a unique temp path for provided-mode handshake tests.
+    fn write_pem(kind: &str, pem: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "praxis_tls_unit_{kind}_{}_{}.pem",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, pem).expect("write pem");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn provided_identity_paths() -> (String, String) {
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert");
+        (
+            write_pem("provided_cert", &server.cert.pem()),
+            write_pem("provided_key", &server.key_pair.serialize_pem()),
+        )
+    }
+
+    /// CA + CA-signed server/client leafs (same shape as `tests/tls_listener.rs`).
+    struct TestPki {
+        ca_pem: String,
+        server_cert_pem: String,
+        server_key_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    impl TestPki {
+        fn generate() -> Self {
+            use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+            let ca_key = KeyPair::generate().expect("ca key");
+            let mut ca = CertificateParams::new(Vec::new()).expect("ca params");
+            ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca.distinguished_name.push(DnType::CommonName, "praxis-tls-unit-ca");
+            let ca_cert = ca.self_signed(&ca_key).expect("ca cert");
+
+            let server_key = KeyPair::generate().expect("server key");
+            let server = CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+            let server_cert = server.signed_by(&server_key, &ca_cert, &ca_key).expect("server cert");
+
+            let client_key = KeyPair::generate().expect("client key");
+            let mut client = CertificateParams::new(vec!["praxis-client".to_owned()]).expect("client params");
+            client.distinguished_name.push(DnType::CommonName, "praxis-client");
+            let client_cert = client.signed_by(&client_key, &ca_cert, &ca_key).expect("client cert");
+
+            Self {
+                ca_pem: ca_cert.pem(),
+                server_cert_pem: server_cert.pem(),
+                server_key_pem: server_key.serialize_pem(),
+                client_cert_pem: client_cert.pem(),
+                client_key_pem: client_key.serialize_pem(),
+            }
+        }
+
+        fn provided_mtls_config(&self) -> TlsConfig {
+            TlsConfig {
+                mode: TlsMode::Provided,
+                cert_path: Some(write_pem("mtls_server_cert", &self.server_cert_pem)),
+                key_path: Some(write_pem("mtls_server_key", &self.server_key_pem)),
+                ca_cert_path: Some(write_pem("mtls_ca", &self.ca_pem)),
+                ..TlsConfig::default()
+            }
+        }
+    }
+
+    async fn client_handshake_with_identity(
+        addr: SocketAddr,
+        identity: Option<(&str, &str)>,
+        verify_peer: bool,
+    ) -> Result<tokio_openssl::SslStream<TcpStream>, openssl::ssl::Error> {
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector builder");
+        if verify_peer {
+            builder.set_verify(SslVerifyMode::PEER);
+        } else {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+        if let Some((cert_pem, key_pem)) = identity {
+            let cert = X509::from_pem(cert_pem.as_bytes()).expect("parse client cert");
+            let key = PKey::private_key_from_pem(key_pem.as_bytes()).expect("parse client key");
+            builder.set_certificate(&cert).expect("set client cert");
+            builder.set_private_key(&key).expect("set client key");
+        }
+        let connector = builder.build();
+        let ssl = connector
+            .configure()
+            .expect("configure")
+            .into_ssl("localhost")
+            .expect("into_ssl");
+        let mut tls = tokio_openssl::SslStream::new(ssl, tcp).expect("SslStream::new");
+        Pin::new(&mut tls).connect().await.map(|()| tls)
+    }
+
+    async fn echo_once_over_tls(acceptor: SslAcceptor) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut incoming = build_tls_incoming(listener, acceptor, HANDSHAKE_CONCURRENCY, HANDSHAKE_TIMEOUT);
+        let server = tokio::spawn(async move {
+            let mut stream = incoming.next().await.expect("stream item").expect("handshake ok");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).await.expect("server read");
+            stream.write_all(&buf).await.expect("server write");
+        });
+        let client = tokio::spawn(async move {
+            let mut tls = client_handshake_with_identity(addr, None, false)
+                .await
+                .expect("client handshake");
+            tls.write_all(b"ping").await.expect("client write");
+            let mut buf = [0_u8; 4];
+            tls.read_exact(&mut buf).await.expect("client read");
+            assert_eq!(&buf, b"ping");
+        });
+        server.await.expect("server task");
+        client.await.expect("client task");
+    }
+
+    /// Positive `build_provided` path: load cert/key from disk and complete a handshake.
+    #[tokio::test]
+    async fn provided_mode_happy_path_handshake_succeeds() {
+        let (cert_path, key_path) = provided_identity_paths();
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(cert_path),
+            key_path: Some(key_path),
+            ca_cert_path: None,
+            ..TlsConfig::default()
+        };
+        let acceptor = build_tls_config(&cfg)
+            .expect("build_provided should succeed")
+            .expect("provided mode returns Some acceptor");
+        echo_once_over_tls(acceptor).await;
+    }
+
+    fn assert_mtls_peer_required(acceptor: &SslAcceptor) {
+        let mode = acceptor.context().verify_mode();
+        assert!(
+            mode.contains(SslVerifyMode::PEER) && mode.contains(SslVerifyMode::FAIL_IF_NO_PEER_CERT),
+            "mTLS acceptor must enable peer verification"
+        );
+    }
+
+    /// `set_verify(PEER|FAIL_IF_NO_PEER_CERT)` accepts a CA-signed client cert.
+    #[tokio::test]
+    async fn provided_mtls_accepts_valid_client_certificate() {
+        let pki = TestPki::generate();
+        let acceptor = build_tls_config(&pki.provided_mtls_config())
+            .expect("mTLS build_provided")
+            .expect("Some acceptor");
+        assert_mtls_peer_required(&acceptor);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut incoming = build_tls_incoming(listener, acceptor, HANDSHAKE_CONCURRENCY, HANDSHAKE_TIMEOUT);
+        let identity = (pki.client_cert_pem.clone(), pki.client_key_pem.clone());
+        // Keep the accepted stream alive until the client finishes (TLS 1.3
+        // can otherwise race the client handshake when the server drops first).
+        let (server, client) = tokio::join!(
+            async move {
+                incoming
+                    .next()
+                    .await
+                    .expect("stream item")
+                    .expect("valid client cert must handshake")
+            },
+            async move {
+                client_handshake_with_identity(addr, Some((&identity.0, &identity.1)), false)
+                    .await
+                    .expect("client with CA-signed cert")
+            }
+        );
+        drop((server, client));
+    }
+
+    /// Same verify path rejects a client certificate from an untrusted CA.
+    #[tokio::test]
+    async fn provided_mtls_rejects_untrusted_client_certificate() {
+        let pki = TestPki::generate();
+        let foreign = rcgen::generate_simple_self_signed(vec!["evil-client".to_owned()]).expect("foreign client");
+
+        let acceptor = build_tls_config(&pki.provided_mtls_config())
+            .expect("mTLS build_provided")
+            .expect("Some acceptor");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut incoming = build_tls_incoming(listener, acceptor, HANDSHAKE_CONCURRENCY, HANDSHAKE_TIMEOUT);
+
+        let bad_cert = foreign.cert.pem();
+        let bad_key = foreign.key_pair.serialize_pem();
+        let server = tokio::spawn(async move {
+            let result = incoming.next().await.expect("stream item");
+            assert!(result.is_err(), "untrusted client cert must fail server handshake");
+        });
+        let client = tokio::spawn(async move {
+            // Client may observe success or failure depending on TLS 1.3 timing;
+            // the server-side accept result above is authoritative.
+            drop(client_handshake_with_identity(addr, Some((&bad_cert, &bad_key)), false).await);
+        });
+        server.await.expect("server task");
+        client.await.expect("client task");
+    }
 }

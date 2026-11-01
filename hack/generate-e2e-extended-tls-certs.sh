@@ -185,7 +185,6 @@ EOF
 echo "Generating e2e-extended TLS material under ${TLS_ROOT}"
 
 gen_ca "${WORKDIR}/positive-ca" "e2e-extended-ca"
-gen_ca "${WORKDIR}/alt-ca" "e2e-extended-alt-ca"
 
 POS="${TLS_ROOT}/positive/certs"
 gen_leaf "$POS" "$POST_SNI" "$SAN_BOTH" "${WORKDIR}/positive-ca"
@@ -193,51 +192,10 @@ gen_leaf "${WORKDIR}/positive-client" "e2e-extended-envoy-client" \
   "$CLIENT_SAN" "${WORKDIR}/positive-ca"
 cp "${WORKDIR}/positive-client/tls.crt" "${POS}/client.crt"
 cp "${WORKDIR}/positive-client/tls.key" "${POS}/client.key"
-# Positive path: validated server TLS only (mTLS is exercised in client-* cells).
+# Positive path only: validated server TLS. Negative cert-matrix cells were
+# dropped (they exercised Envoy/OpenSSL, not praxis-extproc); mTLS coverage
+# for the ExtProc listener lives in src/tls.rs unit tests.
 write_envoyfilter "${TLS_ROOT}/positive/envoyfilter-upstream-tls.yaml" \
   "${POS}/ca.crt" 0
 
-SU="${TLS_ROOT}/server-untrusted/certs"
-gen_leaf "$SU" "$POST_SNI" "$SAN_BOTH" "${WORKDIR}/alt-ca"
-write_envoyfilter "${TLS_ROOT}/server-untrusted/envoyfilter-upstream-tls.yaml" \
-  "${WORKDIR}/positive-ca/ca.crt" 0
-
-SE="${TLS_ROOT}/server-expired/certs"
-gen_leaf "$SE" "$POST_SNI" "$SAN_BOTH" "${WORKDIR}/positive-ca" \
-  "20200101000000Z" "20200102000000Z"
-write_envoyfilter "${TLS_ROOT}/server-expired/envoyfilter-upstream-tls.yaml" \
-  "${WORKDIR}/positive-ca/ca.crt" 0
-
-SWS="${TLS_ROOT}/server-wrong-san/certs"
-gen_leaf "$SWS" "wrong.example" "DNS:wrong.example" "${WORKDIR}/positive-ca"
-write_envoyfilter "${TLS_ROOT}/server-wrong-san/envoyfilter-upstream-tls.yaml" \
-  "${WORKDIR}/positive-ca/ca.crt" 0
-
-CM="${TLS_ROOT}/client-missing/certs"
-mkdir -p "$CM"
-cp "${POS}/tls.crt" "${POS}/tls.key" "${POS}/ca.crt" "$CM/"
-write_envoyfilter "${TLS_ROOT}/client-missing/envoyfilter-upstream-tls.yaml" \
-  "${CM}/ca.crt" 0
-
-CU="${TLS_ROOT}/client-untrusted/certs"
-mkdir -p "$CU"
-cp "${POS}/tls.crt" "${POS}/tls.key" "${POS}/ca.crt" "$CU/"
-gen_leaf "${WORKDIR}/bad-client" "e2e-extended-bad-client" \
-  "$CLIENT_SAN" "${WORKDIR}/alt-ca"
-cp "${WORKDIR}/bad-client/tls.crt" "${CU}/client.crt"
-cp "${WORKDIR}/bad-client/tls.key" "${CU}/client.key"
-write_envoyfilter "${TLS_ROOT}/client-untrusted/envoyfilter-upstream-tls.yaml" \
-  "${CU}/ca.crt" 1 "${CU}/client.crt" "${CU}/client.key"
-
-CE="${TLS_ROOT}/client-expired/certs"
-mkdir -p "$CE"
-cp "${POS}/tls.crt" "${POS}/tls.key" "${POS}/ca.crt" "$CE/"
-gen_leaf "${WORKDIR}/expired-client" "e2e-extended-expired-client" \
-  "$CLIENT_SAN" "${WORKDIR}/positive-ca" \
-  "20200101000000Z" "20200102000000Z"
-cp "${WORKDIR}/expired-client/tls.crt" "${CE}/client.crt"
-cp "${WORKDIR}/expired-client/tls.key" "${CE}/client.key"
-write_envoyfilter "${TLS_ROOT}/client-expired/envoyfilter-upstream-tls.yaml" \
-  "${CE}/ca.crt" 1 "${CE}/client.crt" "${CE}/client.key"
-
-echo "Wrote certs + envoyfilter-upstream-tls.yaml for all TLS scenarios."
+echo "Wrote positive TLS certs + envoyfilter-upstream-tls.yaml."

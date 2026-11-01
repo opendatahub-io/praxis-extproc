@@ -324,44 +324,6 @@ pub(crate) fn latest_details_log_line(logs: &str) -> Option<&str> {
     logs.lines().rev().find(|line| line.contains("details="))
 }
 
-/// Assert negative TLS discrimination: 503, `ext_proc` details, no hop oracle headers.
-pub(crate) fn assert_negative_tls_response(headers: &HeaderMap, status: reqwest::StatusCode) {
-    assert_eq!(
-        status.as_u16(),
-        503,
-        "negative TLS cell must return HTTP 503, got {status}"
-    );
-    assert!(
-        headers.get(HOP_DIGEST_HEADER_1).is_none(),
-        "negative TLS must not include hop-1 oracle header"
-    );
-    assert!(
-        headers.get(HOP_DIGEST_HEADER_2).is_none(),
-        "negative TLS must not include hop-2 oracle header"
-    );
-}
-
-/// Assert a single access-log line mentions `ext_proc` (not bare UF).
-///
-/// Callers must pass the candidate line (not a multi-line tail) so a stale
-/// 503 from an earlier negative cell cannot satisfy the assertion.
-pub(crate) fn assert_ext_proc_error_details(line: &str) {
-    assert!(
-        line.contains("code=503") && line.contains("details=") && line.contains("ext_proc"),
-        "expected access-log line with code=503, details=, and ext_proc; got: {line}"
-    );
-    let details = capture_field(line, "details=").unwrap_or_default();
-    let flags = capture_field(line, "flags=").unwrap_or_default();
-    assert!(
-        details.contains("ext_proc"),
-        "negative TLS details must mention ext_proc, got details={details:?} flags={flags:?} line={line}"
-    );
-    assert!(
-        !flags.contains("UF") || details.contains("ext_proc"),
-        "misclassified UF without ext_proc details: {line}"
-    );
-}
-
 /// Expected Envoy `idle_timeout` string for a topology `pool_settings_ref`.
 pub(crate) fn expected_pool_idle_timeout(pool_settings_ref: &str) -> &'static str {
     match pool_settings_ref {

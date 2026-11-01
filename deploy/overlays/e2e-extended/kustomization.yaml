@@ -9,9 +9,10 @@ resources:
   - envoyfilter-ext-proc-guard.yaml
   - envoyfilter-pre-oracle-response-headers.yaml
   - access-log-reuse.yaml
-  - access-log-tls-negative.yaml
   # pool-configs/*.yaml are patched into praxis-extproc-clusters per idle-matrix
   # cell via hack/patch-e2e-extended-pool-idle.py (not both at once).
+  # Negative TLS cert-matrix overlays were dropped (Envoy/OpenSSL ownership);
+  # praxis-extproc TLS coverage is unit-tested in src/tls.rs.
 
 patches:
   - path: workload/pre-processing-hop-index.yaml

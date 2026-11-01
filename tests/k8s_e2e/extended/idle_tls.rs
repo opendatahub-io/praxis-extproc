@@ -1,37 +1,23 @@
-//! Stale-idle + TLS/mTLS matrix (qualification tier).
+//! Stale-idle qualification + positive TLS control (extended tier).
+//!
+//! Negative upstream cert-matrix cells were removed from this PR: they exercise
+//! Envoy/OpenSSL validation rather than praxis-extproc. Listener TLS coverage
+//! for `provided` / mTLS lives in `src/tls.rs` unit tests. Connection/idle
+//! investigation beyond this harness is tracked separately.
 
 use std::time::Duration;
 
 use super::{
     helpers::{
-        IdleMatrixCell, apply_pool_settings_ref, apply_tls_scenario_overlay, assert_ext_proc_error_details,
-        assert_hop_digests, assert_negative_tls_response, chat_completion_with_digest, delete_pool_envoyfilters,
-        e2e_kubectl_context, effective_idle_secs, fetch_gateway_access_log_tail, http_client_single_pool,
-        kubectl_apply_f, latest_connection_log_line, load_topology_profile, parse_connection_ids, repo_root,
-        tls_overlay_dir, wait_ext_proc_rollout, wait_gateway_pool_idle_timeout,
+        IdleMatrixCell, apply_pool_settings_ref, apply_tls_scenario_overlay, assert_hop_digests,
+        chat_completion_with_digest, delete_pool_envoyfilters, e2e_kubectl_context, effective_idle_secs,
+        fetch_gateway_access_log_tail, http_client_single_pool, kubectl_apply_f, latest_connection_log_line,
+        load_topology_profile, parse_connection_ids, repo_root, tls_overlay_dir, wait_ext_proc_rollout,
+        wait_gateway_pool_idle_timeout,
     },
     report::{ExtendedRunMetadata, IdleMatrixResult},
 };
 use crate::fixtures::{ensure_gateway_ready, gateway_url};
-
-const TLS_SCENARIOS: &[(&str, &str)] = &[
-    ("positive", "positive control"),
-    ("server-untrusted", "server_untrusted"),
-    ("server-expired", "server_expired"),
-    ("server-wrong-san", "server_wrong_san"),
-    ("client-missing", "client_missing"),
-    ("client-untrusted", "client_untrusted"),
-    ("client-expired", "client_expired"),
-];
-
-const NEGATIVE_SCENARIOS: &[(&str, &str)] = &[
-    ("server-untrusted", "server_untrusted"),
-    ("server-expired", "server_expired"),
-    ("server-wrong-san", "server_wrong_san"),
-    ("client-missing", "client_missing"),
-    ("client-untrusted", "client_untrusted"),
-    ("client-expired", "client_expired"),
-];
 
 /// Apply `deploy/overlays/e2e-extended/tls/<scenario>/` and wait for rollout.
 async fn apply_tls_scenario(scenario: &str) -> std::io::Result<()> {
@@ -42,7 +28,7 @@ async fn apply_tls_scenario(scenario: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn publish_tls_metadata(validation_mode: &str, negative: Option<&str>) {
+fn publish_tls_metadata(validation_mode: &str) {
     let path = super::report::report_path();
     let now = {
         std::process::Command::new("date")
@@ -68,7 +54,7 @@ fn publish_tls_metadata(validation_mode: &str, negative: Option<&str>) {
             istio_version: "unknown".into(),
             praxis_extproc_image_digest: "unknown".into(),
             tls_validation_mode: validation_mode.into(),
-            tls_negative_scenario: negative.map(str::to_owned),
+            tls_negative_scenario: None,
             ext_proc_modes: super::report::ExtProcModes {
                 request: "FULL_DUPLEX_STREAMED".into(),
                 response: "FULL_DUPLEX_STREAMED".into(),
@@ -80,7 +66,7 @@ fn publish_tls_metadata(validation_mode: &str, negative: Option<&str>) {
         }
     };
     meta.tls_validation_mode = validation_mode.into();
-    meta.tls_negative_scenario = negative.map(str::to_owned);
+    meta.tls_negative_scenario = None;
     meta.finished_at = now;
     meta.write_to(&path).expect("write tls metadata");
 }
@@ -99,77 +85,13 @@ async fn idle_tls_positive_overlay_applies() {
         "positive TLS cell should return 200 when ext-proc is healthy"
     );
     assert_hop_digests(&digest, resp.headers());
-    publish_tls_metadata("verify_trust_chain", None);
-}
-
-#[tokio::test]
-#[ignore = "qualification tier: requires make e2e-setup-extended"]
-async fn idle_tls_negative_server_untrusted_expects_503_without_oracle() {
-    ensure_gateway_ready().await;
-    apply_tls_scenario("positive")
-        .await
-        .expect("baseline positive overlay before negative cell");
-    run_negative_tls_cell("server-untrusted", "server_untrusted").await;
-}
-
-#[tokio::test]
-#[ignore = "qualification tier: requires make e2e-setup-extended"]
-async fn idle_tls_negative_matrix_all_scenarios() {
-    ensure_gateway_ready().await;
-    apply_tls_scenario("positive").await.expect("baseline positive overlay");
-    for (dir, label) in NEGATIVE_SCENARIOS {
-        run_negative_tls_cell(dir, label).await;
-        apply_tls_scenario("positive")
-            .await
-            .unwrap_or_else(|error| panic!("restore positive after {dir}: {error}"));
-    }
-    // Cluster is back on positive control; clear the last negative label.
-    publish_tls_metadata("verify_trust_chain", None);
-}
-
-async fn run_negative_tls_cell(scenario_dir: &str, scenario_label: &str) {
-    // Same tail size as the poll window so stale 503 lines from earlier cells
-    // remain in `before` and cannot satisfy this cell.
-    let before = fetch_gateway_access_log_tail(80).expect("gateway access-log snapshot before negative TLS cell");
-    apply_tls_scenario(scenario_dir)
-        .await
-        .unwrap_or_else(|error| panic!("apply tls {scenario_dir}: {error}"));
-
-    let (resp, _digest) = chat_completion_with_digest("gpt-4", &format!("negative tls {scenario_label}")).await;
-    assert_negative_tls_response(resp.headers(), resp.status());
-
-    // Poll briefly for a newly written negative access-log line.
-    let mut last_logs = String::new();
-    for _ in 0..10 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let Some(logs) = fetch_gateway_access_log_tail(80) else {
-            continue;
-        };
-        last_logs = logs;
-        if let Some(candidate) = last_logs.lines().rev().find(|line| {
-            !before.contains(*line)
-                && line.contains("details=")
-                && line.contains("ext_proc")
-                && line.contains("code=503")
-        }) {
-            let mode = if scenario_label.starts_with("client_") {
-                "verify_trust_chain_mtls"
-            } else {
-                "verify_trust_chain"
-            };
-            assert_ext_proc_error_details(candidate);
-            publish_tls_metadata(mode, Some(scenario_label));
-            return;
-        }
-    }
-    panic!("negative TLS {scenario_label}: expected access-log details with ext_proc; last logs:\n{last_logs}");
+    publish_tls_metadata("verify_trust_chain");
 }
 
 #[tokio::test]
 #[ignore = "qualification tier: requires make e2e-setup-extended; long idle wait"]
 async fn idle_matrix_post_idle_request_on_reused_connection() {
     ensure_gateway_ready().await;
-    // Ensure validated positive TLS (prior negative cells leave bad leaf material).
     apply_tls_scenario("positive")
         .await
         .expect("restore positive TLS before idle matrix");
@@ -199,10 +121,9 @@ async fn idle_matrix_post_idle_request_on_reused_connection() {
 
 #[expect(
     clippy::large_stack_frames,
-    reason = "idle cell keeps warm-up/post-idle responses and access-log tails in one async frame"
+    reason = "async state machine holds access-log String tails + reqwest futures over the idle wait"
 )]
 async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
-    // Ensure only this cell's pool EnvoyFilter is active (delete sibling refs).
     // Drop legacy second-EnvoyFilter pool objects if present; idle is patched
     // into praxis-extproc-clusters (MERGE via a sibling EnvoyFilter is ignored).
     delete_pool_envoyfilters();
@@ -315,7 +236,7 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
     let post_ids = post_ids.expect("post-idle access-log connection_id");
     assert_eq!(
         post_ids.connection_id, warmup_ids.connection_id,
-        "downstream CONNECTION_ID must be reused after idle ({})",
+        "downstream connection_id must reuse after idle for {}",
         cell.pool_settings_ref
     );
     // Downstream reuse is the qualification signal (client→gateway TCP). Upstream
@@ -346,21 +267,19 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
 }
 
 #[tokio::test]
-#[ignore = "qualification tier: TLS matrix wiring"]
-async fn idle_tls_scenario_inventory_covers_how_spec() {
-    for (dir, _label) in TLS_SCENARIOS {
-        let overlay = tls_overlay_dir(dir);
-        let kustomization = overlay.join("kustomization.yaml");
-        assert!(kustomization.is_file(), "missing tls overlay for {dir}");
-        assert!(
-            !overlay.join("placeholder-configmap.yaml").exists(),
-            "placeholder configmap must be removed for {dir}"
-        );
-        assert!(
-            overlay.join("plugins-pre.yaml").is_file() && overlay.join("plugins-post.yaml").is_file(),
-            "tls scenario {dir} must ship provided-TLS plugin ConfigMaps"
-        );
-    }
+#[ignore = "qualification tier: TLS positive overlay wiring"]
+async fn idle_tls_positive_overlay_inventory() {
+    let overlay = tls_overlay_dir("positive");
+    let kustomization = overlay.join("kustomization.yaml");
+    assert!(kustomization.is_file(), "missing tls overlay for positive");
+    assert!(
+        !overlay.join("placeholder-configmap.yaml").exists(),
+        "placeholder configmap must be removed for positive"
+    );
+    assert!(
+        overlay.join("plugins-pre.yaml").is_file() && overlay.join("plugins-post.yaml").is_file(),
+        "positive tls scenario must ship provided-TLS plugin ConfigMaps"
+    );
     assert_eq!(
         e2e_kubectl_context(),
         std::env::var("E2E_CONTEXT").unwrap_or_else(|_| "kind-praxis-e2e".to_owned()),
