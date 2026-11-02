@@ -140,12 +140,30 @@ fi
   exit 2
 }
 if [[ "$BOOTSTRAP_MODE" == true ]]; then
-  [[ "$CONFIG_SOURCE" == byo && "$PRAXIS_CONFIG_MAP_EXTERNAL" == false && -n "$PRAXIS_CONFIG_FILE" && -f "$PRAXIS_CONFIG_FILE" && -n "$OVERLAY_CONFIGMAP" && "$GRID_SERVING_ENABLED" == false ]] || {
-    printf 'bootstrap mode requires a local BYO config, task Grid overlay, and disabled Grid serving\n' >&2
-    exit 2
-  }
-  if ! grep -Fq 'status: 503' "$PRAXIS_CONFIG_FILE" || ! grep -Fq 'the gateway is starting' "$PRAXIS_CONFIG_FILE"; then
+  if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
+    [[ "$CONFIG_SOURCE" == byo && -z "$PRAXIS_CONFIG_FILE" && -n "$PRAXIS_CONFIG_MAP_NAME" &&
+       -n "$OVERLAY_CONFIGMAP" && -n "$EXPECTED_ENDPOINTS_FILE" && -f "$EXPECTED_ENDPOINTS_FILE" &&
+       -f "$BOOTSTRAP_CONFIG_FILE" && "$MOUNT_RECONCILIATION_ENABLED" == true &&
+       "$GRID_SERVING_ENABLED" == false ]] || {
+      printf 'external bootstrap requires a BYO external ConfigMap, checked 503 fixture, Grid overlay, endpoints, mount reconciliation, and disabled Grid serving\n' >&2
+      exit 2
+    }
+    bootstrap_config_file="$BOOTSTRAP_CONFIG_FILE"
+  else
+    [[ "$CONFIG_SOURCE" == byo && -n "$PRAXIS_CONFIG_FILE" && -f "$PRAXIS_CONFIG_FILE" &&
+       -n "$OVERLAY_CONFIGMAP" && "$GRID_SERVING_ENABLED" == false ]] || {
+      printf 'bootstrap mode requires a checked BYO config, task Grid overlay, and disabled Grid serving\n' >&2
+      exit 2
+    }
+    bootstrap_config_file="$PRAXIS_CONFIG_FILE"
+  fi
+  if ! grep -Fq 'status: 503' "$bootstrap_config_file" || ! grep -Fq 'the gateway is starting' "$bootstrap_config_file"; then
     printf 'bootstrap mode accepts only the checked 503 startup responder config\n' >&2
+    exit 2
+  fi
+  if grep -Eiq '(^|[[:space:]])(authorization|api[_-]?key|access[_-]?token|password|bearer[_-]?token)[[:space:]]*:' "$bootstrap_config_file" ||
+     grep -Eiq '(^|[[:space:]])(endpoints|backends|clusters)[[:space:]]*:' "$bootstrap_config_file"; then
+    printf 'bootstrap responder must not contain credentials or backend configuration\n' >&2
     exit 2
   fi
 fi
@@ -155,7 +173,7 @@ if [[ "$CONFIG_SOURCE" == operator ]]; then
     exit 2
   }
   [[ -z "$PRAXIS_CONFIG_FILE" && "$PRAXIS_CONFIG_MAP_EXTERNAL" == false && -z "$OVERLAY_CONFIGMAP" ]] || {
-    printf 'operator Praxis source owns the generated config and overlay mount; do not set BYO config or overlay inputs\n' >&2
+    printf 'operator Praxis source does not support the external BYO overlay mount\n' >&2
     exit 2
   }
   [[ -n "$OPERATOR_CONFIG_MAP_NAME" && -n "$GRID_OPERATOR_SERVICE_ACCOUNT" && -n "$GRID_OPERATOR_NAMESPACE" && -f "$BOOTSTRAP_CONFIG_FILE" ]] || {
@@ -591,30 +609,80 @@ fi
 if [[ -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
   if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
     CURRENT_PHASE=configmap-ownership-preflight
-    external_configmap_json="$(oc get configmap "$PRAXIS_CONFIG_MAP_NAME" -n "$NAMESPACE" -o json)"
+    base_configmap_json="$(oc get configmap "$PRAXIS_CONFIG_MAP_NAME" -n "$NAMESPACE" -o json)"
     jq -e --arg run "$RUN_LABEL" --arg network "$GRID_NETWORK_NAME" --arg gateway "$SERVICE_NAME" '
       (.metadata.labels["praxis.fast/qualification-run"]==$run) or
       (.metadata.labels["app.kubernetes.io/managed-by"]=="grid-operator" and
        .metadata.labels["grid.praxis.fast/network"]==$network and
        .metadata.labels["grid.praxis.fast/gateway"]==$gateway)
-    ' <<<"$external_configmap_json" >/dev/null || {
-      CURRENT_FAILURE='external Praxis ConfigMap is not owned by this run or the matching task GridNetwork'
-      printf 'external Praxis ConfigMap ownership is ambiguous; refusing to adopt it\n' >&2
+    ' <<<"$base_configmap_json" >/dev/null || {
+      CURRENT_FAILURE='configured Praxis ConfigMap is not owned by this run or the matching task GridNetwork'
+      printf 'configured Praxis ConfigMap ownership is ambiguous; refusing to adopt it\n' >&2
       exit 1
     }
-    jq -j -er '.data["praxis.yaml"]' <<<"$external_configmap_json" |
-      python3 "$SCRIPT_DIR/validate-generated-praxis-config.py" "$EXPECTED_ENDPOINTS_FILE" \
-        >"$EVIDENCE_DIR/external-praxis-config-validation.json" || {
-      CURRENT_FAILURE='Grid-generated Praxis ConfigMap failed overlay, reload, endpoint, or credential-field validation'
-      printf 'external Grid-generated Praxis ConfigMap failed structural validation; see sanitized validation result\n' >&2
-      exit 1
-    }
+    base_config_sha="$(jq -j -er '.data["praxis.yaml"]' <<<"$base_configmap_json" | sha256sum | awk '{print $1}')"
+    jq --arg sha "$base_config_sha" \
+      '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,labels:.metadata.labels},dataKeys:(.data|keys),praxisYamlSha256:$sha}' \
+      <<<"$base_configmap_json" >"$EVIDENCE_DIR/configured-praxis-base-configmap-metadata.json"
+    active_configmap_name="$PRAXIS_CONFIG_MAP_NAME"
+    if gateway_deployment_json="$(oc get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o json 2>/dev/null)"; then
+      active_configmap_name="$(jq -er '[.spec.template.spec.volumes[]?|select(.name=="config")|.configMap.name] | if length==1 then .[0] else error("Gateway has no unique active Praxis config ConfigMap") end' <<<"$gateway_deployment_json")" || {
+        CURRENT_FAILURE='Gateway Deployment does not identify one active Praxis ConfigMap slot'
+        printf 'Gateway Deployment must reference exactly one active Praxis ConfigMap slot\n' >&2
+        exit 1
+      }
+      if [[ "$active_configmap_name" != "$PRAXIS_CONFIG_MAP_NAME" ]]; then
+        [[ "$active_configmap_name" == grid-consumer-config-* ]] || {
+          CURRENT_FAILURE='active Praxis ConfigMap is neither the configured Grid base nor a Grid double-buffered slot'
+          printf 'active Praxis ConfigMap is outside the configured base and Grid double-buffered slot names\n' >&2
+          exit 1
+        }
+        external_configmap_json="$(oc get configmap "$active_configmap_name" -n "$NAMESPACE" -o json)"
+        jq -e --arg network "$GRID_NETWORK_NAME" --arg gateway "$SERVICE_NAME" '
+          .metadata.labels["app.kubernetes.io/managed-by"]=="grid-operator" and
+          .metadata.labels["grid.praxis.fast/network"]==$network and
+          .metadata.labels["grid.praxis.fast/gateway"]==$gateway
+        ' <<<"$external_configmap_json" >/dev/null || {
+          CURRENT_FAILURE='active double-buffered Praxis ConfigMap is not owned by the matching task GridNetwork and Gateway'
+          printf 'active double-buffered Praxis ConfigMap ownership does not match the task GridNetwork and Gateway\n' >&2
+          exit 1
+        }
+      else
+        external_configmap_json="$base_configmap_json"
+      fi
+      unset gateway_deployment_json
+    else
+      external_configmap_json="$base_configmap_json"
+    fi
+    unset base_configmap_json
+    if [[ "$BOOTSTRAP_MODE" == true ]]; then
+      expected_bootstrap_sha="$(sha256sum "$BOOTSTRAP_CONFIG_FILE" | awk '{print $1}')"
+      observed_config_sha="$(jq -j -er '.data["praxis.yaml"]' <<<"$external_configmap_json" | sha256sum | awk '{print $1}')"
+    else
+      expected_bootstrap_sha=''
+      observed_config_sha=''
+    fi
+    if [[ "$BOOTSTRAP_MODE" == true && "$observed_config_sha" == "$expected_bootstrap_sha" ]]; then
+      jq -n --arg sha "$observed_config_sha" --arg path "$BOOTSTRAP_CONFIG_FILE" \
+        '{status:"checked_bootstrap",sha256:$sha,bootstrapFixture:$path,backendConfigurationPresent:false}' \
+        >"$EVIDENCE_DIR/external-praxis-config-validation.json"
+    else
+      jq -j -er '.data["praxis.yaml"]' <<<"$external_configmap_json" |
+        python3 "$SCRIPT_DIR/validate-generated-praxis-config.py" "$EXPECTED_ENDPOINTS_FILE" \
+          >"$EVIDENCE_DIR/external-praxis-config-validation.json" || {
+        CURRENT_FAILURE='Grid-generated Praxis ConfigMap failed overlay, reload, endpoint, or credential-field validation'
+        printf 'external Grid-generated Praxis ConfigMap failed structural validation; see sanitized validation result\n' >&2
+        exit 1
+      }
+    fi
     live_config_sha="$(jq -er '.sha256' "$EVIDENCE_DIR/external-praxis-config-validation.json")"
     source_config_sha=''
     if [[ -n "$PRAXIS_CONFIG_FILE" ]]; then source_config_sha="$(sha256sum "$PRAXIS_CONFIG_FILE" | awk '{print $1}')"; fi
     endpoint_inventory_sha="$(sha256sum "$EXPECTED_ENDPOINTS_FILE" | awk '{print $1}')"
     jq --arg liveSha "$live_config_sha" --arg sourceSha "$source_config_sha" --arg endpointsSha "$endpoint_inventory_sha" \
-      '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels},dataKeys:(.data|keys),praxisYamlLiveSha256:$liveSha,priorSourceSnapshotSha256:(if $sourceSha=="" then null else $sourceSha end),expectedEndpointInventorySha256:$endpointsSha,gridGenerated:true}' \
+      --arg validation "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json")" \
+      --arg configuredBase "$PRAXIS_CONFIG_MAP_NAME" --arg activeName "$active_configmap_name" \
+      '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels},configuredBaseConfigMapName:$configuredBase,activeConfigMapName:$activeName,usesDoubleBufferedGridSlot:($configuredBase!=$activeName),dataKeys:(.data|keys),praxisYamlLiveSha256:$liveSha,priorSourceSnapshotSha256:(if $sourceSha=="" then null else $sourceSha end),expectedEndpointInventorySha256:$endpointsSha,gridGenerated:true,validationStatus:$validation}' \
       <<<"$external_configmap_json" >"$EVIDENCE_DIR/external-praxis-configmap-metadata.json"
     unset external_configmap_json
   else
@@ -766,7 +834,7 @@ cat >"$EVIDENCE_DIR/INVOCATION.md" <<EOF
 - Backend: $NAMESPACE/$SERVICE_NAME:$SERVICE_PORT
 - GridNetwork/site: $GRID_NETWORK_NAME / $GRID_SITE_NAME
 - Resource requests/limits: CPU $CPU_REQUEST/$CPU_LIMIT; memory $MEMORY_REQUEST/$MEMORY_LIMIT
-- Praxis config: $(if [[ "$CONFIG_SOURCE" == operator ]]; then printf 'Grid operator-generated consumer config; bootstrap 503 ConfigMap is temporary and mount-reconciliation readiness is a separate gate'; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf 'Grid-operator-generated task ConfigMap %s, structurally validated for overlay reload and both expected pool endpoints; live and prior source hashes are recorded separately' "$PRAXIS_CONFIG_MAP_NAME"; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf 'task-owned BYO ConfigMap %s; source SHA-256 is recorded separately' "$PRAXIS_CONFIG_MAP_NAME"; else printf 'bootstrap responder only; signal routing is not configured'; fi)
+- Praxis config: $(if [[ "$BOOTSTRAP_MODE" == true && "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json" 2>/dev/null || true)" == checked_bootstrap ]]; then printf 'checked external 503 bootstrap ConfigMap; Grid-generated config is not yet qualified'; elif [[ "$CONFIG_SOURCE" == operator ]]; then printf 'Grid operator-generated consumer config; this chart source does not mount its routing overlay'; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf 'Grid-generated configured base %s and live Deployment slot %s; active content is structurally validated for overlay reload and both expected pool endpoints' "$PRAXIS_CONFIG_MAP_NAME" "$(jq -r '.activeConfigMapName' "$EVIDENCE_DIR/external-praxis-configmap-metadata.json")"; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf 'task-owned BYO ConfigMap %s; source SHA-256 is recorded separately' "$PRAXIS_CONFIG_MAP_NAME"; else printf 'bootstrap responder only; signal routing is not configured'; fi)
 - Grid overlay ConfigMap: ${OVERLAY_CONFIGMAP:-not mounted}
 
 This phase creates only the task-owned Gateway path. It does not deploy inference workloads, ExtProc, or send inference traffic.
@@ -1039,14 +1107,14 @@ cat >"$EVIDENCE_DIR/source-lock.md" <<EOF
 - Listener hostname: $HOSTNAME
 - Gateway controller address: ${gateway_address:-not reported}
 - TLS source: current-run Grid operator Secret metadata; identity values are not recorded
-- Praxis config source: $(if [[ "$CONFIG_SOURCE" == operator ]]; then printf 'Grid operator-generated consumer config in %s; overlay-aware routing and mounted revision are verified by the operator handoff gate' "$OPERATOR_CONFIG_MAP_NAME"; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf 'Grid operator-generated ConfigMap %s is ownership-checked and mounted by the task Gateway chart with overlay %s' "$PRAXIS_CONFIG_MAP_NAME" "$OVERLAY_CONFIGMAP"; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf 'task-owned BYO ConfigMap %s with Grid overlay mount %s' "$PRAXIS_CONFIG_MAP_NAME" "$OVERLAY_CONFIGMAP"; else printf 'chart bootstrap responder only; signal routing is not configured'; fi)
+- Praxis config source: $(if [[ "$BOOTSTRAP_MODE" == true && "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json" 2>/dev/null || true)" == checked_bootstrap ]]; then printf 'checked external fail-closed bootstrap in %s; Grid overlay %s is mounted but inference remains disabled until Grid replaces the config' "$PRAXIS_CONFIG_MAP_NAME" "$OVERLAY_CONFIGMAP"; elif [[ "$CONFIG_SOURCE" == operator ]]; then printf 'Grid operator-generated consumer config in %s; this chart source cannot mount the routing overlay' "$OPERATOR_CONFIG_MAP_NAME"; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf 'Grid generated base ConfigMap %s and active Deployment slot %s are ownership-checked; the chart mounts overlay %s' "$PRAXIS_CONFIG_MAP_NAME" "$(jq -r '.activeConfigMapName' "$EVIDENCE_DIR/external-praxis-configmap-metadata.json")" "$OVERLAY_CONFIGMAP"; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf 'task-owned BYO ConfigMap %s with Grid overlay mount %s' "$PRAXIS_CONFIG_MAP_NAME" "$OVERLAY_CONFIGMAP"; else printf 'chart bootstrap responder only; signal routing is not configured'; fi)
 
 No Secret values or private keys are in this evidence directory.
 EOF
 jq -n --arg mode "$MODE" --arg evidence "$EVIDENCE_DIR" \
   --arg image "$IMAGE" --arg source "$SOURCE_REVISION" --arg address "$gateway_address" \
-  --arg praxisConfigMode "$(if [[ "$CONFIG_SOURCE" == operator ]]; then printf operator-generated-overlay-aware; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf grid-generated-external-overlay-aware; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf task-owned-byo-overlay; else printf bootstrap-responder-only; fi)" \
-  '{mode:$mode,status:(if $mode=="render" then "rendered" elif $praxisConfigMode=="operator-generated-overlay-aware" or $praxisConfigMode=="grid-generated-external-overlay-aware" or $praxisConfigMode=="task-owned-byo-overlay" then "ready" else "bootstrap-only" end),evidenceDirectory:$evidence,image:$image,sourceRevision:$source,gatewayAddress:$address,praxisConfigMode:$praxisConfigMode,inferenceTrafficSent:false}' \
+  --arg praxisConfigMode "$(if [[ "$BOOTSTRAP_MODE" == true && "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json" 2>/dev/null || true)" == checked_bootstrap ]]; then printf grid-generated-external-bootstrap; elif [[ "$CONFIG_SOURCE" == operator ]]; then printf operator-generated-config-no-overlay; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf grid-generated-external-overlay-aware; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf task-owned-byo-overlay; else printf bootstrap-responder-only; fi)" \
+  '{mode:$mode,status:(if $mode=="render" then "rendered" elif $praxisConfigMode=="operator-generated-config-no-overlay" or $praxisConfigMode=="grid-generated-external-bootstrap" then "bootstrap-only" elif $praxisConfigMode=="grid-generated-external-overlay-aware" or $praxisConfigMode=="task-owned-byo-overlay" then "ready" else "bootstrap-only" end),evidenceDirectory:$evidence,image:$image,sourceRevision:$source,gatewayAddress:$address,praxisConfigMode:$praxisConfigMode,inferenceTrafficSent:false}' \
   >"$EVIDENCE_DIR/RESULT.json"
 log "task Grid Gateway Service and HTTPS route $MODE complete: source=$SOURCE_REVISION image=$IMAGE; no inference traffic sent"
 printf 'Evidence: %s\n' "$EVIDENCE_DIR"

@@ -35,6 +35,7 @@ POOL_GATEWAY_INFRA_ANNOTATION_VALUE="$(env_default POOL_GATEWAY_INFRA_ANNOTATION
 LLMISVC_TLS_ENABLED="$(env_default LLMISVC_TLS_ENABLED false)"
 RUN_LABEL="$(env_default GRID_RUN_LABEL '')"
 SOURCE_LOCKS_MD="$(env_default SOURCE_LOCKS_MD "$REPO_ROOT/evidence/$RUN_LABEL/source-locks.md")"
+SOURCE_LOCKS_FILE="$(env_default SOURCE_LOCKS_FILE "${SOURCE_LOCKS_MD%.md}.json")"
 TRANSPORT_STATE_FILE="$(env_default LLMISVC_TRANSPORT_STATE_FILE "$REPO_ROOT/evidence/task-state/$RUN_LABEL/llmisvc-transport-state.json")"
 EVIDENCE_DIR="$(env_default SERVING_POOLS_EVIDENCE_DIR '')"
 WAIT_TIMEOUT="$(env_default SERVING_POOLS_WAIT_TIMEOUT 900s)"
@@ -206,8 +207,32 @@ fi
 for source_revision in "$EXTPROC_SOURCE_REVISION" "$GITOPS_SOURCE_REVISION" "$GRID_GATEWAY_SOURCE_REVISION" "$ODH_GRID_OPERATOR_SOURCE_REVISION" "$MAAS_SOURCE_REVISION"; do
   [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || { printf 'all declared source revisions must be full Git SHAs\n' >&2; exit 2; }
 done
+
+verify_source_lock_revision() {
+  local component="$1" revision="$2" locked_revision
+  locked_revision="$(jq -er --arg component "$component" '.components[$component].resolved_sha // empty' "$SOURCE_LOCKS_FILE" 2>/dev/null || true)"
+  [[ -n "$locked_revision" && "$locked_revision" == "$revision" ]] || {
+    printf 'declared %s source revision does not match SOURCE_LOCKS_FILE\n' "$component" >&2
+    return 1
+  }
+}
+
+[[ -s "$SOURCE_LOCKS_FILE" ]] || { printf 'SOURCE_LOCKS_FILE must name the current run source-locks.json before simulator build or pool operations\n' >&2; exit 2; }
+verify_source_lock_revision llm-d-sim "$SIMULATOR_SOURCE_REVISION"
+verify_source_lock_revision epp "$EPP_SOURCE_REVISION"
+verify_source_lock_revision extproc "$EXTPROC_SOURCE_REVISION"
+verify_source_lock_revision gitops "$GITOPS_SOURCE_REVISION"
+verify_source_lock_revision grid "$GRID_GATEWAY_SOURCE_REVISION"
+verify_source_lock_revision grid-operator "$ODH_GRID_OPERATOR_SOURCE_REVISION"
+verify_source_lock_revision maas "$MAAS_SOURCE_REVISION"
 [[ "$BUILD_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || { printf 'SIMULATOR_BUILD_TIMEOUT must be an integer followed by s, m, or h\n' >&2; exit 2; }
 [[ "$BUILD_STATUS_SYNC_TIMEOUT" =~ ^[1-9][0-9]*s$ ]] || { printf 'SIMULATOR_BUILD_STATUS_SYNC_TIMEOUT must be an integer followed by s\n' >&2; exit 2; }
+case "${BUILD_TIMEOUT: -1}" in
+  s) BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT%?}" ;;
+  m) BUILD_TIMEOUT_SECONDS="$(( ${BUILD_TIMEOUT%?} * 60 ))" ;;
+  h) BUILD_TIMEOUT_SECONDS="$(( ${BUILD_TIMEOUT%?} * 3600 ))" ;;
+esac
+BUILD_STATUS_SYNC_TIMEOUT_SECONDS="${BUILD_STATUS_SYNC_TIMEOUT%s}"
 [[ "$WAIT_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || { printf 'SERVING_POOLS_WAIT_TIMEOUT must be an integer followed by s, m, or h\n' >&2; exit 2; }
 [[ "$SIMULATOR_CPU_REQUEST" =~ ^[0-9]+m$ && "$EPP_CPU_REQUEST" =~ ^[0-9]+m$ ]] || {
   printf 'simulator and EPP CPU requests must use explicit millicore quantities\n' >&2; exit 2;
@@ -653,6 +678,7 @@ write_invocation() {
 - ExtProc checkout: $extproc_branch at $extproc_head; existing dirty worktree preserved
 - Serving helper SHA-256: $helper_sha
 - Run-specific source lock: $SOURCE_LOCKS_MD (sha256 $source_lock_sha)
+- Run-specific source-lock JSON: $SOURCE_LOCKS_FILE
 - Simulator source: $SIMULATOR_SOURCE_URL at $SIMULATOR_SOURCE_REVISION
 - Simulator OCI source label: $SIMULATOR_OCI_SOURCE_URL
 - EPP image: $EPP_IMAGE
@@ -673,6 +699,8 @@ write_invocation() {
 INVOCATION
   chmod 0600 "$EVIDENCE_DIR/INVOCATION.md"
   cp "$SOURCE_LOCKS_MD" "$EVIDENCE_DIR/source-lock.md"
+  cp "$SOURCE_LOCKS_FILE" "$EVIDENCE_DIR/source-locks.json"
+  chmod 0600 "$EVIDENCE_DIR/source-locks.json"
   chmod 0600 "$EVIDENCE_DIR/source-lock.md"
   write_image_availability
 }
@@ -818,8 +846,13 @@ verify_simulator_image_pin() {
 }
 
 wait_for_build_terminal() {
-  local build_name="$1" phase wait_seconds deadline
-  wait_seconds="${BUILD_STATUS_SYNC_TIMEOUT%s}"
+  local build_name="$1" build_deadline_seconds="$2" phase wait_seconds deadline
+  # Build execution can legitimately take the full build budget. The status
+  # sync timeout is an additional allowance for the Build API to publish its
+  # terminal phase after the original build deadline; it is not a second build
+  # timeout when the log stream exits early.
+  wait_seconds="$((build_deadline_seconds + BUILD_STATUS_SYNC_TIMEOUT_SECONDS - SECONDS))"
+  ((wait_seconds > 0)) || wait_seconds="$BUILD_STATUS_SYNC_TIMEOUT_SECONDS"
   deadline=$((SECONDS + wait_seconds))
   while ((SECONDS <= deadline)); do
     phase="$(oc get build "$build_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
@@ -837,7 +870,7 @@ wait_for_build_terminal() {
 }
 
 build_simulator() {
-  local tag_exists=false last_version build_name oc_bin
+  local tag_exists=false last_version build_name oc_bin phase build_deadline_seconds
   CURRENT_PHASE=simulator-build
   write_build_resources
   oc apply --server-side --dry-run=server --field-manager=grid-llmd-e2e -f "$EVIDENCE_DIR/simulator-imagestream.yaml" -o json >"$EVIDENCE_DIR/imagestream-server-dry-run.json"
@@ -852,27 +885,77 @@ build_simulator() {
       "$EVIDENCE_DIR/simulator-imagestreamtag.json" >/dev/null; then tag_exists=true; fi
   fi
   if [[ "$tag_exists" != true ]]; then
-    log "Starting OpenShift build from immutable source revision $SIMULATOR_SOURCE_REVISION"
-    oc_bin="$(type -P oc)"
-    [[ -n "$oc_bin" ]] || { log 'could not resolve the oc executable for the bounded build command'; return 1; }
-    if timeout --foreground --signal=TERM --kill-after=30s "$BUILD_TIMEOUT" \
-      "$oc_bin" --context="$KUBE_CONTEXT" start-build "buildconfig/$SIMULATOR_BUILD_CONFIG" -n "$NAMESPACE" --follow \
-      >"$EVIDENCE_DIR/build-output.txt" 2>&1; then
-      :
+    last_version="$(oc get buildconfig "$SIMULATOR_BUILD_CONFIG" -n "$NAMESPACE" -o jsonpath='{.status.lastVersion}')"
+    if [[ -n "$last_version" && "$last_version" != 0 ]]; then
+      build_name="$SIMULATOR_BUILD_CONFIG-$last_version"
+      phase="$(oc get build "$build_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [[ "$phase" == New || "$phase" == Pending || "$phase" == Running ]]; then
+        local active_source_revision active_started_at active_started_epoch active_elapsed_seconds active_remaining_seconds
+        active_source_revision="$(oc get build "$build_name" -n "$NAMESPACE" -o json | jq -r '.spec.revision.git.commit // .spec.source.git.ref // empty')"
+        [[ "$active_source_revision" == "$SIMULATOR_SOURCE_REVISION" ]] || {
+          log "an active simulator Build already exists for a different source revision: build=$build_name phase=$phase"
+          return 1
+        }
+        active_started_at="$(oc get build "$build_name" -n "$NAMESPACE" -o jsonpath='{.status.startTimestamp}')"
+        [[ -n "$active_started_at" ]] || active_started_at="$(oc get build "$build_name" -n "$NAMESPACE" -o jsonpath='{.metadata.creationTimestamp}')"
+        active_started_epoch="$(date -u -d "$active_started_at" +%s 2>/dev/null)" || {
+          log "could not parse the active Build start timestamp for $build_name"
+          return 1
+        }
+        active_elapsed_seconds="$(( $(date -u +%s) - active_started_epoch ))"
+        active_remaining_seconds="$((BUILD_TIMEOUT_SECONDS - active_elapsed_seconds))"
+        ((active_remaining_seconds > 0)) || active_remaining_seconds=0
+        build_deadline_seconds=$((SECONDS + active_remaining_seconds))
+        log "Adopting active Build $build_name for the pinned source revision; elapsed=${active_elapsed_seconds}s remaining-build-budget=${active_remaining_seconds}s; will not start a duplicate build"
+      else
+        build_name=""
+      fi
     else
-      local build_status="$?"
-      tail -n 80 "$EVIDENCE_DIR/build-output.txt" >"$EVIDENCE_DIR/build-output-tail.txt" || true
-      log "OpenShift simulator build command failed with exit=$build_status; bounded output is in build-output-tail.txt"
-      return "$build_status"
+      build_name=""
     fi
-    tail -n 40 "$EVIDENCE_DIR/build-output.txt" >"$EVIDENCE_DIR/build-output-tail.txt"
+    if [[ -z "$build_name" ]]; then
+      log "Starting OpenShift build from immutable source revision $SIMULATOR_SOURCE_REVISION"
+      oc_bin="$(type -P oc)"
+      [[ -n "$oc_bin" ]] || { log 'could not resolve the oc executable for the bounded build command'; return 1; }
+      build_deadline_seconds=$((SECONDS + BUILD_TIMEOUT_SECONDS))
+      if timeout --foreground --signal=TERM --kill-after=30s "$BUILD_TIMEOUT" \
+        "$oc_bin" --context="$KUBE_CONTEXT" start-build "buildconfig/$SIMULATOR_BUILD_CONFIG" -n "$NAMESPACE" --follow \
+        >"$EVIDENCE_DIR/build-output.txt" 2>&1; then
+        :
+      else
+        local build_status="$?"
+        tail -n 80 "$EVIDENCE_DIR/build-output.txt" >"$EVIDENCE_DIR/build-output-tail.txt" || true
+        last_version="$(oc get buildconfig "$SIMULATOR_BUILD_CONFIG" -n "$NAMESPACE" -o jsonpath='{.status.lastVersion}')"
+        if [[ -n "$last_version" && "$last_version" != 0 ]]; then
+          build_name="$SIMULATOR_BUILD_CONFIG-$last_version"
+          phase="$(oc get build "$build_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        else
+          phase=""
+        fi
+        case "$phase" in
+          New|Pending|Running)
+            log "OpenShift build-log stream exited with code=$build_status while build phase=$phase; preserve and continue watching $build_name without starting another build"
+            log "bounded build output is in build-output-tail.txt"
+            ;;
+          Complete)
+            log "OpenShift build-log stream exited with code=$build_status after the Build API reported Complete; continue immutable output verification"
+            ;;
+          *)
+            log "OpenShift simulator build command failed with exit=$build_status and Build phase=${phase:-unknown}; bounded output is in build-output-tail.txt"
+            return "$build_status"
+            ;;
+        esac
+      fi
+      tail -n 40 "$EVIDENCE_DIR/build-output.txt" >"$EVIDENCE_DIR/build-output-tail.txt"
+    fi
   else
     log 'Existing source-labelled simulator image matches the pinned revision; build was skipped'
   fi
   last_version="$(oc get buildconfig "$SIMULATOR_BUILD_CONFIG" -n "$NAMESPACE" -o jsonpath='{.status.lastVersion}')"
   [[ -n "$last_version" && "$last_version" != 0 ]] || { log 'BuildConfig has no completed build version'; return 1; }
   build_name="$SIMULATOR_BUILD_CONFIG-$last_version"
-  wait_for_build_terminal "$build_name"
+  [[ -n "${build_deadline_seconds:-}" ]] || build_deadline_seconds="$SECONDS"
+  wait_for_build_terminal "$build_name" "$build_deadline_seconds"
   oc get build "$build_name" -n "$NAMESPACE" -o json | jq '{name:.metadata.name,phase:.status.phase,source:.spec.source,gitCommit:(.spec.revision.git.commit // .spec.source.git.ref // .status.revision.git.commit // ""),output:.status.outputDockerImageReference,outputDigest:.status.output.to.imageDigest,reason:.status.reason,message:.status.message,conditions:.status.conditions}' >"$EVIDENCE_DIR/simulator-build-status.json"
   [[ "$(jq -r '.phase' "$EVIDENCE_DIR/simulator-build-status.json")" == Complete ]] || { log "simulator build $build_name did not complete"; return 1; }
   [[ "$(jq -r '.gitCommit // empty' "$EVIDENCE_DIR/simulator-build-status.json")" == "$SIMULATOR_SOURCE_REVISION" ]] || {

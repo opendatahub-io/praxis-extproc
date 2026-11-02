@@ -49,11 +49,27 @@ Resolve sources once per run with tests/shared/resolve_sources.py. main mode res
 
 Build and push the Grid Gateway, downstream ODH Grid operator, Praxis AI provider proxy, Praxis ExtProc, and EPP images with tests/shared/build_and_push.sh. It verifies the clean source lock before building, applies OCI source/revision/build-context labels, pushes the image, resolves the immutable digest, and verifies the registry manifest. For ExtProc, include the qualification filter feature:
 
+`build_and_push.sh` defaults `DOCKERFILE` to `Containerfile`; set it explicitly for each source repository because their build files have different names and paths:
+
+| Image (`COMPONENT`) | Source lock key (`SOURCE_COMPONENT`) | `DOCKERFILE` |
+|---|---|---|
+| `grid-gateway` | `grid` | `deploy/gateway/Containerfile` |
+| `grid-operator` | `grid-operator` | `deploy/operator/Containerfile` |
+| `praxis-ai` | `praxis-ai` | `Containerfile` |
+| `extproc` | `extproc` | `Containerfile` |
+| `epp` | `epp` | `Dockerfile.epp` |
+
+Pass the relative path through the `DOCKERFILE` environment variable. The llm-d-sim image remains owned by `deploy-serving-pools.sh` and is built through its `SERVING_POOLS_MODE=build` mode.
+
 ~~~text
 EXT_PROC_CARGO_FEATURES=responses,aws-sigv4,store-postgres-cert-auth,k8s-e2e
 ~~~
 
 The k8s-e2e feature is qualification-only and must not be included in release or FIPS images. Record the Containerfile hash, feature list, image digest, architecture, OCI labels, and deployed runtime image IDs. Build llm-d-sim with `SERVING_POOLS_MODE=build` in the run-owned task namespace. That helper creates the owned ImageStream/BuildConfig, checks the locked Git revision and image labels, and records the immutable digest used by both pools. Do not push directly to its ImageStream name before running that helper; an integrated-registry push may create an ImageStream without the run ownership labels. Do not use floating image tags or historical digest defaults as provenance.
+
+Pass both the current run's `SOURCE_LOCKS_MD` and `SOURCE_LOCKS_FILE` to every serving-pool helper invocation. The helper checks each declared simulator, EPP, ExtProc, GitOps, Grid, downstream operator, and MaaS revision against the JSON lock before building, applying, verifying, collecting, or cleaning up; it copies both lock records into the phase evidence. This prevents syntactically valid historical defaults from being recorded as current provenance.
+
+`SIMULATOR_BUILD_TIMEOUT` bounds the source build and log-follow command. The helper also watches the Build API through that same deadline, with `SIMULATOR_BUILD_STATUS_SYNC_TIMEOUT` as a short allowance for the API to publish its terminal phase. If log streaming disconnects while the Build remains active, the helper preserves that Build and watches its status instead of starting a duplicate build. On helper resume, the remaining budget is calculated from the Build API start timestamp rather than reset. A terminal `Complete` Build is still checked against the locked source revision and immutable image metadata before qualification.
 
 Example for one component, with registry auth and trust material kept outside the evidence tree:
 
@@ -93,10 +109,12 @@ Use the existing helpers in this order, supplying fresh source SHAs, chart hashe
 3. Create the task Gateway/HTTPRoute and separate pool Gateways. Require current Accepted, Programmed, and ResolvedRefs=True status and verify the task route targets only the Grid Gateway Service.
 4. Create two independent simulator-backed LLMInferenceService/InferencePool graphs. Require both LLMInferenceServices and EPP Deployments Ready, usable backend Services and EndpointSlices, exactly one Ready pinned simulator per pool, disjoint simulator Pod UIDs, and matching runtime image IDs.
 5. Register two current-generation providers and require authenticated EPP metrics for both pools. Configure scoreFirst, queueDepth, deterministic selection, and a 10 second refresh. Require exactly two candidates and exact agreement between EPP samples, score breakdowns, ranks, Distributed overlay revision, and the revision consumed by the serving Gateway.
-6. Generate/mount the operator-owned Praxis configuration only after provider endpoints exist. Use the source-supported intelligent_route plus mTLS provider_route topology. The mounted router and both pool HTTPRoutes must agree on model/path, trust, candidate identity, and provider attribution before traffic.
+6. Generate the Praxis configuration through Grid only after provider endpoints exist. Use the source-supported intelligent_route plus mTLS provider_route topology. Configure the Gateway chart with `praxisConfig.source: byo`, `praxisConfig.byo.configMapName` pointing to Grid's generated consumer ConfigMap, and `PRAXIS_CONFIG_MAP_EXTERNAL=true`; the chart's operator-source mode cannot mount a routing overlay. In BYO external mode the helper validates Grid ownership and both endpoints, then mounts `grid-overlay-<network>-<gatewayRef>` read-only at `/etc/praxis/routing/routing-overlay.json`. Grid still owns and updates the generated Praxis ConfigMap and overlay. The mounted router and both pool HTTPRoutes must agree on model/path, trust, candidate identity, and provider attribution before traffic.
 7. Deploy the task-owned ExtProc filter and client identity. Require the current Deployment generation and completed rollout, exactly one active Ready Pod, pinned runtime image ID, verified Gateway TLS/SNI, and ExtProc attachment.
 
 Relevant helpers are cold-deploy.sh, deploy-grid-operator.sh, configure-grid-site-endpoint.sh, deploy-gateway-path.sh, deploy-pool-gateways.sh, deploy-serving-pools.sh, deploy-grid-providers.sh, deploy-extproc-filter.sh, and deploy-grid-client-identity.sh. Each helper supports a non-mutating plan mode where applicable; render/server-side dry-run before Helm apply.
+
+When delegated mount reconciliation is enabled for a BYO-configured Gateway that already mounts Grid TLS Secrets through Helm, set `GRID_PRAXIS_TLS_CERT_MOUNT_PATH` to a normalized absolute path outside the Helm-owned mount paths (for example `/run/secrets/grid-client-tls`). This lets Grid stage its TLS projection without claiming a Helm-owned mount; keep Helm mounts until the Grid mount status is Ready, then use the documented `releaseHelmMounts` handoff.
 
 The required deployment order is to apply both serving pools, register and verify both providers, then run inference qualification. With the run-specific environment above already exported, the exact helper entry points are:
 
@@ -112,6 +130,10 @@ cargo run --locked -p xtask -- e2e grid-llmd --mode run --qualification-scope ro
 
 Run cargo run --locked -p xtask -- e2e grid-llmd --mode preflight first, with the live resources and evidence inputs below. Do not run a baseline until preflight proves all pool, provider, score, overlay, Gateway revision, route, mTLS, attribution, ExtProc, retry, simulator request-ID, and TLS contracts in the current generation.
 
+For the native LLMInferenceService pool topology, the default request path is `/publishers/<namespace>/models/<model>/v1/chat/completions`; the runner derives it from `GRID_LLMD_NAMESPACE` and `GRID_LLMD_MODEL`. This is the path accepted by both pool HTTPRoutes and rewritten to `/v1/chat/completions` for llm-d-sim. Set `GRID_LLMD_GATEWAY_PATH` only when qualifying a different explicitly supported route. The task Gateway HTTPRoute still matches the public hostname and path prefix.
+
+Use `GRID_LLMD_GRID_GATEWAY_SERVICE` in `namespace/service/name` form. Pool model and backend mappings are keyed by the exact InferencePool resource names, for example `pool-a-inference-pool=task-namespace/llminferenceservice/pool-a` and `pool-a-inference-pool=task-namespace/service/pool-a-kserve-workload-svc`. Use `#exists` for InferencePool gates when that API does not publish a Ready condition; the corresponding LLMInferenceService and serving graph readiness checks remain required.
+
 Then run with --require-signal-transition and both pressure and recovery hooks. The runner derives the expected baseline pool from the current rank-1 candidate; it does not assume Pool A wins. If the overlay ranks Pool B first, the baseline expectation is Pool B and the pressure signal targets that pool. The pressure overlay must rank the other pool first.
 
 A baseline passes only with all of the following in one request:
@@ -119,12 +141,12 @@ A baseline passes only with all of the following in one request:
 - HTTP 200, a unique request ID, no retry, and the selected pool matching live overlay rank.
 - ExtProc response marker and request-body SHA-256 oracle matching the exact serialized request.
 - Trusted provider/backend attribution and the expected simulator response identity.
-- The runner keeps the unique client request ID and records the response `x-request-id` separately. Envoy may replace the client ID; the pinned simulator's `Finished processing request` log must match the backend-visible response ID. Raw simulator logs are not persisted.
+- The runner keeps the unique client request ID and records a response `x-request-id` separately when Envoy returns one. A local ExtProc failure may have no response ID; in that case the client request ID is the correlation basis, and the hook must still prove an observed ExtProc failure and zero backend receipts. For successful traffic, the pinned simulator's `Finished processing request` log must match the backend-visible response ID. Raw simulator logs are not persisted.
 - Gateway upstream request evidence and exact Grid/Gateway revision evidence.
 
-After baseline passes, the pressure hook changes only the selected simulator’s supported /admin/config signal through the run-owned control ConfigMap. Require simulator control, authenticated EPP sample, score/rank reversal, a new Distributed overlay, Gateway consumption, and an independent receipt from the other pool. Recovery restores the original metric/control and proves the same chain returns to the baseline-ranked pool. Run ExtProc failure-closed last; require a correlated 5xx and zero backend receipts, then verify ExtProc recovery.
+After baseline passes, the pressure hook changes only the selected simulator’s supported /admin/config signal through the run-owned control ConfigMap. Require simulator control, authenticated EPP sample, score/rank reversal, a new Distributed overlay, Gateway consumption, and an independent receipt from the other pool. Recovery restores the original metric/control and proves the same chain returns to the baseline-ranked pool. Run ExtProc failure-closed after recovery; require a correlated 5xx and zero backend receipts. Restore the original ExtProc replica state, then send a distinct successful request and verify the ExtProc oracles, baseline-ranked pool attribution, and an independent simulator completion receipt.
 
-A failed baseline stops before pressure. The runner captures diagnostics before cleanup. A run is PASS only when baseline, pressure reroute, recovery, and failure-closed all pass in the same run. An HTTP 200 without simulator receipt, attribution, ExtProc proof, or matching rank is a failure. The failure-closed hook writes into a fresh `failure-closed/` child of the runner evidence directory. It records the unique client request ID and returned Envoy `x-request-id` separately because Envoy can replace the client value.
+A failed baseline stops before pressure. The runner captures diagnostics before cleanup. A run is PASS only when baseline, pressure reroute, recovery, failure-closed, and post-restoration success all pass in the same run. An HTTP 200 without simulator receipt, attribution, ExtProc proof, or matching rank is a failure. The failure-closed hook writes into a fresh `failure-closed/` child of the runner evidence directory. It records the unique client request ID, an optional Envoy `x-request-id`, and which value established correlation.
 
 ## xtask configuration
 
@@ -155,8 +177,8 @@ Set the remaining GRID_LLMD_* values from the live resource inventory and run lo
 
 Each run writes a new private evidence directory with the source/image locks, sanitized invocations, phase/check report, score/metric samples, Grid overlay and Gateway revisions, resource snapshots, simulator receipt summaries, and failure classification. Do not copy kubeconfigs, registry auth, Secret values, private keys, raw credentials, or unredacted logs into evidence.
 
-On failure, preserve diagnostics, then remove only resources labeled with the current run ID. Restore the original DSCI field and any temporary registry route on the same resource UID and verify restoration. Keep shared RHOAI/MaaS components intact. Do not run destructive namespace cleanup without a current run ownership check.
+On failure, preserve diagnostics, then remove only resources labeled with the current run ID. Remove provider CRs before serving pools so provider cleanup does not depend on already-deleted pool snapshots. Then delete the task GridNetwork and wait for the operator's SWIM withdrawal finalizer to complete while the operator is still Ready. Delete the GridSite after the network is gone; uninstall the Helm release only after the withdrawal receipt is captured. Use `cleanup-grid-operator.sh` for this ordered cleanup. It checks provider references, run ownership, object UIDs, the operator image digest/readiness, and the operator withdrawal log; it never strips finalizers. It retains a separate UID-preconditioned DeleteOptions file for each API delete. Remove the task namespace only after checking its run label and UID. Restore the original DSCI field and any temporary registry route on the same resource UID and verify restoration. Keep shared RHOAI/MaaS components intact. Do not run destructive namespace cleanup without a current run ownership check. Provider cleanup mode must remain usable after pool resources have been removed.
 
-For nightlies, provision an OpenShift/RHOAI cluster externally and run the existing-cluster path on a self-hosted GitHub Actions runner with the required CLI tools, source access, registry credentials, API context, and TLS trust. Keep the optional cold bootstrap in a separate workflow/job. Request volume is bounded: one baseline request, one post-pressure reroute request, one recovery request, and one failure-closed request. This is functional qualification, not a performance benchmark.
+For nightlies, provision an OpenShift/RHOAI cluster externally and run the existing-cluster path on a self-hosted GitHub Actions runner with the required CLI tools, source access, registry credentials, API context, and TLS trust. Keep the optional cold bootstrap in a separate workflow/job. Request volume is bounded to five inference requests: baseline, post-pressure reroute, recovery, failure-closed, and post-restoration success. This is functional qualification, not a performance benchmark.
 
 Known limits: routing-smoke does not qualify Enrollment; synthetic queue/KV pressure is simulator-reported and is not real GPU saturation; the harness proves only the declared HTTP routes, providers, overlays, and ExtProc hops; TLS streaming/idle scenarios are not claimed unless explicitly run.

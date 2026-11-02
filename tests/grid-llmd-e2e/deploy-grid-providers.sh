@@ -787,7 +787,10 @@ case "$MODE" in
     write_result PASS 'both task providers are current-generation Available; authenticated EPP metrics match both Distributed overlay queue-depth scores'
     ;;
   cleanup)
-    write_source_lock
+    # Cleanup may run after the serving-pool helper has removed its
+    # InferencePools. The provider source lock needs those live pool objects
+    # and rendered manifests, so cleanup relies on the invocation and CRD
+    # snapshots captured above instead of regenerating an apply-time lock.
     cleanup_task_providers
     write_result CLEANED 'only run-owned InferenceProvider objects were removed; shared Grid/operator resources were preserved'
     ;;

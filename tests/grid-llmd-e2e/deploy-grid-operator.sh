@@ -37,6 +37,7 @@ GRID_GATEWAY_DISCOVERY_ENABLED="${GRID_GATEWAY_DISCOVERY_ENABLED:-false}"
 GRID_PRAXIS_CONFIG_GENERATE="${GRID_PRAXIS_CONFIG_GENERATE:-false}"
 GRID_PRAXIS_CONFIG_MAP_NAME="${GRID_PRAXIS_CONFIG_MAP_NAME:-grid-llmd-praxis-config}"
 GRID_PRAXIS_CONFIG_LISTENER_PORT="${GRID_PRAXIS_CONFIG_LISTENER_PORT:-8080}"
+GRID_PRAXIS_TLS_CERT_MOUNT_PATH="${GRID_PRAXIS_TLS_CERT_MOUNT_PATH:-}"
 GRID_PRAXIS_CLUSTER_ENDPOINTS_FILE="${GRID_PRAXIS_CLUSTER_ENDPOINTS_FILE:-}"
 GRID_PROVIDER_HOP_ENDPOINTS_FILE="${GRID_PROVIDER_HOP_ENDPOINTS_FILE:-}"
 GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION="${GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION:-false}"
@@ -258,6 +259,17 @@ fi
   printf 'GRID_PRAXIS_SITE_ROUTER must be intelligentRoute or gridSiteRoute\n' >&2
   capture_failure 2
 }
+if [[ -n "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" ]]; then
+  [[ "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" =~ ^/[A-Za-z0-9._/-]+$ &&
+     "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" != / &&
+     "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" != */ &&
+     "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" != *//* &&
+     ! "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" =~ (^|/)\.\.?(/|$) ]] || {
+    CURRENT_FAILURE='GRID_PRAXIS_TLS_CERT_MOUNT_PATH must be a normalized absolute path without traversal; no cluster mutation was attempted'
+    printf 'GRID_PRAXIS_TLS_CERT_MOUNT_PATH must be a normalized absolute path without traversal\n' >&2
+    capture_failure 2
+  }
+fi
 if [[ "$GRID_PRAXIS_SITE_ROUTER" == gridSiteRoute ]]; then
   if [[ "$GRID_PRAXIS_CONFIG_GENERATE" == true && "$GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION" != true ]]; then
     CURRENT_FAILURE='generated gridSiteRoute config requires mount reconciliation; no cluster mutation was attempted'
@@ -359,6 +371,11 @@ gateway:
     siteRouter: $GRID_PRAXIS_SITE_ROUTER
     clusterEndpoints: $GRID_PRAXIS_CLUSTER_ENDPOINTS_JSON
 YAML
+  if [[ -n "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH" ]]; then
+    cat >>"$EVIDENCE_DIR/operator-values.yaml" <<YAML
+    tlsCertMountPath: "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH"
+YAML
+  fi
   if [[ "$GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION" == true ]]; then
     cat >>"$EVIDENCE_DIR/operator-values.yaml" <<YAML
     mountReconciliation:
@@ -540,6 +557,7 @@ cat >"$EVIDENCE_DIR/INVOCATION.md" <<EOF
 - Grid Praxis mount reconciliation: $GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION ($GRID_PRAXIS_CONFIG_DEPLOYMENT_NAME/$GRID_PRAXIS_CONFIG_CONTAINER_NAME)
 - GridNetwork TLS Secret namespace: ${GRID_TLS_SECRET_NAMESPACE:-chart default ($RELEASE_NAMESPACE)}
 - Grid Praxis site router: $GRID_PRAXIS_SITE_ROUTER
+- Grid Praxis TLS certificate mount path: ${GRID_PRAXIS_TLS_CERT_MOUNT_PATH:-chart/operator default}
 - Praxis cluster endpoint inventory: $([[ "$GRID_PRAXIS_CONFIG_GENERATE" == true ]] && printf '%s entries' "$(jq 'length' "$EVIDENCE_DIR/operator-cluster-endpoints.json")" || printf deferred)
 - Generated Praxis ConfigMap: $([[ "$GRID_PRAXIS_CONFIG_GENERATE" == true ]] && printf '%s/%s:%s' "$GRID_GATEWAY_NAMESPACE" "$GRID_PRAXIS_CONFIG_MAP_NAME" "$GRID_PRAXIS_CONFIG_LISTENER_PORT" || printf disabled)
 - Grid SWIM key Secret reference: ${GRID_SWIM_KEY_SECRET_NAME:-omitted for single-site dev topology}

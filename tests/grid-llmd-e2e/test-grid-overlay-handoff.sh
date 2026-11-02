@@ -21,6 +21,9 @@ required_operator = (
     'generate: true',
     'clusterEndpoints:',
     'mountReconciliation:',
+    'GRID_PRAXIS_TLS_CERT_MOUNT_PATH="${GRID_PRAXIS_TLS_CERT_MOUNT_PATH:-}"',
+    'tlsCertMountPath: "$GRID_PRAXIS_TLS_CERT_MOUNT_PATH"',
+    'GRID_PRAXIS_TLS_CERT_MOUNT_PATH must be a normalized absolute path without traversal',
     '.phase=="Rendered" and .observedGeneration==$generation',
     '.phase=="Ready" and .deploymentGeneration==$generation',
     'grid.praxis-proxy.io/mount-reconciliation"]=="enabled"',
@@ -72,9 +75,13 @@ required_gateway = (
     'grid-overlay-status-before.json',
     'grid-overlay-configmap-summary.json',
     'if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then',
-    'operator Praxis source owns the generated config and overlay mount; do not set BYO config or overlay inputs',
+    'active_configmap_name="$PRAXIS_CONFIG_MAP_NAME"',
+    'configured-praxis-base-configmap-metadata.json',
+    'usesDoubleBufferedGridSlot',
+    'operator Praxis source does not support the external BYO overlay mount',
+    'external Grid-generated Praxis config requires BYO source, config and overlay map names',
     '(.metadata.labels["app.kubernetes.io/managed-by"]=="grid-operator" and',
-    'external Praxis ConfigMap is not owned by this run or the matching task GridNetwork',
+    'configured Praxis ConfigMap is not owned by this run or the matching task GridNetwork',
 )
 missing = [item for item in required_gateway if item not in gateway]
 if missing:
