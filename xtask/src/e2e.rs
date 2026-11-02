@@ -42,7 +42,6 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 const REPORT_SCHEMA: &str = "praxis-extproc.grid-llmd-e2e/v1";
-const DEFAULT_GATEWAY_PATH: &str = "/v1/chat/completions";
 const DEFAULT_PROMPT: &str = "grid-llmd-extproc-e2e";
 const GATEWAY_REVISION_HOOK_TIMEOUT_CAP_SECONDS: u64 = 60;
 const DEFAULT_PROVIDER_HEADER: &str = "x-grid-llmd-provider-gateway";
@@ -253,8 +252,9 @@ struct GridLlmdArgs {
     #[arg(long, env = "GRID_LLMD_GRID_GATEWAY_SERVICE")]
     grid_gateway_service: Option<String>,
 
-    /// Relative inference path appended to `--gateway-url`.
-    #[arg(long, env = "GRID_LLMD_GATEWAY_PATH", default_value = DEFAULT_GATEWAY_PATH)]
+    /// Inference path appended to `--gateway-url`. Defaults to the canonical
+    /// publisher path for this namespace and model.
+    #[arg(long, env = "GRID_LLMD_GATEWAY_PATH", default_value = "")]
     gateway_path: String,
 
     /// Model sent in the deterministic llm-d-sim request body.
@@ -892,11 +892,15 @@ struct ExtProcFailureClosedReport {
     task_owned: bool,
     resource: String,
     request_id: String,
-    response_request_id: String,
+    client_request_id: String,
+    response_request_id: Option<String>,
+    correlation_basis: String,
     request_status_code: u16,
     extproc_failure_observed: bool,
     failure_closed: bool,
     backend_request_count: u64,
+    simulator_completion_receipt_count: u64,
+    simulator_logs_read: bool,
 }
 
 /// Read-only proof of a topology-specific provider's effective TLS transport.
@@ -1246,7 +1250,7 @@ impl Report {
             auth_header: args.auth_header.clone(),
             model: args.model.clone(),
             model_header: args.model_header.clone(),
-            gateway_path: args.gateway_path.clone(),
+            gateway_path: gateway_request_path(args),
             provider_trust_configured: args.provider_trust.is_some(),
             provider_transport_verified: false,
             extproc_failure_closed_requested: args.extproc_failure_closed_hook.is_some(),
@@ -2003,15 +2007,78 @@ fn run_probes(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path) -> 
         );
         Err("failure-closed probe skipped because recovery failed".to_owned())
     };
-    match (pressure_result, recovery_result, failure_closed_result) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Err(pressure), Ok(()), Ok(())) => Err(pressure),
-        (Err(pressure), Ok(()), Err(failure_closed)) => Err(format!("{pressure}; {failure_closed}")),
-        (Ok(()), Err(recovery), _) => Err(format!("pressure was qualified but recovery failed: {recovery}")),
-        (Err(pressure), Err(recovery), _) => Err(format!("{pressure}; recovery also failed: {recovery}")),
-        (Ok(()), Ok(()), Err(failure_closed)) => {
+    let restoration_result = if failure_closed_result.is_ok() {
+        run_extproc_restoration_probe(args, report, evidence_dir, &baseline)
+    } else {
+        add_blocked_check(
+            report,
+            "extproc/restoration-success",
+            "post-failure success probe was skipped because the fail-closed hook or its restoration check failed",
+        );
+        Err("post-failure success probe skipped because fail-closed qualification did not pass".to_owned())
+    };
+    match (
+        pressure_result,
+        recovery_result,
+        failure_closed_result,
+        restoration_result,
+    ) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(pressure), Ok(()), Ok(()), Ok(())) => Err(pressure),
+        (Err(pressure), Ok(()), Err(failure_closed), _) => Err(format!("{pressure}; {failure_closed}")),
+        (Err(pressure), Ok(()), Ok(()), Err(restoration)) => Err(format!("{pressure}; {restoration}")),
+        (Ok(()), Err(recovery), ..) => Err(format!("pressure was qualified but recovery failed: {recovery}")),
+        (Err(pressure), Err(recovery), ..) => Err(format!("{pressure}; recovery also failed: {recovery}")),
+        (Ok(()), Ok(()), Err(failure_closed), _) => {
             Err(format!("signal transition and recovery passed; {failure_closed}"))
         },
+        (Ok(()), Ok(()), Ok(()), Err(restoration)) => Err(format!(
+            "signal transition, recovery, and failure-closed passed; {restoration}"
+        )),
+    }
+}
+
+fn run_extproc_restoration_probe(
+    args: &GridLlmdArgs,
+    report: &mut Report,
+    evidence_dir: &Path,
+    baseline: &Probe,
+) -> Result<(), String> {
+    let phase = "post-failure-restoration";
+    let grid = observe_grid_revision(args, report, evidence_dir, phase)?;
+    if !grid_revision_is_distributed(&grid) {
+        add_blocked_check(
+            report,
+            "extproc/restoration-grid-revision",
+            "post-failure Grid overlay is not Distributed at the current generation",
+        );
+        return Err("post-failure Grid overlay is not Distributed".to_owned());
+    }
+    wait_for_gateway_revision(args, report, evidence_dir, &grid, phase)?;
+    if !check_baseline_score_overlay_contract(args, report, evidence_dir, &grid, phase)? {
+        add_blocked_check(
+            report,
+            "extproc/restoration-score-overlay-contract",
+            "post-failure EPP samples do not match the Distributed overlay consumed by the Gateway",
+        );
+        return Err("post-failure score/overlay/Gateway contract did not pass".to_owned());
+    }
+    let restored = run_probe(args, report, evidence_dir, phase)?;
+    verify_pool_attribution(args, report, baseline, &restored, phase);
+    let passed = restored.passed && restored.expected_pool == baseline.expected_pool;
+    record_boolean_check(
+        report,
+        "extproc/restoration-success",
+        passed,
+        format!(
+            "post-failure request status={:?}, expected pool={}, baseline pool={}, ExtProc/body/attribution/receipt/retry oracles passed={}",
+            restored.status_code, restored.expected_pool, baseline.expected_pool, restored.passed
+        ),
+    );
+    if passed {
+        Ok(())
+    } else {
+        Err("post-failure request did not prove attributed, receipt-matched ExtProc success at the recovered baseline pool".to_owned())
     }
 }
 
@@ -2037,17 +2104,25 @@ fn run_extproc_failure_closed_test(
         && result.task_owned
         && resource.namespace == args.namespace
         && !result.request_id.is_empty()
-        && !result.response_request_id.is_empty()
+        && result.client_request_id == result.request_id
+        && result.correlation_basis
+            == if result.response_request_id.is_some() {
+                "client-and-response-request-id"
+            } else {
+                "client-request-id"
+            }
         && result.request_status_code >= 500
         && result.extproc_failure_observed
         && result.failure_closed
-        && result.backend_request_count == 0;
+        && result.backend_request_count == 0
+        && result.simulator_completion_receipt_count == 0
+        && result.simulator_logs_read;
     record_boolean_check(
         report,
         "extproc/failure-closed",
         passed,
         format!(
-            "task-owned resource={}/{}/{}, status={}, ExtProc failure observed={}, fail-closed={}, backend receipts={}, hook API CA verified={}, runner API mode={}",
+            "task-owned resource={}/{}/{}, status={}, ExtProc failure observed={}, fail-closed={}, backend requests={}, simulator receipts={}, simulator logs read={}, hook API CA verified={}, runner API mode={}",
             resource.namespace,
             resource.kind,
             resource.name,
@@ -2055,6 +2130,8 @@ fn run_extproc_failure_closed_test(
             result.extproc_failure_observed,
             result.failure_closed,
             result.backend_request_count,
+            result.simulator_completion_receipt_count,
+            result.simulator_logs_read,
             result.api_ca_verified,
             report.api_tls_mode
         ),
@@ -2066,11 +2143,15 @@ fn run_extproc_failure_closed_test(
             "taskOwned": result.task_owned,
             "resource": format!("{}/{}/{}", resource.namespace, resource.kind, resource.name),
             "requestId": result.request_id,
+            "clientRequestId": result.client_request_id,
             "responseRequestId": result.response_request_id,
+            "correlationBasis": result.correlation_basis,
             "requestStatusCode": result.request_status_code,
             "extprocFailureObserved": result.extproc_failure_observed,
             "failureClosed": result.failure_closed,
             "backendRequestCount": result.backend_request_count,
+            "simulatorCompletionReceiptCount": result.simulator_completion_receipt_count,
+            "simulatorLogsRead": result.simulator_logs_read,
         });
         write_json_private(&evidence_dir.join("extproc-failure-closed.json"), &safe)?;
         Ok(())
@@ -2319,6 +2400,20 @@ fn validate_run_inputs(args: &GridLlmdArgs, report: &mut Report) {
         },
         observed_epoch_seconds: epoch_seconds(),
     });
+}
+
+fn gateway_request_path(args: &GridLlmdArgs) -> String {
+    if !args.gateway_path.is_empty() {
+        return args.gateway_path.clone();
+    }
+    if args.namespace.is_empty() || args.model.is_empty() {
+        return "/publishers/<namespace>/models/<model>/v1/chat/completions".to_owned();
+    }
+    default_gateway_request_path(&args.namespace, &args.model)
+}
+
+fn default_gateway_request_path(namespace: &str, model: &str) -> String {
+    format!("/publishers/{namespace}/models/{model}/v1/chat/completions")
 }
 
 fn validate_ipp_inputs(args: &GridLlmdArgs, missing: &mut Vec<&'static str>) {
@@ -5992,7 +6087,8 @@ fn check_external_model_route(
     }
     let route_json = parse_capture_json(&route, "HTTPRoute")?;
     let ready = http_route_accepted_for(&route_json, &expected_gateway.name, &expected_gateway.namespace);
-    let path_matches = route_matches_request_path(&route_json, &args.gateway_path);
+    let request_path = gateway_request_path(args);
+    let path_matches = route_matches_request_path(&route_json, &request_path);
     let host_matches = route_matches_request_host(&route_json, args.gateway_url.as_deref());
     let backend_present = route_json["spec"]["rules"].as_array().is_some_and(|rules| {
         rules
@@ -6033,7 +6129,7 @@ fn check_grid_gateway_route(
     }
     let service_ref = parse_resource_ref(service_raw, &args.namespace)?;
     if !is_resource_kind(&service_ref.kind, &["service", "services", "svc"]) {
-        return Err("--grid-gateway-service must identify a Service".to_owned());
+        return Err("--grid-gateway-service must identify a Service as [namespace/]service/<name>".to_owned());
     }
     let gateway_ref = gate_resource_ref(args, "gateway")?;
     if !is_resource_kind(&gateway_ref.kind, &["gateway", "gateways"]) {
@@ -6066,7 +6162,8 @@ fn check_grid_gateway_route(
             route_ref.namespace, route_ref.name, gateway_ref.namespace, gateway_ref.name
         ),
     );
-    let path_matches = route_matches_request_path(&route, &args.gateway_path);
+    let request_path = gateway_request_path(args);
+    let path_matches = route_matches_request_path(&route, &request_path);
     if let Some(gateway_url) = args.gateway_url.as_deref() {
         let host_matches = route_matches_request_host(&route, Some(gateway_url));
         record_boolean_check(
@@ -6112,7 +6209,7 @@ fn check_grid_gateway_route(
         && service["spec"]["ports"]
             .as_array()
             .is_some_and(|ports| !ports.is_empty());
-    let backend_matches = route_targets_only_service(&route, &args.gateway_path, &service_ref);
+    let backend_matches = route_targets_only_service(&route, &request_path, &service_ref);
     record_boolean_check(
         report,
         "grid-gateway/backend-service",
@@ -6122,7 +6219,7 @@ fn check_grid_gateway_route(
             service_ref.namespace, service_ref.name
         ),
     );
-    let backend_ports_match = route_backend_ports_exist(&route, &args.gateway_path, &service);
+    let backend_ports_match = route_backend_ports_exist(&route, &request_path, &service);
     record_boolean_check(
         report,
         "grid-gateway/backend-service-port",
@@ -7140,7 +7237,7 @@ fn check_pool_route_contract(
         "--model-header".to_owned(),
         args.model_header.clone(),
         "--request-path".to_owned(),
-        args.gateway_path.clone(),
+        gateway_request_path(args),
         "--evidence-dir".to_owned(),
         evidence_dir.display().to_string(),
     ];
@@ -8106,7 +8203,7 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
     let url = format!(
         "{}/{}",
         gateway_url.trim_end_matches('/'),
-        args.gateway_path.trim_start_matches('/')
+        gateway_request_path(args).trim_start_matches('/')
     );
     let request_path = evidence_dir.join(format!("request-{phase}.json"));
     let headers_path = evidence_dir.join(format!("response-{phase}.headers"));
@@ -9156,6 +9253,34 @@ mod tests {
     }
 
     #[test]
+    fn failure_closed_report_accepts_a_local_5xx_without_response_request_id() {
+        let report: ExtProcFailureClosedReport = serde_json::from_value(serde_json::json!({
+            "schema": "praxis-extproc.grid-llmd-failure-closed/v1",
+            "apiCaVerified": false,
+            "taskOwned": true,
+            "resource": "grid-task/deployment/praxis-extproc",
+            "requestId": "client-request-123",
+            "clientRequestId": "client-request-123",
+            "responseRequestId": null,
+            "correlationBasis": "client-request-id",
+            "requestStatusCode": 500,
+            "extprocFailureObserved": true,
+            "failureClosed": true,
+            "backendRequestCount": 0,
+            "simulatorCompletionReceiptCount": 0,
+            "simulatorLogsRead": true
+        }))
+        .expect("hook report with a correlated client request ID should deserialize");
+
+        assert_eq!(report.client_request_id, report.request_id);
+        assert_eq!(report.response_request_id, None);
+        assert_eq!(report.correlation_basis, "client-request-id");
+        assert!(report.failure_closed);
+        assert_eq!(report.simulator_completion_receipt_count, 0);
+        assert!(report.simulator_logs_read);
+    }
+
+    #[test]
     fn baseline_pool_is_derived_from_the_lowest_overlay_rank() {
         assert_eq!(
             selected_pool_from_ranks(["pool-a", "pool-b"], [Some(2), Some(1)]).as_deref(),
@@ -9444,6 +9569,14 @@ mod tests {
             "https://grid-llmd-site.grid.internal",
             "grid-llmd-site.grid.internal:443:gateway.example.com:443:extra"
         ));
+    }
+
+    #[test]
+    fn default_gateway_request_path_uses_the_native_publisher_route() {
+        assert_eq!(
+            default_gateway_request_path("grid-task", "grid-test-model"),
+            "/publishers/grid-task/models/grid-test-model/v1/chat/completions"
+        );
     }
 
     #[test]

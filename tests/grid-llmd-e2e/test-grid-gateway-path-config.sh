@@ -34,6 +34,12 @@ checks = (
     'EXPECTED_ENDPOINTS_FILE="${GRID_GATEWAY_EXPECTED_ENDPOINTS_FILE:-}"',
     'validate-generated-praxis-config.py',
     'external-praxis-config-validation.json',
+    'configured-praxis-base-configmap-metadata.json',
+    'active_configmap_name="$PRAXIS_CONFIG_MAP_NAME"',
+    'select(.name=="config")',
+    'grid-consumer-config-*',
+    'usesDoubleBufferedGridSlot',
+    'active double-buffered Praxis ConfigMap is not owned by the matching task GridNetwork and Gateway',
     'expectedEndpointInventorySha256:$endpointsSha',
     'OVERLAY_CONFIGMAP="${GRID_GATEWAY_OVERLAY_CONFIGMAP:-}"',
     'flavor: grid-gateway',
@@ -42,19 +48,23 @@ checks = (
     'mountReconciliation:',
     'releaseHelmMounts: $RELEASE_HELM_MOUNTS',
     'source: operator',
-    'operator Praxis source owns the generated config and overlay mount; do not set BYO config or overlay inputs',
+    'operator Praxis source does not support the external BYO overlay mount',
     'GridNetwork has no current Distributed overlay or explicitly allowed retained overlay for the task Gateway',
     'grid-overlay-status-before.json',
     'grid-overlay-configmap-summary.json',
     'configMapName: "$OVERLAY_CONFIGMAP"',
     'if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then',
-    'external Praxis ConfigMap is not owned by this run or the matching task GridNetwork',
+    'configured Praxis ConfigMap is not owned by this run or the matching task GridNetwork',
     'Grid-generated Praxis ConfigMap failed overlay, reload, endpoint, or credential-field validation',
     'if [[ -n "$PRAXIS_CONFIG_FILE" && "$PRAXIS_CONFIG_MAP_EXTERNAL" == false ]]',
     'Rendered Gateway Deployment does not mount the configured task Grid overlay ConfigMap',
     'mountPath: "/etc/praxis/routing"',
     'Grid operator-generated consumer config',
-    'operator-generated-overlay-aware',
+    'operator-generated-config-no-overlay',
+    'grid-generated-external-bootstrap',
+    'then "bootstrap-only"',
+    'expected_bootstrap_sha="$(sha256sum "$BOOTSTRAP_CONFIG_FILE" | awk \'{print $1}\')"',
+    'observed_config_sha="$(jq -j -er \'.data["praxis.yaml"]\' <<<"$external_configmap_json" | sha256sum | awk \'{print $1}\')"',
     "grep -Fq '/etc/praxis/routing/routing-overlay.json' \"$PRAXIS_CONFIG_FILE\"",
     'BYO_MOUNT_RECONCILIATION_VALUES="$(cat <<YAML',
     'if [[ "$CONFIG_SOURCE" == byo && "$MOUNT_RECONCILIATION_ENABLED" == true ]]',
@@ -88,6 +98,8 @@ byo_start = source.index('else\ncat >"$EVIDENCE_DIR/gateway-values.yaml"')
 byo_end = source.index("fi\n\nhelm template", byo_start)
 byo_values = source[byo_start:byo_end]
 for value in (
+    'source: byo',
+    'configMapName: "$praxis_config_map_name"',
     'configMapName: "$OVERLAY_CONFIGMAP"',
     'sidecar:\n    enabled: false',
     '$BYO_MOUNT_RECONCILIATION_VALUES',
@@ -140,8 +152,8 @@ for value in (
     if value not in operator_values:
         print(f"operator config must preserve the supported operator handoff: {value!r}", file=sys.stderr)
         raise SystemExit(1)
-if 'configMapName: "$OVERLAY_CONFIGMAP"' in operator_values or 'sidecar:' in operator_values:
-    print("the Helm operator source mode does not support a direct overlay mount", file=sys.stderr)
+if 'overlay:' in operator_values:
+    print("operator-source Gateway values must leave the overlay mount to supported BYO external mode", file=sys.stderr)
     raise SystemExit(1)
 if 'if [[ -n "$OVERLAY_CONFIGMAP" ]]' not in source:
     print("the direct overlay preflight must verify the current operator-distributed ConfigMap", file=sys.stderr)

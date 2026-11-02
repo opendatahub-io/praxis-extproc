@@ -6,9 +6,22 @@ import unittest
 
 
 SCRIPT = Path(__file__).with_name("build_and_push.sh").read_text(encoding="utf-8")
+README = (Path(__file__).parents[1] / "grid-llmd-e2e" / "README.md").read_text(encoding="utf-8")
 
 
 class BuildAndPushTests(unittest.TestCase):
+    def test_e2e_docs_map_each_component_to_its_source_containerfile(self) -> None:
+        self.assertIn("defaults `DOCKERFILE` to `Containerfile`", README)
+        for row in (
+            "| `grid-gateway` | `grid` | `deploy/gateway/Containerfile` |",
+            "| `grid-operator` | `grid-operator` | `deploy/operator/Containerfile` |",
+            "| `praxis-ai` | `praxis-ai` | `Containerfile` |",
+            "| `extproc` | `extproc` | `Containerfile` |",
+            "| `epp` | `epp` | `Dockerfile.epp` |",
+        ):
+            with self.subTest(row=row):
+                self.assertIn(row, README)
+
     def test_registry_tls_is_secure_by_default_and_dev_bypass_is_explicit(self) -> None:
         self.assertIn('IMAGE_PUSH_TLS_VERIFY="${IMAGE_PUSH_TLS_VERIFY:-true}"', SCRIPT)
         self.assertIn('[[ "$CLUSTER_ENV" == ephemeral-dev && "$ALLOW_INSECURE_IMAGE_PUSH" == true ]]', SCRIPT)

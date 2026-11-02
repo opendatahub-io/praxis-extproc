@@ -241,6 +241,14 @@ positions = [apply_case.index(item) if item in apply_case else -1 for item in or
 if any(position < 0 for position in positions) or positions != sorted(positions):
     raise SystemExit("provider registration/readiness/overlay phases are not ordered safely")
 
+cleanup_start = providers.index('  cleanup)\n', providers.index('case "$MODE" in\n  apply|verify)'))
+cleanup_end = providers.index('\n    ;;', cleanup_start)
+cleanup_case = providers[cleanup_start:cleanup_end]
+if 'write_source_lock' in cleanup_case:
+    raise SystemExit("provider cleanup must not require serving-pool snapshots that cleanup may already have removed")
+if 'cleanup_task_providers' not in cleanup_case:
+    raise SystemExit("provider cleanup no longer removes only run-owned provider resources")
+
 serving_case = serving.index('case "$MODE" in\n  collect)')
 serving_apply_start = serving.index('  apply)\n', serving_case)
 serving_apply_end = serving.index('  verify)\n', serving_apply_start)

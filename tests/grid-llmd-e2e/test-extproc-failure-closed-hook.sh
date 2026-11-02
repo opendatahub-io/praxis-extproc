@@ -29,8 +29,10 @@ required = {
     "restoration trap": 'trap cleanup EXIT',
     "unique correlated request": '--header "x-request-id: $REQUEST_ID"',
     "response Envoy request ID is retained": '--arg responseRequestId "$RESPONSE_REQUEST_ID"',
-    "response request ID validation": '[[ "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]',
+    "response request ID is validated when present": 'if [[ -n "$RESPONSE_REQUEST_ID" && ! "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then',
     "request and response correlation IDs captured": 'request-correlation.json',
+    "client request ID remains a valid correlation key": 'correlationBasis:(if $hasResponseRequestId then "client-and-response-request-id" else "client-request-id" end)',
+    "native publisher route is the failure-hook default": 'GATEWAY_PATH="/publishers/$NAMESPACE/models/$MODEL/v1/chat/completions"',
     "runner evidence directory gets an isolated child": 'EVIDENCE_DIR="$EVIDENCE_DIR/failure-closed"',
     "application TLS verification": '--cacert "$GATEWAY_CA_FILE"',
     "optional TLS-preserving connect mapping": 'GATEWAY_CONNECT_TO="${GRID_LLMD_GATEWAY_CONNECT_TO:-}"',
@@ -38,11 +40,20 @@ required = {
     "validated connect mapping is passed only to curl": 'CONNECT_ARGS=(--connect-to "${CONNECT_URL_HOST}:${CONNECT_URL_PORT}:${CONNECT_HOST}:${CONNECT_PORT}")',
     "curl uses the validated connect mapping": '"${CONNECT_ARGS[@]}" --cacert "$GATEWAY_CA_FILE"',
     "connect target is recorded without credentials": 'gatewayConnectTo:(if $gatewayConnectTo=="" then null else $gatewayConnectTo end)',
-    "ExtProc failure counter evidence": 'extprocFilterFailures',
+    "ExtProc cluster failure counter evidence": 'extprocCluster',
     "backend upstream counter evidence": 'backendRequests',
     "Envoy cluster endpoint counters": '/clusters?format=json',
     "per-host backend request total": '"rq_total"',
-    "5xx and zero backend assertion": '[[ "$HTTP_STATUS" -ge 500 && "$EXTPROC_FAILURE_OBSERVED" == true && "$BACKEND_REQUESTS" == 0 ]]',
+    "5xx assertion": '[[ "$HTTP_STATUS" -ge 500 && "$EXTPROC_FAILURE_OBSERVED" == true && "$BACKEND_REQUESTS" == 0 && \\',
+    "simulator receipt is excluded": '"$SIMULATOR_RECEIPT_COUNT" == 0',
+    "simulator evidence is independently read": 'oc logs "$SIM_POD" -n "$NAMESPACE" -c "$SIM_CONTAINER"',
+    "simulator images are pinned and runtime matched": 'endswith($digest)',
+    "simulator inventory excludes pool EPP Pods": 'any(.spec.containers[]?;.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$"))',
+    "response details are sanitized and recorded": 'http-response-details.json',
+    "ExtProc Pod identity is snapshotted": 'extproc-pod-before.json',
+    "ExtProc endpoints are snapshotted": 'extproc-endpoints-before.json',
+    "effective filter contract is snapshotted": 'extproc-filter-contract-before.json',
+    "restoration report retains simulator receipt state": '--argjson simulatorReceiptCount "$SIMULATOR_RECEIPT_COUNT"',
     "required JSON schema": 'praxis-extproc.grid-llmd-failure-closed/v1',
     "runtime restoration check": 'RESTORED_DEPLOYMENT',
 }
@@ -51,6 +62,8 @@ forbidden = [fragment for fragment in ("oc delete", "oc patch", "oc apply", "oc 
 forbidden += ["[[ \"$RESPONSE_REQUEST_ID\" == \"$REQUEST_ID\" ]]" ] if '[[ "$RESPONSE_REQUEST_ID" == "$REQUEST_ID" ]]' in source else []
 if missing:
     raise SystemExit("failure-closed hook contract is missing: " + ", ".join(missing))
+if source.index("summarize_failure_response.py") > source.index('if [[ -n "$RESPONSE_REQUEST_ID" &&'):
+    raise SystemExit("failure-closed response details must be preserved before response-ID validation")
 if forbidden:
     raise SystemExit("failure-closed hook must not mutate filters or shared resources: " + ", ".join(forbidden))
 print("ExtProc failure-closed task-ownership, TLS, correlation, counters, and restoration contract: PASS")

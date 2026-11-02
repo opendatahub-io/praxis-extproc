@@ -12,6 +12,16 @@ required = (
     'SIMULATOR_SOURCE_URL="$(env_default SIMULATOR_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim.git)"',
     'SIMULATOR_OCI_SOURCE_URL="$(env_default SIMULATOR_OCI_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim)"',
     'SOURCE_LOCKS_MD="$(env_default SOURCE_LOCKS_MD "$REPO_ROOT/evidence/$RUN_LABEL/source-locks.md")"',
+    'SOURCE_LOCKS_FILE="$(env_default SOURCE_LOCKS_FILE "${SOURCE_LOCKS_MD%.md}.json")"',
+    "jq -er --arg component \"$component\" '.components[$component].resolved_sha // empty' \"$SOURCE_LOCKS_FILE\"",
+    'verify_source_lock_revision llm-d-sim "$SIMULATOR_SOURCE_REVISION"',
+    'verify_source_lock_revision epp "$EPP_SOURCE_REVISION"',
+    'verify_source_lock_revision extproc "$EXTPROC_SOURCE_REVISION"',
+    'verify_source_lock_revision gitops "$GITOPS_SOURCE_REVISION"',
+    'verify_source_lock_revision grid "$GRID_GATEWAY_SOURCE_REVISION"',
+    'verify_source_lock_revision grid-operator "$ODH_GRID_OPERATOR_SOURCE_REVISION"',
+    'verify_source_lock_revision maas "$MAAS_SOURCE_REVISION"',
+    'cp "$SOURCE_LOCKS_FILE" "$EVIDENCE_DIR/source-locks.json"',
     'praxis.fast/oci-source-url: "$SIMULATOR_OCI_SOURCE_URL"',
     'uri: "$SIMULATOR_SOURCE_URL"',
     'value: "$SIMULATOR_OCI_SOURCE_URL"',
@@ -43,5 +53,5 @@ positions = [apply.index(fragment) for fragment in ordered]
 if positions != sorted(positions):
     raise SystemExit("simulator image provenance and post-DSCI gates must pass before pool resources are applied")
 
-print("simulator Git remote and canonical OCI source identity are separately verified before serving mutation: PASS")
+print("serving-pool source revisions match the current JSON source lock before any operation: PASS")
 PY

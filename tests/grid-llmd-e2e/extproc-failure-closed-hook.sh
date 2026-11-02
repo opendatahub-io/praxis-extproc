@@ -4,6 +4,7 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTEXT=""
 NAMESPACE=""
 EVIDENCE_DIR=""
@@ -14,7 +15,7 @@ ENVOYFILTER_NAME="${GRID_LLMD_EXTPROC_ENVOYFILTER:-praxis-grid-llmd-extproc}"
 HTTPROUTE_NAME="${GRID_LLMD_HTTPROUTE_NAME:-grid-llmd-inference}"
 GATEWAY_URL="${GRID_LLMD_GATEWAY_URL:-}"
 GATEWAY_CONNECT_TO="${GRID_LLMD_GATEWAY_CONNECT_TO:-}"
-GATEWAY_PATH="${GRID_LLMD_GATEWAY_PATH:-/v1/chat/completions}"
+GATEWAY_PATH="${GRID_LLMD_GATEWAY_PATH:-}"
 GATEWAY_CA_FILE="${GRID_LLMD_GATEWAY_CA_FILE:-}"
 MODEL="${GRID_LLMD_MODEL:-}"
 TIMEOUT_SECONDS="${GRID_LLMD_TIMEOUT_SECONDS:-120}"
@@ -59,6 +60,9 @@ done
   printf 'GRID_LLMD_GATEWAY_URL, readable GRID_LLMD_GATEWAY_CA_FILE, and GRID_LLMD_MODEL are required\n' >&2
   exit 2
 }
+if [[ -z "$GATEWAY_PATH" ]]; then
+  GATEWAY_PATH="/publishers/$NAMESPACE/models/$MODEL/v1/chat/completions"
+fi
 [[ "$GATEWAY_URL" == https://* ]] || { printf 'Gateway URL must use HTTPS\n' >&2; exit 2; }
 [[ "$GATEWAY_PATH" == /* && "$GATEWAY_PATH" != *'?'* && "$GATEWAY_PATH" != *'#'* ]] || {
   printf 'Gateway path must be an absolute path without query or fragment\n' >&2
@@ -233,6 +237,26 @@ FILTER_CLUSTER_SERVICE="$(jq -r '[.spec.configPatches[]?|select(.applyTo=="CLUST
 GATEWAY_PODS="$(oc get pods -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$GATEWAY_NAME" -o json)"
 PROXY_POD="$(jq -er '[.items[]|select(.status.phase=="Running" and any(.status.conditions[]?;.type=="Ready" and .status=="True"))]|if length==1 then .[0].metadata.name else error("expected exactly one Ready task Gateway proxy") end' <<<"$GATEWAY_PODS")"
 PROXY_UID="$(jq -er --arg pod "$PROXY_POD" '.items[]|select(.metadata.name==$pod)|.metadata.uid' <<<"$GATEWAY_PODS")"
+SIMULATOR_PODS="$(oc get pods -n "$NAMESPACE" -l "praxis.fast/qualification-run=$RUN_LABEL" -o json)"
+jq -e --arg run "$RUN_LABEL" '
+  [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and
+    (.metadata.labels["praxis.fast/simulator-pool"]//"")!="" and
+    any(.spec.containers[]?;.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$"))) as $pod |
+    {name:$pod.metadata.name,uid:$pod.metadata.uid,pool:$pod.metadata.labels["praxis.fast/simulator-pool"],phase:$pod.status.phase,
+     ready:any($pod.status.conditions[]?;.type=="Ready" and .status=="True"),
+     simulators:[$pod.spec.containers[]?|select(.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$")) as $container|
+       {name:$container.name,image:$container.image,
+        imageID:([$pod.status.containerStatuses[]?|select(.name==$container.name)|.imageID][0]//""),
+        containerReady:([$pod.status.containerStatuses[]?|select(.name==$container.name)|.ready][0]//false)}]}] as $pods |
+  if ($pods|length)==2 and ([ $pods[].pool ]|unique|length)==2 and
+    all($pods[];(.simulators[0].image|split("@")[1]) as $digest |
+      .phase=="Running" and .ready and (.simulators|length)==1 and
+      .simulators[0].containerReady==true and (.simulators[0].imageID|test("@sha256:[0-9a-f]{64}$")) and
+      (.simulators[0].imageID|endswith($digest)))
+  then $pods else error("expected exactly two Ready simulator Pods with pinned runtime image IDs") end
+' <<<"$SIMULATOR_PODS" >"$EVIDENCE_DIR/simulator-pods-before.json" || {
+  log 'failure-closed requires exactly two Ready run-owned simulator Pods with pinned runtime image IDs'; exit 2;
+}
 jq -n --arg run "$RUN_LABEL" --arg ns "$NAMESPACE" --arg deployment "$DEPLOYMENT_NAME" \
   --arg service "$SERVICE_NAME" --arg filter "$ENVOYFILTER_NAME" --arg gateway "$GATEWAY_NAME" \
   --arg route "$HTTPROUTE_NAME" --arg proxyPod "$PROXY_POD" --arg proxyUid "$PROXY_UID" \
@@ -254,7 +278,7 @@ import sys
 
 backend, extproc = sys.argv[1:]
 document = json.load(sys.stdin)
-parsed = {"backendRequests": {}, "extprocCluster": {}, "extprocFilterFailures": {}}
+parsed = {"backendRequests": {}, "extprocCluster": {}}
 
 def collect(fragment, selected_names):
     matches = [item for item in document.get("cluster_statuses", []) if fragment in item.get("name", "")]
@@ -288,6 +312,24 @@ jq -e '.backendRequests|type=="object" and length>0' <<<"$BEFORE_STATS" >/dev/nu
 }
 READY_ENDPOINTS_BEFORE="$(parse_endpoints_ready)"
 [[ "$READY_ENDPOINTS_BEFORE" == 1 ]] || { log 'ExtProc must have exactly one Ready endpoint before failure injection'; exit 2; }
+oc get endpointslice -n "$NAMESPACE" -l "kubernetes.io/service-name=$SERVICE_NAME" -o json \
+  | jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,endpoints:[.endpoints[]?|{addresses,conditions,targetRef:{kind:.targetRef.kind,name:.targetRef.name,uid:.targetRef.uid}}]}]' \
+  >"$EVIDENCE_DIR/extproc-endpoints-before.json"
+FILTER_SNAPSHOT="$(jq '[.spec.configPatches[]?|{applyTo,match,patch:{operation:.patch.operation,failureModeAllow:.patch.value.typed_config.failure_mode_allow,clusterName:.patch.value.name}}]' <<<"$FILTER_JSON")"
+printf '%s\n' "$FILTER_SNAPSHOT" >"$EVIDENCE_DIR/extproc-filter-contract-before.json"
+DEPLOYMENT_SELECTOR="$(jq -r '.spec.selector.matchLabels|to_entries|map("\(.key)=\(.value)")|join(",")' <<<"$DEPLOYMENT_JSON")"
+EXTPROC_PODS="$(oc get pods -n "$NAMESPACE" -l "$DEPLOYMENT_SELECTOR" -o json)"
+jq -e --arg run "$RUN_LABEL" '
+  [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and .metadata.deletionTimestamp==null and .status.phase=="Running" and any(.status.conditions[]?;.type=="Ready" and .status=="True"))] as $pods |
+  ($pods|length)==1 and
+  ([$pods[0].spec.containers[]?|select(.name=="praxis-extproc")]|length)==1 and
+  ([$pods[0].status.containerStatuses[]?|select(.name=="praxis-extproc" and .ready==true and (.imageID|test("@sha256:[0-9a-f]{64}$"))) ]|length)==1
+' <<<"$EXTPROC_PODS" >/dev/null || { log 'expected exactly one active Ready ExtProc Pod with immutable runtime image ID'; exit 2; }
+jq '[.items[]|select(.metadata.deletionTimestamp==null and .status.phase=="Running" and any(.status.conditions[]?;.type=="Ready" and .status=="True"))|
+  {name:.metadata.name,uid:.metadata.uid,labels:.metadata.labels,
+   containers:[.spec.containers[]?|{name,image}],
+   containerStatuses:[.status.containerStatuses[]?|{name,image,imageID,ready,containerID}]}]' \
+  <<<"$EXTPROC_PODS" >"$EVIDENCE_DIR/extproc-pod-before.json"
 ORIGINAL_REPLICAS="$(jq -r '.spec.replicas' <<<"$DEPLOYMENT_JSON")"
 RESTORE_NEEDED=true
 log 'Scaling only the run-owned Praxis ExtProc Deployment to zero for one failure-closed request'
@@ -315,20 +357,69 @@ set +e
 HTTP_STATUS="$(curl --silent --show-error --connect-timeout 10 --max-time "$TIMEOUT_SECONDS" \
   "${CONNECT_ARGS[@]}" --cacert "$GATEWAY_CA_FILE" --request POST --header 'content-type: application/json' \
   --header "x-request-id: $REQUEST_ID" --data-binary "@$TEMP_DIR/request.json" \
-  --dump-header "$TEMP_DIR/response-headers.txt" --output /dev/null \
+  --max-filesize 1048576 --dump-header "$TEMP_DIR/response-headers.txt" --output "$TEMP_DIR/response-body.txt" \
   --write-out '%{http_code}' "$REQUEST_URL" 2>"$TEMP_DIR/curl-error.txt")"
 CURL_STATUS=$?
 set -e
 [[ "$CURL_STATUS" == 0 ]] || { sed -E 's/(authorization|token):.*/\1: [REDACTED]/I' "$TEMP_DIR/curl-error.txt" >&2; log 'Gateway request failed before an HTTP response'; exit 1; }
 [[ "$HTTP_STATUS" =~ ^[0-9]{3}$ ]] || { log 'Gateway returned no parseable HTTP status'; exit 1; }
-RESPONSE_REQUEST_ID="$(awk 'BEGIN{IGNORECASE=1} /^x-request-id:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/\r$/,""); value=$0} END{print value}' "$TEMP_DIR/response-headers.txt")"
 REQUEST_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 "$SCRIPT_DIR/summarize_failure_response.py" "$TEMP_DIR/response-headers.txt" "$TEMP_DIR/response-body.txt" \
+  >"$EVIDENCE_DIR/http-response-details.json"
+chmod 0600 "$EVIDENCE_DIR/http-response-details.json"
+RESPONSE_REQUEST_ID="$(jq -r '.headers["x-request-id"][0] // ""' "$EVIDENCE_DIR/http-response-details.json")"
 jq -n --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
   --arg observedAt "$REQUEST_FINISHED" --argjson status "$HTTP_STATUS" \
-  '{requestId:$requestId,responseRequestId:$responseRequestId,status:$status,observedAt:$observedAt}' \
+  --argjson hasResponseRequestId "$([[ -n "$RESPONSE_REQUEST_ID" ]] && printf true || printf false)" \
+  '{requestId:$requestId,clientRequestId:$requestId,responseRequestId:(if $hasResponseRequestId then $responseRequestId else null end),correlationBasis:(if $hasResponseRequestId then "client-and-response-request-id" else "client-request-id" end),status:$status,observedAt:$observedAt}' \
   >"$EVIDENCE_DIR/request-correlation.json"
 chmod 0600 "$EVIDENCE_DIR/request-correlation.json"
-[[ "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { log 'response did not return a safe correlated Envoy request ID'; exit 1; }
+if [[ -n "$RESPONSE_REQUEST_ID" && ! "$RESPONSE_REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+  log 'response returned an unsafe Envoy request ID; sanitized response details were preserved'
+  exit 1
+fi
+
+SIMULATOR_RECEIPT_COUNT=0
+SIMULATOR_LOGS_READ=true
+: >"$EVIDENCE_DIR/simulator-receipts.ndjson"
+while IFS=$'\t' read -r SIM_POOL SIM_POD SIM_UID SIM_CONTAINER SIM_IMAGE SIM_IMAGE_ID; do
+  [[ -n "$SIM_POD" && -n "$SIM_CONTAINER" ]] || { SIMULATOR_LOGS_READ=false; continue; }
+  set +e
+  SIMULATOR_LOGS="$(oc logs "$SIM_POD" -n "$NAMESPACE" -c "$SIM_CONTAINER" --since-time="$REQUEST_STARTED" 2>"$TEMP_DIR/$SIM_POOL-simulator-logs.err")"
+  SIMULATOR_LOG_STATUS=$?
+  set -e
+  python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$TEMP_DIR/$SIM_POOL-simulator-logs.err" \
+    >"$EVIDENCE_DIR/$SIM_POOL-simulator-log-error.txt"
+  SIMULATOR_RECEIPT=false
+  if ((SIMULATOR_LOG_STATUS == 0)); then
+    SIMULATOR_RECEIPT="$(python3 -c '
+import sys
+request_ids = [value for value in sys.argv[1:] if value]
+lines = sys.stdin.read().splitlines()
+matched = any("Finished processing request" in line and any(request_id in line for request_id in request_ids) for line in lines)
+print("true" if matched else "false")
+' "$REQUEST_ID" "$RESPONSE_REQUEST_ID" <<<"$SIMULATOR_LOGS")"
+  else
+    SIMULATOR_LOGS_READ=false
+  fi
+  if [[ "$SIMULATOR_RECEIPT" == true ]]; then SIMULATOR_RECEIPT_COUNT=$((SIMULATOR_RECEIPT_COUNT + 1)); fi
+  jq -cn --arg pool "$SIM_POOL" --arg pod "$SIM_POD" --arg podUid "$SIM_UID" \
+    --arg container "$SIM_CONTAINER" --arg image "$SIM_IMAGE" --arg imageId "$SIM_IMAGE_ID" \
+    --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
+    --argjson logRead "$([[ "$SIMULATOR_LOG_STATUS" == 0 ]] && printf true || printf false)" \
+    --argjson completionReceipt "$SIMULATOR_RECEIPT" \
+    '{pool:$pool,pod:$pod,podUid:$podUid,container:$container,image:$image,imageId:$imageId,requestId:$requestId,responseRequestId:$responseRequestId,logRead:$logRead,completionReceipt:$completionReceipt}' \
+    >>"$EVIDENCE_DIR/simulator-receipts.ndjson"
+done < <(jq -r '.[]|[.pool,.name,.uid,.simulators[0].name,.simulators[0].image,.simulators[0].imageID]|@tsv' "$EVIDENCE_DIR/simulator-pods-before.json")
+jq -s --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg requestId "$REQUEST_ID" \
+  --arg responseRequestId "$RESPONSE_REQUEST_ID" --argjson logReadsComplete "$SIMULATOR_LOGS_READ" \
+  --argjson receiptCount "$SIMULATOR_RECEIPT_COUNT" \
+  '{observedAt:$observedAt,requestId:$requestId,responseRequestId:$responseRequestId,logReadsComplete:$logReadsComplete,completionReceiptCount:$receiptCount,pools:.}' \
+  "$EVIDENCE_DIR/simulator-receipts.ndjson" >"$EVIDENCE_DIR/simulator-receipts.json"
+chmod 0600 "$EVIDENCE_DIR/simulator-receipts.ndjson" "$EVIDENCE_DIR/simulator-receipts.json"
+for log_error in "$EVIDENCE_DIR"/*-simulator-log-error.txt; do
+  [[ -f "$log_error" ]] && chmod 0600 "$log_error"
+done
 
 AFTER_STATS="$(read_proxy_stats)"
 printf '%s\n' "$BEFORE_STATS" | jq -S . >"$EVIDENCE_DIR/proxy-counters-before.json"
@@ -340,11 +431,11 @@ BACKEND_REQUESTS="$(jq -n --argjson before "$BEFORE_STATS" --argjson after "$AFT
 EXTPROC_FAILURE_OBSERVED="$(jq -n --argjson before "$BEFORE_STATS" --argjson after "$AFTER_STATS" '
   def changedFailure($old;$new):
     ($new|to_entries|map(select(.value > ($old[.key]//0)))|length)>0;
-  changedFailure(($before.extprocFilterFailures//{});($after.extprocFilterFailures//{})) or
   changedFailure(($before.extprocCluster//{});($after.extprocCluster//{}))
 ')"
-[[ "$HTTP_STATUS" -ge 500 && "$EXTPROC_FAILURE_OBSERVED" == true && "$BACKEND_REQUESTS" == 0 ]] || {
-  log "failure-closed assertion failed: status=$HTTP_STATUS extprocFailureObserved=$EXTPROC_FAILURE_OBSERVED backendRequestCount=$BACKEND_REQUESTS"
+[[ "$HTTP_STATUS" -ge 500 && "$EXTPROC_FAILURE_OBSERVED" == true && "$BACKEND_REQUESTS" == 0 && \
+  "$SIMULATOR_RECEIPT_COUNT" == 0 && "$SIMULATOR_LOGS_READ" == true ]] || {
+  log "failure-closed assertion failed: status=$HTTP_STATUS extprocFailureObserved=$EXTPROC_FAILURE_OBSERVED backendRequestCount=$BACKEND_REQUESTS simulatorCompletionReceipts=$SIMULATOR_RECEIPT_COUNT simulatorLogsRead=$SIMULATOR_LOGS_READ"
   exit 1
 }
 
@@ -353,7 +444,9 @@ jq -n --arg schema "praxis-extproc.grid-llmd-failure-closed/v1" --arg resource "
   --arg started "$REQUEST_STARTED" --arg finished "$REQUEST_FINISHED" \
   --argjson apiCaVerified "$API_TLS_VERIFIED" --argjson status "$HTTP_STATUS" \
   --argjson extprocFailureObserved "$EXTPROC_FAILURE_OBSERVED" --argjson backendRequestCount "$BACKEND_REQUESTS" \
-  '{schema:$schema,apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,responseRequestId:$responseRequestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$started,requestFinished:$finished}' \
+  --argjson simulatorReceiptCount "$SIMULATOR_RECEIPT_COUNT" --argjson simulatorLogsRead "$SIMULATOR_LOGS_READ" \
+  --argjson hasResponseRequestId "$([[ -n "$RESPONSE_REQUEST_ID" ]] && printf true || printf false)" \
+  '{schema:$schema,apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,clientRequestId:$requestId,responseRequestId:(if $hasResponseRequestId then $responseRequestId else null end),correlationBasis:(if $hasResponseRequestId then "client-and-response-request-id" else "client-request-id" end),requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0 and $simulatorReceiptCount==0 and $simulatorLogsRead),backendRequestCount:$backendRequestCount,simulatorCompletionReceiptCount:$simulatorReceiptCount,simulatorLogsRead:$simulatorLogsRead,requestStarted:$started,requestFinished:$finished}' \
   >"$EVIDENCE_DIR/failure-closed-report.json"
 chmod 0600 "$EVIDENCE_DIR/failure-closed-report.json"
 
@@ -368,8 +461,10 @@ jq -e --arg run "$RUN_LABEL" --argjson replicas "$ORIGINAL_REPLICAS" '
 jq -n --arg requestId "$REQUEST_ID" --arg responseRequestId "$RESPONSE_REQUEST_ID" \
   --arg requestStarted "$REQUEST_STARTED" --arg requestFinished "$REQUEST_FINISHED" \
   --argjson status "$HTTP_STATUS" --argjson extprocFailureObserved "$EXTPROC_FAILURE_OBSERVED" \
-  --argjson backendRequestCount "$BACKEND_REQUESTS" --argjson apiCaVerified "$API_TLS_VERIFIED" \
+  --argjson backendRequestCount "$BACKEND_REQUESTS" --argjson simulatorReceiptCount "$SIMULATOR_RECEIPT_COUNT" \
+  --argjson simulatorLogsRead "$SIMULATOR_LOGS_READ" --argjson apiCaVerified "$API_TLS_VERIFIED" \
+  --argjson hasResponseRequestId "$([[ -n "$RESPONSE_REQUEST_ID" ]] && printf true || printf false)" \
   --arg resource "deployment/$DEPLOYMENT_NAME" \
-  '{schema:"praxis-extproc.grid-llmd-failure-closed/v1",apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,responseRequestId:$responseRequestId,requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0),backendRequestCount:$backendRequestCount,requestStarted:$requestStarted,requestFinished:$requestFinished}' \
+  '{schema:"praxis-extproc.grid-llmd-failure-closed/v1",apiCaVerified:$apiCaVerified,taskOwned:true,resource:$resource,requestId:$requestId,clientRequestId:$requestId,responseRequestId:(if $hasResponseRequestId then $responseRequestId else null end),correlationBasis:(if $hasResponseRequestId then "client-and-response-request-id" else "client-request-id" end),requestStatusCode:$status,extprocFailureObserved:$extprocFailureObserved,failureClosed:($status>=500 and $extprocFailureObserved and $backendRequestCount==0 and $simulatorReceiptCount==0 and $simulatorLogsRead),backendRequestCount:$backendRequestCount,simulatorCompletionReceiptCount:$simulatorReceiptCount,simulatorLogsRead:$simulatorLogsRead,requestStarted:$requestStarted,requestFinished:$requestFinished}' \
   | tee "$EVIDENCE_DIR/hook-result.json"
 chmod 0600 "$EVIDENCE_DIR/hook-result.json"
