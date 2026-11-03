@@ -293,25 +293,34 @@ pub(crate) async fn handle_request_body(
         // fill `state.request_body`, so enforce the accumulation ceiling with a
         // running byte count before forwarding each chunk.
         (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => {
-            if let Err(_error) =
-                check_body_limit(state.streamed_request_bytes, body.body.len(), state.max_body_accumulation)
-            {
-                return Ok(vec![request_body_limit_exceeded(pipeline)]);
+            if let Some(rejection) = reject_streamed_request_over_limit(pipeline, state, body.body.len()) {
+                return Ok(vec![rejection]);
             }
-            state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(body.body.len());
             Ok(passthrough_chunk(&body, state, mode, true))
         }
         (BodyMode::Streamed, true) => {
-            if let Err(_error) =
-                check_body_limit(state.streamed_request_bytes, body.body.len(), state.max_body_accumulation)
-            {
-                return Ok(vec![request_body_limit_exceeded(pipeline)]);
+            if let Some(rejection) = reject_streamed_request_over_limit(pipeline, state, body.body.len()) {
+                return Ok(vec![rejection]);
             }
-            state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(body.body.len());
             process_streamed_body_chunk(pipeline, body, state, true).await
         }
         _ => accumulate_request_body(pipeline, body, state).await,
     }
+}
+
+/// Count a streamed request chunk toward `max_body_accumulation` without buffering.
+///
+/// Returns `Some(ImmediateResponse)` with status 413 when the chunk would exceed the ceiling.
+fn reject_streamed_request_over_limit(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    chunk_len: usize,
+) -> Option<ProcessingResponse> {
+    if check_body_limit(state.streamed_request_bytes, chunk_len, state.max_body_accumulation).is_err() {
+        return Some(request_body_limit_exceeded(pipeline));
+    }
+    state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(chunk_len);
+    None
 }
 
 /// Build a fail-closed local response for an unsupported request-processing path.
@@ -320,7 +329,7 @@ fn request_processing_rejection(body: &'static [u8]) -> ProcessingResponse {
     response::immediate(adapter::rejection_to_immediate(&rejection))
 }
 
-/// Prefer ImmediateResponse 413 over gRPC RESOURCE_EXHAUSTED so Envoy surfaces a
+/// Prefer `ImmediateResponse` 413 over gRPC `RESOURCE_EXHAUSTED` so Envoy surfaces a
 /// diagnosable client error instead of an empty HTTP 500 under
 /// `failure_mode_allow: false` (follow-up to RHOAIENG-102139).
 fn request_body_limit_exceeded(pipeline: &FilterPipeline) -> ProcessingResponse {
@@ -747,6 +756,10 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks both sides of the streamed passthrough limit"
+    )]
     async fn streamed_passthrough_enforces_max_body_bytes() {
         let pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins())
             .expect("empty test pipeline");

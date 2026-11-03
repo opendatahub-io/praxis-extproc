@@ -159,9 +159,11 @@ impl TryFrom<u64> for DrainTimeoutSecs {
 
 /// Default maximum accumulated body size (32 MiB) before rejecting a stream.
 ///
-/// Aligned with [`crate::grpc_limits::DEFAULT_GRPC_MAX_RECV_MSG_SIZE`] so a
-/// single BUFFERED body that fits the gRPC per-message ceiling is not then
-/// rejected by accumulation with an opaque ExtProc failure.
+/// Kept at the Go IPP / RHAI-13005 body ceiling. The gRPC per-message default
+/// ([`crate::grpc_limits::DEFAULT_GRPC_MAX_RECV_MSG_SIZE`]) is intentionally
+/// higher by framing headroom so an exactly-at-limit BUFFERED body reaches this
+/// accumulation check (and returns `ImmediateResponse` 413) instead of failing
+/// at tonic decode with an empty HTTP 500.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum accumulated request/response body size in bytes, guaranteed non-zero
@@ -184,7 +186,7 @@ impl MaxBodyBytes {
 }
 
 impl Default for MaxBodyBytes {
-    /// 32 MiB, matching the default gRPC per-message receive ceiling.
+    /// 32 MiB body accumulation ceiling (gRPC recv default sits above this for framing).
     fn default() -> Self {
         // DEFAULT_MAX_BODY_BYTES is non-zero, so the fallback arm is never taken.
         Self(match std::num::NonZeroUsize::new(DEFAULT_MAX_BODY_BYTES) {

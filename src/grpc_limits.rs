@@ -13,8 +13,10 @@
 //! quantity such as `64Mi`). This is a **per-message** cap only; cumulative
 //! body accumulation across streamed chunks is still governed by
 //! `server.max_body_bytes` / `insecure_options.allow_unbounded_body`. The
-//! library default for `max_body_bytes` matches this 32 MiB ceiling so the two
-//! knobs do not disagree for BUFFERED single-message bodies.
+//! default here sits **above** the 32 MiB `max_body_bytes` default by
+//! [`GRPC_RECV_FRAMING_HEADROOM`] so a BUFFERED body exactly at the
+//! accumulation limit still fits inside the enclosing `ProcessingRequest`
+//! protobuf framing and reaches the `ImmediateResponse` 413 path.
 
 use std::env;
 
@@ -27,9 +29,16 @@ use crate::error::{ExtProcError, Result};
 /// Environment variable that overrides [`DEFAULT_GRPC_MAX_RECV_MSG_SIZE`].
 pub const GRPC_MAX_RECV_MSG_SIZE_ENV: &str = "GRPC_MAX_RECV_MSG_SIZE";
 
+/// Headroom above the 32 MiB body accumulation default so protobuf framing of
+/// a `ProcessingRequest` that carries an exactly-at-limit BUFFERED body does
+/// not trip tonic before [`crate::handlers`] can return `ImmediateResponse` 413.
+pub const GRPC_RECV_FRAMING_HEADROOM: usize = 1024 * 1024;
+
 /// Default max decoding message size: above tonic's 4 MiB compiled default,
-/// aligned with Go `ai-gateway-payload-processing` / RHAI-13005.
-pub const DEFAULT_GRPC_MAX_RECV_MSG_SIZE: usize = 32 * 1024 * 1024;
+/// and above the 32 MiB `max_body_bytes` default by [`GRPC_RECV_FRAMING_HEADROOM`]
+/// (Go IPP / RHAI-13005 used a flat 32 MiB; we keep the body backstop there and
+/// leave framing room on the gRPC knob).
+pub const DEFAULT_GRPC_MAX_RECV_MSG_SIZE: usize = (32 * 1024 * 1024) + GRPC_RECV_FRAMING_HEADROOM;
 
 /// tonic / gRPC compiled default receive limit (bytes).
 pub const GRPC_COMPILED_MAX_RECV_DEFAULT: usize = 4 * 1024 * 1024;
@@ -262,6 +271,16 @@ mod tests {
     fn default_above_grpc_compiled() {
         const {
             assert!(DEFAULT_GRPC_MAX_RECV_MSG_SIZE > GRPC_COMPILED_MAX_RECV_DEFAULT);
+        }
+    }
+
+    #[test]
+    fn default_above_max_body_bytes_for_framing() {
+        const {
+            assert!(
+                DEFAULT_GRPC_MAX_RECV_MSG_SIZE
+                    >= crate::config::DEFAULT_MAX_BODY_BYTES + GRPC_RECV_FRAMING_HEADROOM
+            );
         }
     }
 }

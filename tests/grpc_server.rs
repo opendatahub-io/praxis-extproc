@@ -202,8 +202,8 @@ async fn large_body_request_succeeds() {
     assert!(!responses.is_empty(), "should produce responses for large body");
 }
 
-/// Request bodies over `server.max_body_bytes` must be ImmediateResponse 413,
-/// not a gRPC RESOURCE_EXHAUSTED that Envoy turns into an empty HTTP 500.
+/// Request bodies over `server.max_body_bytes` must be `ImmediateResponse` 413,
+/// not a gRPC `RESOURCE_EXHAUSTED` that Envoy turns into an empty HTTP 500.
 #[tokio::test]
 async fn request_body_over_max_returns_immediate_413() {
     let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
@@ -219,7 +219,42 @@ async fn request_body_over_max_returns_immediate_413() {
     );
 }
 
-/// RHOAIENG-102139: the shipped binary's default (32 MiB) must accept a body
+/// Framing headroom: a BUFFERED body exactly at `max_body_bytes` must reach the
+/// handler (not fail at tonic decode), and one byte over must be `ImmediateResponse` 413.
+#[tokio::test]
+async fn buffered_body_at_and_over_max_body_bytes() {
+    use praxis_extproc::config::DEFAULT_MAX_BODY_BYTES;
+
+    let (mut client, _shutdown) = start_server(DEFAULT_BODY_LIMIT_CONFIG).await;
+
+    let at_limit = vec![b'x'; DEFAULT_MAX_BODY_BYTES];
+    let accepted = send_full_request(&mut client, "POST", "/at-limit", &at_limit).await;
+    assert!(
+        accepted
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestBody(_)))),
+        "exact max_body_bytes BUFFERED body must reach the handler, got: {accepted:?}"
+    );
+    assert!(
+        !accepted
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "exact max_body_bytes body must not be rejected"
+    );
+
+    let over_limit = vec![b'x'; DEFAULT_MAX_BODY_BYTES + 1];
+    let rejected = send_full_request(&mut client, "POST", "/over-limit", &over_limit).await;
+    assert!(
+        rejected.iter().any(|response| matches!(
+            response.response.as_ref(),
+            Some(RespVariant::ImmediateResponse(reply))
+                if reply.status.as_ref().map(|status| status.code) == Some(413)
+        )),
+        "over max_body_bytes must be ImmediateResponse 413, got: {rejected:?}"
+    );
+}
+
+/// RHOAIENG-102139: the shipped binary's default recv ceiling must accept a body
 /// just over tonic's compiled 4 MiB `MaxRecv`. Spawns `praxis-extproc` so the
 /// assertion exercises `serve_grpc` wiring, not the in-process harness.
 #[tokio::test(flavor = "multi_thread")]
@@ -2991,6 +3026,15 @@ insecure_options:
 const SMALL_BODY_LIMIT_CONFIG: &str = r#"
 server:
   max_body_bytes: 1024
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+"#;
+
+/// Default `max_body_bytes` (32 MiB) with no `allow_unbounded_body`, for framing
+/// / accumulation boundary tests against the raised gRPC receive ceiling.
+const DEFAULT_BODY_LIMIT_CONFIG: &str = r#"
 filter_chains:
   - name: test
     filters:

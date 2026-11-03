@@ -251,19 +251,25 @@ async fn process_messages(
                 return Ok(());
             }
         }
-        // Envoy ignores further ExtProc messages after ImmediateResponse. Stop
+        // Envoy ignores further ExtProc messages after `ImmediateResponse`. Stop
         // reading the inbound stream and drop buffered bodies so a client that
         // keeps the gRPC stream open cannot pin large buffers here (CWE-400).
         if stop_after_immediate {
-            stream_state.request_body.clear();
-            stream_state.response_body.clear();
-            stream_state.streamed_request_bytes = 0;
-            debug!("ImmediateResponse sent; ending ExtProc stream processing");
+            release_buffers_after_immediate(stream_state);
             return Ok(());
         }
     }
 
     Ok(())
+}
+
+/// Drop accumulated bodies after an `ImmediateResponse` so a hung client cannot
+/// pin them for the remainder of the gRPC stream lifetime.
+fn release_buffers_after_immediate(stream_state: &mut StreamState) {
+    stream_state.request_body.clear();
+    stream_state.response_body.clear();
+    stream_state.streamed_request_bytes = 0;
+    debug!("ImmediateResponse sent; ending ExtProc stream processing");
 }
 
 // -----------------------------------------------------------------------------
