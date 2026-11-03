@@ -25,11 +25,9 @@ server:
   grpc_address: "0.0.0.0:50051"
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
+  max_body_bytes: 33554432
   tls:
     mode: none
-
-insecure_options:
-  allow_unbounded_body: true
 ```
 
 ## Filter Chains
@@ -162,7 +160,7 @@ server:
   health_address: "0.0.0.0:50052"
   metrics_address: "0.0.0.0:9090"
   shutdown_drain_timeout_secs: 20
-  max_body_bytes: 10485760
+  max_body_bytes: 33554432
   tls:
     mode: none
 ```
@@ -173,7 +171,7 @@ server:
 | `health_address`              | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`             | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
  | `shutdown_drain_timeout_secs` | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
-| `max_body_bytes`              | integer | `10485760`      | Maximum accumulated request/response body size in bytes before a stream is rejected with `RESOURCE_EXHAUSTED`. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely |
+| `max_body_bytes`              | integer | `33554432`      | Maximum accumulated request/response body size in bytes before a request stream is rejected with an `ImmediateResponse` **413**. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely. Keep this at or above the effective gRPC per-message ceiling for BUFFERED workloads (see `GRPC_MAX_RECV_MSG_SIZE`) so the two limits do not disagree |
 | `tls`                         | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
 ### Graceful shutdown
@@ -288,11 +286,11 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes` |
+| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes`. Prefer an explicit `server.max_body_bytes` in production; with a raised gRPC receive limit this flag removes the only remaining DoS backstop on streamed chunks |
 
 ```yaml
 insecure_options:
-  allow_unbounded_body: true
+  allow_unbounded_body: true   # development only
 ```
 
 ## CLI Options
@@ -338,7 +336,7 @@ RUST_LOG=praxis_extproc::server=trace praxis-extproc -c praxis-extproc.yaml
 | Variable | Description |
 | --- | --- |
 | `RUST_LOG` | Tracing filter (e.g. `info`, `debug`, `praxis_extproc=trace`) |
-| `GRPC_MAX_RECV_MSG_SIZE` | Per-gRPC-message receive limit for the ExtProc tonic server (bytes or a Kubernetes quantity such as `64Mi`). Default **32 MiB** (above tonic's compiled 4 MiB default) so multimodal / agent chat bodies do not fail with an empty HTTP 500 (`decoded message length too large`). Invalid values fail closed at startup. This does **not** replace `server.max_body_bytes` / `insecure_options.allow_unbounded_body`, which govern cumulative body accumulation across streamed chunks. |
+| `GRPC_MAX_RECV_MSG_SIZE` | Per-gRPC-message receive limit for the ExtProc tonic server (bytes or a Kubernetes quantity such as `64Mi`). Default **32 MiB** (above tonic's compiled 4 MiB default) so multimodal / agent chat bodies do not fail with an empty HTTP 500 (`decoded message length too large`). Invalid values fail closed at startup. This is independent of `server.max_body_bytes`: gRPC limits each message, while `max_body_bytes` limits cumulative accumulation across streamed chunks. For BUFFERED bodies Envoy typically sends one message, so the effective ceiling is `min(GRPC_MAX_RECV_MSG_SIZE, max_body_bytes)` unless `allow_unbounded_body` is set. |
 
 ## Example Configs
 
@@ -384,10 +382,14 @@ At runtime:
 
 - **Filter error**: an `Err` from a filter produces
   a gRPC `INTERNAL` status on the stream.
-- **Body too large**: exceeding the
+- **Body too large (request)**: exceeding the
   `server.max_body_bytes` accumulation limit
-  (10 MiB by default) produces a gRPC
-  `RESOURCE_EXHAUSTED` status. The limit is lifted
+  (32 MiB by default) returns an ExtProc
+  `ImmediateResponse` with HTTP **413** so the
+  client sees a diagnosable error instead of an
+  empty 500. Response-body accumulation over the
+  same limit still fails the stream with gRPC
+  `RESOURCE_EXHAUSTED`. The limit is lifted
   entirely when `insecure_options.allow_unbounded_body`
   is set.
 - **Filter rejection**: a `FilterAction::Reject`

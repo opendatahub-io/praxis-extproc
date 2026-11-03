@@ -77,7 +77,7 @@ impl PraxisExtProc {
     ///
     /// No drain deadline is wired: the force-shutdown latch never fires. Use
     /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one. The
-    /// body-accumulation ceiling defaults to the built-in 10 MiB
+    /// body-accumulation ceiling defaults to the built-in 32 MiB
     /// (`config::DEFAULT_MAX_BODY_BYTES`); use
     /// [`with_max_body_accumulation`](Self::with_max_body_accumulation) to set
     /// the configured effective limit.
@@ -581,7 +581,7 @@ impl Default for StreamState {
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
     ///
-    /// The body-accumulation ceiling defaults to the built-in 10 MiB
+    /// The body-accumulation ceiling defaults to the built-in 32 MiB
     /// ([`crate::config::DEFAULT_MAX_BODY_BYTES`]); [`handle_stream`] overrides
     /// it with the configured effective limit.
     pub(crate) fn new() -> Self {

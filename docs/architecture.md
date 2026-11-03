@@ -83,9 +83,10 @@ is sent so Envoy proceeds to send the body.
 
 Body bytes arrive in one or more `HttpBody` messages.
 Chunks are accumulated in a per-stream buffer (capped
-at 10 MiB). When `end_of_stream` is true, the
+at 32 MiB by default). When `end_of_stream` is true, the
 pipeline runs with the full body. Filters can inspect,
-mutate, or reject based on body content.
+mutate, or reject based on body content. Request bodies
+over the cap return an `ImmediateResponse` 413.
 
 ### 3. Response Headers
 

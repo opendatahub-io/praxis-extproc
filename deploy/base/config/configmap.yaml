@@ -10,6 +10,10 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Cap accumulation at the default gRPC per-message ceiling (32 MiB). Do not
+      # set insecure_options.allow_unbounded_body here: after the gRPC raise in
+      # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
+      max_body_bytes: 33554432
       tls:
         mode: self_signed
 
@@ -30,15 +34,16 @@ data:
           - filter: llmisvc_model_provider_resolver
             header: X-Gateway-Model-Name
 
-    insecure_options:
-      allow_unbounded_body: true
-
   # Post-auth (IPP) Praxis chain: full processing pipeline.
   extproc.yaml: |
     server:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Cap accumulation at the default gRPC per-message ceiling (32 MiB). Do not
+      # set insecure_options.allow_unbounded_body here: after the gRPC raise in
+      # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
+      max_body_bytes: 33554432
       tls:
         mode: self_signed
 
@@ -84,6 +89,3 @@ data:
               - x-maas-return-all-models
               - x-maas-model
           - filter: request_id
-
-    insecure_options:
-      allow_unbounded_body: true

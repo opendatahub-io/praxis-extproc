@@ -307,13 +307,17 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if let Err(error) = check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation) {
-        if pipeline.body_capabilities().needs_selected_upstream_request_body {
-            let rejection = praxis_filter::Rejection::status(413)
-                .with_body(b"request body exceeds the selected-upstream limit".to_vec());
-            return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
-        }
-        return Err(error);
+    if let Err(_error) = check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation) {
+        // Prefer ImmediateResponse 413 over gRPC RESOURCE_EXHAUSTED so Envoy
+        // surfaces a diagnosable client error instead of an empty HTTP 500
+        // under failure_mode_allow: false (follow-up to RHOAIENG-102139).
+        let message = if pipeline.body_capabilities().needs_selected_upstream_request_body {
+            b"request body exceeds the selected-upstream limit".as_slice()
+        } else {
+            b"request body exceeds maximum size"
+        };
+        let rejection = praxis_filter::Rejection::status(413).with_body(message.to_vec());
+        return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
     }
     state.request_body.extend_from_slice(&body.body);
 
@@ -691,7 +695,7 @@ mod tests {
         assert!(exact.is_empty(), "an incomplete body waits for its final chunk");
         assert_eq!(state.request_body, b"abcd");
 
-        let error = accumulate_request_body(
+        let rejected = accumulate_request_body(
             &pipeline,
             praxis_proto::envoy::service::ext_proc::v3::HttpBody {
                 body: b"e".to_vec(),
@@ -700,8 +704,18 @@ mod tests {
             &mut state,
         )
         .await
-        .expect_err("a body beyond the configured limit must be rejected");
-        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        .expect("over-limit bodies return ImmediateResponse 413, not a gRPC error");
+        assert!(
+            rejected.iter().any(|response| {
+                matches!(
+                    &response.response,
+                    Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+                        immediate
+                    )) if immediate.status.as_ref().map(|status| status.code) == Some(413)
+                )
+            }),
+            "over-limit request body must be an ImmediateResponse 413, got: {rejected:?}"
+        );
         assert_eq!(
             state.request_body, b"abcd",
             "the rejected chunk must not extend the buffer"

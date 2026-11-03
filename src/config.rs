@@ -81,7 +81,8 @@ pub struct ServerConfig {
     pub shutdown_drain_timeout_secs: DrainTimeoutSecs,
 
     /// Maximum accumulated request/response body size, in bytes, before a
-    /// stream is rejected with `RESOURCE_EXHAUSTED`.
+    /// request stream is rejected with an `ImmediateResponse` 413 (response
+    /// accumulation still fails closed with gRPC `RESOURCE_EXHAUSTED`).
     ///
     /// Defaults to [`DEFAULT_MAX_BODY_BYTES`]. Ignored when
     /// `insecure_options.allow_unbounded_body` is set, which lifts the cap
@@ -156,8 +157,12 @@ impl TryFrom<u64> for DrainTimeoutSecs {
     }
 }
 
-/// Default maximum accumulated body size (10 MiB) before rejecting a stream.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Default maximum accumulated body size (32 MiB) before rejecting a stream.
+///
+/// Aligned with [`crate::grpc_limits::DEFAULT_GRPC_MAX_RECV_MSG_SIZE`] so a
+/// single BUFFERED body that fits the gRPC per-message ceiling is not then
+/// rejected by accumulation with an opaque ExtProc failure.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum accumulated request/response body size in bytes, guaranteed non-zero
 /// at parse time.
@@ -179,7 +184,7 @@ impl MaxBodyBytes {
 }
 
 impl Default for MaxBodyBytes {
-    /// 10 MiB, matching the historical fixed accumulation cap.
+    /// 32 MiB, matching the default gRPC per-message receive ceiling.
     fn default() -> Self {
         // DEFAULT_MAX_BODY_BYTES is non-zero, so the fallback arm is never taken.
         Self(match std::num::NonZeroUsize::new(DEFAULT_MAX_BODY_BYTES) {
@@ -383,7 +388,7 @@ server:
         assert_eq!(
             cfg.server.max_body_bytes.get(),
             DEFAULT_MAX_BODY_BYTES,
-            "max_body_bytes should default to 10 MiB"
+            "max_body_bytes should default to 32 MiB"
         );
         assert_eq!(
             cfg.max_body_accumulation(),

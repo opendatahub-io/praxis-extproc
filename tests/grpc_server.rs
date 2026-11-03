@@ -202,6 +202,23 @@ async fn large_body_request_succeeds() {
     assert!(!responses.is_empty(), "should produce responses for large body");
 }
 
+/// Request bodies over `server.max_body_bytes` must be ImmediateResponse 413,
+/// not a gRPC RESOURCE_EXHAUSTED that Envoy turns into an empty HTTP 500.
+#[tokio::test]
+async fn request_body_over_max_returns_immediate_413() {
+    let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
+    let body = vec![b'x'; 2048];
+    let responses = send_full_request(&mut client, "POST", "/too-large", &body).await;
+    assert!(
+        responses.iter().any(|response| matches!(
+            response.response.as_ref(),
+            Some(RespVariant::ImmediateResponse(reply))
+                if reply.status.as_ref().map(|status| status.code) == Some(413)
+        )),
+        "over-limit request body must be ImmediateResponse 413, got: {responses:?}"
+    );
+}
+
 /// RHOAIENG-102139: the shipped binary's default (32 MiB) must accept a body
 /// just over tonic's compiled 4 MiB `MaxRecv`. Spawns `praxis-extproc` so the
 /// assertion exercises `serve_grpc` wiring, not the in-process harness.
@@ -2971,6 +2988,15 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+const SMALL_BODY_LIMIT_CONFIG: &str = r#"
+server:
+  max_body_bytes: 1024
+filter_chains:
+  - name: test
+    filters:
+      - filter: request_id
+"#;
+
 const HEADERS_CONFIG: &str = r#"
 filter_chains:
   - name: test
@@ -3132,7 +3158,10 @@ async fn start_server_with_registry_and_max_recv(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = server::external_processor_server(PraxisExtProc::new(pipeline), max_recv);
+    let svc = server::external_processor_server(
+        PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+        max_recv,
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -3159,7 +3188,9 @@ async fn start_server_with_tonic_compiled_max_recv(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let svc = ExternalProcessorServer::new(
+        PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {

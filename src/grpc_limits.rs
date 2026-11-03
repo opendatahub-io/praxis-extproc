@@ -12,7 +12,9 @@
 //! Override with [`GRPC_MAX_RECV_MSG_SIZE_ENV`] (plain bytes or a Kubernetes
 //! quantity such as `64Mi`). This is a **per-message** cap only; cumulative
 //! body accumulation across streamed chunks is still governed by
-//! `server.max_body_bytes` / `insecure_options.allow_unbounded_body`.
+//! `server.max_body_bytes` / `insecure_options.allow_unbounded_body`. The
+//! library default for `max_body_bytes` matches this 32 MiB ceiling so the two
+//! knobs do not disagree for BUFFERED single-message bodies.
 
 use std::env;
 
