@@ -234,6 +234,31 @@ filter_chains:
   `unless` conditions covers header add/set/remove,
   but the MaaS-specific capture-into-state semantics
   are not yet modeled — tracked in [#5].
+
+  A port of this `maas-headers-guard` is proposed in #160.
+  The `ipp` chain's leading `headers` filter removes the
+  caller's own credentials (`authorization`, `x-api-key`),
+  the internal remote-MaaS loop-detection header
+  (`x-origin-cluster`), and every Authorino-injected MaaS
+  identity/routing header: `x-maas-*`. This list is to be kept in
+  lockstep with `ai-gateway-controller/pkg/tenant/extproc_headers.go`'s
+  `GuardedRequestHeaders` (the dynamic ExternalModel chain's
+  copy of the same filter) whenever a new header is added on
+  either side.
+
+  This `ipp` chain also carries maas-api's own (non-inference)
+  traffic, which needs its own `authorization` and identity
+  headers. The filter's `unless` conditions exempt every rule
+  of the `maas-api-route` HTTPRoute
+  (`models-as-a-service/deployment/base/maas-api/networking/httproute.yaml`):
+  `/maas-api` (a `path_prefix`, covering both the rewritten
+  `/maas-api/v1` and `/maas-api/health` rules), `/v1/models`,
+  `/v1/subscriptions`, and `/v1/api-keys` (also `path_prefix`),
+  plus the exact-match `/v1/me` route (`path`). This is
+  defense-in-depth independent of the per-route ext_proc
+  disable in `deploy/overlays/odh/envoy-filter.yaml`, which has
+  its own route-name-matching caveats.
+
 - **`model-provider-resolver` → `intelligent_route`.**
   The IPP plugin runs a live Kubernetes controller
   watch over inference CRDs. `intelligent_route`

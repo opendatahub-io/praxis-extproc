@@ -28,14 +28,6 @@ pub(crate) struct ProtocolConfig {
 
     /// Response body processing mode.
     pub(crate) response_body_mode: BodyMode,
-
-    /// Whether body is sent immediately without waiting for header response.
-    /// Only applies to `STREAMED` body mode per Envoy spec; ignored for other
-    /// modes. `FULL_DUPLEX_STREAMED` inherently streams body without waiting.
-    ///
-    /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
-    #[expect(dead_code, reason = "captured for future STREAMED delayed-response implementation")]
-    send_body_without_waiting: bool,
 }
 
 impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
@@ -47,7 +39,6 @@ impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
                 .map_err(|e| format!("request_body_mode: {e}"))?,
             response_body_mode: BodyMode::try_from(proto_cfg.response_body_mode)
                 .map_err(|e| format!("response_body_mode: {e}"))?,
-            send_body_without_waiting: proto_cfg.send_body_without_waiting_for_header_response,
         })
     }
 }

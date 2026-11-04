@@ -8,6 +8,9 @@ resources:
   - pre-processing-configmap.yaml
   - pre-processing-deployment.yaml
   - pre-processing-service.yaml
+  - streaming-configmap.yaml
+  - streaming-deployment.yaml
+  - streaming-service.yaml
 
 images:
   - name: praxis-extproc

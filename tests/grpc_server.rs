@@ -27,7 +27,17 @@
 )]
 #![allow(missing_docs, reason = "test module")]
 
-use praxis_extproc::{config, server::PraxisExtProc};
+use std::{path::PathBuf, process::Command};
+
+use praxis_extproc::{
+    config,
+    grpc_limits::{DEFAULT_GRPC_MAX_RECV_MSG_SIZE, GRPC_COMPILED_MAX_RECV_DEFAULT, GRPC_MAX_RECV_MSG_SIZE_ENV},
+    server::{self, PraxisExtProc},
+};
+use praxis_filter::{
+    BodyAccess, BodyMode as FilterBodyMode, FilterAction, FilterError, FilterRegistry, HttpFilter, HttpFilterContext,
+    SelectedUpstreamBodyOutcome,
+};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
@@ -190,6 +200,88 @@ async fn large_body_request_succeeds() {
 
     assert!(!has_immediate, "large body should not be rejected");
     assert!(!responses.is_empty(), "should produce responses for large body");
+}
+
+/// RHOAIENG-102139: the shipped binary's default (32 MiB) must accept a body
+/// just over tonic's compiled 4 MiB `MaxRecv`. Spawns `praxis-extproc` so the
+/// assertion exercises `serve_grpc` wiring, not the in-process harness.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_max_recv_binary_accepts_body_above_four_mib() {
+    let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
+    let (grpc, health, metrics) = (free_port(), free_port(), free_port());
+    let config_path = write_grpc_max_recv_config(grpc, health, metrics);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+        .arg("-c")
+        .arg(&config_path)
+        .env_remove(GRPC_MAX_RECV_MSG_SIZE_ENV)
+        .spawn()
+        .expect("spawn praxis-extproc");
+
+    let mut client = connect_extproc_client(grpc).await;
+    let responses = send_full_request(&mut client, "POST", "/large-over-4mib", &payload).await;
+
+    let kill = child.kill();
+    drop(std::fs::remove_file(&config_path));
+    kill.expect("kill praxis-extproc");
+    child.wait().expect("reap praxis-extproc");
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestBody(_)))),
+        "default max recv must process the request body, got: {responses:?}"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "body just over 4 MiB must not be rejected as immediate response"
+    );
+}
+
+/// RHOAIENG-102139 control: tonic's compiled 4 MiB default (no
+/// `.max_decoding_message_size`) rejects a body just over that limit.
+#[tokio::test]
+async fn grpc_compiled_max_recv_rejects_body_above_four_mib() {
+    let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
+    let (mut client, _shutdown) = start_server_with_tonic_compiled_max_recv(HEADERS_ONLY_CONFIG).await;
+    let err = send_full_request_result(&mut client, "POST", "/large-over-4mib", &payload)
+        .await
+        .expect_err("compiled 4 MiB limit must reject the oversized gRPC message");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("length too large") || msg.contains("RESOURCE_EXHAUSTED") || msg.contains("message size"),
+        "expected gRPC size rejection, got: {msg}"
+    );
+}
+
+/// Invalid `GRPC_MAX_RECV_MSG_SIZE` must fail `praxis-extproc -t` (same fail-
+/// closed path as serve).
+#[test]
+fn grpc_max_recv_invalid_fails_validate() {
+    let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
+    let output = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+        .args(["-t", "-c"])
+        .arg(&config)
+        .env(GRPC_MAX_RECV_MSG_SIZE_ENV, "not-a-size")
+        .output()
+        .expect("run praxis-extproc -t");
+    assert!(
+        !output.status.success(),
+        "invalid {GRPC_MAX_RECV_MSG_SIZE_ENV} must fail validate, stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(GRPC_MAX_RECV_MSG_SIZE_ENV) || combined.contains("config:"),
+        "validate refusal should name the bad override, got: {combined}"
+    );
 }
 
 #[tokio::test]
@@ -2286,6 +2378,238 @@ async fn streamed_multi_chunk_request_body() {
     assert_eq!(received_body, expected, "reassembled body should match input chunks");
 }
 
+struct WireSelectedBodyFilter;
+
+#[async_trait::async_trait]
+impl HttpFilter for WireSelectedBodyFilter {
+    fn name(&self) -> &'static str {
+        "wire_selected_body"
+    }
+
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.cluster = Some("selected-provider".into());
+        ctx.request_headers_to_set.push((
+            "x-selected-early".parse().expect("header name"),
+            "yes".parse().expect("header value"),
+        ));
+        Ok(FilterAction::Continue)
+    }
+
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn request_body_mode(&self) -> FilterBodyMode {
+        FilterBodyMode::StreamBuffer { max_bytes: Some(1024) }
+    }
+
+    async fn on_selected_upstream_request_body(
+        &self,
+        _: &mut HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        *body = Some(bytes::Bytes::from_static(b"rewritten-on-selected-upstream"));
+        Ok(SelectedUpstreamBodyOutcome::Continue)
+    }
+}
+
+impl WireSelectedBodyFilter {
+    #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+    fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self))
+    }
+}
+
+/// Envoy-routed requests need both body translation and the late path mutation.
+#[tokio::test]
+async fn envoy_routed_anthropic_request_translates_body_and_path() {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+
+    let (mut client, _shutdown) = start_server(ENVOY_ANTHROPIC_CONFIG).await;
+    let input = br#"{"model":"internal-model","max_tokens":73,"system":"Be concise","messages":[{"role":"user","content":"hello"}]}"#;
+    let responses = send_full_request(&mut client, "POST", "/v1/messages", input).await;
+    let translated = responses
+        .iter()
+        .find_map(|response| {
+            let RespVariant::RequestBody(body) = response.response.as_ref()? else {
+                return None;
+            };
+            match body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+                body_mutation::Mutation::Body(bytes) => Some(bytes),
+                _ => None,
+            }
+        })
+        .expect("Envoy-routed request must emit a translated body");
+    let body: serde_json::Value = serde_json::from_slice(translated).unwrap();
+    assert_eq!(body["model"], "internal-model");
+    assert_eq!(body["max_completion_tokens"], 73);
+    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][0]["content"], "Be concise");
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert!(body.get("system").is_none());
+    assert!(
+        extract_all_set_headers(&responses)
+            .iter()
+            .any(|header| { header.key == ":path" && header.value == "/v1/chat/completions" }),
+        "translated body and rewritten path must be delivered together"
+    );
+}
+
+/// Request-phase conditions must keep `OpenAI` bodies out of the Anthropic hook.
+#[tokio::test]
+async fn envoy_routed_openai_request_preserves_body() {
+    let (mut client, _shutdown) = start_server(ENVOY_ANTHROPIC_CONFIG).await;
+    let input = br#"{"model":"internal-model","messages":[{"role":"user","content":"hello"}]}"#;
+    let responses = send_full_request(&mut client, "POST", "/v1/chat/completions", input).await;
+    assert!(
+        !responses
+            .iter()
+            .any(|response| matches!(response.response, Some(RespVariant::ImmediateResponse(_))))
+    );
+    assert!(
+        !extract_all_set_headers(&responses)
+            .iter()
+            .any(|header| header.key == ":path")
+    );
+    for response in &responses {
+        if let Some(RespVariant::RequestBody(body)) = &response.response
+            && let Some(praxis_proto::envoy::service::ext_proc::v3::body_mutation::Mutation::Body(bytes)) = body
+                .response
+                .as_ref()
+                .and_then(|common| common.body_mutation.as_ref())
+                .and_then(|mutation| mutation.mutation.as_ref())
+        {
+            assert_eq!(bytes, input, "non-matching OpenAI body must remain unchanged");
+        }
+    }
+}
+
+/// Envoy-owned routing must not bypass the selected-body input limit.
+#[tokio::test]
+async fn envoy_routed_translation_rejects_oversized_input() {
+    let (mut client, _shutdown) = start_server(ENVOY_ANTHROPIC_CONFIG).await;
+    let mut input =
+        br#"{"model":"internal-model","max_tokens":73,"messages":[{"role":"user","content":"hello"}]}"#.to_vec();
+    input.resize(1_048_577, b' ');
+    let responses = send_full_request(&mut client, "POST", "/v1/messages", &input).await;
+    assert!(
+        responses.iter().any(|response| matches!(response.response.as_ref(),
+        Some(RespVariant::ImmediateResponse(reply)) if reply.status.as_ref().map(|status| status.code) == Some(413))),
+        "input over the filter limit must be rejected before forwarding"
+    );
+}
+
+/// A selected-body filter must reject STREAMED mode before Envoy forwards bytes.
+#[tokio::test]
+async fn streamed_selected_body_rejects_before_header_ack() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "wire_selected_body",
+            praxis_filter::http_builtin(WireSelectedBodyFilter::from_config),
+        )
+        .expect("register selected-body test filter");
+    let (mut client, _shutdown) = start_server_with_registry(SELECTED_BODY_CONFIG, registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut inbound = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .expect("open stream")
+        .into_inner();
+    let mut headers = make_request_headers("POST", "/selected", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1,
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: true,
+    });
+    tx.send(headers).await.expect("send headers");
+    let response = inbound.message().await.expect("gRPC response").expect("local reply");
+    let Some(RespVariant::ImmediateResponse(immediate)) = response.response else {
+        panic!("selected STREAMED mode must fail before body delivery");
+    };
+    assert_eq!(immediate.status.as_ref().map(|status| status.code), Some(500));
+    assert!(immediate.body.contains("BUFFERED"));
+}
+
+/// BUFFERED mode carries selected-body bytes and late header mutations in its body response.
+#[tokio::test]
+async fn buffered_selected_body_translates_and_preserves_header_mutation() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "wire_selected_body",
+            praxis_filter::http_builtin(WireSelectedBodyFilter::from_config),
+        )
+        .expect("register selected-body test filter");
+    let (mut client, _shutdown) = start_server_with_registry(SELECTED_BODY_CONFIG, registry).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut inbound = client
+        .process(ReceiverStream::new(rx))
+        .await
+        .expect("open stream")
+        .into_inner();
+    let mut headers = make_request_headers("POST", "/selected", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 2,
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+    let header_reply = inbound.message().await.expect("gRPC response").expect("header ack");
+    assert!(matches!(header_reply.response, Some(RespVariant::RequestHeaders(_))));
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"original".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send complete buffered body");
+    let body_reply = inbound
+        .message()
+        .await
+        .expect("gRPC response")
+        .expect("translated body");
+    let Some(RespVariant::RequestBody(body)) = body_reply.response else {
+        panic!("BUFFERED translation must return a body response");
+    };
+    let common = body.response.expect("common response");
+    let translated = common
+        .body_mutation
+        .as_ref()
+        .and_then(|mutation| mutation.mutation.as_ref());
+    assert!(
+        matches!(translated, Some(body_mutation::Mutation::Body(bytes)) if bytes == b"rewritten-on-selected-upstream")
+    );
+    let early_header = common.header_mutation.as_ref().is_some_and(|mutation| {
+        mutation.set_headers.iter().any(|option| {
+            option
+                .header
+                .as_ref()
+                .is_some_and(|header| header.key == "x-selected-early" && header.value == "yes")
+        })
+    });
+    assert!(
+        early_header,
+        "buffered body response must carry the request header mutation"
+    );
+    let content_length = common.header_mutation.as_ref().is_some_and(|mutation| {
+        mutation.set_headers.iter().any(|option| {
+            option.header.as_ref().is_some_and(|header| {
+                header.key == "content-length" && header.value == b"rewritten-on-selected-upstream".len().to_string()
+            })
+        })
+    });
+    assert!(content_length, "buffered rewrite must update content-length");
+}
+
 #[tokio::test]
 async fn streamed_empty_body() {
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
@@ -2746,6 +3070,37 @@ insecure_options:
   allow_unbounded_body: true
 "#;
 
+/// Shared translation chain with Envoy-owned routing and path-conditional filters.
+const ENVOY_ANTHROPIC_CONFIG: &str = r#"
+filter_chains:
+  - name: shared
+    filters:
+      - filter: anthropic_messages_request
+        on_invalid: reject
+        conditions:
+          - when:
+              path: "/v1/messages"
+      - filter: anthropic_messages_to_chat_completions
+        max_body_bytes: 1048576
+        conditions:
+          - when:
+              path: "/v1/messages"
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/messages$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path: "/v1/messages"
+"#;
+
+const SELECTED_BODY_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: wire_selected_body
+"#;
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -2754,19 +3109,35 @@ type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    start_server_with_registry(config_yaml, praxis_ai_filters::build_ai_registry()).await
+}
+
+async fn start_server_with_registry(
+    config_yaml: &str,
+    registry: FilterRegistry,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    // Pin the shared harness to the crate default so ambient
+    // `GRPC_MAX_RECV_MSG_SIZE` cannot reshape unrelated tests.
+    start_server_with_registry_and_max_recv(config_yaml, registry, DEFAULT_GRPC_MAX_RECV_MSG_SIZE).await
+}
+
+async fn start_server_with_registry_and_max_recv(
+    config_yaml: &str,
+    registry: FilterRegistry,
+    max_recv: usize,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
-    let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry).expect("build pipeline");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
 
-    let svc = PraxisExtProc::new(pipeline);
+    let svc = server::external_processor_server(PraxisExtProc::new(pipeline), max_recv);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
         Server::builder()
-            .add_service(ExternalProcessorServer::new(svc))
+            .add_service(svc)
             .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
                 drop(shutdown_rx.await);
             })
@@ -2775,15 +3146,90 @@ async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (extproc_client_for_addr(addr).await, shutdown_tx)
+}
 
+/// In-process server that leaves tonic's compiled 4 MiB max-recv untouched.
+async fn start_server_with_tonic_compiled_max_recv(
+    config_yaml: &str,
+) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
+    let cfg: config::ExtProcConfig = serde_yaml::from_str(config_yaml).expect("parse config");
+    let pipeline = config::build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).expect("build pipeline");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), async {
+                drop(shutdown_rx.await);
+            })
+            .await
+            .expect("server failed");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (extproc_client_for_addr(addr).await, shutdown_tx)
+}
+
+async fn extproc_client_for_addr(addr: std::net::SocketAddr) -> ExtProcClient {
     let channel = Channel::from_shared(format!("http://{addr}"))
         .expect("uri")
         .connect()
         .await
         .expect("connect");
-    let client = ExtProcClient::new(channel);
+    // Client send/recv limits stay at the raised default so tests can deliver
+    // bodies that only the *server* max_recv under test should reject.
+    ExtProcClient::new(channel)
+        .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+        .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+}
 
-    (client, shutdown_tx)
+/// Connect to a spawned `praxis-extproc` gRPC listener, retrying until ready.
+async fn connect_extproc_client(port: u16) -> ExtProcClient {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(channel) = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("uri")
+            .connect()
+            .await
+        {
+            return ExtProcClient::new(channel)
+                .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
+                .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "praxis-extproc never accepted connections on 127.0.0.1:{port}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Minimal serving config on free ports for the binary max-recv regression.
+fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
+    let yaml = format!(
+        "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
+         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: test\n    \
+         filters:\n      - filter: request_id\ninsecure_options:\n  allow_unbounded_body: true\n"
+    );
+    let path = std::env::temp_dir().join(format!(
+        "praxis-extproc-grpc-max-recv-{}-{grpc}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&path, yaml).expect("write server config");
+    path
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .expect("find a free port")
 }
 
 async fn send_headers_only(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {
@@ -2807,10 +3253,21 @@ async fn send_full_request(
     path: &str,
     body: &[u8],
 ) -> Vec<ProcessingResponse> {
+    send_full_request_result(client, method, path, body)
+        .await
+        .expect("process call failed")
+}
+
+async fn send_full_request_result(
+    client: &mut ExtProcClient,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<ProcessingResponse>, tonic::Status> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
 
-    let response = client.process(stream).await.expect("process call failed");
+    let response = client.process(stream).await?;
     let mut inbound = response.into_inner();
 
     let has_body = !body.is_empty();
@@ -2832,7 +3289,7 @@ async fn send_full_request(
     }
 
     drop(tx);
-    collect_responses(&mut inbound).await
+    collect_responses_result(&mut inbound).await
 }
 
 async fn send_full_roundtrip(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {
@@ -2937,14 +3394,25 @@ fn make_header(key: &str, value: &str) -> HeaderValue {
 }
 
 async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -> Vec<ProcessingResponse> {
+    collect_responses_result(inbound).await.expect("collect responses")
+}
+
+async fn collect_responses_result(
+    inbound: &mut tonic::Streaming<ProcessingResponse>,
+) -> Result<Vec<ProcessingResponse>, tonic::Status> {
     let mut responses = Vec::new();
     let timeout = tokio::time::Duration::from_secs(2);
 
-    while let Ok(Ok(Some(resp))) = tokio::time::timeout(timeout, inbound.message()).await {
-        responses.push(resp);
+    loop {
+        match tokio::time::timeout(timeout, inbound.message()).await {
+            Ok(Ok(Some(resp))) => responses.push(resp),
+            // Idle timeout (`Err`) means the stream went quiet.
+            Ok(Ok(None)) | Err(_) => break,
+            Ok(Err(status)) => return Err(status),
+        }
     }
 
-    responses
+    Ok(responses)
 }
 
 /// Collect streamed body chunks from a response stream.

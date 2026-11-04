@@ -16,6 +16,7 @@ pub mod adapter;
 pub mod config;
 pub mod error;
 pub mod fips;
+pub mod grpc_limits;
 mod handlers;
 pub mod health;
 pub mod metrics;

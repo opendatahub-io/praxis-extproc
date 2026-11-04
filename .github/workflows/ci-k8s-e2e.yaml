@@ -67,10 +67,13 @@ jobs:
       - name: Diagnostics
         if: failure()
         run: |
-          kubectl --context kind-praxis-e2e get pods -A
-          kubectl --context kind-praxis-e2e describe pods -n praxis-extproc
-          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100
-          kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30
+          kubectl --context kind-praxis-e2e get pods -A || true
+          kubectl --context kind-praxis-e2e get gateways,httproutes,referencegrants -A -o yaml || true
+          kubectl --context kind-praxis-e2e get services -n istio-system -o wide || true
+          kubectl --context kind-praxis-e2e logs -n istio-system deployment/istiod --tail=200 || true
+          kubectl --context kind-praxis-e2e describe pods -n praxis-extproc || true
+          kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100 || true
+          kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30 || true
 
       - name: Teardown
         if: always()

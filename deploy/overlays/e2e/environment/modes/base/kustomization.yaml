@@ -5,3 +5,4 @@ kind: Kustomization
 # overlays consume this base and patch the body/trailer modes.
 resources:
   - ext-proc.yaml
+  - streaming-ext-proc.yaml

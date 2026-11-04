@@ -12,6 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
+    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV},
     server::PraxisExtProc,
     tls,
 };
@@ -68,26 +69,38 @@ async fn main() {
 // Startup
 // -----------------------------------------------------------------------------
 
+/// Per-message and cumulative body ceilings resolved at startup.
+#[derive(Clone, Copy)]
+struct BodyLimits {
+    /// Cumulative body accumulation across streamed chunks (`None` = unbounded).
+    max_body: Option<usize>,
+    /// Per-gRPC-message tonic decoding ceiling.
+    max_recv: usize,
+}
+
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before anything that builds a filter registry, a subrequest client or a
     // TLS configuration: the provider installed here is the only one there is.
     let fips = praxis_extproc::fips::install()?;
 
+    // Fail closed on a bad `GRPC_MAX_RECV_MSG_SIZE` before validate/sidecars so
+    // `praxis-extproc -t` matches serve-time behaviour for this override.
+    let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
+
     let cfg = load_config(&cli.config)?;
     let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        if let Some(reason) = fips_refusal(&fips, &registry) {
-            return Err(reason.into());
-        }
-        pipeline?;
-        info!("configuration is valid");
-        return Ok(());
+        return validate_config(&fips, &registry, pipeline, max_recv);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
+    let limits = BodyLimits {
+        max_body: cfg.max_body_accumulation(),
+        max_recv,
+    };
 
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
@@ -101,10 +114,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         addrs,
         pipeline,
         &cfg.server,
-        cfg.max_body_accumulation(),
+        limits,
         praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+/// `--validate` path: FIPS refusal, pipeline build, and already-resolved limits.
+fn validate_config(
+    fips: &praxis_extproc::fips::Status,
+    registry: &praxis_filter::FilterRegistry,
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+    max_recv: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(reason) = fips_refusal(fips, registry) {
+        return Err(reason.into());
+    }
+    pipeline?;
+    info!(
+        bytes = max_recv,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "configuration is valid"
+    );
+    Ok(())
 }
 
 
@@ -147,7 +179,7 @@ async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -157,7 +189,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, max_body, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, limits, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -171,11 +203,11 @@ async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
+        serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx)
     }))
     .await
 }
@@ -292,17 +324,26 @@ async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
-    max_body: Option<usize>,
+    limits: BodyLimits,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
+    // bound cumulative body bytes reassembled across streamed chunks.
+    info!(
+        bytes = limits.max_recv,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "gRPC max decoding message size configured"
+    );
+
     // The latch fires when the drain deadline expires, forcing any streams still
     // running after graceful shutdown began to cancel.
     let (force_tx, force_rx) = tokio::sync::watch::channel(false);
-    let svc = ExternalProcessorServer::new(
+    let svc = praxis_extproc::server::external_processor_server(
         PraxisExtProc::new(pipeline)
-            .with_max_body_accumulation(max_body)
+            .with_max_body_accumulation(limits.max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
             .with_force_shutdown(force_rx.clone()),
+        limits.max_recv,
     );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());
     let controls = ShutdownControls {

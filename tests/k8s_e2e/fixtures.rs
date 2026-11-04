@@ -6,19 +6,29 @@ const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const GATEWAY_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 static GATEWAY_READY: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static STREAMING_GATEWAY_READY: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Wait until the gateway is accepting HTTP connections.
 ///
 /// Polls with a simple GET — any HTTP response (even 404) means the
 /// gateway is up. Does NOT depend on ext-proc or routing being functional.
 pub(crate) async fn ensure_gateway_ready() {
-    let ready = GATEWAY_READY
+    ensure_gateway_ready_at(&GATEWAY_READY, gateway_url()).await;
+}
+
+/// Wait until the isolated streaming gateway is accepting HTTP connections.
+pub(crate) async fn ensure_streaming_gateway_ready() {
+    ensure_gateway_ready_at(&STREAMING_GATEWAY_READY, streaming_gateway_url()).await;
+}
+
+/// Poll one gateway endpoint once per test binary.
+async fn ensure_gateway_ready_at(ready: &'static tokio::sync::OnceCell<bool>, url: String) {
+    let ready = ready
         .get_or_init(|| async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client");
-            let url = gateway_url();
             let deadline = tokio::time::Instant::now() + GATEWAY_READY_TIMEOUT;
 
             loop {
@@ -63,6 +73,12 @@ pub(crate) fn assert_praxis_mutations(resp: &reqwest::Response) {
 
 pub(crate) fn gateway_url() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
+}
+
+/// Return the E2E endpoint whose ExtProc chain permits streamed responses.
+pub(crate) fn streaming_gateway_url() -> String {
+    std::env::var("STREAMING_GATEWAY_URL")
+        .expect("E2E harness must set STREAMING_GATEWAY_URL for the unguarded response stream")
 }
 
 /// Build an HTTP client with the llm-katan auth token pre-configured.

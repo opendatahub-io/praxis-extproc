@@ -173,17 +173,12 @@ async fn provider_unknown_status_fails_closed_on_response() {
     assert_response_fails_closed("__GUARD_UNKNOWN_OUT__").await;
 }
 
-/// Story: a streaming request must fail closed when response guardrails are enabled.
+/// Story: a streaming request is rejected before upstream when response guardrails are enabled.
 ///
-/// `ai_guardrails` can only evaluate a response by buffering it, which an SSE
-/// stream can't do without destroying streaming. Today the filter silently
-/// skips response-phase evaluation for `text/event-stream` instead, so unsafe
-/// model output reaches the client ungated — a real guardrails bypass, not an
-/// accepted limitation. Until streaming evaluation lands (praxis-proxy/ai#1108),
-/// the proxy should reject the request up front instead of serving unvetted
-/// content. Fixed upstream in praxis-ai 0.7.0: the filter now rejects a
-/// streaming request with a 422 before the upstream is reached when a response
-/// guardrail is active (<https://github.com/praxis-proxy/ai/issues/1604>).
+/// The pinned `ai_guardrails` filter cannot inspect SSE response bodies, so it
+/// rejects `stream: true` with 422 during request-body processing. The separate
+/// `completions::streaming` test uses a chain without response guardrails to
+/// verify ExtProc's SSE pass-through behavior.
 #[tokio::test]
 async fn streaming_request_rejected_when_response_guardrails_enabled() {
     ensure_gateway_ready().await;
@@ -202,13 +197,16 @@ async fn streaming_request_rejected_when_response_guardrails_enabled() {
         .expect("request failed");
 
     let status = resp.status();
-    assert_eq!(
-        status, 422,
-        "ai_guardrails must fail closed on a streaming request with 422 while it cannot \
-         evaluate SSE response bodies (praxis-proxy/ai#1604), got {status}"
+    assert!(
+        status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "response-guarded streaming requests must be rejected before upstream with 422, got {status}"
     );
 
     let body = resp.text().await.expect("failed to read body");
+    assert_eq!(
+        body, "ai_guardrails: streaming responses are not supported while a response guardrail is active",
+        "the request must be rejected by the response-guardrail stream validation"
+    );
     assert!(
         !body.contains("data:"),
         "no SSE chunks may reach the client, got {body:?}"

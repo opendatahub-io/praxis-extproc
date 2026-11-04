@@ -27,6 +27,56 @@ data:
     filter_chains:
       - name: ai-filters
         filters:
+          # Mirrors the `ipp` chain's guard filter
+          # (../../../base/config/configmap.yaml) for maas-headers-guard
+          # regression coverage. Two e2e-only additions: a `when
+          # path_prefix: /direct/internal` condition, so the strip never
+          # hits gpt-4/llm-katan's shared /v1/chat/completions (which needs
+          # its real Authorization header); and an unconditional
+          # response_add marker so tests can observe this filter's own
+          # conditions matching -- see tests/k8s_e2e/filters.rs for why a
+          # later-filter canary can't do that instead.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+              - unless:
+                  path: /v1/me
+              - when:
+                  path_prefix: /direct/internal
+            request_remove:
+              - authorization
+              - x-api-key
+              - x-origin-cluster
+              - x-maas-username
+              - x-maas-username-oc
+              - x-maas-username-token
+              - x-maas-group
+              - x-maas-group-oc
+              - x-maas-group-token
+              - x-maas-keyname
+              - x-maas-key-id
+              - x-maas-subscription
+              - x-maas-subscription-rate-limit-id
+              - x-maas-cost-center
+              - x-maas-organization-id
+              - x-maas-identity
+              - x-maas-admin-scope
+              - x-maas-tenant
+              - x-maas-invocation-mode
+              - x-maas-policy-revision
+              - x-maas-responses-owner
+              - x-maas-return-all-models
+              - x-maas-model
+            response_add:
+              - name: X-Guard-Applied
+                value: "true"
           # Request + response phases both evaluate against the mock NeMo service;
           # a "passed" verdict forwards traffic unchanged, so the rest of the
           # e2e suite is undisturbed.

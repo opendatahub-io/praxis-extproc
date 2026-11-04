@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-processing-streaming-plugins
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      max_body_bytes: 1048576
+      tls:
+        mode: self_signed
+
+    insecure_options:
+      allow_private_upstreams: true
+
+    # This isolated test chain keeps request guardrails active while leaving
+    # the response guardrail on the primary Gateway unchanged. The ai_guardrails
+    # filter intentionally rejects stream=true when response evaluation is on.
+    filter_chains:
+      - name: streaming-e2e
+        filters:
+          - filter: ai_guardrails
+            provider:
+              type: nemo
+              endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
+            phase:
+              request: true
+              response: false
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: continue
+          - filter: headers
+            request_add:
+              - name: X-Praxis-Processed
+                value: "true"
+            response_set:
+              - name: X-Praxis-Version
+                value: "e2e-streaming"

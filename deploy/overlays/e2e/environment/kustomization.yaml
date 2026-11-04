@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - gateway.yaml
+  - streaming-gateway.yaml
   - envoyfilter.yaml
   - internal-model.yaml
   - echo.yaml
