@@ -58,7 +58,7 @@ jobs:
         run: make e2e-setup MODE=${{ matrix.mode }}
 
       - name: Run K8s e2e tests
-        run: make e2e-test V=1
+        run: make e2e-test V=1 MODE=${{ matrix.mode }}
 
       - name: Diagnostics
         if: failure()

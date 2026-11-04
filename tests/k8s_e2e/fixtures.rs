@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 const DEFAULT_GATEWAY_URL: &str = "http://172.18.0.200";
+const DEFAULT_IPP_METRICS_URL: &str = "http://127.0.0.1:19090/metrics";
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const GATEWAY_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -69,6 +70,61 @@ pub(crate) fn assert_praxis_mutations(resp: &reqwest::Response) {
         "missing X-Praxis-Version — IPP response mutations not applied \
              (FDS deferral broken or IPP ext-proc not running)",
     );
+}
+
+/// `X-Praxis-Version` is only set by the IPP response-phase `headers` filter,
+/// which only runs once a real upstream response comes back. Its absence
+/// means the request was rejected before the backend was ever dialed, not
+/// just that the backend itself happened to fail.
+///
+/// Only meaningful for BUFFERED rejection fixtures: streamed passthrough can
+/// already have forwarded earlier chunks before ExtProc trips its body cap.
+pub(crate) fn assert_not_forwarded_to_backend(resp: &reqwest::Response) {
+    assert!(
+        resp.headers().get("X-Praxis-Version").is_none(),
+        "X-Praxis-Version present — request reached the backend instead of being rejected"
+    );
+}
+
+/// Whether this e2e run was set up with BUFFERED ExtProc body modes.
+pub(crate) fn is_buffered_body_mode() -> bool {
+    std::env::var("E2E_BODY_MODE")
+        .map(|mode| mode.eq_ignore_ascii_case("buffered"))
+        .unwrap_or(false)
+}
+
+/// Prometheus scrape URL for the fail-closed IPP ExtProc metrics port.
+pub(crate) fn ipp_metrics_url() -> String {
+    std::env::var("IPP_METRICS_URL").unwrap_or_else(|_| DEFAULT_IPP_METRICS_URL.to_owned())
+}
+
+/// Current value of `praxis_extproc_body_size_rejections_total` from IPP metrics.
+pub(crate) async fn body_size_rejections_total() -> u64 {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build metrics HTTP client");
+    let text = client
+        .get(ipp_metrics_url())
+        .send()
+        .await
+        .expect("scrape IPP metrics")
+        .error_for_status()
+        .expect("IPP metrics HTTP status")
+        .text()
+        .await
+        .expect("read IPP metrics body");
+    parse_prometheus_counter(&text, "praxis_extproc_body_size_rejections_total")
+        .expect("praxis_extproc_body_size_rejections_total missing from IPP metrics scrape")
+}
+
+/// Parse an unlabeled (or any-label) counter sample from Prometheus text.
+fn parse_prometheus_counter(text: &str, name: &str) -> Option<u64> {
+    text.lines().filter(|line| !line.starts_with('#')).find_map(|line| {
+        let (metric, value) = line.rsplit_once(' ')?;
+        let base = metric.split('{').next()?;
+        (base == name).then(|| value.parse().ok())?
+    })
 }
 
 pub(crate) fn gateway_url() -> String {

@@ -16,15 +16,24 @@ SVC="${E2E_GATEWAY_SVC:-e2e-gateway-istio}"
 PORT="${E2E_PORT:-18080}"
 STREAMING_SVC="${E2E_STREAMING_GATEWAY_SVC:-e2e-streaming-gateway-istio}"
 STREAMING_PORT="${E2E_STREAMING_PORT:-18081}"
+EXTPROC_NS="${E2E_EXTPROC_NS:-praxis-extproc}"
+IPP_DEPLOY="${E2E_IPP_DEPLOY:-payload-processing}"
+METRICS_PORT="${E2E_METRICS_PORT:-19090}"
+
+# Body mode under test (fds|buffered). Prefer an explicit export from `make
+# e2e-test MODE=...`; otherwise default to fds to match Makefile.
+export E2E_BODY_MODE="${E2E_BODY_MODE:-${MODE:-fds}}"
 
 # Any HTTP response (even 404) means the endpoint is reachable.
 reachable() { curl -s -o /dev/null --max-time 5 "$1" 2>/dev/null; }
 
 PF_PID=""
 STREAMING_PF_PID=""
+METRICS_PF_PID=""
 cleanup() {
   [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null || true
   [[ -n "$STREAMING_PF_PID" ]] && kill "$STREAMING_PF_PID" 2>/dev/null || true
+  [[ -n "$METRICS_PF_PID" ]] && kill "$METRICS_PF_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -66,7 +75,21 @@ else
   echo "e2e: using ${STREAMING_GATEWAY_URL}"
 fi
 
-if [[ -n "$PF_PID" || -n "$STREAMING_PF_PID" ]]; then
+echo "e2e: port-forwarding ${IPP_DEPLOY} metrics -> 127.0.0.1:${METRICS_PORT}"
+kubectl --context "$CTX" -n "$EXTPROC_NS" port-forward "deploy/${IPP_DEPLOY}" "${METRICS_PORT}:9090" >/dev/null 2>&1 &
+METRICS_PF_PID=$!
+for _ in $(seq 1 20); do
+  reachable "http://127.0.0.1:${METRICS_PORT}/metrics" && break
+  sleep 0.5
+done
+reachable "http://127.0.0.1:${METRICS_PORT}/metrics" || {
+  echo "e2e: IPP metrics port-forward did not become ready" >&2
+  exit 1
+}
+export IPP_METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
+echo "e2e: using ${IPP_METRICS_URL} (E2E_BODY_MODE=${E2E_BODY_MODE})"
+
+if [[ -n "$PF_PID" || -n "$STREAMING_PF_PID" || -n "$METRICS_PF_PID" ]]; then
   # Port-forward tunnels can collapse when concurrent tests flood them. Keep
   # the whole E2E process serial when either Gateway needs a tunnel.
   : "${RUST_TEST_THREADS:=1}"

@@ -219,6 +219,68 @@ async fn request_body_over_max_returns_immediate_413() {
     );
 }
 
+/// After `ImmediateResponse` 413, the server must end its response stream even
+/// when the client keeps the request sender open (resource-lifetime guard).
+#[tokio::test]
+async fn immediate_413_ends_response_stream_while_client_input_stays_open() {
+    let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
+    let (tx, mut inbound) = open_stream(&mut client).await;
+
+    tx.send(make_request_headers("POST", "/too-large-open", false))
+        .await
+        .expect("send headers");
+    let header_resp = inbound.message().await.expect("recv").expect("headers response");
+    assert!(
+        matches!(&header_resp.response, Some(RespVariant::RequestHeaders(_))),
+        "headers phase must complete before the over-limit body, got: {header_resp:?}"
+    );
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: vec![b'x'; 2048],
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .expect("send over-limit body");
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    let mut saw_413 = false;
+    let mut saw_eof = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(200), inbound.message()).await {
+            Ok(Ok(Some(resp))) => {
+                if matches!(
+                    resp.response.as_ref(),
+                    Some(RespVariant::ImmediateResponse(reply))
+                        if reply.status.as_ref().map(|status| status.code) == Some(413)
+                ) {
+                    saw_413 = true;
+                }
+            },
+            Ok(Ok(None)) => {
+                saw_eof = true;
+                break;
+            },
+            Ok(Err(status)) => panic!("unexpected stream error before EOF: {status}"),
+            Err(_) => {},
+        }
+    }
+
+    assert!(
+        saw_413,
+        "must receive ImmediateResponse 413 while client input stays open"
+    );
+    assert!(
+        saw_eof,
+        "server must EOF the response stream after ImmediateResponse without waiting for client input EOF"
+    );
+    // Keep the request sender alive until after the assertions so this case
+    // cannot pass merely because the client closed the input stream.
+    drop(tx);
+}
+
 /// Framing headroom: a BUFFERED body exactly at `max_body_bytes` must reach the
 /// handler (not fail at tonic decode), and one byte over must be `ImmediateResponse` 413.
 #[tokio::test]
