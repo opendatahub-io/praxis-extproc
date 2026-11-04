@@ -297,13 +297,13 @@ pub(crate) async fn handle_request_body(
                 return Ok(vec![rejection]);
             }
             Ok(passthrough_chunk(&body, state, mode, true))
-        }
+        },
         (BodyMode::Streamed, true) => {
             if let Some(rejection) = reject_streamed_request_over_limit(pipeline, state, body.body.len()) {
                 return Ok(vec![rejection]);
             }
             process_streamed_body_chunk(pipeline, body, state, true).await
-        }
+        },
         _ => accumulate_request_body(pipeline, body, state).await,
     }
 }

@@ -31,7 +31,7 @@ pub const GRPC_MAX_RECV_MSG_SIZE_ENV: &str = "GRPC_MAX_RECV_MSG_SIZE";
 
 /// Headroom above the 32 MiB body accumulation default so protobuf framing of
 /// a `ProcessingRequest` that carries an exactly-at-limit BUFFERED body does
-/// not trip tonic before [`crate::handlers`] can return `ImmediateResponse` 413.
+/// not trip tonic before the request handler can return `ImmediateResponse` 413.
 pub const GRPC_RECV_FRAMING_HEADROOM: usize = 1024 * 1024;
 
 /// Default max decoding message size: above tonic's 4 MiB compiled default,
@@ -278,8 +278,7 @@ mod tests {
     fn default_above_max_body_bytes_for_framing() {
         const {
             assert!(
-                DEFAULT_GRPC_MAX_RECV_MSG_SIZE
-                    >= crate::config::DEFAULT_MAX_BODY_BYTES + GRPC_RECV_FRAMING_HEADROOM
+                DEFAULT_GRPC_MAX_RECV_MSG_SIZE >= crate::config::DEFAULT_MAX_BODY_BYTES + GRPC_RECV_FRAMING_HEADROOM
             );
         }
     }
