@@ -97,16 +97,22 @@ async fn oversized_body_rejected() {
     );
 }
 
-/// Prove the ExtProc ImmediateResponse 413 path specifically (not a generic 5xx).
+/// Prove ExtProc/Envoy return HTTP 413 for an oversized body (not a generic 5xx).
 ///
-/// Surrounding limits: BBR allows up to 32 MiB so a 2 MiB body reaches IPP, whose
-/// e2e `max_body_bytes` is 1 MiB. That yields HTTP 413 and increments
-/// `praxis_extproc_body_size_rejections_total`. BUFFERED also asserts the request
-/// never reached the backend; streamed fixtures may have forwarded earlier chunks.
+/// Surrounding limits: BBR allows up to 32 MiB; IPP e2e `max_body_bytes` is 1 MiB.
+/// Under FULL_DUPLEX_STREAMED, Envoy streams the body into IPP so the rejection is
+/// ExtProc's ImmediateResponse 413 and `praxis_extproc_body_size_rejections_total`
+/// must increase. Under BUFFERED, Envoy may 413 before ExtProc sees the body, so
+/// we require 413 + "not forwarded to backend" instead of the IPP counter.
 #[tokio::test]
-async fn oversized_body_returns_extproc_413_and_increments_rejection_counter() {
+async fn oversized_body_returns_413_with_mode_specific_proof() {
     ensure_gateway_ready().await;
-    let before = body_size_rejections_total().await;
+    let buffered = is_buffered_body_mode();
+    let before = if buffered {
+        0
+    } else {
+        body_size_rejections_total().await
+    };
 
     let oversized = "x".repeat(2 * 1024 * 1024);
     let resp = http_client()
@@ -122,17 +128,19 @@ async fn oversized_body_returns_extproc_413_and_increments_rejection_counter() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-        "body between BBR and IPP caps must surface ExtProc ImmediateResponse 413, got {}",
+        "oversized body must surface HTTP 413 (ExtProc ImmediateResponse or Envoy buffer), got {}",
         resp.status()
     );
-    if is_buffered_body_mode() {
+
+    if buffered {
         assert_not_forwarded_to_backend(&resp);
+        return;
     }
 
     let after = body_size_rejections_total().await;
     assert!(
         after > before,
-        "IPP body-size rejection counter must increase (before={before}, after={after})"
+        "FULL_DUPLEX_STREAMED must reject in IPP so body-size counter increases (before={before}, after={after})"
     );
 }
 

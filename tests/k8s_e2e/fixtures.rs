@@ -99,6 +99,9 @@ pub(crate) fn ipp_metrics_url() -> String {
 }
 
 /// Current value of `praxis_extproc_body_size_rejections_total` from IPP metrics.
+///
+/// Missing samples count as `0`: Prometheus exporters often omit a counter until
+/// it has been incremented at least once.
 pub(crate) async fn body_size_rejections_total() -> u64 {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -114,8 +117,7 @@ pub(crate) async fn body_size_rejections_total() -> u64 {
         .text()
         .await
         .expect("read IPP metrics body");
-    parse_prometheus_counter(&text, "praxis_extproc_body_size_rejections_total")
-        .expect("praxis_extproc_body_size_rejections_total missing from IPP metrics scrape")
+    parse_prometheus_counter(&text, "praxis_extproc_body_size_rejections_total").unwrap_or(0)
 }
 
 /// Parse an unlabeled (or any-label) counter sample from Prometheus text.
@@ -125,6 +127,30 @@ fn parse_prometheus_counter(text: &str, name: &str) -> Option<u64> {
         let base = metric.split('{').next()?;
         (base == name).then(|| value.parse().ok())?
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_prometheus_counter;
+
+    #[test]
+    fn parse_prometheus_counter_reads_sample_and_missing() {
+        let text = "\
+# HELP praxis_extproc_body_size_rejections_total Total requests rejected
+# TYPE praxis_extproc_body_size_rejections_total counter
+praxis_extproc_body_size_rejections_total 3
+praxis_extproc_requests_total 9
+";
+        assert_eq!(
+            parse_prometheus_counter(text, "praxis_extproc_body_size_rejections_total"),
+            Some(3)
+        );
+        assert_eq!(parse_prometheus_counter(text, "does_not_exist"), None);
+        assert_eq!(
+            parse_prometheus_counter("# only comments\n", "praxis_extproc_body_size_rejections_total"),
+            None
+        );
+    }
 }
 
 pub(crate) fn gateway_url() -> String {
