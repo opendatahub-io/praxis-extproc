@@ -12,7 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
-    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV},
+    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV, GRPC_RECV_FRAMING_HEADROOM},
     server::PraxisExtProc,
     tls,
 };
@@ -147,10 +147,10 @@ fn validate_config(
 
 /// Whether a BUFFERED body of size `max_body` cannot fit under `max_recv`.
 ///
-/// Equality counts as a miss: protobuf framing of `ProcessingRequest` makes
-/// the enclosing gRPC message larger than the raw body bytes.
+/// Requires [`GRPC_RECV_FRAMING_HEADROOM`] above the raw body so protobuf
+/// framing of `ProcessingRequest` does not trip tonic before the 413 path.
 fn buffered_body_cannot_fit_recv(max_body: Option<usize>, max_recv: usize) -> bool {
-    max_body.is_some_and(|n| max_recv <= n)
+    max_body.is_some_and(|n| max_recv < n.saturating_add(GRPC_RECV_FRAMING_HEADROOM))
 }
 
 /// Soft warning when tonic would reject an exactly-at-limit BUFFERED body.
@@ -165,8 +165,9 @@ fn warn_if_buffered_body_cannot_fit_recv(limits: BodyLimits) {
     warn!(
         max_body_bytes = max_body,
         max_recv_bytes = limits.max_recv,
+        framing_headroom_bytes = GRPC_RECV_FRAMING_HEADROOM,
         env = GRPC_MAX_RECV_MSG_SIZE_ENV,
-        "gRPC receive ceiling is at or below max_body_bytes; a BUFFERED body of that size cannot fit in one ProcessingRequest message"
+        "gRPC receive ceiling is below max_body_bytes plus ProcessingRequest framing headroom; an at-limit BUFFERED body can fail at tonic decode with HTTP 500 instead of ImmediateResponse 413"
     );
 }
 
@@ -633,10 +634,17 @@ mod tests {
     }
 
     #[test]
-    fn buffered_body_fit_check_warns_at_or_below_recv() {
+    fn buffered_body_fit_check_requires_framing_headroom() {
+        const BODY: usize = 32 * 1024 * 1024;
         assert!(!buffered_body_cannot_fit_recv(None, 1));
-        assert!(!buffered_body_cannot_fit_recv(Some(32 * 1024 * 1024), 33 * 1024 * 1024));
-        assert!(buffered_body_cannot_fit_recv(Some(32 * 1024 * 1024), 32 * 1024 * 1024));
-        assert!(buffered_body_cannot_fit_recv(Some(32 * 1024 * 1024), 31 * 1024 * 1024));
+        // Exact default pairing: body + headroom fits.
+        assert!(!buffered_body_cannot_fit_recv(
+            Some(BODY),
+            BODY + GRPC_RECV_FRAMING_HEADROOM
+        ));
+        // One byte of headroom is not enough once protobuf framing is counted.
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY + 1));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY - 1));
     }
 }
