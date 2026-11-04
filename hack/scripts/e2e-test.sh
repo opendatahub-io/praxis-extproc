@@ -16,7 +16,9 @@ SVC="${E2E_GATEWAY_SVC:-e2e-gateway-istio}"
 PORT="${E2E_PORT:-18080}"
 STREAMING_SVC="${E2E_STREAMING_GATEWAY_SVC:-e2e-streaming-gateway-istio}"
 STREAMING_PORT="${E2E_STREAMING_PORT:-18081}"
-EXTPROC_NS="${E2E_EXTPROC_NS:-praxis-extproc}"
+# E2E deploys IPP into the gateway namespace (istio-system); override only when
+# pointing at a different overlay (e.g. demo/odh in praxis-extproc).
+EXTPROC_NS="${E2E_EXTPROC_NS:-$NS}"
 IPP_DEPLOY="${E2E_IPP_DEPLOY:-payload-processing}"
 METRICS_PORT="${E2E_METRICS_PORT:-19090}"
 
@@ -75,15 +77,16 @@ else
   echo "e2e: using ${STREAMING_GATEWAY_URL}"
 fi
 
-echo "e2e: port-forwarding ${IPP_DEPLOY} metrics -> 127.0.0.1:${METRICS_PORT}"
+echo "e2e: port-forwarding ${EXTPROC_NS}/deploy/${IPP_DEPLOY} metrics -> 127.0.0.1:${METRICS_PORT}"
 kubectl --context "$CTX" -n "$EXTPROC_NS" port-forward "deploy/${IPP_DEPLOY}" "${METRICS_PORT}:9090" >/dev/null 2>&1 &
 METRICS_PF_PID=$!
-for _ in $(seq 1 20); do
+for _ in $(seq 1 40); do
   reachable "http://127.0.0.1:${METRICS_PORT}/metrics" && break
   sleep 0.5
 done
 reachable "http://127.0.0.1:${METRICS_PORT}/metrics" || {
-  echo "e2e: IPP metrics port-forward did not become ready" >&2
+  echo "e2e: IPP metrics port-forward did not become ready (${EXTPROC_NS}/deploy/${IPP_DEPLOY}:9090)" >&2
+  kubectl --context "$CTX" -n "$EXTPROC_NS" get deploy,pods -l "app=${IPP_DEPLOY}" -o wide >&2 || true
   exit 1
 }
 export IPP_METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
