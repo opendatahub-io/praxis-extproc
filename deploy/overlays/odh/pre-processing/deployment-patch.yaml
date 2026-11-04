@@ -29,3 +29,6 @@
 - op: add
   path: /spec/template/spec/serviceAccountName
   value: payload-processing
+- op: replace
+  path: /spec/template/spec/volumes/1/secret/secretName
+  value: payload-pre-processing-tls

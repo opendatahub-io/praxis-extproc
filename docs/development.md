@@ -80,7 +80,7 @@ deploy/
       workload/        # Namespace, TLS-disabled config patch
       test/            # Echo backend, Gateway, HTTPRoute, EnvoyFilter
     odh/               # OpenDataHub production overlay
-      rbac/            # ServiceAccount, ClusterRole, ClusterRoleBinding
+      rbac/            # ServiceAccount only (no API reader binding; token automount off)
       networking/      # NetworkPolicy (ingress/egress restrictions)
       pre-processing/  # Second Deployment for pre-auth model extraction
       after/           # Post-auth Deployment + DestinationRule (TLS)

@@ -12,6 +12,7 @@ spec:
       labels:
         app: payload-processing
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -69,7 +70,13 @@ spec:
             - name: plugins-config-volume
               mountPath: /etc/praxis
               readOnly: true
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
       volumes:
         - name: plugins-config-volume
           configMap:
             name: payload-processing-plugins
+        - name: tls
+          secret:
+            secretName: payload-processing-tls

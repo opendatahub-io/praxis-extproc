@@ -15,7 +15,9 @@ data:
       # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
       max_body_bytes: 33554432
       tls:
-        mode: self_signed
+        mode: provided
+        cert_path: /etc/tls/private/tls.crt
+        key_path: /etc/tls/private/tls.key
 
     filter_chains:
       - name: bbr
@@ -45,7 +47,9 @@ data:
       # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
       max_body_bytes: 33554432
       tls:
-        mode: self_signed
+        mode: provided
+        cert_path: /etc/tls/private/tls.crt
+        key_path: /etc/tls/private/tls.key
 
     filter_chains:
       - name: ipp

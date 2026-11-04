@@ -17,6 +17,9 @@ patches:
         path: /metadata/name
         value: payload-pre-processing
       - op: replace
+        path: /metadata/annotations/service.beta.openshift.io~1serving-cert-secret-name
+        value: payload-pre-processing-tls
+      - op: replace
         path: /spec/selector/app
         value: payload-pre-processing
   - target:
