@@ -107,7 +107,7 @@ filter_chains:
           - pointer: /model                 # IPP fieldName: model
             header: X-Gateway-Model-Name    # IPP headerName
         on_invalid: continue                # absent/invalid body -> pass through
-        max_body_bytes: 1048576             # core default is 10 MiB; size per workload
+        max_body_bytes: 1048576             # json_body default is 10 MiB; size per workload
 
       # 3. model-provider-resolver  ->  intelligent_route
       #    K8s routing gap tracked in #5, #7. Candidates

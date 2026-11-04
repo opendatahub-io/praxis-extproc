@@ -473,7 +473,8 @@ e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
 
 e2e-test:
-	bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
+	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
+	E2E_BODY_MODE=$(MODE) bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
