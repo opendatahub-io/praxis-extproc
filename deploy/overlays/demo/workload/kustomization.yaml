@@ -6,6 +6,7 @@ namespace: praxis-extproc
 resources:
   - ../../../base
   - namespace.yaml
+  - tls-secret.yaml
 
 images:
   - name: praxis-extproc
