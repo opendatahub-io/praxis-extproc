@@ -30,6 +30,52 @@ async fn input_only_and_unselected_checks_release_each_sse_chunk_before_eos() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_final_body_frame_checks_and_releases_the_buffered_document() {
+    for mode in [BodySendMode::Streamed, BodySendMode::FullDuplexStreamed] {
+        for reply in [NemoReply::Pass, NemoReply::BlockOutput] {
+            let harness = Harness::new(reply, false).await;
+            let mut session = harness.session(mode, false, true).await;
+            session.exchange(request("hello", false)).await;
+            session.send(response_headers("application/json")).await;
+            if mode == BodySendMode::Streamed {
+                session.next().await.expect("streamed headers acknowledgement");
+            }
+            let document = json!({"choices":[{"message":{"role":"assistant","content":"complete answer"}}]});
+            let encoded = serde_json::to_vec(&document).unwrap();
+            session.send(response_body(&encoded, false)).await;
+            if mode == BodySendMode::Streamed {
+                let pending = session.next().await.unwrap();
+                assert_eq!(body_bytes(&[pending]), b"", "{mode:?}: output must wait for EOS");
+            }
+            assert!(harness.calls().is_empty(), "no verdict before EOS");
+            session.send(response_body(b"", true)).await;
+            drop(session.sender);
+            let mut responses = Vec::new();
+            while let Some(response) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), session.responses.message())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            {
+                responses.push(response);
+            }
+            let output: serde_json::Value = serde_json::from_slice(&body_bytes(&responses)).unwrap();
+            let calls = harness.calls();
+            assert_eq!(calls.len(), 1, "{mode:?}: exactly one complete Output check");
+            assert_eq!(calls[0]["messages"][0]["content"], "complete answer");
+            match reply {
+                NemoReply::Pass => assert_eq!(output, document),
+                NemoReply::BlockOutput => {
+                    assert_eq!(output["error"]["code"], "content_blocked");
+                    assert!(output.get("choices").is_none(), "blocked content must be replaced");
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_selected_and_unselected_requests_do_not_share_guardrail_state() {
     let harness = Harness::new(NemoReply::BlockOutput, true).await;
     let requests = (0..16).map(|index| {
