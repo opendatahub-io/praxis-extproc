@@ -5,6 +5,9 @@ ignore = [
     # Pingora transitive dependencies; not under our control.
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
+    # pin-utils archived; pulled by aws-smithy-types (praxis-ai → aws-credential-types).
+    # No safe upgrade; pin_mut! replacement is upstream in aws-smithy.
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
