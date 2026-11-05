@@ -33,102 +33,105 @@
 )]
 #![allow(missing_docs, reason = "integration test module")]
 
-use std::time::Duration;
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------------
 
-const DEFAULT_GATEWAY_URL: &str = "http://localhost:18080";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Istio echo server includes this in every response body.
-const ECHO_MARKER: &str = "ServiceVersion=";
+    const DEFAULT_GATEWAY_URL: &str = "http://localhost:18080";
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Istio echo server includes this in every response body.
+    const ECHO_MARKER: &str = "ServiceVersion=";
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------------
 
-#[tokio::test]
-#[ignore]
-async fn gateway_routes_traffic_to_echo_backend() {
-    let client = http_client();
-    let url = gateway_url();
+    #[tokio::test]
+    #[ignore]
+    async fn gateway_routes_traffic_to_echo_backend() {
+        let client = http_client();
+        let url = gateway_url();
 
-    let resp = client.get(&url).send().await.expect("request failed");
-
-    assert_eq!(resp.status(), 200, "expected 200 OK from echo backend");
-
-    let body = resp.text().await.expect("failed to read body");
-
-    assert!(
-        body.contains(ECHO_MARKER),
-        "response body should contain echo marker, got: {body}"
-    );
-}
-
-#[tokio::test]
-#[ignore]
-async fn ext_proc_adds_response_header() {
-    let client = http_client();
-    let url = gateway_url();
-
-    let resp = client.get(&url).send().await.expect("request failed");
-
-    assert_eq!(resp.status(), 200, "expected 200 OK");
-
-    let praxis_header = resp.headers().get("x-praxis");
-
-    assert!(praxis_header.is_some(), "X-Praxis header should be present");
-    assert_eq!(
-        praxis_header
-            .expect("header present after is_some check")
-            .to_str()
-            .expect("header should be valid UTF-8"),
-        "true",
-        "X-Praxis header should be 'true'"
-    );
-}
-
-#[tokio::test]
-#[ignore]
-async fn post_with_body_passes_through() {
-    let client = http_client();
-    let url = gateway_url();
-
-    let resp = client
-        .post(&url)
-        .body("test payload")
-        .send()
-        .await
-        .expect("request failed");
-
-    assert_eq!(resp.status(), 200, "POST should succeed through ext_proc pipeline");
-}
-
-#[tokio::test]
-#[ignore]
-async fn multiple_sequential_requests_succeed() {
-    let client = http_client();
-    let url = gateway_url();
-
-    for i in 0..5 {
         let resp = client.get(&url).send().await.expect("request failed");
 
-        assert_eq!(resp.status(), 200, "request {i} should succeed");
+        assert_eq!(resp.status(), 200, "expected 200 OK from echo backend");
+
+        let body = resp.text().await.expect("failed to read body");
+
+        assert!(
+            body.contains(ECHO_MARKER),
+            "response body should contain echo marker, got: {body}"
+        );
     }
-}
 
-// -----------------------------------------------------------------------------
-// Test Utilities
-// -----------------------------------------------------------------------------
+    #[tokio::test]
+    #[ignore]
+    async fn ext_proc_adds_response_header() {
+        let client = http_client();
+        let url = gateway_url();
 
-fn gateway_url() -> String {
-    std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
-}
+        let resp = client.get(&url).send().await.expect("request failed");
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .expect("failed to build HTTP client")
+        assert_eq!(resp.status(), 200, "expected 200 OK");
+
+        let praxis_header = resp.headers().get("x-praxis");
+
+        assert!(praxis_header.is_some(), "X-Praxis header should be present");
+        assert_eq!(
+            praxis_header
+                .expect("header present after is_some check")
+                .to_str()
+                .expect("header should be valid UTF-8"),
+            "true",
+            "X-Praxis header should be 'true'"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn post_with_body_passes_through() {
+        let client = http_client();
+        let url = gateway_url();
+
+        let resp = client
+            .post(&url)
+            .body("test payload")
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), 200, "POST should succeed through ext_proc pipeline");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn multiple_sequential_requests_succeed() {
+        let client = http_client();
+        let url = gateway_url();
+
+        for i in 0..5 {
+            let resp = client.get(&url).send().await.expect("request failed");
+
+            assert_eq!(resp.status(), 200, "request {i} should succeed");
+        }
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    fn gateway_url() -> String {
+        std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
+    }
+
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client")
+    }
 }

@@ -1,5 +1,5 @@
 .PHONY: all build release check clean \
-	test test-integration lint fmt doc audit \
+	test test-integration test-envoy lint fmt doc audit \
 	coverage-check \
 	require-container-engine require-podman require-go require-oc \
 	container container-release images kind-up kind-down smoke-test \
@@ -60,6 +60,13 @@ test:
 
 test-integration:
 	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
+
+# Loopback HTTP qualification uses the product executable with its shipped
+# feature set. No Kubernetes cluster or externally hosted model is involved.
+ENVOY_TEST_BIN ?= $(CURDIR)/target/tools/envoy-1.37.0
+test-envoy:
+	bash hack/scripts/install-test-envoy.sh "$(ENVOY_TEST_BIN)"
+	ENVOY_BIN="$(ENVOY_TEST_BIN)" cargo test $(FIPS_CARGO_ARGS) --features integration --test guardrails_transport envoy:: $(_NOCAPTURE)
 
 # ---------------------------------------------------------------------------
 # Quality

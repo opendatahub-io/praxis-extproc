@@ -45,6 +45,8 @@ pub(crate) enum NemoReply {
 
 pub(crate) struct Harness {
     pub(crate) client: ExternalProcessorClient<Channel>,
+    #[cfg(feature = "integration")]
+    pub(crate) endpoint: String,
     calls: Arc<Mutex<Vec<Value>>>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -100,6 +102,8 @@ impl Harness {
             .unwrap();
         Self {
             client,
+            #[cfg(feature = "integration")]
+            endpoint,
             calls,
             tasks: vec![nemo, server],
         }

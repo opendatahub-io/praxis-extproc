@@ -162,6 +162,39 @@ lifecycle: request headers, request body, response
 headers, response body, trailers, and rejection
 scenarios.
 
+### Guardrail transport contracts
+
+`make test` includes `tests/guardrails_transport.rs`, using the real AI filter
+registry and a recording local NeMo peer. It covers selected Input/Output
+combinations, translation filters present/absent, buffered/streamed/full-duplex
+response transport, complete-body enforcement, failure handling, limits,
+cancellation, and request isolation. No hosted model is needed.
+
+`make test-envoy` additionally runs the compiled product executable with the
+container's feature set behind real Envoy. The backend holds its final chunk
+until the test client has received the first one, proving progressive SSE
+delivery. Output-check tests prove the opposite contract: no partial unchecked
+output reaches the client. Logs and generated configurations are retained under
+`target/envoy-tests/`. The pinned Envoy download supports Linux x86_64.
+
+The generated test chain follows the controller's selection-header and filter
+ordering contract. This does not exercise Kubernetes reconciliation, MaaS
+authentication, AIGuardrail status, or an actual release container. Those still
+need controller/release qualification. ExtProc has no runtime pipeline reload;
+configuration changes take effect by replacing the process.
+
+Guardrail enforcement cases use OpenAI Chat Completions payloads. The Anthropic
+round-trip test checks translation compatibility; it does not prove guardrail
+coverage of Anthropic system prompts or content blocks before translation.
+
+Request-specific response-mode selection remains the subject of PR #172.
+These tests distinguish ordinary STREAMED transport from FULL_DUPLEX_STREAMED.
+A BUFFERED Envoy configuration still holds an SSE response until completion.
+Selecting an Output guardrail for a `stream: true` request remains unsupported
+and returns 422; unexpected SSE output returns 502. Buffered response checks
+terminated by trailers fail closed because a trailers acknowledgement cannot
+carry the replacement body.
+
 ### Service Tests
 
 `tests/services.rs` tests the health and metrics
