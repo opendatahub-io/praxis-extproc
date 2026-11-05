@@ -391,6 +391,29 @@ pub(crate) fn passthrough_chunk(
     responses
 }
 
+/// Hold response bytes until filters that requested a complete body can inspect them.
+fn buffer_response_chunk(
+    ctx: &HttpFilterContext<'_>,
+    chunk: &mut Vec<u8>,
+    buffered: &mut Vec<u8>,
+    eos: bool,
+    server_limit: Option<usize>,
+) -> Result<(), Status> {
+    let praxis_filter::BodyMode::StreamBuffer { max_bytes } = ctx.response_body_mode else {
+        return Ok(());
+    };
+    let total = buffered.len().saturating_add(chunk.len());
+    if max_bytes.into_iter().chain(server_limit).any(|limit| total > limit) {
+        metrics::record_body_size_rejection();
+        return Err(Status::resource_exhausted("buffered response exceeds maximum size"));
+    }
+    buffered.append(chunk);
+    if eos {
+        *chunk = mem::take(buffered);
+    }
+    Ok(())
+}
+
 /// Build a `HeadersResponse` carrying the deferred header-phase mutation.
 ///
 /// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
@@ -447,6 +470,15 @@ pub(crate) async fn process_streamed_body_chunk(
     let eos = body.end_of_stream;
     let mut chunk = body.body;
     let original_chunk_had_bytes = !chunk.is_empty();
+    if !is_request {
+        buffer_response_chunk(
+            &ctx,
+            &mut chunk,
+            &mut state.response_body,
+            eos,
+            state.max_body_accumulation,
+        )?;
+    }
     let reject = if is_request {
         run_body_filters(pipeline, &mut ctx, &mut chunk, eos).await?
     } else {
@@ -813,6 +845,13 @@ pub(crate) async fn flush_streamed_body_filters(
     state: &mut StreamState,
     is_request: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    if !is_request && !state.response_body.is_empty() {
+        // A trailers reply cannot carry the buffered replacement body. Refuse
+        // the response rather than silently dropping its pending checks.
+        let rejection = praxis_filter::Rejection::status(502)
+            .with_body(b"buffered response filters require a final body message before trailers".to_vec());
+        return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
+    }
     let request = state.request.as_ref().ok_or_else(|| {
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
@@ -2632,6 +2671,7 @@ mod tests {
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+        hydrated.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) };
 
         // Capture (`dehydrate`) must move every field into the empty slot.
         let mut slot = None;
@@ -2646,7 +2686,15 @@ mod tests {
             executed_filter_indices,
             filter_metadata,
             filter_state,
+            response_body_mode,
         } = &carried;
+        assert!(
+            matches!(
+                response_body_mode,
+                Some(praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) })
+            ),
+            "response body mode must survive dehydrate"
+        );
         assert_eq!(cluster.as_deref(), Some("selected-cluster"));
         assert_eq!(branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
@@ -2658,6 +2706,10 @@ mod tests {
         let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.cluster.as_deref(), Some("selected-cluster"));
+        assert!(matches!(
+            hydrated.response_body_mode,
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) }
+        ));
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
         assert_eq!(hydrated.get_metadata("carry.meta"), Some("kept"));
