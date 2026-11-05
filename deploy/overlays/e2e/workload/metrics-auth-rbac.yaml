@@ -1,6 +1,6 @@
 # Metrics authentication creates cluster-scoped TokenReview and
 # SubjectAccessReview objects during a scrape. The e2e configuration keeps
-# metrics_auth enabled, so both ExtProc deployments need this identity.
+# metrics_auth enabled, so every ExtProc deployment needs this identity.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
