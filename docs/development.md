@@ -240,11 +240,12 @@ warnings fatal.
 The two-hop request-body SHA-256 oracle from
 [proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
 (issue [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27))
-lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
-`praxis-extproc` image with `--features k8s-e2e` (same product binary; the
-non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
-registered only under that feature), and `make e2e-test` exercises it through
-`tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
+lives in the `integrity` profile: `make e2e-setup PROFILE=integrity` builds and
+deploys the `praxis-extproc` image with `--features k8s-e2e` (same product
+binary; the non-production `e2e_body_oracle` filter in `src/e2e/` is compiled
+and registered only under that feature), and `make e2e-test PROFILE=integrity`
+exercises it through `tests/k8s_e2e/integrity/chained_oracle.rs` and
+`tests/k8s_e2e/integrity/fd_streamed_oracle.rs`.
 TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
 in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 

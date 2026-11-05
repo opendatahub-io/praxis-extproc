@@ -33,6 +33,8 @@ use tracing::debug;
 const STATE_AMBIGUOUS: &str = "ambiguous";
 /// Response value when the request-phase snapshot never reached `on_response`.
 const STATE_MISSING: &str = "state-missing";
+/// Response value when the stashed state cannot be encoded as a header value.
+const STATE_ENCODE_ERROR: &str = "encode-error";
 /// Metadata key prefix stashing per-header state between phases.
 const META_PREFIX: &str = "e2e_header_oracle.";
 
@@ -76,7 +78,7 @@ pub struct HeaderOracleFilter {
     /// Lowercased header names to observe.
     watch: Vec<String>,
 
-    /// Request-flow hop index from [`HOP_INDEX_ENV`], when set.
+    /// Request-flow hop index from [`super::HOP_INDEX_ENV`], when set.
     hop_index: Option<u32>,
 }
 
@@ -168,7 +170,10 @@ impl HttpFilter for HeaderOracleFilter {
         BodyAccess::ReadOnly
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Baseline snapshot so header-only requests (e.g. GET, no body EOS) are
+        // captured. Refined at request-body EOS for body-derived headers.
+        self.snapshot(ctx);
         Ok(FilterAction::Continue)
     }
 
@@ -197,7 +202,7 @@ impl HttpFilter for HeaderOracleFilter {
                     ))
                 })?;
                 let header_value = http::HeaderValue::from_str(&value)
-                    .unwrap_or_else(|_| http::HeaderValue::from_static(STATE_AMBIGUOUS));
+                    .unwrap_or_else(|_| http::HeaderValue::from_static(STATE_ENCODE_ERROR));
                 response.headers.insert(header_name, header_value);
             }
             debug!(target: "e2e_header_oracle", header = %name, state = %value, hop_index = ?self.hop_index, "forwarded header state");

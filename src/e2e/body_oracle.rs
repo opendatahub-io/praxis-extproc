@@ -73,7 +73,7 @@ struct BodyOracleState {
 
 /// Filter that publishes `x-qualification-request-sha256[-hop-N]` on the response.
 pub struct BodyOracleFilter {
-    /// Request-flow hop index from [`HOP_INDEX_ENV`], when set.
+    /// Request-flow hop index from [`super::HOP_INDEX_ENV`], when set.
     hop_index: Option<u32>,
 }
 
