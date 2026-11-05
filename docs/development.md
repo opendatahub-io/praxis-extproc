@@ -258,6 +258,7 @@ runs on every push and pull request:
 - Tests (`cargo test`)
 - Doc build (`RUSTDOCFLAGS="-D warnings" cargo doc`)
 - Audit (`cargo audit`, `cargo deny check`)
+- Line coverage (`make coverage-check`, at least 93%, from a 93.19% measured baseline)
 - Minimal-feature tests and product-feature HTTP contracts through Envoy
 
 The Kubernetes suite runs BUFFERED, STREAMED, and FULL_DUPLEX_STREAMED response
