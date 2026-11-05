@@ -4,9 +4,9 @@
 # NetworkPolicy. Without this, payload-processing pods cannot receive
 # ext_proc traffic from the gateway.
 #
-# API-server egress (443/6443) is intentionally omitted: ExtProc mounts
-# projected credentials and ConfigMaps as volumes and must not hold a
-# usable service-account token path to the apiserver.
+# API-server egress (443/6443) is intentionally omitted for the default
+# ODH posture. Workloads that call the apiserver (e.g. metrics TokenReview /
+# SubjectAccessReview) must restore that egress separately.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

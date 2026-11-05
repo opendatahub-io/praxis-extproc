@@ -18,7 +18,6 @@ spec:
       labels:
         app: payload-processing
     spec:
-      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
