@@ -64,9 +64,10 @@ test-integration:
 # Loopback HTTP qualification uses the product executable with its shipped
 # feature set. No Kubernetes cluster or externally hosted model is involved.
 ENVOY_TEST_BIN ?= $(CURDIR)/target/tools/envoy-1.37.0
+export ENVOY_TEST_BIN
 test-envoy:
-	bash hack/scripts/install-test-envoy.sh "$(ENVOY_TEST_BIN)"
-	ENVOY_BIN="$(ENVOY_TEST_BIN)" cargo test $(FIPS_CARGO_ARGS) --features integration --test guardrails_transport envoy:: $(_NOCAPTURE)
+	bash hack/scripts/install-test-envoy.sh "$$ENVOY_TEST_BIN"
+	ENVOY_BIN="$$ENVOY_TEST_BIN" cargo test $(FIPS_CARGO_ARGS) --features integration --test guardrails_transport envoy:: $(_NOCAPTURE)
 
 # ---------------------------------------------------------------------------
 # Quality
