@@ -665,6 +665,13 @@ pub(crate) async fn run_response_header_filters_early(
         return Ok(vec![response::immediate(imm)]);
     }
 
+    if state.protocol_config.response_body_mode == BodyMode::None
+        && matches!(ctx.response_body_mode, praxis_filter::BodyMode::StreamBuffer { .. })
+    {
+        let rejection = praxis_filter::Rejection::status(502)
+            .with_body(b"response filters require response body delivery; NONE mode is unsupported".to_vec());
+        return Ok(vec![response::immediate(adapter::rejection_to_immediate(&rejection))]);
+    }
     state.header_state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
     ctx.dehydrate(&mut state.carried_context)?;

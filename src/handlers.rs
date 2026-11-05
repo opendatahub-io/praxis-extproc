@@ -164,6 +164,9 @@ pub(crate) async fn handle_request_headers(
     }
 
     let envoy_headers = extract_header_list(&headers);
+    if let Some(rejection) = reject_ambiguous_guardrail_selection(&envoy_headers) {
+        return Ok(vec![rejection]);
+    }
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
@@ -320,6 +323,28 @@ fn reject_streamed_request_over_limit(
         return Some(request_body_limit_exceeded(pipeline));
     }
     state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(chunk_len);
+    None
+}
+
+/// Refuse ambiguous gateway selection metadata before filters can disagree on it.
+fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<ProcessingResponse> {
+    let mut names = std::collections::HashSet::new();
+    for header in headers {
+        let name = header.key.to_ascii_lowercase();
+        if !name.starts_with("x-aigateway-guardrail-") {
+            continue;
+        }
+        let value = if header.raw_value.is_empty() {
+            header.value.as_bytes()
+        } else {
+            &header.raw_value
+        };
+        if !names.insert(name) || !matches!(value, b"true" | b"false") {
+            let rejection = praxis_filter::Rejection::status(400)
+                .with_body(b"guardrail selection headers must be unique boolean values".to_vec());
+            return Some(response::immediate(adapter::rejection_to_immediate(&rejection)));
+        }
+    }
     None
 }
 
