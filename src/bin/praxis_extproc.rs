@@ -33,6 +33,11 @@ struct Cli {
     #[arg(short, long, default_value = "praxis-extproc.yaml")]
     config: String,
 
+    /// Run the gated SSE backend used by Kubernetes qualification tests.
+    #[cfg(feature = "k8s-e2e")]
+    #[arg(long)]
+    e2e_sse_backend: bool,
+
     /// Override the gRPC listen address.
     #[arg(long)]
     grpc_address: Option<String>,
@@ -59,10 +64,19 @@ async fn main() {
     init_tracing();
     let cli = Cli::parse();
 
-    if let Err(e) = Box::pin(run(cli)).await {
+    if let Err(e) = Box::pin(run_command(cli)).await {
         error!(error = %e, "fatal");
         process::exit(1);
     }
+}
+
+/// Dispatch the qualification fixture or the ExtProc server.
+async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "k8s-e2e")]
+    if cli.e2e_sse_backend {
+        return Ok(praxis_extproc::e2e::sse_backend::serve().await?);
+    }
+    Box::pin(run(cli)).await
 }
 
 // -----------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 //! shipped binary does not register these filters.
 
 pub mod body_oracle;
+pub mod sse_backend;
 
 use praxis_filter::FilterRegistry;
 
