@@ -97,7 +97,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     if cli.validate {
-        return validate_config(&fips, &registry, pipeline, limits);
+        resolve_addresses(&cli, &cfg)?;
+        return validate_config(&cfg.server, &fips, &registry, pipeline, limits);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
@@ -120,12 +121,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
 }
 
-/// `--validate` path: FIPS refusal, pipeline build, and already-resolved limits.
+/// `--validate` path after listener resolution: FIPS refusal, pipeline build,
+/// TLS, and already-resolved limits.
 ///
 /// Soft-warns when [`BodyLimits::max_recv`] cannot carry a BUFFERED body at the
 /// accumulation ceiling, but still exits successfully (`0`) so operators can
 /// catch the misconfig without blocking startup scripts.
 fn validate_config(
+    server_cfg: &config::ServerConfig,
     fips: &praxis_extproc::fips::Status,
     registry: &praxis_filter::FilterRegistry,
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
@@ -135,6 +138,7 @@ fn validate_config(
         return Err(reason.into());
     }
     pipeline?;
+    drop(tls::build_tls_config(&server_cfg.tls)?);
     warn_if_buffered_body_cannot_fit_recv(limits);
     info!(
         max_body_bytes = ?limits.max_body,
