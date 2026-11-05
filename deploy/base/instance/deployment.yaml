@@ -2,6 +2,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: payload-processing
+  annotations:
+    # Restart pods when the serving-cert Secret is rotated (OpenShift service-ca
+    # updates the Secret; kubelet refreshes the mount, but the process loads
+    # certs only at startup). No-op unless Reloader or an equivalent controller
+    # is installed. In-process hot reload is tracked separately.
+    secret.reloader.stakater.com/reload: payload-processing-tls
 spec:
   replicas: 1
   selector:

@@ -2,6 +2,9 @@
   path: /metadata/name
   value: payload-pre-processing
 - op: replace
+  path: /metadata/annotations/secret.reloader.stakater.com~1reload
+  value: payload-pre-processing-tls
+- op: replace
   path: /spec/selector/matchLabels/app
   value: payload-pre-processing
 - op: replace
