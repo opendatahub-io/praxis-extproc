@@ -20,6 +20,9 @@
 #[path = "guardrails_transport/support.rs"]
 mod support;
 
+#[path = "guardrails_transport/boundaries.rs"]
+mod boundaries;
+
 use praxis_proto::envoy::service::ext_proc::v3::BodySendMode;
 use serde_json::json;
 use support::{Harness, NemoReply, body_bytes, immediate_status, request, response_body, response_headers};
