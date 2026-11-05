@@ -1,0 +1,6 @@
+# Upstream pool idle timeout (pool_settings_ref: default_5min_keepalive).
+#
+# Applied via hack/patch-e2e-extended-pool-idle.py --manifest <this file>.
+# A second EnvoyFilter MERGE on ADD-created clusters is ignored by istiod
+# (same constraint as upstream TLS patching).
+idle_timeout: 300s

@@ -245,8 +245,35 @@ lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
 non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
 registered only under that feature), and `make e2e-test` exercises it through
 `tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
-TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
-in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
+
+## Extended e2e qualification tier (idle / TLS)
+
+Long-running idle and TLS/mTLS scenarios from proposal #27 stay out of default
+PR CI (tracked in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132)):
+
+```console
+make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay + TLS positive
+make test-e2e-extended    # cargo test --features k8s-e2e -- … extended --ignored
+```
+
+`e2e-setup-extended` runs `hack/generate-e2e-extended-tls-certs.sh` (requires
+`openssl` on `PATH`) and applies the positive TLS overlay via
+`hack/apply-e2e-extended-tls.sh positive`. That helper mounts scenario Secrets,
+rewrites Praxis `provided` TLS ConfigMaps, and patches the live
+`EnvoyFilter/praxis-extproc` clusters to `VERIFY_TRUST_CHAIN` + trusted CA +
+explicit SAN match (`hack/patch-e2e-extended-upstream-tls.py`). Generated PEMs
+under `deploy/overlays/e2e-extended/tls/**/certs/` are gitignored.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUALIFICATION_IDLE_SECS` | `300` | Default idle wait when a matrix cell omits `idle_secs` |
+| `E2E_EXTENDED_PROFILE` | `maas_two_hop_fd_streamed` | Topology inventory selection |
+| `GATEWAY_URL` | (auto) | Same as baseline k8s-e2e |
+
+Optional artifacts under `target/e2e-extended/`. Release / manual runs use
+`workflow_dispatch` on `.github/workflows/ci-k8s-e2e.yaml` with
+`run_extended=true` (job timeout 120 minutes). Envoy/Istio versions are pinned
+in forge — the suite does not scrape cluster version metadata.
 
 ## FIPS Tooling
 

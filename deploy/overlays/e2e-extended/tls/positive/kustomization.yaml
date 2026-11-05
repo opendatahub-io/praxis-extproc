@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: istio-system
+resources:
+  - plugins-pre.yaml
+  - plugins-post.yaml
+  - deployment-pre.yaml
+  - deployment-post.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+secretGenerator:
+  - name: e2e-extended-tls-server
+    files:
+      - tls.crt=certs/tls.crt
+      - tls.key=certs/tls.key
+      - ca.crt=certs/ca.crt
