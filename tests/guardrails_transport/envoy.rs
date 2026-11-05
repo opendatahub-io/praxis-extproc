@@ -78,6 +78,9 @@ async fn envoy_never_releases_partial_output_before_the_guardrail_verdict() {
     let world = World::new("STREAMED", NemoReply::BlockOutput, true).await;
     let response = world.send((false, true), false).await;
     let mut stream = response.bytes_stream();
+    tokio::time::timeout(DEADLINE, world.first_frame.notified())
+        .await
+        .expect("backend must yield its first frame before checking for leaks");
     assert!(
         tokio::time::timeout(Duration::from_millis(150), stream.next())
             .await
@@ -93,9 +96,15 @@ async fn envoy_never_releases_partial_output_before_the_guardrail_verdict() {
     while let Some(chunk) = tokio::time::timeout(DEADLINE, stream.next()).await.unwrap() {
         output.extend_from_slice(&chunk.unwrap());
     }
-    let body = String::from_utf8(output).unwrap();
-    assert!(body.contains("content_blocked"));
-    assert!(!body.contains("private answer"));
+    let body: serde_json::Value = serde_json::from_slice(&output)
+        .expect("the response must be one complete error document without a leaked JSON prefix");
+    assert_eq!(body["error"]["code"], "content_blocked");
+    assert_eq!(body["error"]["type"], "guardrail_violation");
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        1,
+        "only the guardrail error may be sent"
+    );
     assert_eq!(world.nemo.calls().len(), 1);
 }
 
@@ -155,6 +164,7 @@ impl Drop for Process {
 struct World {
     children: Vec<Process>,
     finish: Arc<Notify>,
+    first_frame: Arc<Notify>,
     nemo: Harness,
     requests: Arc<Mutex<Vec<http::HeaderMap>>>,
     task: JoinHandle<()>,
@@ -181,10 +191,17 @@ impl World {
         std::fs::create_dir_all(&directory).unwrap();
         let nemo = Box::pin(Harness::new(reply, true)).await;
         let finish = Arc::new(Notify::new());
+        let first_frame = Arc::new(Notify::new());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = listener.local_addr().unwrap();
-        let task = spawn_backend(listener, Arc::clone(&finish), Arc::clone(&requests), hold_json);
+        let task = spawn_backend(
+            listener,
+            Arc::clone(&finish),
+            Arc::clone(&first_frame),
+            Arc::clone(&requests),
+            hold_json,
+        );
         let grpc = unused_address();
         let frontend = unused_address();
         let mut cfg = support::configuration(&nemo.endpoint, true, 2_097_152);
@@ -219,6 +236,7 @@ impl World {
         let world = Self {
             children: vec![extproc, proxy],
             finish,
+            first_frame,
             nemo,
             requests,
             task,
@@ -275,6 +293,7 @@ fn unused_address() -> SocketAddr {
 fn spawn_backend(
     listener: TcpListener,
     finish: Arc<Notify>,
+    first_frame: Arc<Notify>,
     requests: Arc<Mutex<Vec<http::HeaderMap>>>,
     hold_json: bool,
 ) -> JoinHandle<()> {
@@ -282,10 +301,17 @@ fn spawn_backend(
         let mut connections = tokio::task::JoinSet::new();
         while let Ok((socket, _)) = listener.accept().await {
             let finish = Arc::clone(&finish);
+            let first_frame = Arc::clone(&first_frame);
             let requests = Arc::clone(&requests);
             connections.spawn(async move {
                 let service = service_fn(move |request| {
-                    backend_response(request, Arc::clone(&finish), Arc::clone(&requests), hold_json)
+                    backend_response(
+                        request,
+                        Arc::clone(&finish),
+                        Arc::clone(&first_frame),
+                        Arc::clone(&requests),
+                        hold_json,
+                    )
                 });
                 drop(
                     hyper::server::conn::http1::Builder::new()
@@ -300,6 +326,7 @@ fn spawn_backend(
 async fn backend_response(
     request: Request<Incoming>,
     finish: Arc<Notify>,
+    first_frame: Arc<Notify>,
     requests: Arc<Mutex<Vec<http::HeaderMap>>>,
     hold_json: bool,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
@@ -326,17 +353,24 @@ async fn backend_response(
                 Bytes::copy_from_slice(&json[split..]),
             )
         };
-        let chunks = futures::stream::unfold((0, first, last, finish), |(step, first, last, finish)| async move {
-            let chunk = match step {
-                0 => first.clone(),
-                1 => {
-                    finish.notified().await;
-                    last.clone()
-                },
-                _ => return None,
-            };
-            Some((Ok::<_, Infallible>(Frame::data(chunk)), (step + 1, first, last, finish)))
-        });
+        let chunks = futures::stream::unfold(
+            (0, first, last, finish, first_frame),
+            |(step, first, last, finish, first_frame)| async move {
+                let chunk = match step {
+                    0 => first.clone(),
+                    1 => {
+                        first_frame.notify_one();
+                        finish.notified().await;
+                        last.clone()
+                    },
+                    _ => return None,
+                };
+                Some((
+                    Ok::<_, Infallible>(Frame::data(chunk)),
+                    (step + 1, first, last, finish, first_frame),
+                ))
+            },
+        );
         StreamBody::new(chunks).boxed_unsync()
     } else {
         Full::new(Bytes::from(json)).boxed_unsync()
