@@ -420,9 +420,8 @@ fn invalid_listener_addresses_fail_validate() {
 
 #[test]
 fn unusable_tls_files_fail_validate() {
-    let config = write_invalid_tls_validate_config();
+    let (_temp_dir, config) = write_invalid_tls_validate_config();
     let output = validate_command(&config).output().expect("run praxis-extproc -t");
-    drop(std::fs::remove_file(&config));
     let combined = command_output(&output);
 
     assert!(
@@ -3291,9 +3290,9 @@ fn validate_command(config: &std::path::Path) -> Command {
     command
 }
 
-fn write_invalid_tls_validate_config() -> PathBuf {
-    let process_id = std::process::id();
-    let missing = std::env::temp_dir().join(format!("praxis-extproc-missing-tls-{process_id}"));
+fn write_invalid_tls_validate_config() -> (tempfile::TempDir, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("create temporary directory");
+    let missing = temp_dir.path().join("missing-tls");
     let yaml = format!(
         "server:\n  grpc_address: \"127.0.0.1:50051\"\n  health_address: \"127.0.0.1:50052\"\n  \
          metrics_address: \"127.0.0.1:9090\"\n  tls:\n    mode: provided\n    cert_path: \"{}.crt\"\n    \
@@ -3302,9 +3301,9 @@ fn write_invalid_tls_validate_config() -> PathBuf {
         missing.display(),
         missing.display()
     );
-    let path = std::env::temp_dir().join(format!("praxis-extproc-invalid-tls-{process_id}.yaml"));
+    let path = temp_dir.path().join("config.yaml");
     std::fs::write(&path, yaml).expect("write invalid TLS config");
-    path
+    (temp_dir, path)
 }
 
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
