@@ -86,11 +86,10 @@ pub(crate) fn assert_not_forwarded_to_backend(resp: &reqwest::Response) {
     );
 }
 
-/// Whether this e2e run was set up with BUFFERED ExtProc body modes.
-pub(crate) fn is_buffered_body_mode() -> bool {
+/// Whether the request direction uses BUFFERED transport in this E2E mode.
+pub(crate) fn request_body_is_buffered() -> bool {
     std::env::var("E2E_BODY_MODE")
-        .map(|mode| mode.eq_ignore_ascii_case("buffered"))
-        .unwrap_or(false)
+        .is_ok_and(|mode| mode.eq_ignore_ascii_case("buffered") || mode.eq_ignore_ascii_case("streamed"))
 }
 
 /// Prometheus scrape URL for the fail-closed IPP ExtProc metrics port.
@@ -129,29 +128,6 @@ fn parse_prometheus_counter(text: &str, name: &str) -> Option<u64> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_prometheus_counter;
-
-    #[test]
-    fn parse_prometheus_counter_reads_sample_and_missing() {
-        let text = "\
-# HELP praxis_extproc_body_size_rejections_total Total requests rejected
-# TYPE praxis_extproc_body_size_rejections_total counter
-praxis_extproc_body_size_rejections_total 3
-praxis_extproc_requests_total 9
-";
-        assert_eq!(
-            parse_prometheus_counter(text, "praxis_extproc_body_size_rejections_total"),
-            Some(3)
-        );
-        assert_eq!(parse_prometheus_counter(text, "does_not_exist"), None);
-        assert_eq!(
-            parse_prometheus_counter("# only comments\n", "praxis_extproc_body_size_rejections_total"),
-            None
-        );
-    }
-}
 
 pub(crate) fn gateway_url() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
@@ -176,4 +152,28 @@ pub(crate) fn http_client() -> reqwest::Client {
         .default_headers(headers)
         .build()
         .expect("failed to build HTTP client")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_prometheus_counter;
+
+    #[test]
+    fn parse_prometheus_counter_reads_sample_and_missing() {
+        let text = "\
+# HELP praxis_extproc_body_size_rejections_total Total requests rejected
+# TYPE praxis_extproc_body_size_rejections_total counter
+praxis_extproc_body_size_rejections_total 3
+praxis_extproc_requests_total 9
+";
+        assert_eq!(
+            parse_prometheus_counter(text, "praxis_extproc_body_size_rejections_total"),
+            Some(3)
+        );
+        assert_eq!(parse_prometheus_counter(text, "does_not_exist"), None);
+        assert_eq!(
+            parse_prometheus_counter("# only comments\n", "praxis_extproc_body_size_rejections_total"),
+            None
+        );
+    }
 }

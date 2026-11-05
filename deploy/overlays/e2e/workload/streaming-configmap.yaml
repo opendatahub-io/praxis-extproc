@@ -21,6 +21,14 @@ data:
     filter_chains:
       - name: streaming-e2e
         filters:
+          # Preserve the hosted simulator's authentication contract locally.
+          - filter: static_response
+            conditions:
+              - unless:
+                  headers:
+                    authorization: "Bearer llm-katan-openai-key"
+            status: 401
+            body: "invalid test API key"
           - filter: ai_guardrails
             provider:
               type: nemo
