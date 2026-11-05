@@ -12,7 +12,7 @@ use clap::Parser;
 use praxis_extproc::{
     config::{self, ExtProcConfig},
     error::ExtProcError,
-    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV},
+    grpc_limits::{self, GRPC_MAX_RECV_MSG_SIZE_ENV, GRPC_RECV_FRAMING_HEADROOM},
     server::PraxisExtProc,
     tls,
 };
@@ -91,16 +91,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = load_config(&cli.config)?;
     let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
-
-    if cli.validate {
-        return validate_config(&fips, &registry, pipeline, max_recv);
-    }
-
-    let addrs = resolve_addresses(&cli, &cfg)?;
     let limits = BodyLimits {
         max_body: cfg.max_body_accumulation(),
         max_recv,
     };
+
+    if cli.validate {
+        return validate_config(&fips, &registry, pipeline, limits);
+    }
+
+    let addrs = resolve_addresses(&cli, &cfg)?;
 
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
@@ -121,22 +121,54 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// `--validate` path: FIPS refusal, pipeline build, and already-resolved limits.
+///
+/// Soft-warns when [`BodyLimits::max_recv`] cannot carry a BUFFERED body at the
+/// accumulation ceiling, but still exits successfully (`0`) so operators can
+/// catch the misconfig without blocking startup scripts.
 fn validate_config(
     fips: &praxis_extproc::fips::Status,
     registry: &praxis_filter::FilterRegistry,
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
-    max_recv: usize,
+    limits: BodyLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(reason) = fips_refusal(fips, registry) {
         return Err(reason.into());
     }
     pipeline?;
+    warn_if_buffered_body_cannot_fit_recv(limits);
     info!(
-        bytes = max_recv,
+        max_body_bytes = ?limits.max_body,
+        max_recv_bytes = limits.max_recv,
         env = GRPC_MAX_RECV_MSG_SIZE_ENV,
         "configuration is valid"
     );
     Ok(())
+}
+
+/// Whether a BUFFERED body of size `max_body` cannot fit under `max_recv`.
+///
+/// Requires [`GRPC_RECV_FRAMING_HEADROOM`] above the raw body so protobuf
+/// framing of `ProcessingRequest` does not trip tonic before the 413 path.
+fn buffered_body_cannot_fit_recv(max_body: Option<usize>, max_recv: usize) -> bool {
+    max_body.is_some_and(|n| max_recv < n.saturating_add(GRPC_RECV_FRAMING_HEADROOM))
+}
+
+/// Soft warning when tonic would reject an exactly-at-limit BUFFERED body.
+fn warn_if_buffered_body_cannot_fit_recv(limits: BodyLimits) {
+    if !buffered_body_cannot_fit_recv(limits.max_body, limits.max_recv) {
+        return;
+    }
+    // `buffered_body_cannot_fit_recv` is true only when `max_body` is `Some`.
+    let Some(max_body) = limits.max_body else {
+        return;
+    };
+    warn!(
+        max_body_bytes = max_body,
+        max_recv_bytes = limits.max_recv,
+        framing_headroom_bytes = GRPC_RECV_FRAMING_HEADROOM,
+        env = GRPC_MAX_RECV_MSG_SIZE_ENV,
+        "gRPC receive ceiling is below max_body_bytes plus ProcessingRequest framing headroom; an at-limit BUFFERED body can fail at tonic decode with HTTP 500 instead of ImmediateResponse 413"
+    );
 }
 
 
@@ -329,8 +361,10 @@ async fn serve_grpc(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
     // bound cumulative body bytes reassembled across streamed chunks.
+    warn_if_buffered_body_cannot_fit_recv(limits);
     info!(
-        bytes = limits.max_recv,
+        max_body_bytes = ?limits.max_body,
+        max_recv_bytes = limits.max_recv,
         env = GRPC_MAX_RECV_MSG_SIZE_ENV,
         "gRPC max decoding message size configured"
     );
@@ -597,5 +631,20 @@ mod tests {
         serve_bounded(serve, force_rx)
             .await
             .expect("normal completion is not an error");
+    }
+
+    #[test]
+    fn buffered_body_fit_check_requires_framing_headroom() {
+        const BODY: usize = 32 * 1024 * 1024;
+        assert!(!buffered_body_cannot_fit_recv(None, 1));
+        // Exact default pairing: body + headroom fits.
+        assert!(!buffered_body_cannot_fit_recv(
+            Some(BODY),
+            BODY + GRPC_RECV_FRAMING_HEADROOM
+        ));
+        // One byte of headroom is not enough once protobuf framing is counted.
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY + 1));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY));
+        assert!(buffered_body_cannot_fit_recv(Some(BODY), BODY - 1));
     }
 }

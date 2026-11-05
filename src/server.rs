@@ -77,7 +77,7 @@ impl PraxisExtProc {
     ///
     /// No drain deadline is wired: the force-shutdown latch never fires. Use
     /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one. The
-    /// body-accumulation ceiling defaults to the built-in 10 MiB
+    /// body-accumulation ceiling defaults to the built-in 32 MiB
     /// (`config::DEFAULT_MAX_BODY_BYTES`); use
     /// [`with_max_body_accumulation`](Self::with_max_body_accumulation) to set
     /// the configured effective limit.
@@ -244,15 +244,32 @@ async fn process_messages(
         let responses = Box::pin(dispatch_request(pipeline, req, stream_state)).await?;
         debug!(phase = req_type, count = responses.len(), "sending responses");
 
+        let stop_after_immediate = responses.iter().any(crate::response::is_immediate);
         for resp in responses {
             if tx.send(Ok(resp)).await.is_err() {
                 debug!("response channel closed, ending stream");
                 return Ok(());
             }
         }
+        // Envoy ignores further ExtProc messages after `ImmediateResponse`. Stop
+        // reading the inbound stream and drop buffered bodies so a client that
+        // keeps the gRPC stream open cannot pin large buffers here (CWE-400).
+        if stop_after_immediate {
+            release_buffers_after_immediate(stream_state);
+            return Ok(());
+        }
     }
 
     Ok(())
+}
+
+/// Drop accumulated bodies after an `ImmediateResponse` so a hung client cannot
+/// pin them for the remainder of the gRPC stream lifetime.
+fn release_buffers_after_immediate(stream_state: &mut StreamState) {
+    stream_state.request_body.clear();
+    stream_state.response_body.clear();
+    stream_state.streamed_request_bytes = 0;
+    debug!("ImmediateResponse sent; ending ExtProc stream processing");
 }
 
 // -----------------------------------------------------------------------------
@@ -514,6 +531,11 @@ pub(crate) struct StreamState {
     /// Accumulated request body bytes.
     pub(crate) request_body: Vec<u8>,
 
+    /// Running total of streamed / full-duplex request body bytes forwarded
+    /// without buffering into [`Self::request_body`]. Used to enforce
+    /// [`Self::max_body_accumulation`] on passthrough and streamed-filter paths.
+    pub(crate) streamed_request_bytes: usize,
+
     /// Converted response from the response headers phase.
     pub(crate) response: Option<Response>,
 
@@ -562,6 +584,7 @@ impl Default for StreamState {
             carried_context: Some(CarriedContext::default()),
             request: None,
             request_body: Vec::new(),
+            streamed_request_bytes: 0,
             response: None,
             response_body: Vec::new(),
             body_receipt: BodyReceiptTracker::default(),
@@ -581,7 +604,7 @@ impl Default for StreamState {
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
     ///
-    /// The body-accumulation ceiling defaults to the built-in 10 MiB
+    /// The body-accumulation ceiling defaults to the built-in 32 MiB
     /// ([`crate::config::DEFAULT_MAX_BODY_BYTES`]); [`handle_stream`] overrides
     /// it with the configured effective limit.
     pub(crate) fn new() -> Self {

@@ -505,7 +505,7 @@ e2e-teardown:
 # iteration loop against an already-correct deployment, run
 # `bash hack/scripts/e2e-test.sh` directly.
 e2e-test: e2e-setup
-	PROFILE="$(PROFILE)" bash hack/scripts/e2e-test.sh $(if $(V),--nocapture,)
+	E2E_BODY_MODE=$(MODE) PROFILE="$(PROFILE)" bash hack/scripts/e2e-test.sh $(if $(V),--nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development

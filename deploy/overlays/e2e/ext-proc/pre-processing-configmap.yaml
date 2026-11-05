@@ -8,6 +8,9 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Keep BBR above the IPP e2e 1 MiB cap so oversized-body tests still reach
+      # the fail-closed post-auth ext-proc.
+      max_body_bytes: 33554432
       tls:
         mode: self_signed
 
@@ -25,6 +28,3 @@ data:
               - pointer: /model
                 header: X-Gateway-Model-Name
             on_invalid: continue
-
-    insecure_options:
-      allow_unbounded_body: true
