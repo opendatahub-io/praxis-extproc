@@ -104,6 +104,17 @@ spec:
         - name: internal-model
           namespace: llm
           port: 8080
+    # Echo backend: echo-model → header-reflecting app. Used by the integrity
+    # profile to assert what headers actually reach the backend (#165).
+    - matches:
+        - headers:
+            - name: X-Gateway-Model-Name
+              type: Exact
+              value: echo-model
+      backendRefs:
+        - name: echo-backend
+          namespace: llm
+          port: 8080
 ---
 # Direct path-based routes: no BBR header matching required.
 # /direct/external/v1/... and /direct/internal/v1/... are rewritten

@@ -1,9 +1,9 @@
 //! `FULL_DUPLEX_STREAMED` request-body scenarios on the two-hop chain.
 
-use futures::StreamExt as _;
-
-use super::oracle_helpers::{assert_hop_digests, chat_json_with_digest, post_raw_chunked};
-use crate::fixtures::{assert_praxis_mutations, ensure_gateway_ready, gateway_url, http_client};
+use crate::{
+    fixtures::{assert_praxis_mutations, ensure_gateway_ready},
+    oracle_helpers::{assert_hop_digests, chat_json_with_digest, post_raw_chunked},
+};
 
 #[tokio::test]
 async fn fd_streamed_empty_message_oracle() {
@@ -50,39 +50,4 @@ async fn fd_streamed_multi_chunk_request_oracle() {
         "chunked request should succeed when gateway accepts body"
     );
     assert_hop_digests(&digest, resp.headers());
-}
-
-/// Streaming chat (`stream: true`) conflicts with `ai_guardrails` response-phase
-/// on the shared e2e chain (fail-closed 422). Re-enable when oracle coverage
-/// moves to a separate lane/tier without response guardrails.
-#[tokio::test]
-#[ignore = "blocked: streaming + ai_guardrails response-phase on shared e2e chain (follow-up issue)"]
-async fn fd_streamed_response_first_chunk_before_eos() {
-    ensure_gateway_ready().await;
-    let client = http_client();
-    let url = format!("{}/v1/chat/completions", gateway_url());
-    let body = serde_json::json!({
-        "model": "gpt-4",
-        "messages": [{ "role": "user", "content": "stream please" }],
-        "stream": true
-    });
-    let bytes = serde_json::to_vec(&body).expect("serialize");
-    let resp = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(bytes)
-        .send()
-        .await
-        .expect("streaming request failed");
-    assert_eq!(resp.status(), 200, "streaming chat completion");
-    let mut stream = resp.bytes_stream();
-    let first = stream
-        .next()
-        .await
-        .expect("expected first response chunk before full body EOS");
-    assert!(
-        !first.expect("first chunk bytes").is_empty(),
-        "first SSE chunk should be non-empty"
-    );
-    while stream.next().await.is_some() {}
 }

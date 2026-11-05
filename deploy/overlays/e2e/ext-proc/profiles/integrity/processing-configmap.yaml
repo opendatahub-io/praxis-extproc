@@ -1,0 +1,48 @@
+# Integrity (oracle) profile — hop 2 (IPP / post-auth).
+#
+# Instrumented, NON-production lane for issue #165. Unlike the conformance
+# baseline this chain has NO ai_guardrails: the guardrails response phase is
+# global and rejects streaming (ai#1604), which would block the oracles and the
+# streaming coverage. Here the oracles run guardrail-free so streaming works and
+# header/body assertions are unobstructed. Applied by
+# `make e2e-setup PROFILE=integrity`; never part of the production (odh) config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-processing-plugins
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      # Keep the fail-closed body cap so the oversized-body case still yields a
+      # deterministic 5xx on this failure_mode_allow: false ext-proc.
+      max_body_bytes: 1048576
+      tls:
+        mode: self_signed
+
+    filter_chains:
+      - name: ai-filters
+        filters:
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: continue
+          - filter: headers
+            request_add:
+              - name: X-Praxis-Processed
+                value: "true"
+            response_set:
+              - name: X-Praxis-Version
+                value: "e2e"
+          # Observe what crossed the hop-1 trust boundary and what this hop adds,
+          # via x-qualification-fwd-<name>-hop-2 response headers.
+          - filter: e2e_header_oracle
+            watch:
+              - x-maas-tenant
+              - x-gateway-model-name
+              - x-praxis-processed
+              - x-model-name
+          - filter: e2e_body_oracle

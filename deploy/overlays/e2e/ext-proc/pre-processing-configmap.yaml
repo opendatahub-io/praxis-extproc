@@ -28,4 +28,3 @@ data:
               - pointer: /model
                 header: X-Gateway-Model-Name
             on_invalid: continue
-          - filter: e2e_body_oracle

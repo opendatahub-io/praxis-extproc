@@ -5,6 +5,8 @@ ignore = [
     # Pingora transitive dependencies; not under our control.
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
+    # pin-utils 0.1.0: unmaintained (via aws-smithy-types -> praxis-ai-filters)
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]

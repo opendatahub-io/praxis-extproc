@@ -43,9 +43,10 @@ spec:
             message_timeout: 300s
             processing_mode:
               request_header_mode: SEND
-              # e2e_body_oracle on the pre-processing hop publishes its digest
-              # from on_response; SEND so the hop-1 header reaches the client.
-              response_header_mode: SEND
+              # Production-faithful default (mirrors the odh ipp-pre hop, which
+              # does no response work). The integrity profile patches this to
+              # SEND at setup so its hop-1 oracles can publish response headers.
+              response_header_mode: SKIP
               request_body_mode: FULL_DUPLEX_STREAMED
               response_body_mode: NONE
               request_trailer_mode: SEND

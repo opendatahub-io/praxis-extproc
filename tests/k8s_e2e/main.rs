@@ -40,12 +40,9 @@
 
 mod fixtures;
 
-mod chained_oracle;
-mod completions;
-mod direct;
-mod errors;
-mod fd_streamed_oracle;
-mod filters;
-mod guardrails;
+// Every test lives in exactly one profile module. The runner selects a lane by
+// name filter (`cargo test --test k8s_e2e <profile>`), so a test's module is its
+// profile gate. `oracle_helpers` is a shared helper module (no tests).
+mod conformance;
+mod integrity;
 mod oracle_helpers;
-mod routing;

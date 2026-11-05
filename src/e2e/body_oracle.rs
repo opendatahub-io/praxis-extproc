@@ -28,9 +28,6 @@ use praxis_filter::{
 };
 use tracing::debug;
 
-/// Env var that assigns this Deployment's hop index in request-flow order.
-pub const HOP_INDEX_ENV: &str = "BODY_ORACLE_HOP_INDEX";
-
 /// Metadata key holding the lowercase hex digest until `on_response`.
 const META_DIGEST: &str = "e2e_body_oracle.digest";
 
@@ -76,7 +73,7 @@ struct BodyOracleState {
 
 /// Filter that publishes `x-qualification-request-sha256[-hop-N]` on the response.
 pub struct BodyOracleFilter {
-    /// Request-flow hop index from [`HOP_INDEX_ENV`], when set.
+    /// Request-flow hop index from [`super::HOP_INDEX_ENV`], when set.
     hop_index: Option<u32>,
 }
 
@@ -88,16 +85,7 @@ impl BodyOracleFilter {
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let _: EmptyFilterConfig = parse_filter_config("e2e_body_oracle", config)?;
-        let hop_index = std::env::var(HOP_INDEX_ENV)
-            .ok()
-            .map(|raw| {
-                raw.parse::<u32>().map_err(|error| {
-                    FilterError::from(format!(
-                        "e2e_body_oracle: {HOP_INDEX_ENV}={raw:?} is not a u32: {error}"
-                    ))
-                })
-            })
-            .transpose()?;
+        let hop_index = super::hop_index_from_env()?;
         Ok(Box::new(Self { hop_index }))
     }
 
