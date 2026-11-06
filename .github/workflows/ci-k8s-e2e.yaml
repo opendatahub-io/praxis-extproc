@@ -48,6 +48,11 @@ jobs:
           kubectl --context kind-praxis-e2e get gateways,httproutes,referencegrants -A -o yaml || true
           kubectl --context kind-praxis-e2e get services -n istio-system -o wide || true
           kubectl --context kind-praxis-e2e logs -n istio-system deployment/istiod --tail=200 || true
+          kubectl --context kind-praxis-e2e describe pods -n istio-system || true
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-processing --tail=100 || true
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-pre-processing --tail=100 || true
           kubectl --context kind-praxis-e2e describe pods -n praxis-extproc || true
           kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100 || true
           kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30 || true

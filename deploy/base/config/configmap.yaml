@@ -14,6 +14,8 @@ data:
       # set insecure_options.allow_unbounded_body here: after the gRPC raise in
       # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
       max_body_bytes: 33554432
+      metrics_auth:
+        enabled: true
       tls:
         mode: self_signed
 
@@ -44,6 +46,8 @@ data:
       # set insecure_options.allow_unbounded_body here: after the gRPC raise in
       # RHOAIENG-102139 that flag would leave streamed bodies uncapped.
       max_body_bytes: 33554432
+      metrics_auth:
+        enabled: true
       tls:
         mode: self_signed
 

@@ -209,7 +209,19 @@ impl World {
         cfg.server.health_address = unused_address().to_string();
         cfg.server.metrics_address = unused_address().to_string();
         let config_path = directory.join("extproc.yaml");
-        let config = serde_yaml::to_value(serde_json::json!({"filter_chains":cfg.filter_chains, "insecure_options":{"allow_private_upstreams":true}, "server":{"grpc_address":cfg.server.grpc_address,"health_address":cfg.server.health_address,"metrics_address":cfg.server.metrics_address,"max_body_bytes":2_097_152}})).unwrap();
+        // metrics_auth defaults to enabled and exits when this process has no kubeconfig.
+        let config = serde_yaml::to_value(serde_json::json!({
+            "filter_chains": cfg.filter_chains,
+            "insecure_options": {"allow_private_upstreams": true},
+            "server": {
+                "grpc_address": cfg.server.grpc_address,
+                "health_address": cfg.server.health_address,
+                "metrics_address": cfg.server.metrics_address,
+                "max_body_bytes": 2_097_152,
+                "metrics_auth": {"enabled": false},
+            }
+        }))
+        .unwrap();
         std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
         let extproc_log = std::fs::File::create(directory.join("extproc.log")).unwrap();
         let extproc = Process(

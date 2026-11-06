@@ -3414,11 +3414,15 @@ async fn connect_extproc_client(port: u16) -> ExtProcClient {
 }
 
 /// Minimal serving config on free ports for the binary max-recv regression.
+///
+/// `metrics_auth` is off: this process has no kubeconfig, and the default
+/// `enabled: true` exits before the gRPC listener starts.
 fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
     let yaml = format!(
         "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
-         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: test\n    \
-         filters:\n      - filter: request_id\ninsecure_options:\n  allow_unbounded_body: true\n"
+         metrics_address: \"127.0.0.1:{metrics}\"\n  metrics_auth:\n    enabled: false\n  tls:\n    mode: none\n\
+         filter_chains:\n  - name: test\n    filters:\n      - filter: request_id\n\
+         insecure_options:\n  allow_unbounded_body: true\n"
     );
     let path = std::env::temp_dir().join(format!(
         "praxis-extproc-grpc-max-recv-{}-{grpc}.yaml",

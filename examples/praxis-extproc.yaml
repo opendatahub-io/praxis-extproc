@@ -10,6 +10,8 @@ server:
   shutdown_drain_timeout_secs: 20   # optional: default shown; force-cancel in-flight streams after this (keep < k8s terminationGracePeriodSeconds)
   tls:
     mode: none
+  metrics_auth:
+    enabled: false           # disable for local dev (default: true)
 
 filter_chains:
   - name: observability

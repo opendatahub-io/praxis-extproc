@@ -92,7 +92,13 @@ reachable "http://127.0.0.1:${METRICS_PORT}/metrics" || {
   exit 1
 }
 export IPP_METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
-echo "e2e: using ${IPP_METRICS_URL} (E2E_BODY_MODE=${E2E_BODY_MODE})"
+# Audience stays unset: TokenReview in the extproc process checks the
+# apiserver audience. This account is the scraper, not the extproc identity.
+METRICS_READER_SA="${E2E_METRICS_READER_SA:-e2e-metrics-reader}"
+IPP_METRICS_TOKEN="$(kubectl --context "$CTX" -n "$EXTPROC_NS" create token "${METRICS_READER_SA}")"
+[[ -n "${IPP_METRICS_TOKEN}" ]] || { echo "e2e: empty metrics reader token for ${METRICS_READER_SA}" >&2; exit 1; }
+export IPP_METRICS_TOKEN
+echo "e2e: using ${IPP_METRICS_URL} (E2E_BODY_MODE=${E2E_BODY_MODE}, reader ${EXTPROC_NS}/${METRICS_READER_SA})"
 
 if [[ -n "$PF_PID" || -n "$STREAMING_PF_PID" || -n "$METRICS_PF_PID" ]]; then
   # Port-forward tunnels can collapse when concurrent tests flood them. Keep
