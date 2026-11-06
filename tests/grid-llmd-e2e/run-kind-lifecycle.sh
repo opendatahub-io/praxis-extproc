@@ -430,7 +430,14 @@ if [[ "$MODE" == cleanup ]]; then
     if [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" && -f "$RUN_DIR/grid/operator-bootstrap/RESULT.json" ]]; then
       CLEANUP_STAGE=task-namespace-cleanup
       task_namespace_cleanup_dir="$RUN_DIR/cleanup/task-namespace-$(date -u +%H%M%S)"
-      KIND_TASK_CLEANUP_MODE=fresh KIND_TASK_CLEANUP_EVIDENCE_DIR="$task_namespace_cleanup_dir" \
+      task_cleanup_mode=fresh
+      if [[ "$CLEANUP_CONTEXT" == workflow-retry ]]; then
+        # An interrupted Gateway bootstrap may have created no release. Resume
+        # mode proves the live Gateway/HTTPRoute/data-plane inventory is empty
+        # before it allows namespace cleanup in that case.
+        task_cleanup_mode=resume
+      fi
+      KIND_TASK_CLEANUP_MODE="$task_cleanup_mode" KIND_TASK_CLEANUP_EVIDENCE_DIR="$task_namespace_cleanup_dir" \
         bash "$(helper cleanup-kind-task-namespace.sh)" || cleanup_rc=$?
       if [[ -s "$task_namespace_cleanup_dir/RESULT.json" ]] && jq -e '.status=="task-gateway-and-namespace-removed" and .naturalGridWithdrawalWasVerifiedBeforeCleanup==true and .manualFinalizerRemoval==false' \
         "$task_namespace_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
@@ -876,8 +883,8 @@ GRID_IDENTITY_MODE=apply GRID_IDENTITY_TIMEOUT=300 \
 phase_end 0
 
 phase_start task-gateway-bootstrap
-GRID_GATEWAY_MODE=install GRID_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE" \
-  GRID_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256" \
+GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE" \
+  PRAXIS_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256" \
   PRAXIS_GATEWAY_IMAGE="$(image_ref grid-gateway)" \
   PRAXIS_GRID_SOURCE_REVISION="$(source_value grid)" \
   GRID_GATEWAY_EVIDENCE_DIR="$RUN_DIR/grid/gateway-bootstrap" \
@@ -951,8 +958,8 @@ OVERLAY_CONFIGMAP="$(kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT
   | jq -er --arg gateway grid-gateway --arg ns "$TASK_NAMESPACE" \
     '[.status.routingMapStatus[]?|select(.gatewayName==$gateway and .namespace==$ns)]|if length==1 then .[0].configMapName else error("expected exactly one current Gateway overlay") end')"
 phase_start task-gateway-grid-config
-GRID_GATEWAY_MODE=install GRID_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE" \
-  GRID_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256" \
+GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE" \
+  PRAXIS_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256" \
   PRAXIS_GATEWAY_IMAGE="$(image_ref grid-gateway)" \
   PRAXIS_GRID_SOURCE_REVISION="$(source_value grid)" \
   GRID_GATEWAY_EVIDENCE_DIR="$RUN_DIR/grid/gateway-grid-config" \

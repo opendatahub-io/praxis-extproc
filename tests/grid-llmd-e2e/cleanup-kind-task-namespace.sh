@@ -113,8 +113,10 @@ for resource in configmaps secrets serviceaccounts roles rolebindings services d
     >"$EVIDENCE_DIR/$file.json" || fail "could not snapshot $resource"
 done
 
+gateway_release_was_present=false
 helm list -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/helm-releases-before.json" || fail 'could not list Helm releases'
 if jq -e --arg release "$GATEWAY_RELEASE" 'any(.[];.name==$release)' "$EVIDENCE_DIR/helm-releases-before.json" >/dev/null; then
+  gateway_release_was_present=true
   jq -e --arg release "$GATEWAY_RELEASE" 'any(.[];.name==$release and .status=="deployed" and (.chart|startswith("praxis-gateway-")))' \
     "$EVIDENCE_DIR/helm-releases-before.json" >/dev/null || fail 'task Gateway release has the wrong chart or status'
   helm status "$GATEWAY_RELEASE" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/gateway-release-status-before.json" || fail 'Gateway release status is unreadable'
@@ -230,6 +232,11 @@ oc get namespace "$NAMESPACE" -o json >"$EVIDENCE_DIR/task-namespace-after.json"
 kill "$API_PROXY_PID" 2>/dev/null || true
 wait "$API_PROXY_PID" 2>/dev/null || true
 jq -n --arg run "$RUN_LABEL" --arg namespace "$NAMESPACE" --arg uid "$NAMESPACE_UID" --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson gatewayReleaseWasPresent "$gateway_release_was_present" \
   '{status:"task-gateway-and-namespace-removed",runLabel:$run,namespace:$namespace,namespaceUID:$uid,completedAt:$completedAt,
-    naturalGridWithdrawalWasVerifiedBeforeCleanup:true,manualFinalizerRemoval:false}' >"$EVIDENCE_DIR/RESULT.json"
-log 'Task Gateway release, task namespace, and run-owned EPP metrics role/binding were removed; platform dependencies remain until Kind cluster deletion'
+    taskGatewayReleaseWasPresent:$gatewayReleaseWasPresent,naturalGridWithdrawalWasVerifiedBeforeCleanup:true,manualFinalizerRemoval:false}' >"$EVIDENCE_DIR/RESULT.json"
+if [[ "$gateway_release_was_present" == true ]]; then
+  log 'Task Gateway release, task namespace, and run-owned EPP metrics role/binding were removed; platform dependencies remain until Kind cluster deletion'
+else
+  log 'Task Gateway release was absent and the live Gateway/HTTPRoute/data-plane inventory was empty; task namespace and run-owned EPP metrics role/binding were removed'
+fi

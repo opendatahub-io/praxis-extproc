@@ -175,6 +175,10 @@ if '[[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" && -f "$RUN_DIR/grid/op
     raise SystemExit("full task cleanup must run only after Grid operator installation, when Grid CRDs and natural withdrawal can be verified")
 if 'pre-grid-task-namespace-not-applicable' not in cleanup or 'naturalGridWithdrawalVerified:false' not in cleanup:
     raise SystemExit("pre-Grid failure cleanup must record task namespace removal by cluster teardown without claiming natural Grid cleanup")
+if lifecycle.count('GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE"') != 2 or lifecycle.count('PRAXIS_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256"') != 2:
+    raise SystemExit("both task Gateway installs must pass the chart archive and digest under the helper's PRAXIS_GATEWAY_* inputs")
+if 'task_cleanup_mode=fresh' not in cleanup or 'if [[ "$CLEANUP_CONTEXT" == workflow-retry ]]; then' not in cleanup or 'task_cleanup_mode=resume' not in cleanup or 'KIND_TASK_CLEANUP_MODE="$task_cleanup_mode"' not in cleanup:
+    raise SystemExit("workflow failure cleanup must use resume mode so an uninstalled task Gateway is safely inventoried and cleaned")
 
 source_validation = builder.index('[[ "$actual_head" == "$SOURCE_SHA" && -z "$actual_branch" ]]')
 permission_fix = builder.index('make_build_context_readable "$BUILD_CONTEXT_DIR"')

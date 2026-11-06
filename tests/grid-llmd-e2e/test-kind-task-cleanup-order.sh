@@ -32,6 +32,10 @@ required = (
     '"$EVIDENCE_DIR/namespace-delete-options.json"',
     'dataKeys:(if .kind=="Secret" or .kind=="ConfigMap" then ((.data//{})|keys) else null end)',
     "naturalGridWithdrawalWasVerifiedBeforeCleanup:true",
+    "taskGatewayReleaseWasPresent:$gatewayReleaseWasPresent",
+    "gateway_release_was_present=false",
+    "gateway_release_was_present=true",
+    "live Gateway/HTTPRoute/data-plane inventory was empty",
 )
 missing = [fragment for fragment in required if fragment not in source]
 if missing:
