@@ -156,22 +156,26 @@ mkdir -m 0700 "$charts_dir"
 crd_chart="$SOURCE_DIR/charts/kserve-llmisvc-crd"
 resources_chart="$SOURCE_DIR/charts/kserve-llmisvc-resources"
 runtime_chart="$SOURCE_DIR/charts/kserve-runtime-configs"
+python3 "$SCRIPT_DIR/resolve_kind_kserve_chart_metadata.py" --source-dir "$SOURCE_DIR" --source-sha "$SOURCE_SHA" \
+  >"$EVIDENCE_DIR/chart-source-metadata.json"
+chmod 0600 "$EVIDENCE_DIR/chart-source-metadata.json"
+crd_chart_version="$(jq -er '.charts["kserve-llmisvc-crd"].version' "$EVIDENCE_DIR/chart-source-metadata.json")"
+resources_chart_version="$(jq -er '.charts["kserve-llmisvc-resources"].version' "$EVIDENCE_DIR/chart-source-metadata.json")"
+runtime_chart_version="$(jq -er '.charts["kserve-runtime-configs"].version' "$EVIDENCE_DIR/chart-source-metadata.json")"
 for chart in "$crd_chart" "$resources_chart" "$runtime_chart"; do
   [[ -f "$chart/Chart.yaml" ]] || fail "source chart is missing: $chart"
-  version="$(awk -F': *' '$1=="version" {print $2; exit}' "$chart/Chart.yaml")"
-  [[ "$version" == v0.21.0 ]] || fail "unexpected chart version in $chart"
   h package "$chart" --destination "$charts_dir" >"$EVIDENCE_DIR/helm-package-$(basename "$chart").txt"
 done
 sha256sum "$charts_dir"/*.tgz >"$EVIDENCE_DIR/chart-archives.sha256"
-printf 'kserve:\n  version: v0.21.0\n  llmisvc:\n    createGIECRDs: true\n    controller:\n      image: "%s"\n      tag: "%s"\n      imagePullPolicy: IfNotPresent\n' \
+printf 'kserve:\n  llmisvc:\n    createGIECRDs: true\n    controller:\n      image: "%s"\n      tag: "%s"\n      imagePullPolicy: IfNotPresent\n' \
   "$IMAGE_REPOSITORY" "$IMAGE_TAG" >"$EVIDENCE_DIR/kserve-kind-values.yaml"
 chmod 0600 "$EVIDENCE_DIR/kserve-kind-values.yaml"
-h template kserve-llmisvc-crd "$charts_dir/kserve-llmisvc-crd-v0.21.0.tgz" --namespace kserve --include-crds \
+h template kserve-llmisvc-crd "$charts_dir/kserve-llmisvc-crd-$crd_chart_version.tgz" --namespace kserve --include-crds \
   >"$EVIDENCE_DIR/rendered-crds.yaml"
-h template kserve-llmisvc-resources "$charts_dir/kserve-llmisvc-resources-v0.21.0.tgz" --namespace kserve \
+h template kserve-llmisvc-resources "$charts_dir/kserve-llmisvc-resources-$resources_chart_version.tgz" --namespace kserve \
   --values "$EVIDENCE_DIR/kserve-kind-values.yaml" --include-crds >"$EVIDENCE_DIR/rendered-controller-resources.yaml"
-h template kserve-runtime-configs "$charts_dir/kserve-runtime-configs-v0.21.0.tgz" --namespace kserve \
-  --set kserve.version=v0.21.0 --set kserve.llmisvcConfigs.enabled=true --set kserve.servingruntime.enabled=false \
+h template kserve-runtime-configs "$charts_dir/kserve-runtime-configs-$runtime_chart_version.tgz" --namespace kserve \
+  --set kserve.llmisvcConfigs.enabled=true --set kserve.servingruntime.enabled=false \
   >"$EVIDENCE_DIR/rendered-runtime-configs.yaml"
 rg -Fq "image: $CONTROLLER_IMAGE" "$EVIDENCE_DIR/rendered-controller-resources.yaml" || fail 'rendered controller image does not match the run image tag'
 rg -Fq 'kind: CustomResourceDefinition' "$EVIDENCE_DIR/rendered-crds.yaml" || fail 'KServe CRD chart rendered no CRDs'
@@ -180,7 +184,7 @@ rg -Fq 'name: inferencepools.inference.networking.k8s.io' "$EVIDENCE_DIR/rendere
 rg -Fq 'kind: LLMInferenceServiceConfig' "$EVIDENCE_DIR/rendered-runtime-configs.yaml" || fail 'KServe runtime chart rendered no LLMInferenceServiceConfig resources'
 
 log "Installing source-locked KServe LLMInferenceService stack on $actual_server"
-h upgrade --install kserve-llmisvc-crd "$charts_dir/kserve-llmisvc-crd-v0.21.0.tgz" \
+h upgrade --install kserve-llmisvc-crd "$charts_dir/kserve-llmisvc-crd-$crd_chart_version.tgz" \
   --namespace kserve --create-namespace --wait --timeout "$TIMEOUT" >"$EVIDENCE_DIR/install-crds.txt" 2>&1
 for crd in llminferenceservices.serving.kserve.io llminferenceserviceconfigs.serving.kserve.io; do
   k wait --for=condition=Established "crd/$crd" --timeout="$TIMEOUT" >"$EVIDENCE_DIR/wait-${crd}.txt"
@@ -188,7 +192,7 @@ done
 k get crd llminferenceservices.serving.kserve.io -o json >"$EVIDENCE_DIR/llmisvc-crd.json"
 jq -e 'any(.spec.versions[];.name=="v1alpha2" and .served==true and .storage==true)' "$EVIDENCE_DIR/llmisvc-crd.json" >/dev/null || fail 'LLMInferenceService CRD does not serve and store v1alpha2'
 
-h upgrade --install kserve-llmisvc-resources "$charts_dir/kserve-llmisvc-resources-v0.21.0.tgz" \
+h upgrade --install kserve-llmisvc-resources "$charts_dir/kserve-llmisvc-resources-$resources_chart_version.tgz" \
   --namespace kserve --create-namespace --values "$EVIDENCE_DIR/kserve-kind-values.yaml" \
   --timeout "$TIMEOUT" >"$EVIDENCE_DIR/install-controller.txt" 2>&1
 k wait --for=condition=Ready certificate/llmisvc-serving-cert -n kserve --timeout="$TIMEOUT" \
@@ -245,8 +249,8 @@ done
 for crd in inferencepools.inference.networking.k8s.io inferencepools.inference.networking.x-k8s.io; do
   k wait --for=condition=Established "crd/$crd" --timeout="$TIMEOUT" >"$EVIDENCE_DIR/wait-${crd}.txt"
 done
-h upgrade --install kserve-runtime-configs "$charts_dir/kserve-runtime-configs-v0.21.0.tgz" \
-  --namespace kserve --create-namespace --set kserve.version=v0.21.0 \
+h upgrade --install kserve-runtime-configs "$charts_dir/kserve-runtime-configs-$runtime_chart_version.tgz" \
+  --namespace kserve --create-namespace \
   --set kserve.llmisvcConfigs.enabled=true --set kserve.servingruntime.enabled=false \
   --wait --timeout "$TIMEOUT" >"$EVIDENCE_DIR/install-runtime-configs.txt" 2>&1
 k get llminferenceserviceconfigs.serving.kserve.io -n kserve -o json >"$EVIDENCE_DIR/runtime-configs.json"
@@ -265,8 +269,10 @@ h list --all --namespace kserve --output json >"$EVIDENCE_DIR/helm-releases.json
 k get --raw=/readyz >"$EVIDENCE_DIR/readyz-after.txt"
 jq -n --arg sourceSha "$SOURCE_SHA" --arg contextSha "$SOURCE_CONTEXT_SHA" \
   --arg image "$CONTROLLER_IMAGE" --arg digest "$IMAGE_DIGEST" --arg server "$actual_server" \
+  --argjson chartMetadata "$(cat "$EVIDENCE_DIR/chart-source-metadata.json")" \
   '{status:"PASS",apiServer:$server,sourceSha:$sourceSha,buildContextSha256:$contextSha,
     controllerImage:$image,controllerManifestDigest:$digest,controllerReadyReplicas:1,
+    chartSourceMetadata:$chartMetadata,
     llmInferenceServiceAPI:{group:"serving.kserve.io",version:"v1alpha2",served:true,stored:true},
     controllerWebhookCertificateReady:true,webhookReadyEndpoint:true,webhookCABundlesPresent:true,
     gatewayInferenceExtensionCRDsEstablished:true,runtimeSchedulerConfigPresent:true,

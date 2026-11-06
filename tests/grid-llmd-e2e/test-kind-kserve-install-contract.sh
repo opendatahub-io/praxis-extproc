@@ -19,9 +19,12 @@ required = {
     "build metadata and architecture check": '.build_platform=="linux/amd64"',
     "build tag is derived from image metadata": 'resolve_kind_image_tag.py',
     "image tag is not a mandatory duplicate input": '[--image-tag TAG]',
-    "KServe CRD source chart": 'kserve-llmisvc-crd-v0.21.0.tgz',
-    "KServe controller and webhook chart": 'kserve-llmisvc-resources-v0.21.0.tgz',
-    "KServe runtime chart": 'kserve-runtime-configs-v0.21.0.tgz',
+    "KServe chart versions come from locked source metadata": 'resolve_kind_kserve_chart_metadata.py',
+    "KServe CRD package uses source chart version": 'kserve-llmisvc-crd-$crd_chart_version.tgz',
+    "KServe controller package uses source chart version": 'kserve-llmisvc-resources-$resources_chart_version.tgz',
+    "KServe runtime package uses source chart version": 'kserve-runtime-configs-$runtime_chart_version.tgz',
+    "source chart metadata recorded": 'chart-source-metadata.json',
+    "runtime configuration toggles use source chart defaults": '--set kserve.llmisvcConfigs.enabled=true',
     "serving certificate before controller rollout": 'wait --for=condition=Ready certificate/llmisvc-serving-cert',
     "controller rollout and pinned runtime digest": 'exactly one Ready Pod with the pinned runtime image digest',
     "bounded webhook convergence": 'webhook-convergence-polls.tsv',
@@ -44,6 +47,8 @@ if tag_resolution > first_cluster_read:
     raise SystemExit("KServe image tag must be verified before contacting or mutating the cluster")
 if "kubectl patch" in source or "--set image.tag=latest" in source:
     raise SystemExit("installer contains a manual resource patch or mutable latest image")
+if "--set kserve.version=" in source:
+    raise SystemExit("installer overrides the source-locked runtime chart version")
 if 'k rollout restart deployment/llmisvc-controller-manager' in source:
     raise SystemExit("installer forces a controller rollout that can leave an old webhook Pod terminating")
 if not (Path(sys.argv[1]).parent / "verify_kind_kserve_webhook_readiness.py").is_file():
