@@ -81,8 +81,9 @@ deploy/
       workload/        # Namespace, tls.mode none; strips base TLS volume
       test/            # Echo backend, Gateway, HTTPRoute, EnvoyFilter
     odh/               # OpenDataHub production overlay
-      rbac/            # ServiceAccount only (no API reader binding)
+      rbac/            # ServiceAccount only (no ClusterRole / secret reader)
       networking/      # NetworkPolicy (ingress/egress restrictions)
+      monitoring/      # Optional ServiceMonitor for ExtProc metrics
       pre-processing/  # Second Deployment + OpenShift serving-cert annotation
       after/           # Post-auth Deployment + DestinationRule + serving-cert
     e2e/workload/      # KIND e2e; self_signed TLS; strips base TLS volume

@@ -280,17 +280,29 @@ For production MaaS environments, use the `odh`
 overlay which adds:
 
 - Dual ExtProc instances (pre-auth BBR +
-  post-auth IPP)
-- RBAC with least-privilege read-only access to
-  CRDs and secrets
+  post-auth IPP), each with a 512 MiB memory limit
+- ServiceAccount only (no ClusterRole); the SA
+  token stays mounted for metrics TokenReview /
+  SubjectAccessReview, not for reading CRDs or
+  Secrets
+- OpenShift service-ca serving certificates on the
+  ExtProc Services (`provided` TLS + trusted CA /
+  SAN match on the Envoy side)
 - NetworkPolicy restricting ingress to gateway
-  pods and monitoring
-- DestinationRules with SIMPLE TLS and explicit SNI
+  pods and monitoring (API-server egress kept for
+  metrics auth)
+- DestinationRules with SIMPLE TLS, CA bundle, and
+  explicit SNI / SANs
 - EnvoyFilter anchored around Kuadrant auth
-  (supports Istio <=1.25 through >=1.30 and RHCL)
+  (supports Istio <=1.25 through >=1.30 and RHCL),
+  with fail-closed pre- and post-auth ExtProc,
+  `max_body_bytes` 10 MiB, and concurrency capped
+  at 8
 - Istio's InferencePool filter moved in front of
   the router, so the endpoint picker sees the
   model header set by pre-auth BBR
+- Optional ServiceMonitor under `odh/monitoring`
+  when the monitoring stack is present
 
 ```console
 kubectl apply -k deploy/overlays/odh
