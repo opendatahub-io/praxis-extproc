@@ -92,47 +92,89 @@ struct BodyLimits {
     max_recv: usize,
 }
 
-/// Top-level application logic.
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Before anything that builds a filter registry, a subrequest client or a
-    // TLS configuration: the provider installed here is the only one there is.
-    let fips = praxis_extproc::fips::install()?;
+/// Config, registry, pipeline, and limits resolved before validate-or-serve.
+struct Prepared {
+    /// Installed crypto provider and the host FIPS signals.
+    fips: praxis_extproc::fips::Status,
+    /// Loaded ExtProc configuration.
+    cfg: ExtProcConfig,
+    /// Filter registry the pipeline was built from.
+    registry: praxis_filter::FilterRegistry,
+    /// Built pipeline, or the error from building it.
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+    /// Body ceilings resolved from config and the gRPC receive override.
+    limits: BodyLimits,
+}
 
+/// Install the crypto provider, load config, and build the pipeline.
+///
+/// The provider is installed before the registry, a subrequest client, or a
+/// TLS configuration: rustls has no fallback provider in this build, so a
+/// provider that is not installed here is not installed at all.
+fn prepare(config_path: &str) -> Result<Prepared, Box<dyn std::error::Error + Send + Sync>> {
+    let fips = praxis_extproc::fips::install()?;
     // Fail closed on a bad `GRPC_MAX_RECV_MSG_SIZE` before validate/sidecars so
     // `praxis-extproc -t` matches serve-time behaviour for this override.
     let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
-
-    let cfg = load_config(&cli.config)?;
+    let cfg = load_config(config_path)?;
     let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
     let limits = BodyLimits {
         max_body: cfg.max_body_accumulation(),
         max_recv,
     };
+    Ok(Prepared {
+        fips,
+        cfg,
+        registry,
+        pipeline,
+        limits,
+    })
+}
+
+/// Top-level application logic.
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let prepared = prepare(&cli.config)?;
 
     if cli.validate {
-        resolve_addresses(&cli, &cfg)?;
-        return validate_config(&cfg.server, &fips, &registry, pipeline, limits);
+        return validate_prepared(&cli, prepared);
     }
 
-    let addrs = resolve_addresses(&cli, &cfg)?;
+    let addrs = resolve_addresses(&cli, &prepared.cfg)?;
 
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
     // inspectable (health NotServing) but serves no traffic.
-    if let Some(reason) = fips_refusal(&fips, &registry) {
+    if let Some(reason) = fips_refusal(&prepared.fips, &prepared.registry) {
         error!(error = %reason, "refusing to serve");
-        return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
+        return Box::pin(serve_unready(
+            addrs,
+            praxis_extproc::fips::active(&prepared.fips),
+            prepared.cfg.server.metrics_auth.clone(),
+        ))
+        .await;
     }
 
     Box::pin(serve_pipeline(
         addrs,
-        pipeline,
-        &cfg.server,
-        limits,
-        praxis_extproc::fips::active(&fips),
+        prepared.pipeline,
+        &prepared.cfg.server,
+        prepared.limits,
+        praxis_extproc::fips::active(&prepared.fips),
     ))
     .await
+}
+
+/// `--validate` path: resolve listeners, then [`validate_config`].
+fn validate_prepared(cli: &Cli, prepared: Prepared) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    resolve_addresses(cli, &prepared.cfg)?;
+    validate_config(
+        &prepared.cfg.server,
+        &prepared.fips,
+        &prepared.registry,
+        prepared.pipeline,
+        prepared.limits,
+    )
 }
 
 /// `--validate` path after listener resolution: FIPS refusal, pipeline build,
@@ -243,7 +285,7 @@ async fn serve_pipeline(
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
-            Box::pin(serve_unready(addrs, fips_active)).await
+            Box::pin(serve_unready(addrs, fips_active, server_cfg.metrics_auth.clone())).await
         },
     }
 }
@@ -256,9 +298,13 @@ async fn start_services(
     limits: BodyLimits,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx)
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        true,
+        fips_active,
+        server_cfg.metrics_auth.clone(),
+        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx),
+    ))
     .await
 }
 
@@ -268,11 +314,18 @@ async fn start_services(
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, fips_active, |drain_rx| async move {
-        wait_drain(drain_rx).await;
-        Ok(())
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        false,
+        fips_active,
+        metrics_auth,
+        |drain_rx| async move {
+            wait_drain(drain_rx).await;
+            Ok(())
+        },
+    ))
     .await
 }
 
@@ -297,10 +350,15 @@ enum Selected {
 /// sidecar's bind failure) is returned as the originating error.
 ///
 /// [`watch::Receiver`]: tokio::sync::watch::Receiver
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential sidecar supervision; extraction would split related logic"
+)]
 async fn run_with_sidecars<F, Fut>(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     serving: bool,
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
     foreground: F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -317,8 +375,14 @@ where
     });
 
     let metrics_rx = shutdown_tx.subscribe();
-    let mut metrics =
-        tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
+    let (metrics_ready_tx, metrics_ready_rx) = tokio::sync::oneshot::channel();
+    let mut metrics = tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addrs.2, &metrics_auth, metrics_ready_tx, wait_broadcast(metrics_rx)).await
+    });
+
+    if metrics_ready_rx.await.is_err() {
+        return task_outcome(metrics.await);
+    }
 
     let foreground = foreground(drain_rx);
     tokio::pin!(foreground);

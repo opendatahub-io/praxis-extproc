@@ -12,6 +12,7 @@ use crate::fixtures::{chat_completion, ensure_gateway_ready};
 static PRE_PROC_LOCK: Mutex<()> = Mutex::new(());
 
 const PRE_PROC_DEPLOY: &str = "payload-pre-processing";
+const PRE_PROC_SVC: &str = "payload-pre-processing";
 const PRE_PROC_NS: &str = "istio-system";
 
 fn kubectl_context() -> String {
@@ -23,6 +24,18 @@ fn kubectl(args: &[&str]) -> std::process::Output {
     cmd.args(["--context", &kubectl_context()]);
     cmd.args(args);
     cmd.output().unwrap_or_else(|e| panic!("kubectl {args:?}: {e}"))
+}
+
+fn kubectl_stdout(args: &[&str]) -> String {
+    String::from_utf8_lossy(&kubectl(args).stdout).trim().to_owned()
+}
+
+fn parse_replicas(text: &str) -> u32 {
+    if text.is_empty() {
+        0
+    } else {
+        text.parse::<u32>().unwrap_or(0)
+    }
 }
 
 fn scale_pre_processing(replicas: u32) {
@@ -40,10 +53,11 @@ fn scale_pre_processing(replicas: u32) {
     );
 }
 
-fn wait_pre_processing_replicas(want: u32, timeout: Duration) {
+/// Wait until the Deployment reports the desired ready replica count.
+fn wait_pre_processing_ready(want: u32, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let out = kubectl(&[
+        let text = kubectl_stdout(&[
             "-n",
             PRE_PROC_NS,
             "get",
@@ -51,12 +65,7 @@ fn wait_pre_processing_replicas(want: u32, timeout: Duration) {
             "-o",
             "jsonpath={.status.availableReplicas}",
         ]);
-        let text = String::from_utf8_lossy(&out.stdout);
-        let have = if text.is_empty() {
-            0
-        } else {
-            text.parse::<u32>().unwrap_or(0)
-        };
+        let have = parse_replicas(&text);
         if have == want {
             return;
         }
@@ -68,15 +77,69 @@ fn wait_pre_processing_replicas(want: u32, timeout: Duration) {
     }
 }
 
-/// When BBR ExtProc has no endpoints, Envoy must reject (failure_mode_allow: false),
-/// not route with a caller-controlled or missing model header.
+/// Wait until scaled-to-zero is fully drained.
+///
+/// Deployment `status.replicas` / Endpoints can clear while a terminating pod
+/// is still alive and answering Envoy's pooled HTTP/2 ExtProc connection
+/// (manual repro: empty replicas+endpoints with `pods=1` still returns 200;
+/// once `pods=0`, Envoy returns 500). Wait for zero pods, not just status.
+fn wait_pre_processing_gone(timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let replicas = parse_replicas(&kubectl_stdout(&[
+            "-n",
+            PRE_PROC_NS,
+            "get",
+            &format!("deploy/{PRE_PROC_DEPLOY}"),
+            "-o",
+            "jsonpath={.status.replicas}",
+        ]));
+        let endpoints = kubectl_stdout(&[
+            "-n",
+            PRE_PROC_NS,
+            "get",
+            &format!("endpoints/{PRE_PROC_SVC}"),
+            "-o",
+            "jsonpath={.subsets[*].addresses[*].ip}",
+        ]);
+        // `--no-headers` yields one line per pod (including Terminating).
+        let pod_lines = kubectl_stdout(&[
+            "-n",
+            PRE_PROC_NS,
+            "get",
+            "pods",
+            "-l",
+            &format!("app={PRE_PROC_DEPLOY}"),
+            "--no-headers",
+        ]);
+        let pods = if pod_lines.is_empty() {
+            0_usize
+        } else {
+            pod_lines.lines().filter(|l| !l.is_empty()).count()
+        };
+        if replicas == 0 && endpoints.is_empty() && pods == 0 {
+            // Give Envoy a beat to drop pooled connections to the old pods.
+            std::thread::sleep(Duration::from_secs(2));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {PRE_PROC_DEPLOY} drained \
+             (status.replicas={replicas}, endpoints={endpoints:?}, pods={pods})"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// When BBR ExtProc has no endpoints, Envoy must reject (`failure_mode_allow:
+/// false`), not route with a caller-controlled or missing model header.
 #[tokio::test]
 async fn unavailable_pre_processor_fails_closed() {
     let _guard = PRE_PROC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_gateway_ready().await;
 
     scale_pre_processing(0);
-    wait_pre_processing_replicas(0, Duration::from_secs(90));
+    wait_pre_processing_gone(Duration::from_secs(90));
 
     let status = {
         let resp = chat_completion("gpt-4", "hello").await;
@@ -87,7 +150,7 @@ async fn unavailable_pre_processor_fails_closed() {
     };
 
     scale_pre_processing(1);
-    wait_pre_processing_replicas(1, Duration::from_secs(120));
+    wait_pre_processing_ready(1, Duration::from_secs(120));
 
     assert!(
         status.is_server_error(),
