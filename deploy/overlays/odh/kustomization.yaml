@@ -26,3 +26,7 @@ patches:
       - op: add
         path: /spec/template/spec/serviceAccountName
         value: payload-processing
+      # metrics_auth TokenReview/SAR needs the mounted SA token (#57).
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: true
