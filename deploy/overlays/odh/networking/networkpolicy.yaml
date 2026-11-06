@@ -2,7 +2,8 @@
 #
 # Required on OCP 4.22+ where openshift-ingress has a default deny-all
 # NetworkPolicy. Without this, payload-processing pods cannot receive
-# ext_proc traffic from the gateway or reach the Kubernetes API server.
+# ext_proc traffic from the gateway or reach the Kubernetes API server
+# (needed for metrics TokenReview / SubjectAccessReview).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -60,7 +61,7 @@ spec:
           port: 5353
         - protocol: TCP
           port: 5353
-    # Kubernetes API server
+    # Kubernetes API server (metrics auth TokenReview / SubjectAccessReview)
     - ports:
         - protocol: TCP
           port: 443

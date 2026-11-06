@@ -28,3 +28,7 @@ patches:
     target:
       kind: Deployment
       name: payload-processing
+  - path: tls-volume-patch.yaml
+    target:
+      kind: Deployment
+      name: payload-processing

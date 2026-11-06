@@ -4,3 +4,13 @@ kind: Kustomization
 resources:
   - ../../../base/instance
   - destination-rule.yaml
+
+patches:
+  - target:
+      kind: Service
+      name: payload-processing
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.beta.openshift.io/serving-cert-secret-name: payload-processing-tls

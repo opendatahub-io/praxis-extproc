@@ -41,6 +41,9 @@ spec:
             # Hop index for e2e_body_oracle: pre-IPP is the first hop.
             - name: BODY_ORACLE_HOP_INDEX
               value: "1"
+            # Match pre max_body_bytes (10 MiB) + framing; see base Deployment.
+            - name: GRPC_MAX_RECV_MSG_SIZE
+              value: "11Mi"
           ports:
             - containerPort: 9004
               name: grpc

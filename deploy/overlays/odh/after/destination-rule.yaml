@@ -7,7 +7,11 @@ spec:
   trafficPolicy:
     tls:
       mode: SIMPLE
-      insecureSkipVerify: true
+      # Verify the OpenShift service-serving certificate. The gateway's
+      # projected service-ca bundle trusts the signer.
+      caCertificates: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
       # Explicit SNI required: without it Envoy uses the Istio cluster name
       # (outbound|9004||...), which rustls rejects as an illegal hostname.
       sni: payload-processing.openshift-ingress.svc.cluster.local
+      subjectAltNames:
+        - payload-processing.openshift-ingress.svc.cluster.local
