@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout requested fork source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: nerdalert/praxis-extproc
           ref: ${{ inputs.source_ref }}
@@ -180,7 +180,7 @@ jobs:
 
       - name: Upload sanitized run evidence
         if: always()
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kind-grid-llmd-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
