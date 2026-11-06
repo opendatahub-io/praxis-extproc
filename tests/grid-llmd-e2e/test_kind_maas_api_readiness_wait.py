@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 args = sys.argv[1:]
-index = next(i for i, value in enumerate(args) if value in {"config", "get"})
+index = next(i for i, value in enumerate(args) if value in {"config", "get", "logs"})
 args = args[index:]
 operation, *rest = args
 state = Path(os.environ["MOCK_STATE"])
@@ -54,12 +54,14 @@ def counter(name):
 
 if operation == "config":
     emit({"clusters": [{"cluster": {"server": "https://kind.example:6443"}}]})
+elif operation == "logs":
+    print("mock sanitized controller log")
 elif rest and rest[0] == "--raw=/readyz":
     print("ok")
 elif rest[:2] == ["namespace", "maas-system"]:
     emit({"metadata": {"labels": {"praxis.kind/run": "kind-readiness-test"}}})
 elif rest[:2] == ["config", "default"]:
-    ready = counter("config") >= 3
+    ready = os.environ.get("MOCK_CONFIG_READY", "delayed") != "never" and counter("config") >= 3
     emit({
         "metadata": {"uid": uid, "generation": 1},
         "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False",
@@ -94,6 +96,8 @@ elif rest[:2] == ["httproute", "maas-api-route"]:
           "spec": {"parentRefs": [{"name": "maas-default-gateway"}]},
           "status": {"parents": [{"conditions": [{"type": "Accepted", "status": "True"},
                                                    {"type": "ResolvedRefs", "status": "True"}]}]}})
+elif rest[:1] == ["events"]:
+    emit({"items": []})
 else:
     print("unexpected read-only kubectl request: " + " ".join(rest), file=sys.stderr)
     sys.exit(2)
@@ -143,7 +147,72 @@ else:
             self.assertIn("ready=true", config_polls[-1])
             self.assertEqual(len(service_polls), 1)
             self.assertEqual(len(route_polls), 1)
-            self.assertEqual(json.loads((evidence / "RESULT.json").read_text())["status"], "PASS")
+            full_result = json.loads((evidence / "RESULT.json").read_text())
+            self.assertEqual(full_result["status"], "PASS")
+            self.assertEqual(full_result["readinessScope"], "platform-ready")
+            self.assertTrue(full_result["configReady"])
+
+            # Bootstrap may finish API transport setup after the controller
+            # observes Config/default even while a required AIGC EnvoyFilter
+            # keeps the tenant aggregate NotReady.
+            for path in state.iterdir():
+                path.unlink()
+            env["MOCK_CONFIG_READY"] = "never"
+            bootstrap_evidence = root / "bootstrap-evidence"
+            bootstrap_result = subprocess.run(
+                [
+                    "bash", str(SCRIPT),
+                    "--context", "kind-test",
+                    "--kubeconfig", str(kubeconfig),
+                    "--expected-api-server", "https://kind.example:6443",
+                    "--run-id", RUN_ID,
+                    "--image", IMAGE,
+                    "--mode", "api-bootstrap",
+                    "--evidence-dir", str(bootstrap_evidence),
+                    "--timeout-seconds", "10",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(bootstrap_result.returncode, 0, bootstrap_result.stdout + bootstrap_result.stderr)
+            self.assertIn("scope=api-bootstrap", bootstrap_result.stdout)
+            bootstrap_result_json = json.loads((bootstrap_evidence / "RESULT.json").read_text())
+            self.assertEqual(bootstrap_result_json["readinessScope"], "api-bootstrap")
+            self.assertFalse(bootstrap_result_json["configReady"])
+            bootstrap_polls = (bootstrap_evidence / "config-readiness-polls.tsv").read_text().splitlines()
+            self.assertEqual(len(bootstrap_polls), 1)
+            self.assertIn("observed=true", bootstrap_polls[0])
+            self.assertIn("ready=false", bootstrap_polls[0])
+
+            # Full platform readiness must still reject that same NotReady Config.
+            for path in state.iterdir():
+                path.unlink()
+            blocked_evidence = root / "blocked-platform-evidence"
+            blocked_result = subprocess.run(
+                [
+                    "bash", str(SCRIPT),
+                    "--context", "kind-test",
+                    "--kubeconfig", str(kubeconfig),
+                    "--expected-api-server", "https://kind.example:6443",
+                    "--run-id", RUN_ID,
+                    "--image", IMAGE,
+                    "--mode", "platform-ready",
+                    "--evidence-dir", str(blocked_evidence),
+                    "--timeout-seconds", "1",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(blocked_result.returncode, 2, blocked_result.stdout + blocked_result.stderr)
+            self.assertIn("did not reach current-generation Ready", blocked_result.stderr)
+            self.assertEqual(json.loads((blocked_evidence / "RESULT.json").read_text())["status"], "FAILED")
+            self.assertTrue((blocked_evidence / "maas-controller-logs-failure.txt").is_file())
 
 
 if __name__ == "__main__":

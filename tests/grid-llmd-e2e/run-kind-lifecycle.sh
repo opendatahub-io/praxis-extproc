@@ -562,7 +562,7 @@ run_phase maas-controller -- "$(helper deploy-kind-maas-controller.sh)" \
   --source-dir "$MAAS_SOURCE" --source-sha "$MAAS_SHA" --run-id "$RUN_ID" \
   --controller-image "$(image_ref maas-controller)" --api-image "$(image_ref maas-api)" \
   --payload-image "$(image_ref payload-processing)" --evidence-dir "$RUN_DIR/platform/maas-controller" --apply
-run_phase maas-api -- "$(helper install-kind-maas-api.sh)" \
+run_phase maas-api-bootstrap -- "$(helper install-kind-maas-api.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
   --source-dir "$MAAS_SOURCE" --source-sha "$MAAS_SHA" --run-id "$RUN_ID" \
   --api-image "$(image_ref maas-api)" --evidence-dir "$RUN_DIR/platform/maas-api"
@@ -629,6 +629,10 @@ kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" apply --dry-run=ser
   -f "$RUN_DIR/platform/default-aitenant.yaml" >"$RUN_DIR/platform/default-aitenant-dry-run.txt"
 kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" apply -f "$RUN_DIR/platform/default-aitenant.yaml" \
   >"$RUN_DIR/platform/default-aitenant-apply.txt"
+run_phase maas-platform-ready -- "$(helper verify-kind-maas-api.sh)" \
+  --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
+  --run-id "$RUN_ID" --image "$(image_ref maas-api)" --mode platform-ready \
+  --evidence-dir "$RUN_DIR/platform/maas-platform-readiness"
 export CLUSTER_ENV=kind RESOURCE_PROFILE=reduced-dev GRID_LLMD_CLUSTER_PLATFORM=kind
 export SOURCE_LOCKS_FILE="$RUN_DIR/source-resolution/source-locks.json"
 export SOURCE_LOCKS_MD="$RUN_DIR/source-resolution/source-locks.md"

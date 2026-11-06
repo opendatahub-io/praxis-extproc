@@ -14,8 +14,10 @@ required = [
     "k get gateway maas-default-gateway",
     "run-owned MaaS Gateway must be current-generation Accepted and Programmed",
     '"$SCRIPT_DIR/verify-kind-maas-api.sh"',
+    "--mode api-bootstrap",
     "controller-owned-verify/RESULT.json",
     "controllerOperandsMutated:false",
+    "readinessScope:\"api-bootstrap\"",
     "failure-events.json",
 ]
 if any(item not in source for item in required):

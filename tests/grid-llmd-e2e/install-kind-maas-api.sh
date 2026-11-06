@@ -88,20 +88,23 @@ k get gateway maas-default-gateway -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/gatew
 jq -e --arg run "$RUN_ID" '.metadata.labels["praxis.kind/run"]==$run and (.metadata.generation as $g | any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g) and any(.status.listeners[]?.conditions[]?;.type=="Programmed" and .status=="True" and .observedGeneration==$g))' \
   "$EVIDENCE_DIR/gateway.json" >/dev/null || fail 'run-owned MaaS Gateway must be current-generation Accepted and Programmed before API reconciliation'
 
-# This verifier is read-only. It waits for Config/default reconciliation and
-# proves ownership, current Deployment generation, immutable runtime imageID,
-# Service endpoint, and accepted HTTPRoute. No static bundle is applied here.
+# This verifier is read-only. At this bootstrap point, AIGC has not yet
+# installed the payload-processing EnvoyFilter required for tenant readiness.
+# Verify only the observed Config generation and controller-owned API transport
+# here; the lifecycle performs a separate full Config/tenant readiness gate
+# after applying the AIGC bundle and default AITenant.
 "$SCRIPT_DIR/verify-kind-maas-api.sh" \
   --context "$CONTEXT" \
   --kubeconfig "$KUBECONFIG_FILE" \
   --expected-api-server "$EXPECTED_API_SERVER" \
   --run-id "$RUN_ID" \
   --image "$IMAGE" \
+  --mode api-bootstrap \
   --timeout-seconds "$TIMEOUT_SECONDS" \
   --evidence-dir "$EVIDENCE_DIR/controller-owned-verify"
 
 jq -n --arg run "$RUN_ID" --arg sourceSha "$SOURCE_SHA" --arg apiServer "$server" --arg namespace "$NAMESPACE" --arg image "$IMAGE" \
   --arg overlayPath "$XKS_KUSTOMIZATION" --arg overlaySha "$(sha256sum "$XKS_KUSTOMIZATION" | awk '{print $1}')" \
-  '{status:"PASS",run:$run,sourceSha:$sourceSha,apiServer:$apiServer,namespace:$namespace,image:$image,owner:"MaaS controller via Config/default",controllerOverlayPath:$overlayPath,controllerOverlaySha256:$overlaySha,controllerVerification:"controller-owned-verify/RESULT.json",controllerOperandsMutated:false,secretValuesRecorded:false}' \
+  '{status:"PASS",run:$run,sourceSha:$sourceSha,apiServer:$apiServer,namespace:$namespace,image:$image,owner:"MaaS controller via Config/default",readinessScope:"api-bootstrap",controllerOverlayPath:$overlayPath,controllerOverlaySha256:$overlaySha,controllerVerification:"controller-owned-verify/RESULT.json",controllerOperandsMutated:false,secretValuesRecorded:false}' \
   >"$EVIDENCE_DIR/RESULT.json"
-printf 'MaaS controller-owned Kind API passed its current-generation, pinned-image, endpoint, and route gate; no API operand was statically applied\n'
+printf 'MaaS controller-owned Kind API bootstrap passed its current-generation, pinned-image, endpoint, and route gate; full tenant readiness is checked after AIGC install\n'
