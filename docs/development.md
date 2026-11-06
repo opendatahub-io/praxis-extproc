@@ -290,8 +290,9 @@ registered only under that feature), and `make e2e-test` exercises it through
 `tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
 The streaming oracle uses a backend compiled only with `k8s-e2e`. In streamed
 response modes the client must receive the first SSE event before releasing
-the backend's terminal event. BUFFERED mode releases the backend first; all
-modes require the exact complete response and propagate transport errors.
+the backend's terminal event. BUFFERED mode must withhold SSE bytes after the
+backend has yielded its first frame. All modes require the exact complete
+response after release and propagate transport errors.
 TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
 in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 

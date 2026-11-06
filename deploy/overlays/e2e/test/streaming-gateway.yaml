@@ -32,6 +32,9 @@ spec:
         - path:
             type: Exact
             value: /oracle/release
+        - path:
+            type: Exact
+            value: /oracle/started
       backendRefs:
         - name: streaming-oracle
           namespace: llm
