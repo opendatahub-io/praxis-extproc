@@ -1,0 +1,202 @@
+name: Native Grid llm-d Kind E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact nerdalert/praxis-extproc branch or commit to qualify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-native-grid-llmd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kind-e2e:
+    name: Four-CPU Kind qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    env:
+      SOURCE_MODE: main
+      CLUSTER_ENV: kind
+      RESOURCE_PROFILE: reduced-dev
+      KIND_CAPACITY_PROFILE: gha-standard-4cpu
+      EXTPROC_REPOSITORY_URL: https://github.com/nerdalert/praxis-extproc.git
+      EXTPROC_REF: ${{ inputs.source_ref }}
+      CARGO_BUILD_JOBS: "1"
+      CONTAINER_BUILD_JOBS: "1"
+
+    steps:
+      - name: Checkout requested fork source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: nerdalert/praxis-extproc
+          ref: ${{ inputs.source_ref }}
+          path: praxis-extproc
+          persist-credentials: false
+
+      - name: Verify requested source identity
+        id: source
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$SOURCE_REF" ]]
+          requested_sha="$(git -C praxis-extproc rev-parse --verify 'HEAD^{commit}')"
+          git -C praxis-extproc cat-file -e "${SOURCE_REF}^{commit}"
+          resolved_sha="$(git -C praxis-extproc rev-parse --verify "${SOURCE_REF}^{commit}")"
+          [[ "$requested_sha" == "$resolved_sha" ]]
+          printf 'tested_source_sha=%s\nsource_ref=%s\n' "$requested_sha" "$SOURCE_REF" \
+            | tee "$RUNNER_TEMP/kind-tested-source.txt"
+          printf 'tested_source_sha=%s\n' "$requested_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned tools and record runner capacity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman skopeo jq iproute2 shellcheck python3-pip
+          mkdir -p "$RUNNER_TEMP/kind-tools"
+          tool_dir="$RUNNER_TEMP/kind-tools"
+          cd "$tool_dir"
+
+          curl -fsSL https://dl.k8s.io/release/v1.34.3/bin/linux/amd64/kubectl -o kubectl
+          printf '%s  kubectl\n' ab60ca5f0fd60c1eb81b52909e67060e3ba0bd27e55a8ac147cbc2172ff14212 | sha256sum --check
+          chmod 0755 kubectl
+
+          curl -fsSL https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-amd64 -o kind
+          printf '%s  kind\n' 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889 | sha256sum --check
+          chmod 0755 kind
+
+          curl -fsSL https://get.helm.sh/helm-v3.18.4-linux-amd64.tar.gz -o helm.tar.gz
+          printf '%s  helm.tar.gz\n' f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1 | sha256sum --check
+          tar -xzf helm.tar.gz linux-amd64/helm
+          install -m 0755 linux-amd64/helm helm
+
+          curl -fsSL 'https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz' -o kustomize.tar.gz
+          printf '%s  kustomize.tar.gz\n' 54e4031ddc4e7fc59e408da29e7c646e8e57b8088c51b84b3df0864f47b5148f | sha256sum --check
+          tar -xzf kustomize.tar.gz kustomize
+          chmod 0755 kustomize
+
+          curl -fsSL https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/4.19.0/openshift-client-linux.tar.gz -o oc.tar.gz
+          printf '%s  oc.tar.gz\n' c90254d7ededb6da4f6d3911fbe6d7d2e35654a480d684f5d2e502e8be7cd6fd | sha256sum --check
+          tar -xzf oc.tar.gz oc
+          chmod 0755 oc
+          echo "$tool_dir" >>"$GITHUB_PATH"
+
+          python3 -m pip install --user --break-system-packages PyYAML==6.0.2
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.96.0
+
+          {
+            printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'architecture=%s\nvisible_cpus=%s\n' "$(uname -m)" "$(nproc)"
+            printf '\n-- memory --\n'; free -b
+            printf '\n-- filesystem --\n'; df -B1 -h "$RUNNER_TEMP"
+            printf '\n-- cgroup --\n'
+            for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current; do
+              [[ ! -r "$f" ]] || { printf '\n[%s]\n' "$f"; cat "$f"; }
+            done
+            printf '\n-- docker capacity --\n'; docker info --format 'cpus={{.NCPU}} memory_bytes={{.MemTotal}} root={{.DockerRootDir}}'
+            printf '\n-- installed tool versions --\n'
+            kind version; kubectl version --client --output=yaml; helm version --short
+            kustomize version; oc version --client; podman version; skopeo --version; cargo --version
+            dpkg-query -W -f='${binary:Package}=${Version}\n' podman skopeo jq iproute2 python3-pip
+          } >"$RUNNER_TEMP/kind-runner-capacity.txt"
+          cat "$RUNNER_TEMP/kind-runner-capacity.txt"
+
+      - name: Run deployment, traffic qualification, and natural cleanup
+        id: qualification
+        working-directory: praxis-extproc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export KIND_RUN_ROOT="$RUNNER_TEMP/grid-llmd-kind-run"
+          timeout --signal=TERM --kill-after=30s 330m \
+            bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode run
+
+      - name: Retry run-owned cleanup after failure or cancellation
+        if: always()
+        working-directory: praxis-extproc
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          state_dir="$RUNNER_TEMP/grid-llmd-kind-run/private-state"
+          if [[ -s "$state_dir/lifecycle.env" ]]; then
+            KIND_PRIVATE_STATE_DIR="$state_dir" \
+              bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode cleanup
+          else
+            printf 'No lifecycle journal exists; provisioning did not create resumable run state.\n'
+          fi
+
+      - name: Sanitize evidence and write job summary
+        if: always()
+        shell: bash
+        env:
+          TESTED_SOURCE_SHA: ${{ steps.source.outputs.tested_source_sha }}
+        run: |
+          set -Eeuo pipefail
+          evidence="$RUNNER_TEMP/grid-llmd-kind-run/evidence"
+          if [[ -d "$evidence" ]]; then
+            while IFS= read -r -d '' file; do
+              temp="$file.sanitized.$$"
+              python3 praxis-extproc/tests/grid-llmd-e2e/sanitize_diagnostics.py <"$file" >"$temp"
+              mv "$temp" "$file"
+            done < <(find "$evidence" -type f ! -name '*.sanitized.*' -print0)
+          fi
+          {
+            printf '# Native Grid llm-d Kind qualification\n\n'
+            printf -- '- Tested source SHA: %s\n' "${TESTED_SOURCE_SHA:-unresolved}"
+            printf -- '- Runner: ubuntu-24.04, explicit profile gha-standard-4cpu\n'
+            printf -- '- Scope: native Grid → ExtProc → EPP → llm-d-sim; Enrollment and ExternalModel translation excluded\n'
+            printf -- '- Evidence artifact: uploaded after this summary step; inspect RESULT.json, qualification/report.json, PHASES.jsonl, and resource samples.\n'
+            if [[ -s "$evidence/RESULT.json" ]]; then
+              printf '\n## Lifecycle result\n\n'
+              cat "$evidence/RESULT.json"
+              printf '\n'
+            else
+              printf '\nLifecycle RESULT.json was not produced.\n'
+            fi
+            if [[ -s "$evidence/qualification/report.json" ]]; then
+              report="$evidence/qualification/report.json"
+              check_count="$(jq '.checks|length' "$report")"
+              passed_count="$(jq '[.checks[]|select(.status=="pass")]|length' "$report")"
+              printf '\n## Traffic checks\n\nQualification status: %s; %s/%s checks passed.\n' \
+                "$(jq -r '.status // "unknown"' "$report")" "$passed_count" "$check_count"
+              jq -r '.checks[]|select(.status!="pass")|"- \(.name): \(.detail)"' "$report"
+            fi
+            printf '\n## Runner capacity\n\n'
+            cat "$RUNNER_TEMP/kind-runner-capacity.txt" 2>/dev/null || true
+            printf '\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload sanitized run evidence
+        if: always()
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18
+        with:
+          name: kind-grid-llmd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/grid-llmd-kind-run/evidence/
+            ${{ runner.temp }}/kind-runner-capacity.txt
+            ${{ runner.temp }}/kind-tested-source.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove private state after artifact upload
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          state_dir="$RUNNER_TEMP/grid-llmd-kind-run/private-state"
+          if [[ -d "$state_dir" ]]; then
+            chmod -R u+rwX,go-rwx "$state_dir"
+            rm -rf -- "$state_dir"
+          fi

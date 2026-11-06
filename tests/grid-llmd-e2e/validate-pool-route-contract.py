@@ -2,8 +2,10 @@
 """Fail closed unless mounted Praxis config and both pool routes agree on request shape."""
 
 import argparse
+import base64
 import hashlib
 import json
+import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -55,6 +57,28 @@ def validate_operator_config_map_mount(network, gateway_ref, mounted_name, confi
     return content, content_revision
 
 
+def task_gateway_deployments(deployments, run_label, base_config_map_name, container_name):
+    """Select by run ownership and actual Praxis ConfigMap mount, not Helm release naming."""
+    alternate_name = f"grid-consumer-config-{hashlib.sha256(base_config_map_name.encode()).hexdigest()[:16]}"
+    matches = []
+    for deployment in deployments:
+        metadata = deployment.get("metadata", {})
+        if (metadata.get("labels") or {}).get("praxis.fast/qualification-run") != run_label:
+            continue
+        pod_spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
+        containers = [container for container in pod_spec.get("containers", []) if container.get("name") == container_name]
+        if len(containers) != 1 or not any(mount.get("mountPath") == "/etc/praxis" for mount in containers[0].get("volumeMounts", [])):
+            continue
+        config_names = {
+            (volume.get("configMap") or {}).get("name")
+            for volume in pod_spec.get("volumes", [])
+            if volume.get("name") in {mount.get("name") for mount in containers[0].get("volumeMounts", []) if mount.get("mountPath") == "/etc/praxis"}
+        }
+        if config_names & {base_config_map_name, alternate_name}:
+            matches.append(deployment)
+    return matches
+
+
 def model_extraction_matches(config, requested_header, model):
     chains = config.get("filter_chains", [])
     for chain in chains:
@@ -92,25 +116,20 @@ def path_matches(match, request_path):
     return False
 
 
-def route_match_without_gateway_header(rule, request_path, model_header, model):
-    matches = rule.get("matches") or [{}]
-    for match in matches:
+def route_match_with_gateway_model_header(rule, request_path, gateway_model_name):
+    """Match a pool route reached after the trusted provider proxy rewrites the request."""
+    for match in rule.get("matches") or [{}]:
         if not path_matches(match, request_path):
             continue
-        headers_ok = True
-        for header in match.get("headers", []):
-            name = str(header.get("name", "")).lower()
-            value = header.get("value")
-            if name == "x-gateway-model-name":
-                headers_ok = False
-                break
-            if name == model_header.lower() and value == model:
-                continue
-            if name in ("content-type",) and value in ("application/json",):
-                continue
-            headers_ok = False
-            break
-        if headers_ok:
+        headers = match.get("headers", [])
+        if len(headers) != 1:
+            continue
+        header = headers[0]
+        if (
+            str(header.get("name", "")).lower() == "x-gateway-model-name"
+            and header.get("type", "Exact") == "Exact"
+            and header.get("value") == gateway_model_name
+        ):
             return True
     return False
 
@@ -315,8 +334,33 @@ def current_overlay_candidates(context, network_namespace, network, gateway_name
     return status, candidates
 
 
+def grid_site_certificate_digest(context, network):
+    """Return the SHA-256 of the GridNetwork's trusted site leaf certificate without persisting it."""
+    site_ref = (network.get("spec", {}).get("tls") or {}).get("siteSecretRef") or {}
+    secret_name = site_ref.get("name")
+    secret_namespace = site_ref.get("namespace") or network.get("metadata", {}).get("namespace")
+    if not secret_name or not secret_namespace:
+        raise RuntimeError("GridNetwork does not identify its site TLS Secret")
+    secret = get_json(context, secret_namespace, "get", "secret", secret_name)
+    encoded = (secret.get("data") or {}).get("tls.crt")
+    if not isinstance(encoded, str) or not encoded:
+        raise RuntimeError("GridNetwork site TLS Secret has no tls.crt value")
+    try:
+        pem = base64.b64decode(encoded, validate=True).decode("ascii")
+        der = ssl.PEM_cert_to_DER_cert(pem)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise RuntimeError("GridNetwork site tls.crt is not a valid PEM certificate") from error
+    return hashlib.sha256(der).hexdigest()
+
+
+def validate_provider_peer_trust(trusted_peers, expected_certificate_digest, pool):
+    """Require provider authorization to pin the precise current GridSite leaf certificate."""
+    if trusted_peers != [{"cert_digest": expected_certificate_digest}]:
+        raise RuntimeError(f"provider proxy for {pool} does not pin the current GridSite certificate digest")
+
+
 def validate_provider_proxy_configs(
-    context, namespace, run_label, site_name, model, request_path, overlay_candidates, expected_backends
+    context, namespace, run_label, site_name, expected_certificate_digest, model, request_path, overlay_candidates, expected_backends
 ):
     selector = f"praxis.fast/qualification-run={run_label},praxis.fast/component=provider-proxy"
     config_maps = get_json(context, namespace, "get", "configmaps", "-l", selector).get("items", [])
@@ -347,8 +391,7 @@ def validate_provider_proxy_configs(
         if not filters or filters[0].get("filter") != "peer_identity_trust":
             raise RuntimeError(f"provider proxy for {pool} must place peer_identity_trust first")
         trust = filters[0].get("trusted_peers", [])
-        if not any(peer.get("organization") == site_name for peer in trust):
-            raise RuntimeError(f"provider proxy for {pool} does not trust the current GridSite identity")
+        validate_provider_peer_trust(trust, expected_certificate_digest, pool)
         routes = [item for item in filters if item.get("filter") == "provider_route"]
         if len(routes) != 1:
             raise RuntimeError(f"provider proxy for {pool} must have exactly one provider_route")
@@ -370,6 +413,24 @@ def validate_provider_proxy_configs(
             or proxy_route.get("cluster") not in (f"{pool}-backend", f"{pool}-gateway")
         ):
             raise RuntimeError(f"provider proxy for {pool} model, canonical path, or backend cluster does not match the pool contract")
+        chat_path_suffix = "/v1/chat/completions"
+        if not request_path.endswith(chat_path_suffix):
+            raise RuntimeError("provider route contract must use the canonical publisher chat-completions path")
+        model_route_path = request_path[: -len(chat_path_suffix)]
+        expected_gateway_model_name = model_route_path.removeprefix("/")
+        rewrites = [item for item in filters if item.get("filter") == "path_rewrite"]
+        header_filters = [item for item in filters if item.get("filter") == "headers"]
+        if len(rewrites) != 1 or rewrites[0].get("strip_prefix") != model_route_path:
+            raise RuntimeError(f"provider proxy for {pool} must strip the canonical publisher model prefix before the pool Gateway")
+        if len(header_filters) != 1 or header_filters[0].get("request_set") != [
+            {"name": "X-Gateway-Model-Name", "value": expected_gateway_model_name}
+        ]:
+            raise RuntimeError(f"provider proxy for {pool} must overwrite X-Gateway-Model-Name for the selected publisher model")
+        filter_order = [item.get("filter") for item in filters]
+        required_order = ("provider_route", "path_rewrite", "headers", "credential_inject", "load_balancer")
+        positions = [filter_order.index(name) if name in filter_order else -1 for name in required_order]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            raise RuntimeError(f"provider proxy for {pool} must route the original path before rewriting and setting trusted headers")
         backend_cluster = proxy_route["cluster"]
         load_balancers = [
             cluster
@@ -391,6 +452,11 @@ def validate_provider_proxy_configs(
                 "site": candidate.get("site"),
                 "providerResponseHeader": "x-ai-demo-provider-gateway",
                 "backendResponseHeader": "x-ai-inference-provider",
+                "providerRequestPath": request_path,
+                "poolGatewayRequestPath": "/v1/chat/completions",
+                "poolGatewayModelHeader": expected_gateway_model_name,
+                "poolGatewayModelHeaderSource": "trusted-provider-proxy-request_set-overwrite",
+                "trustedGridSiteCertificateSha256": expected_certificate_digest,
                 "backendCluster": backend_cluster,
                 "backendEndpoint": endpoints[0],
                 "peerTrustOrganization": site_name,
@@ -459,10 +525,16 @@ def main():
                 "get",
                 "deployments",
                 "-l",
-                f"app.kubernetes.io/instance={gateway_ref.get('name')}",
+                f"praxis.fast/qualification-run={network.get('metadata', {}).get('labels', {}).get('praxis.fast/qualification-run', '')}",
             ).get("items", [])
+            deployments = task_gateway_deployments(
+                deployments,
+                network.get("metadata", {}).get("labels", {}).get("praxis.fast/qualification-run", ""),
+                praxis_config.get("configMapName", ""),
+                container_name,
+            )
             if len(deployments) != 1:
-                raise RuntimeError("direct-mounted task Gateway must resolve to exactly one Deployment by its Helm instance label")
+                raise RuntimeError("direct-mounted task Gateway must resolve to exactly one run-owned Deployment mounting the current operator Praxis ConfigMap")
             deployment_name = deployments[0].get("metadata", {}).get("name")
         if not deployment_name:
             raise RuntimeError("task Gateway Deployment name is unavailable")
@@ -649,6 +721,7 @@ def main():
                 if any(ref.get("uid") == uid for ref in route.get("metadata", {}).get("ownerReferences", []))
             ]
             candidates = []
+            expected_gateway_model_name = f"publishers/{model_namespace}/models/{args.model}"
             for route in owned_routes:
                 if not current_route(route, gateway, pool_gateway_namespace):
                     continue
@@ -659,24 +732,17 @@ def main():
                         and backend.get("group", "") in ("inference.networking.k8s.io", "inference.networking.x-k8s.io")
                         for backend in rule.get("backendRefs", [])
                     )
-                    if not backend_ok or not route_match_without_gateway_header(
-                        rule, args.request_path, args.model_header, args.model
+                    if not backend_ok or not route_match_with_gateway_model_header(
+                        rule, "/v1/chat/completions", expected_gateway_model_name
                     ):
                         continue
-                    rewrite = next(
-                        (
-                            item.get("urlRewrite", {}).get("path", {}).get("replacePrefixMatch")
-                            for item in rule.get("filters", [])
-                            if item.get("type") == "URLRewrite"
-                        ),
-                        None,
-                    )
-                    if rewrite == "/v1/chat/completions":
+                    has_url_rewrite = any(item.get("type") == "URLRewrite" for item in rule.get("filters", []))
+                    if not has_url_rewrite:
                         candidates.append(route)
             expected_path = f"/publishers/{model_namespace}/models/{args.model}/v1/chat/completions"
             if args.request_path != expected_path or not candidates:
                 raise RuntimeError(
-                    f"pool {pool_name} has no current accepted route for the request path without X-Gateway-Model-Name and the expected rewrite"
+                    f"pool {pool_name} has no current accepted native /v1/chat/completions route for the trusted exact X-Gateway-Model-Name"
                 )
             pool_services = get_json(
                 args.context,
@@ -704,8 +770,10 @@ def main():
                     "route": candidates[0].get("metadata", {}).get("name"),
                     "routeGeneration": candidates[0].get("metadata", {}).get("generation"),
                     "poolGateway": f"{pool_gateway_namespace}/{gateway}",
-                    "requestPathMatchedWithoutGatewayModelHeader": True,
-                    "rewriteTarget": "/v1/chat/completions",
+                    "poolGatewayRequestPath": "/v1/chat/completions",
+                    "poolGatewayModelHeader": expected_gateway_model_name,
+                    "poolGatewayRouteMatchesTrustedHeader": True,
+                    "poolGatewayUrlRewriteRequired": False,
                     "backendInferencePool": backend_pool_name,
                     "gatewayServiceEndpoint": expected_backends[pool_label],
                 }
@@ -736,6 +804,7 @@ def main():
             args.namespace,
             network.get("metadata", {}).get("labels", {}).get("praxis.fast/qualification-run", ""),
             site_name,
+            grid_site_certificate_digest(args.context, network),
             args.model,
             args.request_path,
             overlay_candidates,
@@ -758,7 +827,7 @@ def main():
         (evidence_dir / "pool-route-contract.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         return 1
 
-    report["detail"] = "mounted intelligentRoute, exact mTLS provider-hop allowlist, provider-owned attribution configs, current overlay candidate mapping, and both current pool HTTPRoutes agree on the canonical publisher path; no client X-Gateway-Model-Name is used"
+    report["detail"] = "mounted intelligentRoute selects the scored candidate on the canonical publisher path; the mTLS provider proxy rewrites to the native pool /v1/chat/completions path and overwrites X-Gateway-Model-Name; both accepted pool HTTPRoutes and MaaS authorization match that downstream request; client does not supply the trusted model header"
     (evidence_dir / "pool-route-contract.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True))
     return 0

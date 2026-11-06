@@ -10,20 +10,35 @@ MODE="${POOL_GATEWAYS_MODE:-plan}"
 EXPECTED_API_SERVER="${EXPECTED_API_SERVER:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 CLUSTER_ENV="${CLUSTER_ENV:-}"
+CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-$CLUSTER_ENV}"
 ALLOW_INSECURE_DEV_API="${ALLOW_INSECURE_DEV_API:-false}"
 NAMESPACE="${GRID_RESOURCE_NAMESPACE:-grid-llmd-e2e}"
+GATEWAY_NAMESPACE="${POOL_GATEWAY_NAMESPACE:-$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf maas-system; else printf '%s' "$NAMESPACE"; fi)}"
 RUN_LABEL="${GRID_RUN_LABEL:-}"
-GATEWAY_CLASS="${GRID_API_GATEWAY_CLASS:-data-science-gateway-class}"
+GATEWAY_CLASS="${GRID_API_GATEWAY_CLASS:-$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf istio; else printf data-science-gateway-class; fi)}"
 POOL_A="${POOL_A_NAME:-pool-a}"
 POOL_B="${POOL_B_NAME:-pool-b}"
 POOL_A_GATEWAY="${POOL_A_GATEWAY_NAME:-grid-llmd-pool-a}"
 POOL_B_GATEWAY="${POOL_B_GATEWAY_NAME:-grid-llmd-pool-b}"
 LISTENER_NAME="${POOL_GATEWAY_LISTENER_NAME:-inference}"
 LISTENER_PORT="${POOL_GATEWAY_LISTENER_PORT:-8080}"
-INFRA_ANNOTATION_KEY="${POOL_GATEWAY_INFRA_ANNOTATION_KEY:-service.beta.kubernetes.io/aws-load-balancer-internal}"
-INFRA_ANNOTATION_VALUE="${POOL_GATEWAY_INFRA_ANNOTATION_VALUE:-true}"
+INFRA_ANNOTATION_KEY="${POOL_GATEWAY_INFRA_ANNOTATION_KEY:-$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf networking.istio.io/service-type; else printf service.beta.kubernetes.io/aws-load-balancer-internal; fi)}"
+INFRA_ANNOTATION_VALUE="${POOL_GATEWAY_INFRA_ANNOTATION_VALUE:-$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf ClusterIP; else printf true; fi)}"
+ADDRESS_MODE="${POOL_GATEWAY_ADDRESS_MODE:-$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf cluster-service-dns; else printf private-dns; fi)}"
+GATEWAY_OBJECT_ANNOTATION_KEY="${POOL_GATEWAY_OBJECT_ANNOTATION_KEY:-}"
+GATEWAY_OBJECT_ANNOTATION_VALUE="${POOL_GATEWAY_OBJECT_ANNOTATION_VALUE:-}"
+# Istio reads service-type from the Gateway object metadata. Putting this only
+# under spec.infrastructure.annotations copies it onto the generated Service,
+# but leaves that Service as LoadBalancer. Keep the infrastructure annotation
+# as additional metadata, and set the controller input on the Gateway itself.
+if [[ "$CLUSTER_PLATFORM" == kind && -z "$GATEWAY_OBJECT_ANNOTATION_KEY" && -z "$GATEWAY_OBJECT_ANNOTATION_VALUE" ]]; then
+  GATEWAY_OBJECT_ANNOTATION_KEY="networking.istio.io/service-type"
+  GATEWAY_OBJECT_ANNOTATION_VALUE="ClusterIP"
+fi
 TIMEOUT="${POOL_GATEWAYS_TIMEOUT:-10m}"
 EVIDENCE_DIR="${POOL_GATEWAYS_EVIDENCE_DIR:-}"
+declare -A GATEWAY_PREEXISTING=()
+CREATED_GATEWAYS=()
 
 oc() {
   if [[ -z "$KUBE_CONTEXT" ]]; then KUBE_CONTEXT="$(command oc config current-context)"; fi
@@ -34,7 +49,7 @@ if [[ "$MODE" == plan ]]; then
   cat <<'PLAN'
 Pool Gateway plan (no cluster calls):
   1. Verify the exact task API, namespace ownership, and GatewayClass.
-  2. Render two run-owned internal HTTP Gateways and server-side dry-run them.
+  2. Render two run-owned internal HTTP Gateways and server-side dry-run them. On Kind, set Istio's service-type annotation on Gateway metadata; infrastructure annotations alone do not select the generated Service type.
   3. Wait for Accepted/Programmed status and ready data-plane endpoints.
   4. Record each Gateway's in-cluster Service DNS, listener name, and port for its LLMInferenceService and Grid provider.
 The pool Gateways are separate from the public task Gateway. They are not selected by the public HTTPRoute or ExtProc EnvoyFilter. The configured
@@ -50,6 +65,7 @@ for bin in oc jq sha256sum python3 paste; do command -v "$bin" >/dev/null || { p
   printf 'EXPECTED_API_SERVER, KUBE_CONTEXT, and GRID_RUN_LABEL are required\n' >&2; exit 2;
 }
 [[ "$RUN_LABEL" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]] || { printf 'GRID_RUN_LABEL is invalid\n' >&2; exit 2; }
+[[ "$GATEWAY_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { printf 'POOL_GATEWAY_NAMESPACE is invalid\n' >&2; exit 2; }
 [[ "$POOL_A_GATEWAY" != "$POOL_B_GATEWAY" ]] || { printf 'pool gateways must have distinct names\n' >&2; exit 2; }
 for value in "$POOL_A" "$POOL_B" "$POOL_A_GATEWAY" "$POOL_B_GATEWAY" "$LISTENER_NAME" "$GATEWAY_CLASS"; do
   [[ "$value" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || { printf 'Gateway names, listener, and class must be valid DNS names\n' >&2; exit 2; }
@@ -57,6 +73,20 @@ done
 [[ "$LISTENER_PORT" =~ ^[0-9]+$ && "$LISTENER_PORT" -ge 1 && "$LISTENER_PORT" -le 65535 ]] || { printf 'invalid POOL_GATEWAY_LISTENER_PORT\n' >&2; exit 2; }
 [[ "$INFRA_ANNOTATION_KEY" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9][-A-Za-z0-9_.]*$ ]] || { printf 'invalid POOL_GATEWAY_INFRA_ANNOTATION_KEY\n' >&2; exit 2; }
 [[ "$INFRA_ANNOTATION_VALUE" =~ ^[A-Za-z0-9][-A-Za-z0-9_.]*$ ]] || { printf 'invalid POOL_GATEWAY_INFRA_ANNOTATION_VALUE\n' >&2; exit 2; }
+[[ "$ADDRESS_MODE" == private-dns || "$ADDRESS_MODE" == cluster-service-dns ]] || {
+  printf 'POOL_GATEWAY_ADDRESS_MODE must be private-dns or cluster-service-dns\n' >&2
+  exit 2
+}
+GATEWAY_OBJECT_ANNOTATION_BLOCK=""
+if [[ -n "$GATEWAY_OBJECT_ANNOTATION_KEY" || -n "$GATEWAY_OBJECT_ANNOTATION_VALUE" ]]; then
+  [[ "$GATEWAY_OBJECT_ANNOTATION_KEY" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9][-A-Za-z0-9_.]*$ &&
+     "$GATEWAY_OBJECT_ANNOTATION_VALUE" =~ ^[A-Za-z0-9][-A-Za-z0-9_.]*$ ]] || {
+    printf 'POOL_GATEWAY_OBJECT_ANNOTATION_KEY and VALUE must both be valid when either is set\n' >&2
+    exit 2
+  }
+  printf -v GATEWAY_OBJECT_ANNOTATION_BLOCK '  annotations:\n    %s: "%s"' \
+    "$GATEWAY_OBJECT_ANNOTATION_KEY" "$GATEWAY_OBJECT_ANNOTATION_VALUE"
+fi
 [[ "$TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || { printf 'POOL_GATEWAYS_TIMEOUT must be an integer followed by s, m, or h\n' >&2; exit 2; }
 case "${TIMEOUT: -1}" in
   s) TIMEOUT_SECONDS="${TIMEOUT%?}" ;;
@@ -76,18 +106,18 @@ log() {
 
 remove_run_gateways() {
   local gateway live remaining deadline
-  for gateway in "$POOL_A_GATEWAY" "$POOL_B_GATEWAY"; do
+  for gateway in "${CREATED_GATEWAYS[@]}"; do
     live="$EVIDENCE_DIR/$gateway-before-safety-delete.json"
-    if oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$live" 2>/dev/null &&
+    if oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$live" 2>/dev/null &&
       jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' "$live" >/dev/null; then
-      oc delete gateway "$gateway" -n "$NAMESPACE" --wait=true --timeout=120s \
+      oc delete gateway "$gateway" -n "$GATEWAY_NAMESPACE" --wait=true --timeout=120s \
         >"$EVIDENCE_DIR/$gateway-safety-delete.txt" 2>&1 || true
     fi
   done
   deadline=$((SECONDS + 180))
-  for gateway in "$POOL_A_GATEWAY" "$POOL_B_GATEWAY"; do
+  for gateway in "${CREATED_GATEWAYS[@]}"; do
     while (( SECONDS <= deadline )); do
-      remaining="$(oc get service -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json 2>/dev/null | jq '.items|length' || printf 'unknown')"
+      remaining="$(oc get service -n "$GATEWAY_NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json 2>/dev/null | jq '.items|length' || printf 'unknown')"
       [[ "$remaining" == 0 ]] && break
       (( SECONDS < deadline )) || break
       sleep 5
@@ -121,6 +151,17 @@ if [[ "$insecure" == true ]]; then
 else API_TLS_MODE=kubeconfig-verified; fi
 oc get namespace "$NAMESPACE" -o json >"$EVIDENCE_DIR/namespace.json"
 jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' "$EVIDENCE_DIR/namespace.json" >/dev/null
+if [[ "$GATEWAY_NAMESPACE" != "$NAMESPACE" ]]; then
+  oc get namespace "$GATEWAY_NAMESPACE" -o json >"$EVIDENCE_DIR/gateway-namespace.json"
+  [[ "$GATEWAY_NAMESPACE" == maas-system ]] || {
+    printf 'cross-namespace pool Gateways require the source-configured MaaS gateway namespace maas-system\n' >&2; exit 1;
+  }
+  if [[ "$MODE" == install ]]; then
+    oc label namespace "$NAMESPACE" \
+      praxis.fast/pool-a-gateway-access=true praxis.fast/pool-b-gateway-access=true --overwrite \
+      >"$EVIDENCE_DIR/task-namespace-route-allow-labels.txt"
+  fi
+fi
 oc get gatewayclass "$GATEWAY_CLASS" -o json >"$EVIDENCE_DIR/gatewayclass.json"
 jq -e 'any(.status.conditions[]?;.type=="Accepted" and .status=="True")' "$EVIDENCE_DIR/gatewayclass.json" >/dev/null
 
@@ -129,7 +170,8 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: $POOL_A_GATEWAY
-  namespace: $NAMESPACE
+  namespace: $GATEWAY_NAMESPACE
+$GATEWAY_OBJECT_ANNOTATION_BLOCK
   labels:
     app.kubernetes.io/part-of: grid-llmd-e2e
     app.kubernetes.io/managed-by: grid-llmd-e2e-run
@@ -146,13 +188,14 @@ spec:
       protocol: HTTP
       allowedRoutes:
         namespaces:
-          from: Same
+          from: $(if [[ "$GATEWAY_NAMESPACE" == "$NAMESPACE" ]]; then printf 'Same'; else printf 'Selector\n          selector:\n            matchLabels:\n              praxis.fast/pool-a-gateway-access: "true"'; fi)
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: $POOL_B_GATEWAY
-  namespace: $NAMESPACE
+  namespace: $GATEWAY_NAMESPACE
+$GATEWAY_OBJECT_ANNOTATION_BLOCK
   labels:
     app.kubernetes.io/part-of: grid-llmd-e2e
     app.kubernetes.io/managed-by: grid-llmd-e2e-run
@@ -169,16 +212,19 @@ spec:
       protocol: HTTP
       allowedRoutes:
         namespaces:
-          from: Same
+          from: $(if [[ "$GATEWAY_NAMESPACE" == "$NAMESPACE" ]]; then printf 'Same'; else printf 'Selector\n          selector:\n            matchLabels:\n              praxis.fast/pool-b-gateway-access: "true"'; fi)
 YAML
 chmod 0600 "$EVIDENCE_DIR/pool-gateways.yaml"
 sha256sum "$EVIDENCE_DIR/pool-gateways.yaml" >"$EVIDENCE_DIR/render-sha256.txt"
 
 for gateway in "$POOL_A_GATEWAY" "$POOL_B_GATEWAY"; do
-  if oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/existing-$gateway.json" 2>/dev/null; then
+  if oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$EVIDENCE_DIR/existing-$gateway.json" 2>/dev/null; then
     jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' "$EVIDENCE_DIR/existing-$gateway.json" >/dev/null || {
       printf 'Gateway %s already exists outside this run ownership\n' "$gateway" >&2; exit 1;
     }
+    GATEWAY_PREEXISTING["$gateway"]=true
+  else
+    GATEWAY_PREEXISTING["$gateway"]=false
   fi
 done
 oc apply --dry-run=server -f "$EVIDENCE_DIR/pool-gateways.yaml" >"$EVIDENCE_DIR/server-dry-run.txt"
@@ -189,8 +235,11 @@ if [[ "$MODE" == render ]]; then
 fi
 printf 'context=%s\nuser=%s\nserver=%s\nreadyz=%s\napi_tls_mode=%s\n' "$KUBE_CONTEXT" "$user" "$server" "$ready" "$API_TLS_MODE" >"$EVIDENCE_DIR/api-access-summary.txt"
 if [[ "$MODE" == install ]]; then
-  oc apply -f "$EVIDENCE_DIR/pool-gateways.yaml" >"$EVIDENCE_DIR/apply.txt"
+  for gateway in "$POOL_A_GATEWAY" "$POOL_B_GATEWAY"; do
+    if [[ "${GATEWAY_PREEXISTING[$gateway]}" == false ]]; then CREATED_GATEWAYS+=("$gateway"); fi
+  done
   POOL_GATEWAYS_APPLIED=true
+  oc apply -f "$EVIDENCE_DIR/pool-gateways.yaml" >"$EVIDENCE_DIR/apply.txt"
 fi
 
 wait_gateway_ready() {
@@ -198,7 +247,7 @@ wait_gateway_ready() {
   deadline=$((SECONDS + TIMEOUT_SECONDS))
   snapshot="$EVIDENCE_DIR/$gateway-live.json"
   while (( SECONDS <= deadline )); do
-    if oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$snapshot" 2>"$EVIDENCE_DIR/$gateway-get.stderr"; then
+    if oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$snapshot" 2>"$EVIDENCE_DIR/$gateway-get.stderr"; then
       if jq -e --arg run "$RUN_LABEL" --arg listener "$LISTENER_NAME" --argjson port "$LISTENER_PORT" '
         .metadata.labels["praxis.fast/qualification-run"]==$run and
         (.metadata.generation as $g |
@@ -217,20 +266,34 @@ wait_gateway_ready() {
     (( now < deadline )) || break
     sleep 5
   done
-  oc describe gateway "$gateway" -n "$NAMESPACE" >"$EVIDENCE_DIR/$gateway-describe.txt" 2>&1 || true
-  oc get events -n "$NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
+  oc describe gateway "$gateway" -n "$GATEWAY_NAMESPACE" >"$EVIDENCE_DIR/$gateway-describe.txt" 2>&1 || true
+  oc get events -n "$GATEWAY_NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
   printf 'Gateway %s for %s did not become current-generation Accepted and Programmed within %s\n' "$gateway" "$pool" "$TIMEOUT" >&2
   return 1
 }
 
 wait_for_private_gateway_address() {
-  local pool="$1" gateway="$2" deadline host snapshot addresses resolution_rc public_since unresolved_since now
+  local pool="$1" gateway="$2" service="$3" deadline host snapshot addresses resolution_rc public_since unresolved_since now service_type
+  if [[ "$ADDRESS_MODE" == cluster-service-dns ]]; then
+    snapshot="$EVIDENCE_DIR/$gateway-live.json"
+    host="$(oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o jsonpath='{.status.addresses[0].value}')"
+    service_type="$(oc get service "$service" -n "$GATEWAY_NAMESPACE" -o jsonpath='{.spec.type}')"
+    if [[ "$host" != "$service.$GATEWAY_NAMESPACE.svc.cluster.local" || "$service_type" != ClusterIP ]]; then
+      log "Gateway $gateway did not publish its exact in-cluster Service DNS name and ClusterIP service"
+      return 1
+    fi
+    printf '%s\n' "$host" >"$EVIDENCE_DIR/$gateway-load-balancer-host.txt"
+    : >"$EVIDENCE_DIR/$gateway-load-balancer-private-addresses.txt"
+    printf '%s\n' 'kind-cluster-service-dns-and-ready-endpoints' >"$EVIDENCE_DIR/$gateway-load-balancer-scope-verification.txt"
+    log "Gateway $gateway for $pool uses its run-owned ClusterIP Service DNS and Ready EndpointSlice"
+    return 0
+  fi
   deadline=$((SECONDS + TIMEOUT_SECONDS))
   public_since=0
   unresolved_since=0
   snapshot="$EVIDENCE_DIR/$gateway-live.json"
   while (( SECONDS <= deadline )); do
-    if oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$snapshot" 2>"$EVIDENCE_DIR/$gateway-get.stderr"; then
+    if oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$snapshot" 2>"$EVIDENCE_DIR/$gateway-get.stderr"; then
       host="$(jq -r '[.status.addresses[]?.value|select(type=="string" and length>0)][0] // empty' "$snapshot")"
       if [[ -n "$host" ]] && python3 - "$host" >"$EVIDENCE_DIR/$gateway-private-addresses.txt" 2>"$EVIDENCE_DIR/$gateway-address-resolution.stderr" <<'PY'
 import ipaddress
@@ -291,8 +354,8 @@ PY
     (( SECONDS < deadline )) || break
     sleep 5
   done
-  oc describe gateway "$gateway" -n "$NAMESPACE" >"$EVIDENCE_DIR/$gateway-describe.txt" 2>&1 || true
-  oc get events -n "$NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
+  oc describe gateway "$gateway" -n "$GATEWAY_NAMESPACE" >"$EVIDENCE_DIR/$gateway-describe.txt" 2>&1 || true
+  oc get events -n "$GATEWAY_NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
   log "Gateway $gateway did not resolve exclusively to private addresses; run-owned pool Gateways will be removed"
   return 1
 }
@@ -304,13 +367,13 @@ capture_gateway() {
   deadline=$((SECONDS + TIMEOUT_SECONDS))
   service=""
   while (( SECONDS <= deadline )); do
-    if oc get service -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json >"$service_json" 2>"$EVIDENCE_DIR/$gateway-service-get.stderr"; then
+    if oc get service -n "$GATEWAY_NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json >"$service_json" 2>"$EVIDENCE_DIR/$gateway-service-get.stderr"; then
       service="$(jq -r --argjson port "$LISTENER_PORT" '[.items[]|select(any(.spec.ports[]?;.port==$port))]|if length==1 then .[0].metadata.name else empty end' "$service_json")"
       if [[ -n "$service" ]]; then
         slices_json="$EVIDENCE_DIR/$gateway-endpointslices.json"
-        if oc get service "$service" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/$gateway-service-live.json" 2>"$EVIDENCE_DIR/$gateway-service-live.stderr" &&
+        if oc get service "$service" -n "$GATEWAY_NAMESPACE" -o json >"$EVIDENCE_DIR/$gateway-service-live.json" 2>"$EVIDENCE_DIR/$gateway-service-live.stderr" &&
           jq -e --arg key "$INFRA_ANNOTATION_KEY" --arg value "$INFRA_ANNOTATION_VALUE" '.metadata.annotations[$key]==$value' "$EVIDENCE_DIR/$gateway-service-live.json" >/dev/null 2>&1 &&
-          oc get endpointslice -n "$NAMESPACE" -l "kubernetes.io/service-name=$service" -o json >"$slices_json" 2>"$EVIDENCE_DIR/$gateway-endpointslices-get.stderr" &&
+          oc get endpointslice -n "$GATEWAY_NAMESPACE" -l "kubernetes.io/service-name=$service" -o json >"$slices_json" 2>"$EVIDENCE_DIR/$gateway-endpointslices-get.stderr" &&
           jq -e 'any(.items[]?;.endpoints|any(.[]?;.conditions.ready==true))' "$slices_json" >/dev/null 2>&1; then
           break
         fi
@@ -321,22 +384,22 @@ capture_gateway() {
   done
   [[ -n "$service" ]] || { printf 'Gateway %s has no unique listener Service on port %s within %s\n' "$gateway" "$LISTENER_PORT" "$TIMEOUT" >&2; return 1; }
   if ! jq -e --arg key "$INFRA_ANNOTATION_KEY" --arg value "$INFRA_ANNOTATION_VALUE" '.metadata.annotations[$key]==$value' "$EVIDENCE_DIR/$gateway-service-live.json" >/dev/null 2>&1; then
-    oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/$gateway-live.json" 2>&1 || true
-    oc get events -n "$NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
+    oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$EVIDENCE_DIR/$gateway-live.json" 2>&1 || true
+    oc get events -n "$GATEWAY_NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/$gateway-events.txt" 2>&1 || true
     log "Gateway controller did not propagate $INFRA_ANNOTATION_KEY=$INFRA_ANNOTATION_VALUE to $service; removing both run-owned pool Gateways to avoid retaining public endpoints"
     return 1
   fi
   log "Gateway $gateway Service carries $INFRA_ANNOTATION_KEY=$INFRA_ANNOTATION_VALUE"
   jq -e 'any(.items[]?;.endpoints|any(.[]?;.conditions.ready==true))' "$EVIDENCE_DIR/$gateway-endpointslices.json" >/dev/null || {
-    oc get pods -n "$NAMESPACE" -o wide >"$EVIDENCE_DIR/$gateway-pods-on-timeout.txt" 2>&1 || true
-    oc describe service "$service" -n "$NAMESPACE" >"$EVIDENCE_DIR/$gateway-service-describe.txt" 2>&1 || true
+    oc get pods -n "$GATEWAY_NAMESPACE" -o wide >"$EVIDENCE_DIR/$gateway-pods-on-timeout.txt" 2>&1 || true
+    oc describe service "$service" -n "$GATEWAY_NAMESPACE" >"$EVIDENCE_DIR/$gateway-service-describe.txt" 2>&1 || true
     printf 'Gateway %s Service %s has no ready EndpointSlice target within %s\n' "$gateway" "$service" "$TIMEOUT" >&2
     return 1
   }
   log "Gateway $gateway listener Service $service has a ready EndpointSlice target"
-  wait_for_private_gateway_address "$pool" "$gateway"
-  jq -n --arg pool "$pool" --arg gateway "$gateway" --arg namespace "$NAMESPACE" --arg service "$service" \
-    --arg host "$service.$NAMESPACE.svc.cluster.local" --arg listener "$LISTENER_NAME" --argjson port "$LISTENER_PORT" \
+  wait_for_private_gateway_address "$pool" "$gateway" "$service"
+  jq -n --arg pool "$pool" --arg gateway "$gateway" --arg namespace "$GATEWAY_NAMESPACE" --arg service "$service" \
+    --arg host "$service.$GATEWAY_NAMESPACE.svc.cluster.local" --arg listener "$LISTENER_NAME" --argjson port "$LISTENER_PORT" \
     --arg annotationKey "$INFRA_ANNOTATION_KEY" --arg annotationValue "$INFRA_ANNOTATION_VALUE" \
     --arg loadBalancerHost "$(cat "$EVIDENCE_DIR/$gateway-load-balancer-host.txt")" \
     --arg privateAddresses "$(cat "$EVIDENCE_DIR/$gateway-load-balancer-private-addresses.txt")" \
@@ -345,14 +408,84 @@ capture_gateway() {
     >"$EVIDENCE_DIR/$pool-gateway-endpoint.json"
 }
 
+ensure_maas_gateway_alias() {
+  local gateway="$1" pool="$2" gateway_uid
+  local gateway_file="$EVIDENCE_DIR/$gateway-owner.json"
+  local manifest="$EVIDENCE_DIR/$gateway-maas-service-alias.yaml" service_live="$EVIDENCE_DIR/$gateway-maas-service-alias-live.json"
+  [[ "$GATEWAY_NAMESPACE" == maas-system ]] || return 0
+  oc get gateway "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$gateway_file"
+  jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' "$gateway_file" >/dev/null || {
+    printf 'refusing MaaS alias for Gateway outside this run: %s/%s\n' "$GATEWAY_NAMESPACE" "$gateway" >&2; return 1;
+  }
+  gateway_uid="$(jq -r '.metadata.uid' "$gateway_file")"
+  cat >"$manifest" <<YAML
+apiVersion: v1
+kind: Service
+metadata:
+  name: $gateway
+  namespace: $GATEWAY_NAMESPACE
+  labels:
+    gateway.networking.k8s.io/gateway-name: $gateway
+    app.kubernetes.io/part-of: grid-llmd-e2e
+    app.kubernetes.io/managed-by: grid-llmd-e2e-run
+    praxis.fast/qualification-run: "$RUN_LABEL"
+    praxis.fast/simulator-pool: "$pool"
+  ownerReferences:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    name: $gateway
+    uid: "$gateway_uid"
+    controller: false
+    blockOwnerDeletion: false
+spec:
+  type: ClusterIP
+  selector:
+    gateway.networking.k8s.io/gateway-name: $gateway
+  ports:
+  - name: https
+    port: 443
+    targetPort: $LISTENER_PORT
+    protocol: TCP
+YAML
+  chmod 0600 "$manifest"
+  if [[ "$MODE" == install ]]; then
+    if oc get service "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$EVIDENCE_DIR/$gateway-maas-service-alias-before.json" 2>/dev/null; then
+      jq -e --arg run "$RUN_LABEL" --arg uid "$gateway_uid" '
+        .metadata.labels["praxis.fast/qualification-run"]==$run and
+        any(.metadata.ownerReferences[]?;.kind=="Gateway" and .uid==$uid) and
+        any(.spec.ports[]?;.port==443)
+      ' "$EVIDENCE_DIR/$gateway-maas-service-alias-before.json" >/dev/null || {
+        printf 'refusing to replace non-run-owned MaaS Gateway alias Service %s/%s\n' "$GATEWAY_NAMESPACE" "$gateway" >&2; return 1;
+      }
+    fi
+    oc apply --dry-run=server -f "$manifest" >"$EVIDENCE_DIR/$gateway-maas-service-alias-dry-run.txt"
+    oc apply -f "$manifest" >"$EVIDENCE_DIR/$gateway-maas-service-alias-apply.txt"
+  fi
+  oc get service "$gateway" -n "$GATEWAY_NAMESPACE" -o json >"$service_live"
+  jq -e --arg run "$RUN_LABEL" --arg uid "$gateway_uid" --argjson port "$LISTENER_PORT" '
+    .metadata.labels["praxis.fast/qualification-run"]==$run and
+    any(.metadata.ownerReferences[]?;.kind=="Gateway" and .uid==$uid) and
+    any(.spec.ports[]?;.port==443 and .targetPort==$port)
+  ' "$service_live" >/dev/null || { printf 'MaaS alias Service %s does not match its run Gateway\n' "$gateway" >&2; return 1; }
+  oc get endpointslices -n "$GATEWAY_NAMESPACE" -l "kubernetes.io/service-name=$gateway" -o json \
+    >"$EVIDENCE_DIR/$gateway-maas-service-alias-endpointslices.json"
+  jq -e 'any(.items[]?;.endpoints|any(.[]?;.conditions.ready==true))' \
+    "$EVIDENCE_DIR/$gateway-maas-service-alias-endpointslices.json" >/dev/null || {
+      printf 'MaaS alias Service %s has no Ready Gateway endpoint\n' "$gateway" >&2; return 1;
+    }
+  log "MaaS internal-host alias Service $GATEWAY_NAMESPACE/$gateway is run-owned by its Gateway and has a Ready endpoint"
+}
+
 capture_gateway "$POOL_A" "$POOL_A_GATEWAY"
 capture_gateway "$POOL_B" "$POOL_B_GATEWAY"
+ensure_maas_gateway_alias "$POOL_A_GATEWAY" "$POOL_A"
+ensure_maas_gateway_alias "$POOL_B_GATEWAY" "$POOL_B"
 jq -s '{status:"READY",poolGateways:.}' "$EVIDENCE_DIR/$POOL_A-gateway-endpoint.json" "$EVIDENCE_DIR/$POOL_B-gateway-endpoint.json" >"$EVIDENCE_DIR/pool-gateways-result.json"
 jq -n --arg mode "$MODE" --arg evidence "$EVIDENCE_DIR" '{mode:$mode,status:"ready",evidenceDirectory:$evidence,gatewaysReady:true,inferenceTrafficSent:false}' >"$EVIDENCE_DIR/RESULT.json"
 cat >"$EVIDENCE_DIR/FINAL-RESULT.md" <<EOF
 # Internal pool Gateways
 
-- Status: both run-owned Gateways are current-generation Accepted/Programmed with Ready Service endpoints and AWS hostnames resolving only to RFC1918/ULA addresses.
+- Status: both run-owned Gateways are current-generation Accepted/Programmed with Ready Service endpoints and scope verification mode $ADDRESS_MODE.
 - Pool A endpoint: $(jq -r '.endpoint.host+":"+(.endpoint.port|tostring)' "$EVIDENCE_DIR/$POOL_A-gateway-endpoint.json")
 - Pool B endpoint: $(jq -r '.endpoint.host+":"+(.endpoint.port|tostring)' "$EVIDENCE_DIR/$POOL_B-gateway-endpoint.json")
 - Public task Gateway and ExtProc filter were not changed.

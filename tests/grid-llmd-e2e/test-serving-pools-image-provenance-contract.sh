@@ -10,7 +10,7 @@ import sys
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
 required = (
     'SIMULATOR_SOURCE_URL="$(env_default SIMULATOR_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim.git)"',
-    'SIMULATOR_OCI_SOURCE_URL="$(env_default SIMULATOR_OCI_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim)"',
+    'SIMULATOR_OCI_SOURCE_URL="$(env_default SIMULATOR_OCI_SOURCE_URL "$SIMULATOR_SOURCE_URL")"',
     'SOURCE_LOCKS_MD="$(env_default SOURCE_LOCKS_MD "$REPO_ROOT/evidence/$RUN_LABEL/source-locks.md")"',
     'SOURCE_LOCKS_FILE="$(env_default SOURCE_LOCKS_FILE "${SOURCE_LOCKS_MD%.md}.json")"',
     "jq -er --arg component \"$component\" '.components[$component].resolved_sha // empty' \"$SOURCE_LOCKS_FILE\"",

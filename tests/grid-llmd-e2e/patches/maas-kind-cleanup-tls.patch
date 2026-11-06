@@ -1,0 +1,205 @@
+diff --git a/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml b/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
+index fe7cc3c5..6f11c8a6 100644
+--- a/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
++++ b/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
+@@ -22,5 +22,6 @@ spec:
+             - /bin/sh
+             - -c
+             - |
++              POD_NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)" && \
+               TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" && \
+-              curl -sf --cacert /etc/pki/maas-api/service-ca.crt -X POST -H "Authorization: Bearer ${TOKEN}" https://maas-api:8443/internal/v1/api-keys/cleanup
++              curl -sf --cacert /etc/pki/maas-api/service-ca.crt -X POST -H "Authorization: Bearer ${TOKEN}" "https://maas-api.${POD_NAMESPACE}.svc:8443/internal/v1/api-keys/cleanup"
+diff --git a/maas-controller/pkg/platform/tenantreconcile/constants.go b/maas-controller/pkg/platform/tenantreconcile/constants.go
+index 3fb66a9c..62b2fcec 100644
+--- a/maas-controller/pkg/platform/tenantreconcile/constants.go
++++ b/maas-controller/pkg/platform/tenantreconcile/constants.go
+@@ -335,6 +335,17 @@ func MaaSAPIServingCertName(tenantID string) string {
+ 	return resourceNameForTenant(baseMaaSAPIServingCertName, tenantID)
+ }
+ 
++// MaaSAPIServingCertSecretName returns the Secret name shared by the generated
++// Certificate, Service annotation, and maas-api Deployment volume. Certificate
++// object names use the standard suffix form, while the Secret name keeps the
++// established maas-api-{tenant}-serving-cert form used by the Service and Pod.
++func MaaSAPIServingCertSecretName(tenantID string) string {
++	if tenantID == "" {
++		return baseMaaSAPIServingCertName
++	}
++	return fmt.Sprintf("maas-api-%s-serving-cert", tenantID)
++}
++
+ func PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID string) string {
+ 	return resourceNameForTenant(PayloadProcessingReaderClusterRoleBindingName, tenantID)
+ }
+diff --git a/maas-controller/pkg/platform/tenantreconcile/naming_test.go b/maas-controller/pkg/platform/tenantreconcile/naming_test.go
+index 84ccb281..3637a01a 100644
+--- a/maas-controller/pkg/platform/tenantreconcile/naming_test.go
++++ b/maas-controller/pkg/platform/tenantreconcile/naming_test.go
+@@ -141,6 +141,22 @@ func TestMaaSAPIGatewayNetworkPolicyNameDefaultDoesNotCollide(t *testing.T) {
+ 	assert.Equal(t, "maas-api-allow-gateway--default", MaaSAPIGatewayNetworkPolicyName(""))
+ }
+ 
++func TestMaaSAPIServingCertSecretName(t *testing.T) {
++	tests := []struct {
++		name     string
++		tenantID string
++		want     string
++	}{
++		{name: "default tenant", tenantID: "", want: "maas-api-serving-cert"},
++		{name: "AITenant managed tenant", tenantID: "pool-a", want: "maas-api-pool-a-serving-cert"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, MaaSAPIServingCertSecretName(tt.tenantID))
++		})
++	}
++}
++
+ func TestResourceNamingFunctions(t *testing.T) {
+ 	tests := []struct {
+ 		name             string
+diff --git a/maas-controller/pkg/platform/tenantreconcile/params.go b/maas-controller/pkg/platform/tenantreconcile/params.go
+index bb200ca0..6e4cd19f 100644
+--- a/maas-controller/pkg/platform/tenantreconcile/params.go
++++ b/maas-controller/pkg/platform/tenantreconcile/params.go
+@@ -949,7 +949,7 @@ func patchMaaSAPIServingCert(log logr.Logger, r *unstructured.Unstructured, para
+ 	certName := MaaSAPIServingCertName(tenantID)
+ 	r.SetName(certName)
+ 
+-	secretName := certName
++	secretName := MaaSAPIServingCertSecretName(tenantID)
+ 	if err := unstructured.SetNestedField(r.Object, secretName, "spec", "secretName"); err != nil {
+ 		return fmt.Errorf("patch Certificate secretName: %w", err)
+ 	}
+@@ -1191,7 +1191,8 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
+ 		return fmt.Errorf("patch cleanup CronJob image: %w", err)
+ 	}
+ 
+-	// Patch the cleanup command to use tenant-specific service name
++	// Patch the cleanup command to use the tenant-specific service's fully
++	// qualified DNS name. TLS certificates cover service FQDNs, not short names.
+ 	containers, found, err := unstructured.NestedSlice(r.Object,
+ 		"spec", "jobTemplate", "spec", "template", "spec", "containers")
+ 	if err != nil {
+@@ -1205,15 +1206,17 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
+ 		command, ok := container["command"].([]any)
+ 		if ok && len(command) > 0 {
+ 			tenantServiceName := MaaSAPIServiceName(params.TenantIdentifier)
+-			// Look for the curl command with maas-api:8443
++			tenantServiceHost := fmt.Sprintf("%s.%s.svc", tenantServiceName, params.GatewayNamespace)
+ 			modified := false
+ 			for i, cmdInterface := range command {
+-				if cmd, ok := cmdInterface.(string); ok && strings.Contains(cmd, "maas-api:8443") {
+-					// Replace maas-api with tenant-specific service name
+-					newCmd := strings.ReplaceAll(cmd, "maas-api:8443", tenantServiceName+":8443")
+-					command[i] = newCmd
+-					modified = true
+-					log.V(4).Info("Patching cleanup CronJob command URL", "old", "maas-api:8443", "new", tenantServiceName+":8443")
++				if cmd, ok := cmdInterface.(string); ok {
++					newCmd := strings.ReplaceAll(cmd, "maas-api.${POD_NAMESPACE}.svc:8443", tenantServiceHost+":8443")
++					newCmd = strings.ReplaceAll(newCmd, "maas-api:8443", tenantServiceHost+":8443")
++					if newCmd != cmd {
++						command[i] = newCmd
++						modified = true
++						log.V(4).Info("Patching cleanup CronJob command URL", "service", tenantServiceHost)
++					}
+ 				}
+ 			}
+ 			if modified {
+diff --git a/maas-controller/pkg/platform/tenantreconcile/params_test.go b/maas-controller/pkg/platform/tenantreconcile/params_test.go
+index d7e8e1d9..276f1252 100644
+--- a/maas-controller/pkg/platform/tenantreconcile/params_test.go
++++ b/maas-controller/pkg/platform/tenantreconcile/params_test.go
+@@ -291,6 +291,9 @@ func TestApplyPlatformParamsWithRenderedOverlay(t *testing.T) {
+ 
+ 	if cleanupCronJob := findResource(resources, GVKCronJob, MaaSAPIKeyCleanupCronJobName(tenantID)); cleanupCronJob != nil {
+ 		assert.Equal(t, params.MaaSAPIKeyCleanupImage, requireContainerImage(t, cleanupCronJob, "spec", "jobTemplate", "spec", "template", "spec", "containers"))
++		cleanupCommand := requireCronJobCommand(t, cleanupCronJob)
++		assert.Contains(t, cleanupCommand, "https://maas-api.gateway-ns.svc:8443/internal/v1/api-keys/cleanup")
++		assert.NotContains(t, cleanupCommand, "https://maas-api:8443")
+ 	}
+ 
+ 	httpRoute := requireResource(t, resources, GVKHTTPRoute, MaaSAPIRouteName(tenantID))
+@@ -559,6 +562,8 @@ func TestAPIKeyCleanupCronJobUserPerPlatform(t *testing.T) {
+ 		t.Run(tc.overlay, func(t *testing.T) {
+ 			resources := renderPlatformOverlayResources(t, tc.overlay, "tenant-ns")
+ 			cronJob := requireResource(t, resources, GVKCronJob, MaaSAPIKeyCleanupCronJobName(""))
++			cleanupCommand := requireCronJobCommand(t, cronJob)
++			assert.Contains(t, cleanupCommand, "https://maas-api.${POD_NAMESPACE}.svc:8443/internal/v1/api-keys/cleanup")
+ 			podSecurity, found, err := unstructured.NestedMap(cronJob.Object,
+ 				"spec", "jobTemplate", "spec", "template", "spec", "securityContext")
+ 			require.NoError(t, err)
+@@ -984,6 +989,30 @@ func requireContainerImage(t *testing.T, r *unstructured.Unstructured, fields ..
+ 	return image
+ }
+ 
++func requireCronJobCommand(t *testing.T, cronJob *unstructured.Unstructured) string {
++	t.Helper()
++
++	containers, found, err := unstructured.NestedSlice(
++		cronJob.Object,
++		"spec", "jobTemplate", "spec", "template", "spec", "containers",
++	)
++	require.NoError(t, err)
++	require.True(t, found)
++	require.NotEmpty(t, containers)
++
++	container, ok := containers[0].(map[string]any)
++	require.True(t, ok)
++	command, ok := container["command"].([]any)
++	require.True(t, ok)
++	commandParts := make([]string, 0, len(command))
++	for _, part := range command {
++		if value, ok := part.(string); ok {
++			commandParts = append(commandParts, value)
++		}
++	}
++	return strings.Join(commandParts, "\n")
++}
++
+ func requireContainerResources(t *testing.T, dep *unstructured.Unstructured) (requests, limits map[string]any) {
+ 	t.Helper()
+ 
+@@ -1259,7 +1288,7 @@ func TestPatchMaaSAPIServingCert_MultiTenant(t *testing.T) {
+ 	assert.Equal(t, "maas-api-serving-cert-redteam", cert.GetName())
+ 
+ 	secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
+-	assert.Equal(t, "maas-api-serving-cert-redteam", secretName)
++	assert.Equal(t, "maas-api-redteam-serving-cert", secretName)
+ 
+ 	dnsNames, _, _ := unstructured.NestedStringSlice(cert.Object, "spec", "dnsNames")
+ 	assert.Equal(t, []string{
+diff --git a/maas-controller/pkg/platform/tenantreconcile/postrender.go b/maas-controller/pkg/platform/tenantreconcile/postrender.go
+index e547a76a..35221055 100644
+--- a/maas-controller/pkg/platform/tenantreconcile/postrender.go
++++ b/maas-controller/pkg/platform/tenantreconcile/postrender.go
+@@ -123,12 +123,7 @@ func configureDestinationRule(log logr.Logger, resource *unstructured.Unstructur
+ }
+ 
+ func configureMaaSAPIService(log logr.Logger, resource *unstructured.Unstructured, tenantID string) error {
+-	// For default tenant (tenantID=""), use "maas-api-serving-cert"
+-	// For other tenants, use "maas-api-{tenantID}-serving-cert"
+-	secretName := "maas-api-serving-cert"
+-	if tenantID != "" {
+-		secretName = fmt.Sprintf("maas-api-%s-serving-cert", tenantID)
+-	}
++	secretName := MaaSAPIServingCertSecretName(tenantID)
+ 
+ 	annotations := resource.GetAnnotations()
+ 	if annotations == nil {
+@@ -142,11 +137,9 @@ func configureMaaSAPIService(log logr.Logger, resource *unstructured.Unstructure
+ }
+ 
+ func configureMaaSAPIDeployment(log logr.Logger, resource *unstructured.Unstructured, tenantID string) error {
+-	// Update the Deployment to mount the correct tenant-specific TLS secret
+-	secretName := "maas-api-serving-cert"
+-	if tenantID != "" {
+-		secretName = fmt.Sprintf("maas-api-%s-serving-cert", tenantID)
+-	}
++	// Update the Deployment to mount the same tenant-specific TLS Secret that
++	// the generated Certificate provisions and the Service advertises.
++	secretName := MaaSAPIServingCertSecretName(tenantID)
+ 
+ 	// Navigate to spec.template.spec.volumes and find the tls-cert volume
+ 	volumes, found, err := unstructured.NestedSlice(resource.Object, "spec", "template", "spec", "volumes")

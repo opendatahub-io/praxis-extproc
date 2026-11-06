@@ -13,6 +13,7 @@ DEPLOYMENT_NAME="${GRID_LLMD_EXTPROC_DEPLOYMENT:-praxis-extproc}"
 SERVICE_NAME="${GRID_LLMD_EXTPROC_SERVICE:-praxis-extproc}"
 ENVOYFILTER_NAME="${GRID_LLMD_EXTPROC_ENVOYFILTER:-praxis-grid-llmd-extproc}"
 HTTPROUTE_NAME="${GRID_LLMD_HTTPROUTE_NAME:-grid-llmd-inference}"
+SIMULATOR_IMAGE_RE='/(llm-d-sim|llm-d-inference-sim)@sha256:[0-9a-f]{64}$'
 GATEWAY_URL="${GRID_LLMD_GATEWAY_URL:-}"
 GATEWAY_CONNECT_TO="${GRID_LLMD_GATEWAY_CONNECT_TO:-}"
 GATEWAY_PATH="${GRID_LLMD_GATEWAY_PATH:-}"
@@ -21,6 +22,7 @@ MODEL="${GRID_LLMD_MODEL:-}"
 TIMEOUT_SECONDS="${GRID_LLMD_TIMEOUT_SECONDS:-120}"
 ALLOW_INSECURE_DEV_API="${ALLOW_INSECURE_DEV_API:-false}"
 CLUSTER_ENV="${CLUSTER_ENV:-}"
+CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"
 ORIGINAL_REPLICAS=""
 RESTORE_NEEDED=false
 RESTORE_FAILED=false
@@ -191,11 +193,27 @@ jq -e --arg run "$RUN_LABEL" --arg ns "$NAMESPACE" '
 GATEWAY_NAME="$(jq -er '.spec.parentRefs|map(select((.kind//"Gateway")=="Gateway"))|if length==1 then .[0].name else error("expected one Gateway parent") end' <<<"$ROUTE_JSON")"
 GATEWAY_HOST="$(jq -er '.spec.hostnames|if length==1 then .[0] else error("expected one hostname") end' <<<"$ROUTE_JSON")"
 GATEWAY_JSON="$(oc get gateway "$GATEWAY_NAME" -n "$NAMESPACE" -o json)"
-jq -e --arg run "$RUN_LABEL" '
-  .metadata.labels["praxis.fast/qualification-run"]==$run and
-  .metadata.generation as $g |
-  all(.status.conditions[]?|select(.type=="Accepted" or .type=="Programmed");.status=="True" and .observedGeneration==$g)
-' <<<"$GATEWAY_JSON" >/dev/null || { log 'task Gateway is not run-owned, Accepted, and Programmed'; exit 2; }
+case "$CLUSTER_PLATFORM" in
+  kind)
+    jq -e --arg run "$RUN_LABEL" '
+      .metadata.generation as $g |
+      .metadata.labels["praxis.fast/qualification-run"]==$run and
+      any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g) and
+      any(.status.listeners[]?; . as $listener |
+        ($listener.attachedRoutes//0)>0 and
+        all(["Accepted","Programmed","ResolvedRefs"][];
+          . as $required | any($listener.conditions[]?;.type==$required and .status=="True" and .observedGeneration==$g)))
+    ' <<<"$GATEWAY_JSON" >/dev/null || { log 'task Kind Gateway is not run-owned with a current Accepted/Programmed/ResolvedRefs listener and attached route'; exit 2; }
+    ;;
+  openshift)
+    jq -e --arg run "$RUN_LABEL" '
+      .metadata.labels["praxis.fast/qualification-run"]==$run and
+      .metadata.generation as $g |
+      all(.status.conditions[]?|select(.type=="Accepted" or .type=="Programmed");.status=="True" and .observedGeneration==$g)
+    ' <<<"$GATEWAY_JSON" >/dev/null || { log 'task Gateway is not run-owned, Accepted, and Programmed'; exit 2; }
+    ;;
+  *) log "unsupported cluster platform: $CLUSTER_PLATFORM"; exit 2 ;;
+esac
 URL_AUTHORITY="${GATEWAY_URL#https://}"
 URL_AUTHORITY="${URL_AUTHORITY%%/*}"
 [[ "$URL_AUTHORITY" =~ ^([A-Za-z0-9.-]+)(:([1-9][0-9]{0,4}))?$ ]] || { log 'Gateway URL authority is invalid'; exit 2; }
@@ -238,13 +256,13 @@ GATEWAY_PODS="$(oc get pods -n "$NAMESPACE" -l "gateway.networking.k8s.io/gatewa
 PROXY_POD="$(jq -er '[.items[]|select(.status.phase=="Running" and any(.status.conditions[]?;.type=="Ready" and .status=="True"))]|if length==1 then .[0].metadata.name else error("expected exactly one Ready task Gateway proxy") end' <<<"$GATEWAY_PODS")"
 PROXY_UID="$(jq -er --arg pod "$PROXY_POD" '.items[]|select(.metadata.name==$pod)|.metadata.uid' <<<"$GATEWAY_PODS")"
 SIMULATOR_PODS="$(oc get pods -n "$NAMESPACE" -l "praxis.fast/qualification-run=$RUN_LABEL" -o json)"
-jq -e --arg run "$RUN_LABEL" '
+jq -e --arg run "$RUN_LABEL" --arg imageRegex "$SIMULATOR_IMAGE_RE" '
   [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and
     (.metadata.labels["praxis.fast/simulator-pool"]//"")!="" and
-    any(.spec.containers[]?;.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$"))) as $pod |
+    any(.spec.containers[]?;.image|test($imageRegex))) as $pod |
     {name:$pod.metadata.name,uid:$pod.metadata.uid,pool:$pod.metadata.labels["praxis.fast/simulator-pool"],phase:$pod.status.phase,
      ready:any($pod.status.conditions[]?;.type=="Ready" and .status=="True"),
-     simulators:[$pod.spec.containers[]?|select(.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$")) as $container|
+     simulators:[$pod.spec.containers[]?|select(.image|test($imageRegex)) as $container|
        {name:$container.name,image:$container.image,
         imageID:([$pod.status.containerStatuses[]?|select(.name==$container.name)|.imageID][0]//""),
         containerReady:([$pod.status.containerStatuses[]?|select(.name==$container.name)|.ready][0]//false)}]}] as $pods |

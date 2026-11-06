@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Focused checks for score-based provider-hop attribution preflight."""
 
+import base64
+import hashlib
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).with_name("validate-pool-route-contract.py")
@@ -50,6 +53,33 @@ def valid_gateway_ref():
 
 
 class SiteAttributionContractTest(unittest.TestCase):
+    def test_provider_proxy_trust_pins_exact_grid_site_certificate_digest(self):
+        digest = hashlib.sha256(b"current grid site leaf").hexdigest()
+        CONTRACT.validate_provider_peer_trust([{"cert_digest": digest}], digest, "pool-a")
+
+    def test_provider_proxy_trust_rejects_organization_wide_or_stale_pins(self):
+        digest = hashlib.sha256(b"current grid site leaf").hexdigest()
+        for trust in (
+            [{"organization": "grid-site"}],
+            [{"cert_digest": "0" * 64}],
+            [{"cert_digest": digest}, {"organization": "grid-site"}],
+        ):
+            with self.subTest(trust=trust), self.assertRaisesRegex(RuntimeError, "does not pin the current GridSite certificate digest"):
+                CONTRACT.validate_provider_peer_trust(trust, digest, "pool-a")
+
+    def test_grid_site_digest_uses_gridnetwork_secret_and_keeps_certificate_private(self):
+        network = {
+            "metadata": {"namespace": "task"},
+            "spec": {"tls": {"siteSecretRef": {"name": "site-identity", "namespace": "grid-system"}}},
+        }
+        secret = {"data": {"tls.crt": base64.b64encode(b"public leaf PEM").decode("ascii")}}
+        with patch.object(CONTRACT, "get_json", return_value=secret) as get_secret, patch.object(
+            CONTRACT.ssl, "PEM_cert_to_DER_cert", return_value=b"DER leaf"
+        ):
+            digest = CONTRACT.grid_site_certificate_digest("kind-context", network)
+        get_secret.assert_called_once_with("kind-context", "grid-system", "get", "secret", "site-identity")
+        self.assertEqual(digest, hashlib.sha256(b"DER leaf").hexdigest())
+
     def test_intelligent_route_with_gossip_and_matching_mtls_hops_passes(self):
         endpoints = CONTRACT.validate_intelligent_provider_hops(valid_network(), valid_gateway_ref())
         self.assertEqual([entry["cluster"] for entry in endpoints], ["pool-a", "pool-b"])

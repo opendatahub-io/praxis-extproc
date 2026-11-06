@@ -26,12 +26,18 @@ required = (
     'gateway.networking.k8s.io/gateway-name: "$GATEWAY_NAME"',
     'oc apply --dry-run=server -f "$EVIDENCE_DIR/extproc-resources.yaml"',
     'pod_deadline=$((SECONDS + 60))',
+    'gateway_class_name="$(jq -er \'.spec.gatewayClassName\' "$EVIDENCE_DIR/gateway.json")"',
+    'gateway_controller="$(jq -er \'.spec.controllerName\' "$EVIDENCE_DIR/gatewayclass.json")"',
+    'if [[ "$gateway_controller" == istio.io/gateway-controller ]]; then',
+    'gateway.networking.k8s.io/gateway-name=$GATEWAY_NAME',
+    'gateway-data-plane-readiness.json',
+    'task Gateway is not current-generation Programmed',
     '.status.observedGeneration==.metadata.generation',
     '(.status.updatedReplicas//0)==1 and (.status.replicas//0)==1',
     '(.status.readyReplicas//0)==1 and (.status.availableReplicas//0)==1',
     'all($pods[];.metadata.deletionTimestamp==null and .phase=="Running"',
     'all($pods[].containers[];.ready==true)',
-    '.image==$image and (.imageID|endswith($digest)) and .ready==true',
+    '(.imageID|endswith($digest)) and .ready==true',
     'extprocRuntime:$runtime',
     'pilot-agent request GET config_dump',
     '.workloadSelector.labels["gateway.networking.k8s.io/gateway-name"]==$gateway and any(.patches[];.applyTo=="HTTP_FILTER" and .filterName=="envoy.filters.http.ext_proc")',
@@ -48,6 +54,17 @@ dry_run = source.index('oc apply --dry-run=server -f "$EVIDENCE_DIR/extproc-reso
 install = source.index('oc apply -f "$EVIDENCE_DIR/extproc-resources.yaml"')
 if not dry_run < render < install:
     print("render mode must server-dry-run all resources and exit before mutation", file=sys.stderr)
+    raise SystemExit(1)
+
+gateway_gate_start = source.index('oc get gateway "$GATEWAY_NAME"')
+gateway_gate_end = source.index('for resource in "configmap/$CONFIGMAP_NAME"', gateway_gate_start)
+gateway_gate = source[gateway_gate_start:gateway_gate_end]
+if '.metadata.generation as $g |' not in gateway_gate or \
+   'any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g)' not in gateway_gate or \
+   'gateway_controller" == istio.io/gateway-controller' not in gateway_gate or \
+   'all(.conditions[]?|select(.type=="Accepted" or .type=="Programmed" or .type=="ResolvedRefs")' not in gateway_gate or \
+   'any(.items[].ports[]?;.port==443)' not in gateway_gate:
+    print("Gateway ownership must use controller-specific readiness, including the Istio ClusterIP/443 data-plane endpoint", file=sys.stderr)
     raise SystemExit(1)
 
 readiness_start = source.index("CURRENT_PHASE=runtime-readiness")
@@ -67,7 +84,7 @@ poll_requirements = (
     "($pods|length)==1",
     ".metadata.deletionTimestamp==null and .phase==\"Running\"",
     "all($pods[].containers[];.ready==true)",
-    ".image==$image and (.imageID|endswith($digest)) and .ready==true",
+    "(.imageID|endswith($digest)) and .ready==true",
 )
 if any(requirement not in poll_body for requirement in poll_requirements):
     print("ExtProc bounded rollout wait must require a fully converged single Ready Pod with the pinned runtime digest", file=sys.stderr)

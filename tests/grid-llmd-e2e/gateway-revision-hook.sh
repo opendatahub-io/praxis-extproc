@@ -103,17 +103,40 @@ network_name="$(jq -er '.metadata.labels["grid.praxis.fast/network"]' <<<"$confi
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/grid-gateway-revision.XXXXXX")"
 chmod 0700 "$tmp_dir"
 trap 'rm -rf "$tmp_dir"' EXIT
-app_pods="$(oc get pods -n "$NAMESPACE" -l app.kubernetes.io/instance=grid-gateway,app.kubernetes.io/name=praxis-gateway -o json)"
+praxis_gateway_name="$(jq -er '.metadata.labels["grid.praxis.fast/gateway"]' <<<"$config_map_json")"
+deployment_json="$(oc get deployment "$praxis_gateway_name" -n "$NAMESPACE" -o json)"
+jq -e --arg run "$run_label" --arg name "$praxis_gateway_name" '
+  .metadata.name==$name and
+  .metadata.labels["praxis.fast/qualification-run"]==$run and
+  .spec.replicas==1 and
+  .status.observedGeneration==.metadata.generation and
+  (.status.readyReplicas//0)==1 and
+  (.status.availableReplicas//0)==1 and
+  ((.spec.selector.matchLabels|length)>0)
+' <<<"$deployment_json" >/dev/null || { printf 'operator-selected Praxis Gateway Deployment is not current, single-replica, Ready, and task-owned\n' >&2; exit 2; }
+deployment_uid="$(jq -er '.metadata.uid' <<<"$deployment_json")"
+deployment_generation="$(jq -er '.metadata.generation' <<<"$deployment_json")"
+deployment_selector="$(jq -er '.spec.selector.matchLabels|to_entries|map("\(.key)=\(.value)")|join(",")|select(length>0)' <<<"$deployment_json")"
+app_pods="$(oc get pods -n "$NAMESPACE" -l "$deployment_selector" -o json)"
 app_pod="$(jq -er '
-  [.items[] | select(.status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))]
-  | if length==1 then .[0].metadata.name else error("expected one Ready task Praxis Gateway Pod") end
+  . as $pods
+  | [$pods.items[] | select(.metadata.deletionTimestamp==null and .status.phase=="Running" and any(.status.conditions[]?; .type=="Ready" and .status=="True"))] as $ready
+  | if ($ready|length)==1 and ($pods.items|length)==1 then $ready[0].metadata.name else error("expected exactly one active Ready task Praxis Gateway Pod selected by its Deployment") end
 ' <<<"$app_pods")"
 app_pod_uid="$(jq -er --arg name "$app_pod" '.items[]|select(.metadata.name==$name)|.metadata.uid' <<<"$app_pods")"
 app_pod_json="$(jq -ce --arg name "$app_pod" '.items[]|select(.metadata.name==$name)' <<<"$app_pods")"
-praxis_gateway_name="$(jq -er '.metadata.labels["grid.praxis.fast/gateway"]' <<<"$config_map_json")"
-deployment_json="$(oc get deployment "$praxis_gateway_name" -n "$NAMESPACE" -o json)"
-deployment_generation="$(jq -er '.metadata.generation' <<<"$deployment_json")"
+app_replicaset_name="$(jq -er '[.metadata.ownerReferences[]?|select(.kind=="ReplicaSet" and .controller==true)]|if length==1 then .[0].name else error("Gateway Pod must have one controller ReplicaSet") end' <<<"$app_pod_json")"
+app_replicaset_uid="$(jq -er '[.metadata.ownerReferences[]?|select(.kind=="ReplicaSet" and .controller==true)]|.[0].uid' <<<"$app_pod_json")"
+app_replicaset_json="$(oc get replicaset "$app_replicaset_name" -n "$NAMESPACE" -o json)"
+jq -e --arg name "$praxis_gateway_name" --arg deployment_uid "$deployment_uid" --arg replicaset_uid "$app_replicaset_uid" '
+  .metadata.uid==$replicaset_uid and
+  any(.metadata.ownerReferences[]?; .kind=="Deployment" and .name==$name and .uid==$deployment_uid and .controller==true)
+' <<<"$app_replicaset_json" >/dev/null || { printf 'selected Praxis Gateway Pod is not owned by the current task Deployment\n' >&2; exit 2; }
 network_json="$(oc get gridnetwork "$network_name" -o json)"
+base_praxis_config_map="$(jq -er --arg gateway "$praxis_gateway_name" --arg ns "$NAMESPACE" '
+  [.spec.consumerGateways[]?|select(.name==$gateway and (.namespace // $ns)==$ns)|.praxisConfig.configMapName]
+  | unique | if length==1 and .[0]!=null then .[0] else error("GridNetwork must declare one generated Praxis ConfigMap for this Gateway") end
+' <<<"$network_json")"
 praxis_config_volume="$(jq -er '
   [.spec.containers[]?|select(.name=="praxis")|.volumeMounts[]?|select(.mountPath=="/etc/praxis")|.name]
   | unique | if length==1 then .[0] else error("expected one /etc/praxis ConfigMap mount") end
@@ -123,6 +146,13 @@ praxis_config_map="$(jq -er --arg volume "$praxis_config_volume" '
   | unique | if length==1 then .[0] else error("/etc/praxis mount is not backed by one ConfigMap") end
 ' <<<"$app_pod_json")"
 praxis_config_map_json="$(oc get configmap "$praxis_config_map" -n "$NAMESPACE" -o json)"
+mount_requirements_map="$(printf '%s' "$base_praxis_config_map" | sha256sum | awk '{print "grid-mount-requirements-" substr($1,1,16)}')"
+mount_status_phase="$(jq -er --arg gateway "$praxis_gateway_name" --arg ns "$NAMESPACE" '[.status.mountReconciliationStatus[]?|select(.gatewayName==$gateway and .namespace==$ns)]|if length==1 then .[0].phase else error("expected one current Gateway mount status") end' <<<"$network_json")"
+if [[ "$mount_status_phase" == RequirementsRendered ]]; then
+  mount_requirements_json="$(oc get configmap "$mount_requirements_map" -n "$NAMESPACE" -o json)"
+else
+  mount_requirements_json='{}'
+fi
 overlay_volume="$(jq -er '
   [.spec.containers[]?|select(.name=="praxis")|.volumeMounts[]?|select(.mountPath=="/etc/praxis/routing")|.name]
   | unique | if length==1 then .[0] else error("expected one direct Grid overlay mount at /etc/praxis/routing") end
@@ -140,6 +170,7 @@ printf '%s\n' "$network_json" >"$tmp_dir/gridnetwork.json"
 printf '%s\n' "$deployment_json" >"$tmp_dir/deployment.json"
 printf '%s\n' "$praxis_config_map_json" >"$tmp_dir/praxis-configmap.json"
 printf '%s\n' "$config_map_json" >"$tmp_dir/overlay-configmap.json"
+printf '%s\n' "$mount_requirements_json" >"$tmp_dir/mount-requirements-configmap.json"
 serving_verification="$(python3 - "$tmp_dir" "$EXPECTED_REVISION" "$praxis_gateway_name" "$NAMESPACE" "$deployment_generation" <<'PY'
 import hashlib
 import json
@@ -157,6 +188,7 @@ network = load("gridnetwork.json")
 deployment = load("deployment.json")
 praxis_cm = load("praxis-configmap.json")
 overlay_cm = load("overlay-configmap.json")
+requirements_cm = load("mount-requirements-configmap.json")
 network_generation = network.get("metadata", {}).get("generation")
 network_namespace = network.get("metadata", {}).get("namespace")
 if network_namespace not in (None, "", namespace):
@@ -182,8 +214,41 @@ statuses = network.get("status", {}).get("praxisConfigStatus", [])
 if not any(item.get("gatewayName") == gateway_name and item.get("namespace") == namespace and item.get("configMapName") == base_name and item.get("phase") == "Rendered" and item.get("observedGeneration") == network_generation for item in statuses):
     raise SystemExit("operator Praxis ConfigMap is not Rendered at the current GridNetwork generation")
 mounts = network.get("status", {}).get("mountReconciliationStatus", [])
-if not any(item.get("gatewayName") == gateway_name and item.get("namespace") == namespace and item.get("deploymentName") == deployment.get("metadata", {}).get("name") and item.get("phase") == "Ready" and item.get("observedGeneration") == network_generation and item.get("deploymentGeneration") == deployment_generation and item.get("appliedRevision") == praxis_digest for item in mounts):
-    raise SystemExit("operator Praxis mount reconciliation is not Ready for the mounted config and current Deployment generation")
+mount_status = [item for item in mounts if item.get("gatewayName") == gateway_name and item.get("namespace") == namespace]
+if len(mount_status) != 1:
+    raise SystemExit("GridNetwork must report exactly one Praxis mount status for the task Gateway")
+mount_status = mount_status[0]
+if mount_status.get("observedGeneration") != network_generation:
+    raise SystemExit("GridNetwork mount requirements are stale")
+if mount_status.get("phase") == "Ready":
+    if mount_status.get("deploymentName") != deployment.get("metadata", {}).get("name") or mount_status.get("deploymentGeneration") != deployment_generation or mount_status.get("appliedRevision") != praxis_digest:
+        raise SystemExit("operator-managed Praxis mount status does not match the mounted config and current Deployment generation")
+    mount_contract = "operator-reconciled"
+elif mount_status.get("phase") == "RequirementsRendered":
+    requirements_name = "grid-mount-requirements-" + hashlib.sha256(base_name.encode()).hexdigest()[:16]
+    requirements_meta = requirements_cm.get("metadata", {})
+    requirements_labels = requirements_meta.get("labels", {})
+    requirements_raw = (requirements_cm.get("data") or {}).get("mount-requirements.json", "")
+    try:
+        requirements = json.loads(requirements_raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("reference-only mount requirements are not valid JSON") from exc
+    requirements_revision = hashlib.sha256(requirements_raw.encode()).hexdigest()
+    if requirements_meta.get("name") != requirements_name or requirements_meta.get("namespace") != namespace:
+        raise SystemExit("reference-only mount requirements ConfigMap identity is incorrect")
+    if requirements_labels.get("app.kubernetes.io/managed-by") != "grid-operator" or requirements_labels.get("grid.praxis-proxy.io/network") != network.get("metadata", {}).get("name") or requirements_labels.get("grid.praxis-proxy.io/gateway") != gateway_name:
+        raise SystemExit("reference-only mount requirements are not owned by the current GridNetwork Gateway")
+    if mount_status.get("requirementsRevision") != requirements_revision:
+        raise SystemExit("reference-only mount requirements digest does not match GridNetwork status")
+    if requirements.get("schemaVersion") != "v1" or requirements.get("network") != network.get("metadata", {}).get("name") or requirements.get("gateway") != {"name": gateway_name, "namespace": namespace}:
+        raise SystemExit("reference-only mount requirements target a different GridNetwork Gateway")
+    if requirements.get("requirements") != []:
+        raise SystemExit("reference-only Gateway has secret mount requirements that this hook cannot verify")
+    if mount_status.get("deploymentName") or mount_status.get("deploymentGeneration") != 0 or mount_status.get("appliedRevision"):
+        raise SystemExit("reference-only mount status unexpectedly claims operator Deployment reconciliation")
+    mount_contract = "reference-only-live-verified"
+else:
+    raise SystemExit("GridNetwork Praxis mount status is not Ready or current RequirementsRendered")
 if deployment.get("status", {}).get("observedGeneration") != deployment_generation or (deployment.get("status", {}).get("readyReplicas") or 0) < 1:
     raise SystemExit("Gateway Deployment has not observed its current generation")
 
@@ -205,11 +270,12 @@ if not routing or routing.get("phase") != "Distributed" or routing.get("observed
 candidates = envelope.get("overlay", {}).get("candidates", [])
 if len(candidates) != 2 or len({item.get("stable_id") for item in candidates}) != 2:
     raise SystemExit("Gateway overlay does not contain exactly two distinct candidates")
-print(json.dumps({"revision": revision, "praxisConfigDigest": praxis_digest, "mountedPraxisConfigMatches": True, "overlayCandidateIdentitiesMatch": True, "overlayCandidateCount": len(candidates)}, separators=(",", ":")))
+print(json.dumps({"revision": revision, "praxisConfigDigest": praxis_digest, "praxisMountContract": mount_contract, "mountedPraxisConfigMatches": True, "overlayCandidateIdentitiesMatch": True, "overlayCandidateCount": len(candidates)}, separators=(",", ":")))
 PY
 )"
 mounted_revision="$(jq -er '.revision' <<<"$serving_verification")"
 praxis_config_digest="$(jq -er '.praxisConfigDigest' <<<"$serving_verification")"
+praxis_mount_contract="$(jq -er '.praxisMountContract' <<<"$serving_verification")"
 overlay_candidate_count="$(jq -er '.overlayCandidateCount' <<<"$serving_verification")"
 [[ "$mounted_revision" == "$EXPECTED_REVISION" && "$overlay_candidate_count" == 2 ]] || {
   printf 'Gateway mounted serving config does not represent the expected two-candidate Grid overlay\n' >&2
@@ -268,12 +334,13 @@ print(json.dumps(values, separators=(",", ":")))
 
 jq -n \
   --arg revision "$mounted_revision" --arg podUid "$app_pod_uid" --arg proxyPodUid "$proxy_pod_uid" \
-  --arg clusterSha256 "$route_cluster_sha256" --arg praxisConfigDigest "$praxis_config_digest" --arg phase "$PHASE" \
+  --arg clusterSha256 "$route_cluster_sha256" --arg praxisConfigDigest "$praxis_config_digest" \
+  --arg praxisMountContract "$praxis_mount_contract" --arg phase "$PHASE" \
   --argjson apiCaVerified "$api_ca_verified" --argjson retryLimit "$(jq -r '.retryLimit' <<<"$route")" \
   --argjson backendCount "$backend_count" --argjson candidateCount "$overlay_candidate_count" --argjson counters "$counter_json" \
   '{schema:"praxis-extproc.grid-llmd-gateway-revision/v1",phase:$phase,revision:$revision,podUid:$podUid,proxyPodUid:$proxyPodUid,
     apiCaVerified:$apiCaVerified,routeRetryLimit:$retryLimit,routeBackendCount:$backendCount,routeClusterSha256:$clusterSha256,
-    routeBackendServiceMatches:true,praxisConfigDigest:$praxisConfigDigest,mountedPraxisConfigMatches:true,
+    routeBackendServiceMatches:true,praxisConfigDigest:$praxisConfigDigest,praxisMountContract:$praxisMountContract,mountedPraxisConfigMatches:true,
     overlayCandidateIdentitiesMatch:true,overlayCandidateCount:$candidateCount,
     retryAttempts:$counters.retryAttempts,upstreamRequests:$counters.upstreamRequests,
     retryCounterPresent:$counters.retryCounterPresent,requestCounterPresent:$counters.requestCounterPresent,

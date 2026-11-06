@@ -159,14 +159,61 @@ jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]=
 }
 oc get gateway "$GATEWAY_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/gateway.json"
 jq -e --arg run "$RUN_LABEL" '
-  .metadata.labels["praxis.fast/qualification-run"]==$run and
   .metadata.generation as $g |
-  all(.status.conditions[]?|select(.type=="Accepted" or .type=="Programmed"); .status=="True" and .observedGeneration==$g)
+  .metadata.labels["praxis.fast/qualification-run"]==$run and
+  any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g)
 ' "$EVIDENCE_DIR/gateway.json" >/dev/null || {
   CURRENT_FAILURE='task Gateway is not current-generation Accepted and Programmed'
-  printf 'task Gateway ownership/readiness gate failed\n' >&2
+  printf 'task Gateway is not owned by this run or is not Accepted for its current generation\n' >&2
   exit 1
 }
+gateway_class_name="$(jq -er '.spec.gatewayClassName' "$EVIDENCE_DIR/gateway.json")"
+oc get gatewayclass "$gateway_class_name" -o json >"$EVIDENCE_DIR/gatewayclass.json"
+gateway_controller="$(jq -er '.spec.controllerName' "$EVIDENCE_DIR/gatewayclass.json")"
+if [[ "$gateway_controller" == istio.io/gateway-controller ]]; then
+  jq -e '
+    .metadata.generation as $g |
+    any(.status.listeners[]?;
+      .name=="https" and (.attachedRoutes // 0)>=1 and
+      all(.conditions[]?|select(.type=="Accepted" or .type=="Programmed" or .type=="ResolvedRefs"); .status=="True" and .observedGeneration==$g))
+  ' "$EVIDENCE_DIR/gateway.json" >/dev/null || {
+    CURRENT_FAILURE='Istio Gateway listener is not current-generation Accepted, Programmed, ResolvedRefs, and attached to a route'
+    printf 'Istio Gateway listener is not current, programmed, reference-resolved, and attached to a route\n' >&2
+    exit 1
+  }
+  oc get services -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$GATEWAY_NAME" -o json \
+    >"$EVIDENCE_DIR/gateway-proxy-services.json"
+  jq -e --arg run "$RUN_LABEL" --arg name "$GATEWAY_NAME" '
+    [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and .metadata.labels["gateway.networking.k8s.io/gateway-name"]==$name)] as $services |
+    ($services|length)==1 and $services[0].spec.clusterIP!="" and any($services[0].spec.ports[]?;.port==443)
+  ' "$EVIDENCE_DIR/gateway-proxy-services.json" >/dev/null || {
+    CURRENT_FAILURE='Istio Gateway lacks one run-owned ClusterIP data-plane Service on port 443'
+    printf 'Istio Gateway has no unique run-owned ClusterIP data-plane Service on port 443\n' >&2
+    exit 1
+  }
+  gateway_proxy_service="$(jq -er --arg run "$RUN_LABEL" --arg name "$GATEWAY_NAME" '[.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and .metadata.labels["gateway.networking.k8s.io/gateway-name"]==$name)]|.[0].metadata.name' "$EVIDENCE_DIR/gateway-proxy-services.json")"
+  oc get endpointslices -n "$NAMESPACE" -l "kubernetes.io/service-name=$gateway_proxy_service" -o json \
+    >"$EVIDENCE_DIR/gateway-proxy-endpointslices.json"
+  jq -e '[.items[].endpoints[]?|select(.conditions.ready==true and (.addresses|length)>0)] as $ready |
+    ($ready|length)==1 and any(.items[].ports[]?;.port==443)' \
+    "$EVIDENCE_DIR/gateway-proxy-endpointslices.json" >/dev/null || {
+    CURRENT_FAILURE='Istio Gateway data-plane Service does not have one Ready EndpointSlice address on port 443'
+    printf 'Istio Gateway data-plane Service lacks one Ready endpoint on port 443\n' >&2
+    exit 1
+  }
+  jq --arg service "$gateway_proxy_service" --arg controller "$gateway_controller" \
+    '{controller:$controller,service:$service,endpointSlices:[.items[]|{name:.metadata.name,ports:.ports,readyEndpoints:[.endpoints[]?|select(.conditions.ready==true)|{addresses,targetRef:{kind:.targetRef.kind,name:.targetRef.name,uid:.targetRef.uid}}]}]}' \
+    "$EVIDENCE_DIR/gateway-proxy-endpointslices.json" >"$EVIDENCE_DIR/gateway-data-plane-readiness.json"
+else
+  jq -e '
+    .metadata.generation as $g |
+    any(.status.conditions[]?;.type=="Programmed" and .status=="True" and .observedGeneration==$g)
+  ' "$EVIDENCE_DIR/gateway.json" >/dev/null || {
+    CURRENT_FAILURE='task Gateway is not current-generation Programmed'
+    printf 'task Gateway is not Programmed for its current generation\n' >&2
+    exit 1
+  }
+fi
 
 for resource in "configmap/$CONFIGMAP_NAME" "deployment/$DEPLOYMENT_NAME" "service/$SERVICE_NAME" "envoyfilter.networking.istio.io/$ENVOYFILTER_NAME"; do
   kind="${resource%%/*}"
@@ -465,7 +512,7 @@ while (( SECONDS < pod_deadline )); do
          any(.conditions[]?;.type=="Ready" and .status=="True")) and
        all($pods[].containers[];.ready==true) and
        ($runtime|length)==1 and
-       all($runtime[];.image==$image and (.imageID|endswith($digest)) and .ready==true)
+       all($runtime[];(.imageID|endswith($digest)) and .ready==true)
      ' "$EVIDENCE_DIR/pods.json" >/dev/null; then
     break
   fi
@@ -490,7 +537,7 @@ jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" '
        any(.conditions[]?;.type=="Ready" and .status=="True")) and
      all($pods[].containers[];.ready==true) and
      ($runtime|length)==1 and
-     all($runtime[];.image==$image and (.imageID|endswith($digest)) and .ready==true)
+     all($runtime[];(.imageID|endswith($digest)) and .ready==true)
    ' "$EVIDENCE_DIR/pods.json" >/dev/null || {
   CURRENT_FAILURE='ExtProc rollout did not converge to one current-generation Ready Pod with the pinned immutable image and no terminating or unready old Pods'
   printf 'ExtProc active Pod/imageID readiness gate failed after bounded rollout wait\n' >&2

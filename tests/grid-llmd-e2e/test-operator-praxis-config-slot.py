@@ -37,6 +37,38 @@ def fixture():
 
 
 class OperatorPraxisConfigSlotTest(unittest.TestCase):
+    def test_direct_gateway_is_selected_by_run_ownership_and_mounted_operator_config(self):
+        deployment = {
+            "metadata": {
+                "name": "grid-llmd-gateway",
+                "labels": {"praxis.fast/qualification-run": "run-1", "app.kubernetes.io/instance": "different-helm-release"},
+            },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "praxis", "volumeMounts": [{"name": "config", "mountPath": "/etc/praxis"}]}],
+                        "volumes": [{"name": "config", "configMap": {"name": "praxis-base"}}],
+                    }
+                }
+            },
+        }
+        matches = CONTRACT.task_gateway_deployments([deployment], "run-1", "praxis-base", "praxis")
+        self.assertEqual([item["metadata"]["name"] for item in matches], ["grid-llmd-gateway"])
+
+    def test_direct_gateway_discovery_rejects_wrong_owner_or_config_map(self):
+        deployment = {
+            "metadata": {"name": "grid-llmd-gateway", "labels": {"praxis.fast/qualification-run": "other-run"}},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "praxis", "volumeMounts": [{"name": "config", "mountPath": "/etc/praxis"}]}],
+                        "volumes": [{"name": "config", "configMap": {"name": "unrelated"}}],
+                    }
+                }
+            },
+        }
+        self.assertEqual(CONTRACT.task_gateway_deployments([deployment], "run-1", "praxis-base", "praxis"), [])
+
     def test_active_alternate_config_slot_passes_with_matching_applied_revision(self):
         network, gateway, config_map, content = fixture()
         alternate = f"grid-consumer-config-{CONTRACT.hashlib.sha256(b'praxis-base').hexdigest()[:16]}"

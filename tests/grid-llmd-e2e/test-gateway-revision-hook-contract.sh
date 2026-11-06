@@ -15,6 +15,11 @@ for required in \
   'appliedRevision' \
   'content_digest' \
   'grid-consumer-config-' \
+  'RequirementsRendered' \
+  'requirementsRevision' \
+  'mount-requirements.json' \
+  'reference-only-live-verified' \
+  'praxisMountContract' \
   'routeRetryLimit' \
   'retryAttempts' \
   'upstreamRequests' \
@@ -23,12 +28,21 @@ for required in \
   'requestCounterPresent' \
   'counterSource:"envoy_clusters_per_host_rq_total"' \
   'gateway.networking.k8s.io/gateway-name' \
-  'praxis.fast/qualification-run'; do
+  'praxis.fast/qualification-run' \
+  '.spec.selector.matchLabels' \
+  'ownerReferences[]?' \
+  'ReplicaSet' \
+  'deployment_uid' \
+  'deletionTimestamp==null'; do
   if ! rg -Fq "$required" "$HOOK"; then
     printf 'gateway revision hook missing contract: %s\n' "$required" >&2
     exit 1
   fi
 done
+if rg -n 'app\.kubernetes\.io/instance=grid-gateway|RUN_LABEL' "$HOOK"; then
+  printf 'Gateway revision hook must derive the release identity and run label from live owned resources\n' >&2
+  exit 1
+fi
 if rg -n 'GRID_SERVING_CONFIG|serving-config.json' "$HOOK"; then
   printf 'Gateway revision hook must validate the operator Praxis config and directly mounted Grid overlay\n' >&2
   exit 1

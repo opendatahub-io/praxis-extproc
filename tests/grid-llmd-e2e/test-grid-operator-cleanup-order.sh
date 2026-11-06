@@ -22,6 +22,8 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
     raise SystemExit("Grid cleanup must await operator-confirmed network withdrawal before deleting the site, Helm release, or namespace")
 
 required = (
+    'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+    '"$SCRIPT_DIR/single-ready-pinned-pod.jq"',
     "--ignore-not-found -o name",
     "could not verify absence",
     "could not list providers; absence is not established",

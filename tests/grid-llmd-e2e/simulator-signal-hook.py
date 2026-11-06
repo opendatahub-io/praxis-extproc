@@ -19,11 +19,8 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "praxis-extproc.grid-llmd-simulator-hook/v1"
+CONTROL_RESOURCE_MANAGER = "grid-llmd-e2e-run"
 METRICS = ("running-requests", "waiting-requests", "kv-cache-usage")
-OWNER_LABELS = {
-    "app.kubernetes.io/managed-by": "grid-llmd-e2e-run",
-    "app.kubernetes.io/part-of": "grid-llmd-e2e",
-}
 
 
 class HookError(RuntimeError):
@@ -240,7 +237,7 @@ def read_private_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def verify_api(context: str, namespace: str, evidence: Path) -> tuple[str, bool, str]:
+def verify_api(context: str, namespace: str, evidence: Path) -> tuple[str, bool, str, str]:
     expected = os.environ.get("EXPECTED_API_SERVER", "")
     run_label = os.environ.get("GRID_RUN_LABEL", "")
     if not expected or not run_label:
@@ -272,7 +269,12 @@ def verify_api(context: str, namespace: str, evidence: Path) -> tuple[str, bool,
         description="verify task namespace ownership",
     )
     labels = namespace_obj.get("metadata", {}).get("labels", {})
-    if labels.get("app.kubernetes.io/part-of") != "grid-llmd-e2e" or labels.get("praxis.fast/qualification-run") != run_label:
+    namespace_manager = labels.get("app.kubernetes.io/managed-by", "")
+    if (
+        labels.get("app.kubernetes.io/part-of") != "grid-llmd-e2e"
+        or labels.get("praxis.fast/qualification-run") != run_label
+        or not namespace_manager
+    ):
         raise HookError("simulator hook namespace is not owned by this run")
     write_private_json(evidence / f"simulator-hook-api-{safe_name(Path(sys.argv[0]).name)}.json", {
         "capturedAt": utc_now(),
@@ -283,23 +285,29 @@ def verify_api(context: str, namespace: str, evidence: Path) -> tuple[str, bool,
         "runLabel": run_label,
         "namespace": namespace,
     })
-    return server, api_ca_verified, run_label
+    # Bootstrap may own the namespace under a platform-specific manager while
+    # task resources use the shared E2E manager label.
+    return server, api_ca_verified, run_label, CONTROL_RESOURCE_MANAGER
 
 
-def read_control(context: str, reference: dict[str, str], run_label: str) -> dict[str, Any]:
+def validate_control_ownership(labels: dict[str, str], reference: dict[str, str], run_label: str, managed_by: str) -> None:
+    """Require control ownership to match the run namespace's manager and pool identity."""
+    if (
+        labels.get("app.kubernetes.io/managed-by") != managed_by
+        or labels.get("praxis.fast/qualification-run") != run_label
+        or labels.get("praxis.fast/simulator-pool") != reference["simulatorPool"]
+    ):
+        raise HookError(f"simulator control {reference['name']} is not owned by this run and pool")
+
+
+def read_control(context: str, reference: dict[str, str], run_label: str, managed_by: str) -> dict[str, Any]:
     obj = kubectl_json(
         context, "get", "configmap", reference["name"], "--namespace", reference["namespace"], "--output=json",
         description=f"read simulator control {reference['name']}",
     )
     metadata = obj.get("metadata", {})
     labels = metadata.get("labels", {})
-    if any(labels.get(key) != value for key, value in OWNER_LABELS.items()):
-        raise HookError(f"simulator control {reference['name']} is not task-owned")
-    if (
-        labels.get("praxis.fast/qualification-run") != run_label
-        or labels.get("praxis.fast/simulator-pool") != reference["simulatorPool"]
-    ):
-        raise HookError(f"simulator control {reference['name']} run/pool labels do not match")
+    validate_control_ownership(labels, reference, run_label, managed_by)
     config = obj.get("data", {}).get(reference["dataKey"])
     if not isinstance(config, str):
         raise HookError(f"simulator control {reference['name']} lacks its declared data key")
@@ -354,7 +362,15 @@ def baseline_document(path: Path, server: str, run_label: str, controls: list[di
     return saved
 
 
-def write_control(context: str, current: dict[str, Any], desired: str, phase: str, evidence: Path, run_label: str) -> dict[str, Any]:
+def write_control(
+    context: str,
+    current: dict[str, Any],
+    desired: str,
+    phase: str,
+    evidence: Path,
+    run_label: str,
+    managed_by: str,
+) -> dict[str, Any]:
     if current["config"] != desired:
         patch_path = evidence / f"simulator-control-patch-{safe_name(current['pool'])}-{phase}.json"
         write_private_json(patch_path, {"data": {current["dataKey"]: desired}})
@@ -363,7 +379,7 @@ def write_control(context: str, current: dict[str, Any], desired: str, phase: st
             "--type=merge", f"--patch-file={patch_path}",
             description=f"update task-owned simulator control {current['name']}",
         )
-    return read_control(context, current, run_label)
+    return read_control(context, current, run_label, managed_by)
 
 
 def simulator_pods(context: str, namespace: str, reference: dict[str, str], run_label: str) -> list[dict[str, str]]:
@@ -489,7 +505,7 @@ def execute(phase: str, args: argparse.Namespace) -> dict[str, Any]:
     evidence = Path(args.evidence_dir)
     evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(evidence, 0o700)
-    server, api_ca_verified, run_label = verify_api(args.context, args.namespace, evidence)
+    server, api_ca_verified, run_label, managed_by = verify_api(args.context, args.namespace, evidence)
     references = parse_control_list(
         os.environ.get("GRID_LLMD_SIMULATOR_CONTROL_RESOURCES", ""),
         args.namespace,
@@ -503,7 +519,7 @@ def execute(phase: str, args: argparse.Namespace) -> dict[str, Any]:
     if phase == "recovery" and not baseline_path.exists():
         raise HookError("recovery refused because the pressure hook did not save a baseline")
 
-    controls = [read_control(args.context, reference, run_label) for reference in references]
+    controls = [read_control(args.context, reference, run_label, managed_by) for reference in references]
     saved = baseline_document(baseline_path, server, run_label, controls)
     baseline = saved["controls"]
     signal_fake_metric = selected_fake_metric()
@@ -541,7 +557,7 @@ def execute(phase: str, args: argparse.Namespace) -> dict[str, Any]:
     desired_controls: dict[str, dict[str, Any]] = {}
     for reference, current in zip(references, controls, strict=True):
         desired_controls[reference["identity"]] = write_control(
-            args.context, current, desired_configs[reference["identity"]], phase, evidence, run_label
+            args.context, current, desired_configs[reference["identity"]], phase, evidence, run_label, managed_by
         )
 
     observations: list[dict[str, Any]] = []
@@ -603,17 +619,19 @@ def execute(phase: str, args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
-    values = sys.argv[1:] if argv is None else argv
-    if not values or values[0] not in ("pressure", "recovery"):
-        print("usage: simulator-signal-hook.py pressure|recovery --context CONTEXT --namespace NS --evidence-dir DIR", file=sys.stderr)
-        return 2
-    phase, *arguments = values
+def parse_hook_args(values: list[str]) -> tuple[str, argparse.Namespace]:
     parser = argparse.ArgumentParser()
+    parser.add_argument("phase", choices=("pressure", "recovery"))
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--evidence-dir", required=True)
-    args = parser.parse_args(arguments)
+    args = parser.parse_args(values)
+    return args.phase, args
+
+
+def main(argv: list[str] | None = None) -> int:
+    values = sys.argv[1:] if argv is None else argv
+    phase, args = parse_hook_args(values)
     try:
         result = execute(phase, args)
     except HookError as error:

@@ -35,6 +35,16 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertEqual(resolver.source_ref("epp", "main", None, locks), ("main", None))
         self.assertEqual(resolver.source_ref("llm-d-sim", "main", None, locks), ("main", None))
         self.assertEqual(resolver.source_ref("praxis-ai", "main", None, locks), ("main", None))
+        self.assertEqual(resolver.source_ref("kserve", "main", None, locks), ("master", None))
+        self.assertEqual(resolver.source_ref("kuadrant", "main", None, locks), ("v1.4.2", None))
+        self.assertEqual(
+            resolver.source_ref("kuadrant", "main", None, locks, "grid-llmd-kind"),
+            ("v1.4.7", None),
+        )
+        self.assertEqual(
+            resolver.source_ref("kuadrant", "locked", None, locks, "grid-llmd-kind"),
+            ("4e138de81f2620edf0f3377cb22c31a0bdcd5a54", "4e138de81f2620edf0f3377cb22c31a0bdcd5a54"),
+        )
         self.assertEqual(
             resolver.source_ref("maas", "locked", None, locks),
             ("ccce7752af146eb3de9e99df107c26f414878726", "ccce7752af146eb3de9e99df107c26f414878726"),
@@ -58,17 +68,30 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertEqual(resolver.REF_ENV["grid"], "GRID_REF")
         self.assertEqual(resolver.REF_ENV["gitops"], "GITOPS_REF")
         self.assertEqual(resolver.SOURCE_DEFAULTS["kuadrant"], "v1.4.2")
+        self.assertEqual(resolver.REF_ENV["kserve"], "KSERVE_REF")
+        self.assertEqual(resolver.REPOSITORY_ENV["kserve"], "KSERVE_REPOSITORY_URL")
+        self.assertEqual(resolver.REPOSITORY_ENV["payload-processing"], "PAYLOAD_PROCESSING_REPOSITORY_URL")
 
     def test_lanes_resolve_only_their_source_roles(self) -> None:
         native = resolver.selected_components("grid-llmd", False)
         maas = resolver.selected_components("grid-maas", True)
+        kind_native = resolver.selected_components("grid-llmd-kind", True)
         self.assertIn("grid", native)
         self.assertIn("maas", native)
         self.assertIn("praxis-ai", native)
         self.assertNotIn("aigc", native)
+        self.assertNotIn("kserve", native)
+        self.assertIn("kserve", resolver.selected_components("grid-llmd", False, include_kserve=True))
+        self.assertIn("aigc", resolver.selected_components("grid-llmd", False, include_aigc=True))
         self.assertIn("aigc", maas)
         self.assertIn("maas", maas)
         self.assertIn("gitops", maas)
+        self.assertIn("aigc", kind_native)
+        self.assertIn("kuadrant", kind_native)
+        self.assertIn("kserve", kind_native)
+        self.assertIn("payload-processing", kind_native)
+        self.assertNotIn("gitops", kind_native)
+        self.assertEqual(len(kind_native), len(set(kind_native)))
 
     def test_embedded_remote_credentials_are_rejected(self) -> None:
         with self.assertRaises(resolver.ResolutionError):

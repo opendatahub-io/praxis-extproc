@@ -10,11 +10,12 @@ MODE="${GRID_OPERATOR_MODE:-plan}"
 EXPECTED_API_SERVER="${EXPECTED_API_SERVER:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 CLUSTER_ENV="${CLUSTER_ENV:-}"
+CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"
 ALLOW_INSECURE_DEV_API="${ALLOW_INSECURE_DEV_API:-false}"
 RESOURCE_PROFILE="${RESOURCE_PROFILE:-strict}"
 CHART_FILE="${GRID_OPERATOR_CHART_FILE:-}"
 CHART_SHA256="${GRID_OPERATOR_CHART_SHA256:-}"
-CHART_VERSION="${GRID_OPERATOR_CHART_VERSION:-0.2.2}"
+CHART_VERSION="${GRID_OPERATOR_CHART_VERSION:-}"
 SOURCE_REVISION="${GRID_OPERATOR_SOURCE_REVISION:-}"
 IMAGE="${GRID_OPERATOR_IMAGE:-}"
 RELEASE_NAME="${GRID_OPERATOR_RELEASE_NAME:-grid-operator}"
@@ -42,7 +43,7 @@ GRID_PRAXIS_CLUSTER_ENDPOINTS_FILE="${GRID_PRAXIS_CLUSTER_ENDPOINTS_FILE:-}"
 GRID_PROVIDER_HOP_ENDPOINTS_FILE="${GRID_PROVIDER_HOP_ENDPOINTS_FILE:-}"
 GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION="${GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION:-false}"
 GRID_PRAXIS_SITE_ROUTER="${GRID_PRAXIS_SITE_ROUTER:-intelligentRoute}"
-GRID_PRAXIS_CONFIG_DEPLOYMENT_NAME="${GRID_PRAXIS_CONFIG_DEPLOYMENT_NAME:-grid-gateway}"
+GRID_PRAXIS_CONFIG_DEPLOYMENT_NAME="${GRID_PRAXIS_CONFIG_DEPLOYMENT_NAME:-${GRID_GATEWAY_DEPLOYMENT_NAME:-grid-gateway}}"
 GRID_PRAXIS_CONFIG_CONTAINER_NAME="${GRID_PRAXIS_CONFIG_CONTAINER_NAME:-praxis}"
 GRID_TLS_SECRET_NAMESPACE="${GRID_TLS_SECRET_NAMESPACE:-}"
 GRID_SWIM_REQUIRE_KEY="${GRID_SWIM_REQUIRE_KEY:-false}"
@@ -55,11 +56,19 @@ TIMEOUT="${GRID_OPERATOR_TIMEOUT:-10m}"
 RUNTIME_READY_TIMEOUT_SECONDS="${GRID_OPERATOR_RUNTIME_TIMEOUT_SECONDS:-300}"
 EVIDENCE_DIR="${GRID_OPERATOR_EVIDENCE_DIR:-}"
 
+[[ "$CLUSTER_PLATFORM" == openshift || "$CLUSTER_PLATFORM" == kind ]] || {
+  printf 'GRID_LLMD_CLUSTER_PLATFORM must be openshift or kind\n' >&2
+  exit 2
+}
+if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+  [[ "$CLUSTER_ENV" == kind ]] || { printf 'GRID_LLMD_CLUSTER_PLATFORM=kind requires CLUSTER_ENV=kind\n' >&2; exit 2; }
+fi
+
 case "$RESOURCE_PROFILE" in
   strict) PROFILE_CPU_REQUEST=50m ;;
   reduced-dev)
-    [[ "$CLUSTER_ENV" == ephemeral-dev ]] || {
-      printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev\n' >&2
+    [[ "$CLUSTER_ENV" == ephemeral-dev || ("$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind) ]] || {
+      printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev or the explicit Kind platform\n' >&2
       exit 2
     }
     PROFILE_CPU_REQUEST=25m
@@ -315,16 +324,30 @@ fi
 CURRENT_PHASE=artifact-validation
 observed_chart_sha="$(sha256sum "$CHART_FILE" | awk '{print $1}')"
 [[ "$observed_chart_sha" == "$CHART_SHA256" ]] || {
+  CURRENT_FAILURE="operator chart SHA mismatch: expected $CHART_SHA256, observed $observed_chart_sha"
   printf 'chart SHA mismatch: expected %s, observed %s\n' "$CHART_SHA256" "$observed_chart_sha" >&2
   exit 1
 }
 chart_metadata="$(helm show chart "$CHART_FILE")"
-grep -Fq 'name: grid-operator' <<<"$chart_metadata" || {
+observed_chart_name="$(awk -F': ' '$1 == "name" { print $2; exit }' <<<"$chart_metadata")"
+observed_chart_version="$(awk -F': ' '$1 == "version" { print $2; exit }' <<<"$chart_metadata")"
+[[ "$observed_chart_name" == grid-operator ]] || {
   CURRENT_FAILURE='operator chart name does not match grid-operator'
   printf 'operator chart archive does not contain the expected grid-operator chart\n' >&2
   exit 1
 }
-grep -Fq "version: $CHART_VERSION" <<<"$chart_metadata"
+[[ -n "$observed_chart_version" ]] || {
+  CURRENT_FAILURE='operator chart archive does not declare a version'
+  printf 'operator chart archive does not declare a version\n' >&2
+  exit 1
+}
+if [[ -z "$CHART_VERSION" ]]; then
+  CHART_VERSION="$observed_chart_version"
+elif [[ "$observed_chart_version" != "$CHART_VERSION" ]]; then
+  CURRENT_FAILURE="operator chart version mismatch: expected $CHART_VERSION, observed $observed_chart_version"
+  printf 'chart version mismatch: expected %s, observed %s\n' "$CHART_VERSION" "$observed_chart_version" >&2
+  exit 1
+fi
 
 write_values() {
   local grid_signals=''
@@ -583,6 +606,11 @@ ensure_owned_namespace() {
       app.kubernetes.io/managed-by=grid-llmd-e2e-run praxis.fast/qualification-run="$RUN_LABEL" \
       --overwrite=true >/dev/null
   fi
+  # Existing run-owned task namespaces may have been created by the Kind
+  # bootstrapper, which uses managed-by=grid-llmd-kind. Add only the common
+  # component label after ownership is confirmed; preserve its manager label.
+  oc label namespace "$namespace" app.kubernetes.io/part-of=grid-llmd-e2e \
+    --overwrite=true >/dev/null
 }
 
 ensure_internal_image_pull_access() {
@@ -730,15 +758,13 @@ wait_for_operator_pod_image() {
   deadline=$((SECONDS + RUNTIME_READY_TIMEOUT_SECONDS))
   while ((SECONDS < deadline)); do
     if oc get pods -n "$RELEASE_NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" -o json |
-      jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,phase:.status.phase,node:.spec.nodeName,conditions:.status.conditions,containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
+      jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,node:.spec.nodeName,conditions:.status.conditions,specContainers:[.spec.containers[]?|{name,image}],containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
         >"$pod_json"; then
       jq -c --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{observedAt:$observedAt,pods:[.[]|{name,phase,containers:[.containers[]|{image,imageID,ready,restartCount}]}]}' \
+        '{observedAt:$observedAt,pods:[.[]|{name,uid,deletionTimestamp,phase,node,specContainers,containers:[.containers[]|{name,image,imageID,ready,restartCount}]}]}' \
         "$pod_json" >>"$attempts_jsonl"
       if jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" \
-        'length==1 and .[0].phase=="Running" and
-        all(.[0].containers[];.ready==true and .image==$image and (.imageID|endswith($digest)))' \
-        "$pod_json" >/dev/null; then
+        -f "$SCRIPT_DIR/single-ready-pinned-pod.jq" "$pod_json" >/dev/null; then
         return 0
       fi
     fi

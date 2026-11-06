@@ -27,12 +27,16 @@ def labels_from(document: dict) -> dict:
 
 
 def verify(args: argparse.Namespace) -> dict:
+    source_patch_sha256 = getattr(args, "source_patch_sha256", "")
+    build_context_subdir = getattr(args, "build_context_subdir", "")
     if not DIGEST_RE.search(args.image):
         raise ValueError("deployed image must use an immutable sha256 digest")
     if not SHA_RE.fullmatch(args.source_sha):
         raise ValueError("source revision must be a full Git SHA")
     if not CONTEXT_RE.fullmatch(args.build_context_sha256):
         raise ValueError("build context must be a SHA-256 digest")
+    if source_patch_sha256 and not CONTEXT_RE.fullmatch(source_patch_sha256):
+        raise ValueError("source patch must be a SHA-256 digest")
     document = json.loads(args.inspect_config.read_text(encoding="utf-8"))
     labels = labels_from(document)
     expected = {
@@ -43,6 +47,18 @@ def verify(args: argparse.Namespace) -> dict:
     mismatches = [key for key, value in expected.items() if labels.get(key) != value]
     if mismatches:
         raise ValueError("required OCI provenance labels are missing or mismatched: " + ", ".join(mismatches))
+    context_subdir_label = labels.get("org.praxis.build-context.subdir")
+    if build_context_subdir:
+        if context_subdir_label != build_context_subdir:
+            raise ValueError("build context subdirectory OCI provenance label is missing or mismatched")
+    elif context_subdir_label is not None:
+        raise ValueError("image has a build context subdirectory label but none was recorded")
+    patch_label = labels.get("org.praxis.source-patch.sha256")
+    if source_patch_sha256:
+        if patch_label != source_patch_sha256:
+            raise ValueError("source patch OCI provenance label is missing or mismatched")
+    elif patch_label is not None:
+        raise ValueError("image has a source patch label but no patch was recorded in the source lock")
     result = {
         "schema": "praxis-extproc.image-provenance/v1",
         "image": args.image,
@@ -59,6 +75,10 @@ def verify(args: argparse.Namespace) -> dict:
         if runtime_digest is None:
             raise ValueError("runtime imageID must end in a sha256 digest")
         result["runtime_image_id"] = args.runtime_image_id
+    if source_patch_sha256:
+        result["source_patch_sha256"] = source_patch_sha256
+    if build_context_subdir:
+        result["build_context_subdir"] = build_context_subdir
     return result
 
 
@@ -68,6 +88,8 @@ def main() -> int:
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--build-context-sha256", required=True)
+    parser.add_argument("--source-patch-sha256", default="")
+    parser.add_argument("--build-context-subdir", default="")
     parser.add_argument("--inspect-config", type=Path, required=True)
     parser.add_argument("--runtime-image-id", default="")
     parser.add_argument("--output", type=Path, required=True)

@@ -15,9 +15,11 @@ env_default() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODE="$(env_default SERVING_POOLS_MODE plan)"
+SERVING_POOL_SELECTION="$(env_default SERVING_POOL_SELECTION both)"
 EXPECTED_API_SERVER="$(env_default EXPECTED_API_SERVER '')"
 KUBE_CONTEXT="$(env_default KUBE_CONTEXT '')"
 CLUSTER_ENV="$(env_default CLUSTER_ENV '')"
+CLUSTER_PLATFORM="$(env_default GRID_LLMD_CLUSTER_PLATFORM openshift)"
 ALLOW_INSECURE_DEV_API="$(env_default ALLOW_INSECURE_DEV_API false)"
 RESOURCE_PROFILE="$(env_default RESOURCE_PROFILE strict)"
 NAMESPACE="$(env_default GRID_RESOURCE_NAMESPACE grid-llmd-e2e)"
@@ -25,13 +27,13 @@ DSC_NAME="$(env_default DATASCIENCECLUSTER_NAME default-dsc)"
 ARGO_APPLICATION_NAME="$(env_default ARGO_APPLICATION_NAME ephemeral-rhoai-maas-platform)"
 ARGO_APPLICATION_NAMESPACE="$(env_default ARGO_APPLICATION_NAMESPACE openshift-gitops)"
 LLMISVC_GATEWAY_NAME="$(env_default LLMISVC_GATEWAY_NAME grid-llmd-ingress)"
-LLMISVC_GATEWAY_NAMESPACE="$(env_default LLMISVC_GATEWAY_NAMESPACE "$NAMESPACE")"
+LLMISVC_GATEWAY_NAMESPACE="$(env_default LLMISVC_GATEWAY_NAMESPACE "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf maas-system; else printf '%s' "$NAMESPACE"; fi)")"
 LLMISVC_GATEWAY_SECTION_NAME="$(env_default LLMISVC_GATEWAY_SECTION_NAME inference)"
 POOL_A_GATEWAY_NAME="$(env_default POOL_A_GATEWAY_NAME grid-llmd-pool-a)"
 POOL_B_GATEWAY_NAME="$(env_default POOL_B_GATEWAY_NAME grid-llmd-pool-b)"
 POOL_GATEWAY_LISTENER_PORT="$(env_default POOL_GATEWAY_LISTENER_PORT 8080)"
-POOL_GATEWAY_INFRA_ANNOTATION_KEY="$(env_default POOL_GATEWAY_INFRA_ANNOTATION_KEY service.beta.kubernetes.io/aws-load-balancer-internal)"
-POOL_GATEWAY_INFRA_ANNOTATION_VALUE="$(env_default POOL_GATEWAY_INFRA_ANNOTATION_VALUE true)"
+POOL_GATEWAY_INFRA_ANNOTATION_KEY="$(env_default POOL_GATEWAY_INFRA_ANNOTATION_KEY "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf networking.istio.io/service-type; else printf service.beta.kubernetes.io/aws-load-balancer-internal; fi)")"
+POOL_GATEWAY_INFRA_ANNOTATION_VALUE="$(env_default POOL_GATEWAY_INFRA_ANNOTATION_VALUE "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf ClusterIP; else printf true; fi)")"
 LLMISVC_TLS_ENABLED="$(env_default LLMISVC_TLS_ENABLED false)"
 RUN_LABEL="$(env_default GRID_RUN_LABEL '')"
 SOURCE_LOCKS_MD="$(env_default SOURCE_LOCKS_MD "$REPO_ROOT/evidence/$RUN_LABEL/source-locks.md")"
@@ -42,21 +44,23 @@ WAIT_TIMEOUT="$(env_default SERVING_POOLS_WAIT_TIMEOUT 900s)"
 BUILD_TIMEOUT="$(env_default SIMULATOR_BUILD_TIMEOUT 3600s)"
 BUILD_STATUS_SYNC_TIMEOUT="$(env_default SIMULATOR_BUILD_STATUS_SYNC_TIMEOUT 120s)"
 SIMULATOR_SOURCE_URL="$(env_default SIMULATOR_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim.git)"
-SIMULATOR_OCI_SOURCE_URL="$(env_default SIMULATOR_OCI_SOURCE_URL https://github.com/llm-d/llm-d-inference-sim)"
+SIMULATOR_OCI_SOURCE_URL="$(env_default SIMULATOR_OCI_SOURCE_URL "$SIMULATOR_SOURCE_URL")"
 SIMULATOR_SOURCE_REVISION="$(env_default SIMULATOR_SOURCE_REVISION bca276ef64263e214b4822940bb1e58d018cbf9d)"
 SIMULATOR_BUILD_CONFIG="$(env_default SIMULATOR_BUILD_CONFIG llm-d-sim-source-build)"
 SIMULATOR_IMAGESTREAM="$(env_default SIMULATOR_IMAGESTREAM llm-d-sim)"
 SIMULATOR_IMAGE_TAG="$(env_default SIMULATOR_IMAGE_TAG source-bca276ef6426)"
 SIMULATOR_IMAGE="$(env_default SIMULATOR_IMAGE '')"
 SIMULATOR_PULL_POLICY="$(env_default SIMULATOR_PULL_POLICY IfNotPresent)"
-EXTPROC_IMAGE="$(env_default EXTPROC_IMAGE quay.io/opendatahub/odh-praxis-extproc@sha256:2d5cac5cb41d99eaf99376d2d094d3c615bbe180d5963e40af0f36016604230d)"
+EXTPROC_IMAGE="$(env_default EXTPROC_IMAGE '')"
 EXTPROC_SOURCE_REVISION="$(env_default EXTPROC_SOURCE_REVISION e20c802675f549c56bd23d29bc64c2fb2fdc895c)"
-GITOPS_SOURCE_REVISION="$(env_default GITOPS_SOURCE_REVISION 1106cd57746be7be9a37805d9f48e48518cc31b9)"
+GITOPS_SOURCE_REVISION="$(env_default GITOPS_SOURCE_REVISION "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf not-used; else printf 1106cd57746be7be9a37805d9f48e48518cc31b9; fi)")"
 GRID_GATEWAY_SOURCE_REVISION="$(env_default GRID_GATEWAY_SOURCE_REVISION 33cb906be2bb0ebdbaf253bd307939a44f41b37b)"
 ODH_GRID_OPERATOR_SOURCE_REVISION="$(env_default ODH_GRID_OPERATOR_SOURCE_REVISION ed60534100b4b0ee986b6714d1e7cb6d685b7236)"
 MAAS_SOURCE_REVISION="$(env_default MAAS_SOURCE_REVISION edddce0581a0863a3a63f4abfdb6f73fcc2686b8)"
-SCHEDULER_CONFIG_NAME="$(env_default SCHEDULER_CONFIG_NAME v3-5-2-kserve-config-llm-scheduler)"
-SCHEDULER_CONFIG_NAMESPACE="$(env_default SCHEDULER_CONFIG_NAMESPACE redhat-ods-applications)"
+SCHEDULER_CONFIG_NAME="$(env_default SCHEDULER_CONFIG_NAME "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf kserve-config-llm-scheduler; else printf v3-5-2-kserve-config-llm-scheduler; fi)")"
+SCHEDULER_CONFIG_NAMESPACE="$(env_default SCHEDULER_CONFIG_NAMESPACE "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf kserve; else printf redhat-ods-applications; fi)")"
+MAAS_TENANT_CONFIG_NAMESPACE="$(env_default MAAS_TENANT_CONFIG_NAMESPACE "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf models-as-a-service; else printf redhat-ods-applications; fi)")"
+KSERVE_ROUTE_CONTROLLER_NAME="$(env_default KSERVE_ROUTE_CONTROLLER_NAME "$(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf istio.io/gateway-controller; else printf openshift.io/gateway-controller/v1; fi)")"
 EPP_IMAGE="$(env_default EPP_IMAGE ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c)"
 EPP_SOURCE_REVISION="$(env_default EPP_SOURCE_REVISION b9393d1a9f1d5a72ecd86f8d2b643ab54c2a9b92)"
 EPP_CPU_REQUEST="$(env_default EPP_CPU_REQUEST 20m)"
@@ -73,6 +77,14 @@ SIMULATOR_MEMORY_REQUEST="$(env_default SIMULATOR_MEMORY_REQUEST 128Mi)"
 SIMULATOR_CPU_LIMIT="$(env_default SIMULATOR_CPU_LIMIT 500m)"
 SIMULATOR_MEMORY_LIMIT="$(env_default SIMULATOR_MEMORY_LIMIT 512Mi)"
 PLATFORM_HELPER="$(env_default PLATFORM_HELPER "$SCRIPT_DIR/cold-deploy.sh")"
+SIMULATOR_IMAGE_EVIDENCE_DIR="$(env_default SIMULATOR_IMAGE_EVIDENCE_DIR '')"
+SIMULATOR_IMAGE_PROVENANCE_FILE="$(env_default SIMULATOR_IMAGE_PROVENANCE_FILE '')"
+SIMULATOR_IMAGE_REPOSITORY="$(env_default SIMULATOR_IMAGE_REPOSITORY '')"
+SIMULATOR_DEPLOY_IMAGE_REPOSITORY="$(env_default SIMULATOR_DEPLOY_IMAGE_REPOSITORY '')"
+SIMULATOR_IMAGE_PUSH_TLS_VERIFY="$(env_default SIMULATOR_IMAGE_PUSH_TLS_VERIFY true)"
+ALLOW_INSECURE_IMAGE_PUSH="$(env_default ALLOW_INSECURE_IMAGE_PUSH false)"
+CONTAINER_ENGINE="$(env_default CONTAINER_ENGINE docker)"
+IMAGE_INSPECTOR="$(env_default IMAGE_INSPECTOR skopeo)"
 
 oc() {
   if [[ -z "$KUBE_CONTEXT" ]]; then KUBE_CONTEXT="$(command oc config current-context)"; fi
@@ -85,6 +97,89 @@ pool_gateway_name() {
     "$POOL_B") printf '%s' "$POOL_B_GATEWAY_NAME" ;;
     *) printf 'unknown simulator pool: %s\n' "$1" >&2; return 2 ;;
   esac
+}
+
+verify_kind_platform() {
+  local dir="$1" server ready dep ns name can_i
+  local deployments='[]'
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  server="$(oc whoami --show-server)"
+  ready="$(oc get --raw=/readyz)"
+  [[ "$server" == "$EXPECTED_API_SERVER" && "$ready" == *ok* ]] || {
+    log "Kind platform API gate failed: server=$server readyz=$ready"; return 1;
+  }
+  oc get nodes -o json >"$dir/nodes.json"
+  jq -e 'length>0 and all(.items[];.status.conditions|any(.type=="Ready" and .status=="True"))' \
+    "$dir/nodes.json" >/dev/null || { log 'Kind platform has no Ready node'; return 1; }
+  oc get pods -A -o json | jq '[.items[]|select(.status.phase=="Pending" or .status.phase=="Failed" or .status.phase=="Unknown")|{namespace:.metadata.namespace,name:.metadata.name,phase:.status.phase,reason:.status.reason}]' >"$dir/pending-failed-pods.json"
+  jq -e 'length==0' "$dir/pending-failed-pods.json" >/dev/null || { log 'Kind platform has Pending/Failed/Unknown Pods'; return 1; }
+  for dep in kserve/llmisvc-controller-manager maas-system/maas-controller maas-system/maas-api \
+    maas-system/postgres maas-system/payload-pre-processing maas-system/payload-processing \
+    opendatahub/ai-gateway-controller kuadrant-system/authorino; do
+    ns="${dep%%/*}"; name="${dep#*/}"
+    oc get deployment "$name" -n "$ns" -o json >"$dir/deployment-${ns}-${name}.json" || {
+      log "Kind platform Deployment $ns/$name is missing"; return 1;
+    }
+    jq -e '
+      (.status.observedGeneration//0)>=(.metadata.generation//0) and
+      (.status.readyReplicas//0)==(.spec.replicas//0) and
+      (.spec.replicas//0)>0 and
+      any(.status.conditions[]?;.type=="Available" and .status=="True")
+    ' "$dir/deployment-${ns}-${name}.json" >/dev/null || {
+      log "Kind platform Deployment $ns/$name is not current and Available"; return 1;
+    }
+    deployments="$(jq --arg ns "$ns" --arg name "$name" --argjson current "$(cat "$dir/deployment-${ns}-${name}.json")" \
+      '. + [{namespace:$ns,name:$name,generation:$current.metadata.generation,observedGeneration:$current.status.observedGeneration,readyReplicas:$current.status.readyReplicas,replicas:$current.spec.replicas,images:[$current.spec.template.spec.containers[].image]}]' <<<"$deployments")"
+  done
+  oc get crd llminferenceservices.serving.kserve.io -o json >"$dir/llmisvc-crd.json"
+  jq -e 'any(.spec.versions[];.name=="v1alpha2" and .served==true and .storage==true)' "$dir/llmisvc-crd.json" >/dev/null || {
+    log 'KServe LLMInferenceService CRD does not serve/store v1alpha2'; return 1;
+  }
+  oc get llminferenceserviceconfig "$SCHEDULER_CONFIG_NAME" -n "$SCHEDULER_CONFIG_NAMESPACE" -o json >"$dir/scheduler-config.json"
+  oc get certificate llmisvc-serving-cert -n kserve -o json >"$dir/kserve-webhook-certificate.json"
+  jq -e 'any(.status.conditions[]?;.type=="Ready" and .status=="True")' "$dir/kserve-webhook-certificate.json" >/dev/null || {
+    log 'KServe webhook serving certificate is not Ready'; return 1;
+  }
+  oc get endpointslices -n kserve -l kubernetes.io/service-name=llmisvc-webhook-server-service -o json >"$dir/kserve-webhook-endpointslices.json"
+  jq -e 'any(.items[]?;.endpoints|any(.[]?;.conditions.ready==true and (.addresses|length)>0))' "$dir/kserve-webhook-endpointslices.json" >/dev/null || {
+    log 'KServe admission/conversion webhook Service has no ready endpoint'; return 1;
+  }
+  oc get aitenant models-as-a-service -n ai-tenants -o json >"$dir/maas-bootstrap-aitenant.json"
+  jq -e 'any(.status.conditions[]?;.type=="Ready" and .status=="True")' "$dir/maas-bootstrap-aitenant.json" >/dev/null || {
+    log 'MaaS default bootstrap AITenant is not Ready'; return 1;
+  }
+  oc get maastenantconfig default-tenant -n "$MAAS_TENANT_CONFIG_NAMESPACE" -o json >"$dir/maas-default-tenant-config.json"
+  can_i="$(oc auth can-i get leases --as=system:serviceaccount:maas-system:maas-controller -n maas-system)"
+  [[ "$can_i" == yes ]] || { log 'MaaS controller cannot read its leader-election Lease'; return 1; }
+  printf '%s\n' "$can_i" >"$dir/maas-controller-lease-rbac-can-i.txt"
+  jq -n --arg server "$server" --arg readyz "$ready" --argjson deployments "$deployments" \
+    '{status:"PASS",clusterPlatform:"kind",server:$server,readyz:$readyz,failedGates:0,deployments:$deployments,actualLlmInferenceServiceAPI:{group:"serving.kserve.io",version:"v1alpha2",controller:"kserve/llmisvc-controller-manager",webhookEndpointReady:true},maasControllerLeaseRBAC:true,inferenceTrafficSent:false}' \
+    >"$dir/platform-gate-summary.json"
+  log 'Kind KServe/MaaS/AIGC/Authorino platform gate PASS; controller, scheduler config, v1alpha2 API, webhook endpoint, default MaaS tenant and lease RBAC are verified'
+}
+
+verify_kind_capacity() {
+  local dir="$EVIDENCE_DIR/capacity-preflight" pending_count ready_nodes status baseline
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  oc get nodes -o json >"$dir/nodes.json"
+  oc describe nodes >"$dir/node-capacity-and-allocated-requests.txt"
+  oc get pods -A -o json | jq '[.items[]|select(.status.phase=="Pending" or .status.phase=="Failed" or .status.phase=="Unknown")|{namespace:.metadata.namespace,name:.metadata.name,phase:.status.phase,reason:.status.reason,nodeName:.spec.nodeName}]' >"$dir/pending-failed-pods.json"
+  pending_count="$(jq 'length' "$dir/pending-failed-pods.json")"
+  ready_nodes="$(jq '[.items[]|select(.status.conditions|any(.type=="Ready" and .status=="True"))]|length' "$dir/nodes.json")"
+  ((ready_nodes>0)) || { log 'Kind capacity gate has no Ready nodes'; return 1; }
+  [[ "$pending_count" == 0 ]] || { log "Kind capacity gate has $pending_count Pending/Failed/Unknown Pods"; return 1; }
+  if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then
+    status=preflight-pass-reduced-dev; baseline=WAIVED_FOR_KIND_DEV_SMOKE
+  else
+    status=preflight-pass; baseline=REQUIRED
+  fi
+  jq -n --arg status "$status" --arg baseline "$baseline" --arg profile "$RESOURCE_PROFILE" \
+    --argjson readyNodes "$ready_nodes" --argjson pendingPods "$pending_count" \
+    '{status:$status,clusterPlatform:"kind",resourceProfile:$profile,capacityBaseline:$baseline,readyNodes:$readyNodes,pendingPods:$pendingPods,workerSizeBaselineEnforced:($profile!="reduced-dev"),inferenceTrafficSent:false}' \
+    >"$dir/report.json"
+  log "Kind capacity preflight PASS: readyNodes=$ready_nodes pendingPods=$pending_count baseline=$baseline; allocated requests captured"
 }
 
 verify_pool_gateways_ready() {
@@ -164,14 +259,21 @@ for bin in oc jq awk sha256sum sed timeout python3; do
 done
 python3 -c 'import yaml' >/dev/null 2>&1 || { printf 'PyYAML is required for sanitized EPP Pod YAML evidence\n' >&2; exit 2; }
 [[ "$MODE" =~ ^(build|apply|verify|collect|cleanup)$ ]] || { printf 'unsupported mode: %s\n' "$MODE" >&2; exit 2; }
+[[ "$SERVING_POOL_SELECTION" == both || "$SERVING_POOL_SELECTION" == pool-a || "$SERVING_POOL_SELECTION" == pool-b ]] || {
+  printf 'SERVING_POOL_SELECTION must be both, pool-a, or pool-b\n' >&2; exit 2;
+}
+[[ "$CLUSTER_PLATFORM" == openshift || "$CLUSTER_PLATFORM" == kind ]] || { printf 'GRID_LLMD_CLUSTER_PLATFORM must be openshift or kind\n' >&2; exit 2; }
+if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+  [[ "$CLUSTER_ENV" == kind ]] || { printf 'GRID_LLMD_CLUSTER_PLATFORM=kind requires CLUSTER_ENV=kind\n' >&2; exit 2; }
+fi
 [[ -n "$EXPECTED_API_SERVER" ]] || { printf 'EXPECTED_API_SERVER is required\n' >&2; exit 2; }
 [[ -n "$KUBE_CONTEXT" ]] || { printf 'KUBE_CONTEXT is required for non-plan serving pool modes\n' >&2; exit 2; }
 [[ "$RESOURCE_PROFILE" == strict || "$RESOURCE_PROFILE" == reduced-dev ]] || {
   printf 'RESOURCE_PROFILE must be strict or reduced-dev\n' >&2; exit 2;
 }
 if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then
-  [[ "$CLUSTER_ENV" == ephemeral-dev ]] || {
-    printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev\n' >&2
+  [[ "$CLUSTER_ENV" == ephemeral-dev || ("$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind) ]] || {
+    printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev or the explicit Kind platform\n' >&2
     exit 2
   }
 fi
@@ -203,13 +305,22 @@ fi
 [[ "$SIMULATOR_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { printf 'SIMULATOR_SOURCE_REVISION must be a full Git SHA\n' >&2; exit 2; }
 [[ "$EPP_IMAGE" == *@sha256:* ]] || { printf 'EPP_IMAGE must use an immutable sha256 digest\n' >&2; exit 2; }
 [[ "$EPP_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { printf 'EPP_SOURCE_REVISION must be a full Git SHA\n' >&2; exit 2; }
-[[ "$EXTPROC_IMAGE" == *@sha256:* ]] || { printf 'EXTPROC_IMAGE must use an immutable sha256 digest\n' >&2; exit 2; }
-for source_revision in "$EXTPROC_SOURCE_REVISION" "$GITOPS_SOURCE_REVISION" "$GRID_GATEWAY_SOURCE_REVISION" "$ODH_GRID_OPERATOR_SOURCE_REVISION" "$MAAS_SOURCE_REVISION"; do
+if [[ -n "$EXTPROC_IMAGE" ]]; then
+  [[ "$EXTPROC_IMAGE" == *@sha256:* ]] || { printf 'EXTPROC_IMAGE must use an immutable sha256 digest when supplied\n' >&2; exit 2; }
+fi
+for source_revision in "$EXTPROC_SOURCE_REVISION" "$GRID_GATEWAY_SOURCE_REVISION" "$ODH_GRID_OPERATOR_SOURCE_REVISION" "$MAAS_SOURCE_REVISION"; do
   [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || { printf 'all declared source revisions must be full Git SHAs\n' >&2; exit 2; }
 done
+if [[ "$CLUSTER_PLATFORM" != kind ]]; then
+  [[ "$GITOPS_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { printf 'GITOPS_SOURCE_REVISION must be a full Git SHA outside Kind\n' >&2; exit 2; }
+fi
 
 verify_source_lock_revision() {
   local component="$1" revision="$2" locked_revision
+  if [[ "$CLUSTER_PLATFORM" == kind && "$component" == gitops ]]; then
+    printf 'GitOps is not used by the existing-platform Kind serving path; source pin is excluded\n' >&2
+    return 0
+  fi
   locked_revision="$(jq -er --arg component "$component" '.components[$component].resolved_sha // empty' "$SOURCE_LOCKS_FILE" 2>/dev/null || true)"
   [[ -n "$locked_revision" && "$locked_revision" == "$revision" ]] || {
     printf 'declared %s source revision does not match SOURCE_LOCKS_FILE\n' "$component" >&2
@@ -359,6 +470,10 @@ verify_namespace() {
 verify_platform() {
   local dir="${1:-$EVIDENCE_DIR/platform-preflight}" expected_api_server="$EXPECTED_API_SERVER"
   CURRENT_PHASE=platform-readiness
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    verify_kind_platform "$dir"
+    return
+  fi
   [[ -x "$PLATFORM_HELPER" ]] || { log "platform verifier is missing or not executable: $PLATFORM_HELPER"; return 1; }
   if ! CLUSTER_ENV="$CLUSTER_ENV" RESOURCE_PROFILE="$RESOURCE_PROFILE" ALLOW_INSECURE_DEV_API="$ALLOW_INSECURE_DEV_API" \
     EXPECTED_API_SERVER="$expected_api_server" COLD_DEPLOY_MODE=verify-platform \
@@ -378,6 +493,10 @@ verify_capacity_mode() {
   local dir="$EVIDENCE_DIR/capacity-preflight" expected_status=preflight-pass expected_baseline=REQUIRED
   local args=(--mode preflight --resource-profile "$RESOURCE_PROFILE" --expected-api-server "$EXPECTED_API_SERVER")
   CURRENT_PHASE=capacity-preflight
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    verify_kind_capacity
+    return
+  fi
   [[ -x "$PLATFORM_HELPER" ]] || { log "capacity preflight helper is missing or not executable: $PLATFORM_HELPER"; return 1; }
   if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then
     expected_status=preflight-pass-reduced-dev
@@ -510,6 +629,19 @@ record_llmisvc_transport_state() {
 configure_llmisvc_transport() {
   local current patch
   CURRENT_PHASE=llmisvc-transport-config
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    [[ "$LLMISVC_TLS_ENABLED" == false ]] || { log 'Kind serving probe currently requires the KServe runtime TLS setting to be disabled for the HTTP simulator backend'; return 1; }
+    oc get configmap inferenceservice-config -n kserve -o json >"$EVIDENCE_DIR/kserve-inferenceservice-config.json"
+    jq -e '(.data.ingress|fromjson) as $ingress | ($ingress.enableLLMInferenceServiceTLS//false)==false and ($ingress.urlScheme//"http")=="http"' \
+      "$EVIDENCE_DIR/kserve-inferenceservice-config.json" >/dev/null || {
+      log 'KServe inferenceservice-config does not resolve to HTTP with LLMInferenceService TLS disabled'; return 1;
+    }
+    jq -n --arg config "kserve/inferenceservice-config" --argjson tls "$LLMISVC_TLS_ENABLED" \
+      '{clusterPlatform:"kind",configurationResource:$config,effectiveWorkloadTLS:$tls,clusterWideMutation:false,reason:"upstream Kind KServe uses its inferenceservice-config; no DSCI exists"}' \
+      >"$EVIDENCE_DIR/kind-serving-transport.json"
+    log 'Verified Kind KServe inferenceservice-config for HTTP simulator serving; no DSCI or shared transport mutation is used'
+    return
+  fi
   capture_llmisvc_transport_state
   current="$(read_effective_llmisvc_tls)"
   if [[ "$current" != "$LLMISVC_TLS_ENABLED" ]]; then
@@ -536,6 +668,10 @@ configure_llmisvc_transport() {
 verify_llmisvc_transport() {
   local dsc_value
   CURRENT_PHASE=llmisvc-transport-verification
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    configure_llmisvc_transport
+    return
+  fi
   capture_llmisvc_transport_state
   dsc_value="$(read_effective_llmisvc_tls)"
   [[ "$dsc_value" == "$LLMISVC_TLS_ENABLED" ]] || {
@@ -548,23 +684,44 @@ verify_llmisvc_transport() {
 }
 
 ensure_no_llmisvc_before_transport_apply() {
-  local count
+  local count inventory task_owned_count
   CURRENT_PHASE=llmisvc-transport-ownership-gate
+  inventory="$EVIDENCE_DIR/llmisvc-transport-workloads-before-apply.json"
   oc get llminferenceservices.serving.kserve.io -A -o json | jq '[.items[]|{
     namespace:.metadata.namespace,name:.metadata.name,
     qualificationRun:.metadata.labels["praxis.fast/qualification-run"]
-  }]' >"$EVIDENCE_DIR/llmisvc-transport-workloads-before-apply.json"
-  count="$(jq 'length' "$EVIDENCE_DIR/llmisvc-transport-workloads-before-apply.json")"
-  [[ "$count" == 0 ]] || {
-    log "refusing to change cluster-wide LLMInferenceService TLS while $count LLMInferenceService resources already exist; inspect/clean only exact task-owned resources first"
-    return 1
-  }
-  log 'No existing LLMInferenceServices; safe to change the supported cluster-wide DSCI transport field for this run'
+  }]' >"$inventory"
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    count="$(jq --arg ns "$NAMESPACE" --arg run "$RUN_LABEL" '[.[]|select(.namespace!=$ns or .qualificationRun!=$run)]|length' "$inventory")"
+    task_owned_count="$(jq --arg ns "$NAMESPACE" --arg run "$RUN_LABEL" '[.[]|select(.namespace==$ns and .qualificationRun==$run)]|length' "$inventory")"
+    [[ "$count" == 0 ]] || {
+      log "refusing to proceed with $count LLMInferenceServices outside this task namespace/run"; return 1;
+    }
+  else
+    count="$(jq 'length' "$inventory")"
+    [[ "$count" == 0 ]] || {
+      log "refusing to change cluster-wide LLMInferenceService TLS while $count LLMInferenceService resources already exist; inspect/clean only exact task-owned resources first"
+      return 1
+    }
+  fi
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    if [[ "$task_owned_count" == 0 ]]; then
+      log 'No existing LLMInferenceServices; Kind KServe transport will be read from its current inferenceservice-config without cluster-wide mutation'
+    else
+      log "Found $task_owned_count LLMInferenceServices owned by this task/run; Kind KServe transport remains read-only with no cluster-wide mutation"
+    fi
+  else
+    log 'No existing LLMInferenceServices; safe to change the supported cluster-wide DSCI transport field for this run'
+  fi
 }
 
 verify_post_transport_platform_gate() {
   local dir="$EVIDENCE_DIR/platform-post-transport" gate_ok=false failed_phase=post-transport-platform-readiness
   CURRENT_PHASE=post-transport-platform-readiness
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    verify_kind_platform "$dir"
+    return
+  fi
   if verify_platform "$dir" && \
     jq -e 'any(.[];.type=="KserveReady" and .status=="True")' "$dir/rhoai-readiness.json" >/dev/null && \
     jq -e '
@@ -593,6 +750,13 @@ verify_post_transport_platform_gate() {
 restore_llmisvc_transport() {
   local current workload_count was_set original_value resolved current_uid saved_uid generation observed patch
   CURRENT_PHASE=llmisvc-transport-restore
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    jq -n --arg run "$RUN_LABEL" --arg server "$EXPECTED_API_SERVER" \
+      '{runLabel:$run,apiServer:$server,clusterPlatform:"kind",restored:true,clusterWideMutation:false,reason:"no DataScienceCluster exists in the upstream Kind topology"}' \
+      >"$EVIDENCE_DIR/kind-serving-transport-restore.json"
+    log 'Kind has no DSCI serving-TLS field to restore; shared platform state was not mutated'
+    return
+  fi
   [[ -f "$TRANSPORT_STATE_FILE" ]] || { log 'No saved LLMInferenceService transport state; nothing to restore'; return 0; }
   jq -e --arg run "$RUN_LABEL" '.runLabel==$run' "$TRANSPORT_STATE_FILE" >/dev/null || {
     log 'refusing to restore LLMInferenceService transport state from a different task run'
@@ -675,6 +839,7 @@ write_invocation() {
 - Capacity baseline disposition: $(if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then printf 'WAIVED_FOR_EPHEMERAL_DEV_SMOKE'; else printf 'REQUIRED'; fi)
 - API TLS mode: recorded in api-access-summary.txt; no token or kubeconfig was recorded
 - Task namespace/run: $NAMESPACE / $RUN_LABEL
+- Serving-pool selection: $SERVING_POOL_SELECTION
 - ExtProc checkout: $extproc_branch at $extproc_head; existing dirty worktree preserved
 - Serving helper SHA-256: $helper_sha
 - Run-specific source lock: $SOURCE_LOCKS_MD (sha256 $source_lock_sha)
@@ -683,7 +848,7 @@ write_invocation() {
 - Simulator OCI source label: $SIMULATOR_OCI_SOURCE_URL
 - EPP image: $EPP_IMAGE
 - EPP source revision: $EPP_SOURCE_REVISION
-- ExtProc image/source: $EXTPROC_IMAGE / $EXTPROC_SOURCE_REVISION
+- ExtProc runtime: $(if [[ -n "$EXTPROC_IMAGE" ]]; then printf 'image pin supplied but not deployed by this serving-pool helper; source lock revision for later phase: %s' "$EXTPROC_SOURCE_REVISION"; else printf 'not part of the serving-pool phase; source lock revision for later deployment: %s' "$EXTPROC_SOURCE_REVISION"; fi)
 - GitOps source revision: $GITOPS_SOURCE_REVISION
 - Grid Gateway source revision: $GRID_GATEWAY_SOURCE_REVISION
 - ODH Grid operator source revision: $ODH_GRID_OPERATOR_SOURCE_REVISION
@@ -717,9 +882,9 @@ Captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 | Component | Immutable image or source target | Source relationship | State |
 |---|---|---|---|
-| Praxis ExtProc | $EXTPROC_IMAGE | OCI revision matches declared ExtProc source $EXTPROC_SOURCE_REVISION | Available; deployment is a later phase |
+| Praxis ExtProc | $(if [[ -n "$EXTPROC_IMAGE" ]]; then printf '%s' "$EXTPROC_IMAGE"; else printf 'not supplied to serving-pool phase'; fi) | Source lock revision for later deployment: $EXTPROC_SOURCE_REVISION | Not deployed by this helper; build and verify the qualification image before Gateway traffic |
 | llm-d EPP | $EPP_IMAGE | Release provenance maps to source $EPP_SOURCE_REVISION | Available; deployed into pool graphs only in apply mode |
-| llm-d-sim | $sim_target | BuildConfig pins the Git ref; final image must carry OCI source label $SIMULATOR_OCI_SOURCE_URL, matching revision, and amd64 metadata | $sim_state |
+| llm-d-sim | $sim_target | $(if [[ "$CLUSTER_PLATFORM" == kind ]]; then printf 'shared Docker/Podman builder verifies registry digest, OCI source/revision/context labels and amd64 metadata'; else printf 'BuildConfig pins the Git ref; final image must carry OCI source label %s, matching revision, and amd64 metadata' "$SIMULATOR_OCI_SOURCE_URL"; fi) | $sim_state |
 AVAILABILITY
   chmod 0600 "$EVIDENCE_DIR/image-availability.md"
 }
@@ -838,6 +1003,25 @@ image_digest_from_tag() {
 
 verify_simulator_image_pin() {
   local requested="$SIMULATOR_IMAGE"
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    [[ "$requested" == *@sha256:* && -s "$SIMULATOR_IMAGE_PROVENANCE_FILE" ]] || {
+      log 'Kind simulator image must be digest-pinned and have verified shared-builder provenance'; return 1;
+    }
+    jq -e --arg image "$requested" --arg revision "$SIMULATOR_SOURCE_REVISION" --arg source "$SIMULATOR_OCI_SOURCE_URL" \
+      --slurpfile locks "$SOURCE_LOCKS_FILE" \
+      '.verified==true and .image==$image and .source_sha==$revision and .source_sha==$locks[0].components["llm-d-sim"].resolved_sha and .build_context_sha256==$locks[0].components["llm-d-sim"].build_context_sha256 and .oci_revision_label==$revision and .oci_source_label==$source and .build_context_sha256==.oci_build_context_label' \
+      "$SIMULATOR_IMAGE_PROVENANCE_FILE" >/dev/null || { log 'Kind simulator source/image provenance does not match this source lock'; return 1; }
+    jq -e --arg image "$requested" --arg revision "$SIMULATOR_SOURCE_REVISION" --slurpfile locks "$SOURCE_LOCKS_FILE" \
+      '.source_sha==$revision and .deployed_image==$image and .build_context_sha256==$locks[0].components["llm-d-sim"].build_context_sha256 and .build_platform=="linux/amd64"' \
+      "$(dirname "$SIMULATOR_IMAGE_PROVENANCE_FILE")/build-metadata-llm-d-sim.json" >/dev/null || {
+      log 'Kind simulator image build metadata does not match the source lock or amd64 platform'; return 1;
+    }
+    cp "$SIMULATOR_IMAGE_PROVENANCE_FILE" "$EVIDENCE_DIR/simulator-image-provenance.json"
+    printf '%s\n' "$SIMULATOR_IMAGE" >"$EVIDENCE_DIR/simulator-image-pin.txt"
+    write_image_availability
+    log "Kind simulator artifact qualified from the source-locked build: $SIMULATOR_IMAGE"
+    return
+  fi
   image_digest_from_tag
   if [[ -n "$requested" && "$requested" != "$SIMULATOR_IMAGE" ]]; then
     log "requested simulator image does not match the qualified task ImageStream digest: requested=$requested qualified=$SIMULATOR_IMAGE"
@@ -872,6 +1056,22 @@ wait_for_build_terminal() {
 build_simulator() {
   local tag_exists=false last_version build_name oc_bin phase build_deadline_seconds
   CURRENT_PHASE=simulator-build
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+    [[ -n "$SIMULATOR_IMAGE_EVIDENCE_DIR" && -n "$SIMULATOR_IMAGE_REPOSITORY" && -n "$SIMULATOR_DEPLOY_IMAGE_REPOSITORY" ]] || {
+      log 'Kind simulator build requires separate evidence, push repository, and in-cluster deployment repository inputs'; return 1;
+    }
+    [[ ! -e "$SIMULATOR_IMAGE_PROVENANCE_FILE" ]] || { log 'Kind simulator provenance already exists; refusing to overwrite a prior build attempt'; return 1; }
+    SIMULATOR_IMAGE="$(env COMPONENT=llm-d-sim SOURCE_COMPONENT=llm-d-sim SOURCE_LOCKS_FILE="$SOURCE_LOCKS_FILE" \
+      IMAGE_REPOSITORY="$SIMULATOR_IMAGE_REPOSITORY" DEPLOY_IMAGE_REPOSITORY="$SIMULATOR_DEPLOY_IMAGE_REPOSITORY" \
+      E2E_RUN_ID="$RUN_LABEL" EVIDENCE_DIR="$SIMULATOR_IMAGE_EVIDENCE_DIR" DOCKERFILE=Dockerfile \
+      CONTAINER_ENGINE="$CONTAINER_ENGINE" IMAGE_INSPECTOR="$IMAGE_INSPECTOR" \
+      IMAGE_PUSH_TLS_VERIFY="$SIMULATOR_IMAGE_PUSH_TLS_VERIFY" ALLOW_INSECURE_IMAGE_PUSH="$ALLOW_INSECURE_IMAGE_PUSH" \
+      CLUSTER_ENV=kind OCI_SOURCE_URL="$SIMULATOR_OCI_SOURCE_URL" \
+      bash "$SCRIPT_DIR/../shared/build_and_push.sh" 2>"$EVIDENCE_DIR/simulator-image-builder-stderr.txt")"
+    SIMULATOR_IMAGE_PROVENANCE_FILE="$SIMULATOR_IMAGE_EVIDENCE_DIR/image-provenance-llm-d-sim.json"
+    verify_simulator_image_pin
+    return
+  fi
   write_build_resources
   oc apply --server-side --dry-run=server --field-manager=grid-llmd-e2e -f "$EVIDENCE_DIR/simulator-imagestream.yaml" -o json >"$EVIDENCE_DIR/imagestream-server-dry-run.json"
   oc apply --server-side --dry-run=server --field-manager=grid-llmd-e2e -f "$EVIDENCE_DIR/simulator-buildconfig.yaml" -o json >"$EVIDENCE_DIR/buildconfig-server-dry-run.json"
@@ -974,7 +1174,7 @@ make_task_scheduler_config() {
   jq --arg namespace "$NAMESPACE" --arg run "$RUN_LABEL" --arg image "$EPP_IMAGE" \
      --arg cpuReq "$EPP_CPU_REQUEST" --arg memReq "$EPP_MEMORY_REQUEST" \
      --arg cpuLimit "$EPP_CPU_LIMIT" --arg memLimit "$EPP_MEMORY_LIMIT" \
-     --arg source "$SCHEDULER_CONFIG_NAME" '
+     --arg source "$SCHEDULER_CONFIG_NAME" --arg clusterPlatform "$CLUSTER_PLATFORM" '
     del(.status,.metadata.uid,.metadata.resourceVersion,.metadata.generation,.metadata.creationTimestamp,.metadata.managedFields,.metadata.finalizers,.metadata.ownerReferences)
     | .metadata.namespace=$namespace
     | .metadata.labels=(.metadata.labels // {})
@@ -987,6 +1187,10 @@ make_task_scheduler_config() {
     | (.spec.router.scheduler.template.containers[]|select(.name=="main")|.image)=$image
     | (.spec.router.scheduler.template.containers[]|select(.name=="main")|.resources)={requests:{cpu:$cpuReq,memory:$memReq},limits:{cpu:$cpuLimit,memory:$memLimit}}
     | (.spec.router.scheduler.template.containers[]|select(.name=="main")|.command) |= map(select(contains("model-server-metrics-scheme")|not))
+    | if $clusterPlatform=="kind" then
+        (.spec.router.scheduler.template.containers[]|select(.name=="main")|.command) |=
+          (map(select(.!="--secure-serving=false"))+["--secure-serving=false"])
+      else . end
   ' "$source_file" >"$target_file"
   chmod 0600 "$source_file" "$target_file"
   jq -e --arg image "$EPP_IMAGE" --arg cpu "$EPP_CPU_REQUEST" --arg mem "$EPP_MEMORY_REQUEST" '
@@ -1233,6 +1437,18 @@ apply_one_pool() {
   log "$pool LLMInferenceService and all owned Deployments are Ready"
 }
 
+verify_pool_a_ready_before_pool_b() {
+  local snapshot="$EVIDENCE_DIR/pool-a-before-pool-b.json"
+  CURRENT_PHASE='pool-b-dependency-gate'
+  oc get llminferenceservice "$POOL_A" -n "$NAMESPACE" -o json >"$snapshot"
+  verify_task_ownership llminferenceservice "$POOL_A" "$NAMESPACE"
+  jq -e --arg run "$RUN_LABEL" '
+    .metadata.labels["praxis.fast/qualification-run"]==$run and
+    .status.observedGeneration==.metadata.generation and
+    any(.status.conditions[]?;.type=="Ready" and .status=="True" and .observedGeneration==.metadata.generation)
+  ' "$snapshot" >/dev/null || { log 'Pool B cannot be applied before the run-owned Pool A LLMInferenceService is current and Ready'; return 1; }
+}
+
 capture_pool_membership() {
   local pool="$1"
   oc get pods -n "$NAMESPACE" -o json | jq --arg pool "$pool" '[.items[]|select(.metadata.labels["praxis.fast/simulator-pool"]==$pool)|{
@@ -1285,12 +1501,12 @@ verify_pool_graph() {
     .spec.simulatorControlSha256==$hash
   ' "$snapshot" >/dev/null || { log "$pool LLMInferenceService generation/readiness/config/image/control checks failed"; return 1; }
   jq -e --arg pool "$pool" --arg gateway "$gateway_name" --arg gatewayNamespace "$LLMISVC_GATEWAY_NAMESPACE" \
-    --arg sectionName "$LLMISVC_GATEWAY_SECTION_NAME" '
+    --arg sectionName "$LLMISVC_GATEWAY_SECTION_NAME" --arg controllerName "$KSERVE_ROUTE_CONTROLLER_NAME" '
     length>=1 and any(.[]|select(.metadata.name==($pool+"-kserve-route")); . as $route |
       any(.spec.parentRefs[]?;.name==$gateway and (.namespace//.metadata.namespace)==$gatewayNamespace and .sectionName==$sectionName) and
       any(.spec.rules[]?.backendRefs[]?;.kind=="InferencePool" and ((.group//"")=="inference.networking.k8s.io" or (.group//"")=="inference.networking.x-k8s.io") and .name==($pool+"-inference-pool")) and
       any(.status.parents[]?;
-        .controllerName=="openshift.io/gateway-controller/v1" and
+        .controllerName==$controllerName and
         .parentRef.name==$gateway and (.parentRef.namespace//$gatewayNamespace)==$gatewayNamespace and
         any(.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$route.metadata.generation) and
         any(.conditions[]?;.type=="ResolvedRefs" and .status=="True" and .observedGeneration==$route.metadata.generation)
@@ -1558,15 +1774,34 @@ case "$MODE" in
     verify_simulator_image_pin
     [[ "$SIMULATOR_IMAGE" == *@sha256:* ]] || { log 'SIMULATOR_IMAGE is not digest-pinned'; exit 1; }
     make_task_scheduler_config
-    write_control_configmap "$POOL_A" "$POOL_A_ORACLE"
-    write_control_configmap "$POOL_B" "$POOL_B_ORACLE"
-    verify_task_ownership configmap "$POOL_A-simulator-control" "$NAMESPACE"
-    verify_task_ownership configmap "$POOL_B-simulator-control" "$NAMESPACE"
     oc apply --server-side --field-manager=grid-llmd-e2e -f "$EVIDENCE_DIR/task-scheduler-config.json" >"$EVIDENCE_DIR/scheduler-config-apply.txt"
     log "Applied owned scheduler config $NAMESPACE/$SCHEDULER_CONFIG_NAME; source config in $SCHEDULER_CONFIG_NAMESPACE was read only"
-    apply_one_pool "$POOL_A" "$POOL_A_ORACLE"
-    apply_one_pool "$POOL_B" "$POOL_B_ORACLE"
-    verify_all
+    case "$SERVING_POOL_SELECTION" in
+      pool-a)
+        write_control_configmap "$POOL_A" "$POOL_A_ORACLE"
+        verify_task_ownership configmap "$POOL_A-simulator-control" "$NAMESPACE"
+        apply_one_pool "$POOL_A" "$POOL_A_ORACLE"
+        capture_pool "$POOL_A"
+        verify_pool_graph "$POOL_A" "$POOL_A_ORACLE"
+        log 'Pool A setup graph is ready; Pool B was not created so its authorized setup probe remains a separate gate'
+        ;;
+      pool-b)
+        verify_pool_a_ready_before_pool_b
+        write_control_configmap "$POOL_B" "$POOL_B_ORACLE"
+        verify_task_ownership configmap "$POOL_B-simulator-control" "$NAMESPACE"
+        apply_one_pool "$POOL_B" "$POOL_B_ORACLE"
+        verify_all
+        ;;
+      both)
+        write_control_configmap "$POOL_A" "$POOL_A_ORACLE"
+        write_control_configmap "$POOL_B" "$POOL_B_ORACLE"
+        verify_task_ownership configmap "$POOL_A-simulator-control" "$NAMESPACE"
+        verify_task_ownership configmap "$POOL_B-simulator-control" "$NAMESPACE"
+        apply_one_pool "$POOL_A" "$POOL_A_ORACLE"
+        apply_one_pool "$POOL_B" "$POOL_B_ORACLE"
+        verify_all
+        ;;
+    esac
     ;;
   verify)
     verify_platform
@@ -1585,19 +1820,25 @@ esac
 
 if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then
   RESULT_LABEL='DEV-SMOKE / REDUCED-CAPACITY'
-  CAPACITY_BASELINE=WAIVED_FOR_EPHEMERAL_DEV_SMOKE
+  if [[ "$CLUSTER_PLATFORM" == kind ]]; then CAPACITY_BASELINE=WAIVED_FOR_KIND_DEV_SMOKE; else CAPACITY_BASELINE=WAIVED_FOR_EPHEMERAL_DEV_SMOKE; fi
 else
   RESULT_LABEL='STRICT / FULL-CAPACITY'
   CAPACITY_BASELINE=REQUIRED
 fi
-jq -n --arg mode "$MODE" --arg namespace "$NAMESPACE" --arg evidence "$EVIDENCE_DIR" \
+jq -n --arg mode "$MODE" --arg namespace "$NAMESPACE" --arg evidence "$EVIDENCE_DIR" --arg poolSelection "$SERVING_POOL_SELECTION" \
   --arg resourceProfile "$RESOURCE_PROFILE" --arg capacityBaseline "$CAPACITY_BASELINE" \
   --arg resultLabel "$RESULT_LABEL" \
-  '{mode:$mode,status:"complete",namespace:$namespace,evidenceDirectory:$evidence,resourceProfile:$resourceProfile,resultLabel:$resultLabel,capacityBaseline:$capacityBaseline,inferenceTrafficSent:false}' \
+  '{mode:$mode,status:"complete",namespace:$namespace,servingPoolSelection:$poolSelection,evidenceDirectory:$evidence,resourceProfile:$resourceProfile,resultLabel:$resultLabel,capacityBaseline:$capacityBaseline,inferenceTrafficSent:false}' \
   >"$EVIDENCE_DIR/RESULT.json"
 case "$MODE" in
   build) FINAL_STATUS='SIMULATOR_IMAGE_BUILT; serving pools not applied' ;;
-  apply|verify) FINAL_STATUS='SERVING_GRAPH_READY; traffic not qualified' ;;
+  apply)
+    case "$SERVING_POOL_SELECTION" in
+      pool-a) FINAL_STATUS='POOL_A_GRAPH_READY; Pool B and setup probe not run' ;;
+      pool-b|both) FINAL_STATUS='SERVING_GRAPH_READY; traffic not qualified' ;;
+    esac
+    ;;
+  verify) FINAL_STATUS='SERVING_GRAPH_READY; traffic not qualified' ;;
   collect) FINAL_STATUS=DIAGNOSTICS_COLLECTED ;;
   cleanup) FINAL_STATUS=TASK_OWNED_SERVING_RESOURCES_CLEANED ;;
 esac

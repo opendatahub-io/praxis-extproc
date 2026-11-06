@@ -31,6 +31,8 @@ SOURCE_DEFAULTS = {
     "kuadrant": "v1.4.2",
     "epp": "main",
     "llm-d-sim": "main",
+    "kserve": "master",
+    "payload-processing": "main",
 }
 REF_ENV = {
     "aigc": "AIGC_REF",
@@ -43,6 +45,8 @@ REF_ENV = {
     "kuadrant": "KUADRANT_REF",
     "epp": "EPP_REF",
     "llm-d-sim": "LLM_D_SIM_REF",
+    "kserve": "KSERVE_REF",
+    "payload-processing": "PAYLOAD_PROCESSING_REF",
 }
 REPOSITORY_ENV = {
     "aigc": "AIGC_REPOSITORY_URL",
@@ -55,6 +59,8 @@ REPOSITORY_ENV = {
     "kuadrant": "KUADRANT_REPOSITORY_URL",
     "epp": "EPP_REPOSITORY_URL",
     "llm-d-sim": "LLM_D_SIM_REPOSITORY_URL",
+    "kserve": "KSERVE_REPOSITORY_URL",
+    "payload-processing": "PAYLOAD_PROCESSING_REPOSITORY_URL",
 }
 CALLER_DIR_ENV = {
     "aigc": "AIGC_SOURCE_DIR",
@@ -67,6 +73,8 @@ CALLER_DIR_ENV = {
     "kuadrant": "KUADRANT_SOURCE_DIR",
     "epp": "EPP_SOURCE_DIR",
     "llm-d-sim": "LLM_D_SIM_SOURCE_DIR",
+    "kserve": "KSERVE_SOURCE_DIR",
+    "payload-processing": "PAYLOAD_PROCESSING_SOURCE_DIR",
 }
 
 
@@ -166,24 +174,57 @@ def hash_caller_tree(source_dir: Path | None) -> tuple[str, str, str, str, str]:
     )
 
 
-def selected_components(scenario: str, platform_manifests: bool) -> list[str]:
+def selected_components(
+    scenario: str,
+    platform_manifests: bool,
+    include_kserve: bool = False,
+    include_aigc: bool = False,
+) -> list[str]:
     if scenario == "grid-maas":
         components = ["aigc", "maas", "extproc", "praxis-ai", "grid", "grid-operator", "kuadrant", "epp", "llm-d-sim"]
+    elif scenario == "grid-llmd-kind":
+        # This native Kind lane needs AIGC's tenant payload processor,
+        # Kuadrant/Authorino authorization, and the upstream KServe controller.
+        # It does not qualify the AIGC ExternalModel translation lane.
+        components = [
+            "aigc",
+            "maas",
+            "extproc",
+            "praxis-ai",
+            "grid",
+            "grid-operator",
+            "kuadrant",
+            "epp",
+            "llm-d-sim",
+            "kserve",
+            "payload-processing",
+        ]
     else:
-        # MaaS remains a required RHOAI platform prerequisite for the native
-        # Grid lane, even though the AIGC/ExternalModel front door is optional.
+        # MaaS is required by the native Grid lane; the optional AIGC front door
+        # is resolved only for scenarios that exercise its tenant components.
         components = ["maas", "extproc", "praxis-ai", "grid", "grid-operator", "epp", "llm-d-sim"]
-    if platform_manifests:
+    if scenario != "grid-llmd-kind" and platform_manifests and "gitops" not in components:
         components.append("gitops")
+    if include_aigc and "aigc" not in components:
+        components.insert(0, "aigc")
+    if include_kserve and "kserve" not in components:
+        components.append("kserve")
     return components
 
 
-def source_ref(component: str, mode: str, explicit: str | None, locked: dict) -> tuple[str, str | None]:
-    lock_entry = locked["components"].get(component)
+def source_ref(
+    component: str,
+    mode: str,
+    explicit: str | None,
+    locked: dict,
+    scenario: str = "grid-llmd",
+) -> tuple[str, str | None]:
+    scenario_lock = locked.get("scenario_overrides", {}).get(scenario, {}).get(component, {})
+    lock_entry = scenario_lock or locked["components"].get(component)
     if lock_entry is None:
         raise ResolutionError(f"locked source is missing for {component}")
     locked_ref = lock_entry["ref"]
-    default = SOURCE_DEFAULTS[component] if mode == "main" else locked_ref
+    default = scenario_lock.get("default_ref", SOURCE_DEFAULTS[component]) if mode == "main" else locked_ref
     requested = explicit if explicit is not None else default
     if mode == "locked" and explicit is not None and not SHA_RE.fullmatch(explicit):
         if component != "kuadrant" or explicit != lock_entry.get("release"):
@@ -293,13 +334,15 @@ def write_outputs(evidence_dir: Path, work_root: Path, run_record: dict) -> None
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("grid-llmd", "grid-maas"), default=os.getenv("E2E_SCENARIO", "grid-llmd"))
+    parser.add_argument("--scenario", choices=("grid-llmd", "grid-maas", "grid-llmd-kind"), default=os.getenv("E2E_SCENARIO", "grid-llmd"))
     parser.add_argument("--source-mode", choices=("main", "locked"), default=os.getenv("SOURCE_MODE", "main"))
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--worktree-root", type=Path)
     parser.add_argument("--caller-repo-root", type=Path, default=ROOT)
     parser.add_argument("--lock-file", type=Path, default=LOCK_FILE)
     parser.add_argument("--platform-manifests", choices=("true", "false"), default=os.getenv("E2E_USE_PLATFORM_MANIFESTS", "true"))
+    parser.add_argument("--include-kserve", action="store_true", help="resolve KServe source for the Kind LLMInferenceService topology")
+    parser.add_argument("--include-aigc", action="store_true", help="resolve the AIGC controller used for Kind tenant payload processing")
     parser.add_argument("--repository", action="append", default=[], metavar="COMPONENT=URL")
     parser.add_argument("--caller-source-dir", action="append", default=[], metavar="COMPONENT=PATH")
     args = parser.parse_args()
@@ -309,7 +352,7 @@ def main() -> int:
             raise ResolutionError("unsupported locked source metadata schema")
         overrides = parse_pairs(args.repository, "--repository")
         caller_overrides = parse_pairs(args.caller_source_dir, "--caller-source-dir")
-        selected = selected_components(args.scenario, args.platform_manifests == "true")
+        selected = selected_components(args.scenario, args.platform_manifests == "true", args.include_kserve, args.include_aigc)
         work_root = args.worktree_root or Path(tempfile.mkdtemp(prefix="praxis-e2e-sources-"))
         work_root.mkdir(parents=True, exist_ok=True)
         if any(work_root.iterdir()):
@@ -319,7 +362,13 @@ def main() -> int:
             lock_entry = locked["components"].get(component)
             if lock_entry is None:
                 raise ResolutionError(f"no locked source metadata for {component}")
-            requested, expected = source_ref(component, args.source_mode, os.getenv(REF_ENV[component]), locked)
+            requested, expected = source_ref(
+                component,
+                args.source_mode,
+                os.getenv(REF_ENV[component]),
+                locked,
+                args.scenario,
+            )
             repository = overrides.get(component, os.getenv(REPOSITORY_ENV[component], lock_entry["repository"]))
             caller_value = caller_overrides.get(component, os.getenv(CALLER_DIR_ENV[component]))
             if component == "extproc" and caller_value is None:

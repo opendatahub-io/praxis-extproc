@@ -322,7 +322,7 @@ async fn buffered_body_at_and_over_max_body_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_max_recv_binary_accepts_body_above_four_mib() {
     let payload = vec![b'x'; GRPC_COMPILED_MAX_RECV_DEFAULT + 64 * 1024];
-    let (grpc, health, metrics) = (free_port(), free_port(), free_port());
+    let [grpc, health, metrics] = free_distinct_ports();
     let config_path = write_grpc_max_recv_config(grpc, health, metrics);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
@@ -3432,11 +3432,16 @@ fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
     path
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .expect("find a free port")
+fn free_distinct_ports<const N: usize>() -> [u16; N] {
+    let listeners = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port"))
+        .collect::<Vec<_>>();
+    listeners
+        .iter()
+        .map(|listener| listener.local_addr().expect("read free port").port())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|_| panic!("allocate exactly {N} distinct ports"))
 }
 
 async fn send_headers_only(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {

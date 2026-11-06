@@ -96,14 +96,37 @@ if 'statefulset' in cold[cold.index('apply_monitoringstack_resource_profile()'):
 
 grid_required = (
     'RESOURCE_PROFILE="${RESOURCE_PROFILE:-strict}"',
+    'CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"',
+    'GRID_LLMD_CLUSTER_PLATFORM=kind requires CLUSTER_ENV=kind',
     'strict) PROFILE_CPU_REQUEST=50m ;;',
     'PROFILE_CPU_REQUEST=25m',
-    'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev',
+    'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev or the explicit Kind platform',
 )
 missing_grid = [fragment for fragment in grid_required if fragment not in grid_operator]
 if missing_grid:
     print("Grid operator resource-profile contract is missing: " + repr(missing_grid), file=sys.stderr)
     raise SystemExit(1)
 
-print("strict-default, explicit reduced-dev selection/order, and strict rollback contract: PASS")
+import os
+import subprocess
+
+operator_plan = subprocess.run(
+    ["bash", sys.argv[3]],
+    env={
+        **os.environ,
+        "GRID_OPERATOR_MODE": "plan",
+        "CLUSTER_ENV": "kind",
+        "GRID_LLMD_CLUSTER_PLATFORM": "kind",
+        "RESOURCE_PROFILE": "reduced-dev",
+    },
+    check=False,
+    capture_output=True,
+    text=True,
+)
+if operator_plan.returncode != 0:
+    print("Grid operator plan must accept the explicitly selected Kind reduced-dev profile", file=sys.stderr)
+    print(operator_plan.stderr, file=sys.stderr)
+    raise SystemExit(operator_plan.returncode)
+
+print("strict-default, explicit reduced-dev selection/order, Kind operator plan, and strict rollback contract: PASS")
 PY

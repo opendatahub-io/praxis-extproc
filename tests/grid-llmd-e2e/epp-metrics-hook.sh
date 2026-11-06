@@ -79,6 +79,17 @@ token="$(oc create token "$SERVICE_ACCOUNT" -n "$SERVICE_ACCOUNT_NAMESPACE" --du
 }
 [[ -n "$token" ]] || { printf 'EPP metrics token request returned empty output\n' >&2; exit 1; }
 declare -A values=()
+forward_pid=""
+
+stop_port_forward() {
+  [[ -n "$forward_pid" ]] || return 0
+  kill "$forward_pid" 2>/dev/null || true
+  wait "$forward_pid" 2>/dev/null || true
+  forward_pid=""
+}
+
+trap stop_port_forward EXIT
+trap 'exit 130' INT TERM
 
 for entry in "${SERVICES[@]}"; do
   pool="${entry%%=*}"
@@ -102,7 +113,10 @@ for entry in "${SERVICES[@]}"; do
   }
   local_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
   raw_file="$EVIDENCE_DIR/$pool-epp-metrics-$PHASE.prom"
-  oc --context="$CONTEXT" port-forward -n "$service_namespace" "service/$service_name" "$local_port:$remote_port" \
+  # Invoke the external process directly. Backgrounding the oc() shell
+  # function makes $! refer to a wrapper subshell; killing it can orphan the
+  # actual oc port-forward process.
+  command oc --context="$CONTEXT" port-forward -n "$service_namespace" "service/$service_name" "$local_port:$remote_port" \
     >"$EVIDENCE_DIR/$pool-port-forward-$PHASE.log" 2>&1 &
   forward_pid=$!
   success=false
@@ -115,8 +129,7 @@ for entry in "${SERVICES[@]}"; do
     fi
     sleep 1
   done
-  kill "$forward_pid" 2>/dev/null || true
-  wait "$forward_pid" 2>/dev/null || true
+  stop_port_forward
   [[ "$success" == true ]] || { unset token; printf 'authenticated EPP metrics scrape failed for %s\n' "$pool" >&2; exit 1; }
   chmod 0600 "$raw_file"
   sample="$(awk -v metric="$METRIC_NAME" -v label="$POOL_LABEL" -v pool="$pool" '

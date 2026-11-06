@@ -10,6 +10,7 @@ MODE="${GRID_GATEWAY_MODE:-plan}"
 EXPECTED_API_SERVER="${EXPECTED_API_SERVER:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 CLUSTER_ENV="${CLUSTER_ENV:-}"
+CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"
 ALLOW_INSECURE_DEV_API="${ALLOW_INSECURE_DEV_API:-false}"
 RUN_LABEL="${GRID_RUN_LABEL:-}"
 NAMESPACE="${GRID_RESOURCE_NAMESPACE:-grid-llmd-e2e}"
@@ -21,6 +22,7 @@ SERVICE_NAME="${GRID_GATEWAY_SERVICE_NAME:-grid-gateway}"
 SERVICE_PORT="${GRID_GATEWAY_SERVICE_PORT:-8080}"
 GATEWAY_NAME="${GRID_API_GATEWAY_NAME:-grid-llmd-ingress}"
 GATEWAY_CLASS="${GRID_API_GATEWAY_CLASS:-data-science-gateway-class}"
+GATEWAY_CONTROLLER_NAME=""
 HTTPROUTE_NAME="${GRID_HTTPROUTE_NAME:-grid-llmd-inference}"
 HOSTNAME="${GRID_GATEWAY_HOSTNAME:-${GRID_SITE_NAME}.grid.internal}"
 TLS_SECRET_NAME="${GRID_GATEWAY_TLS_SECRET_NAME:-grid-site-identity}"
@@ -29,7 +31,7 @@ SOURCE_IDENTITY_SECRET="${GRID_IDENTITY_SECRET_NAME:-grid-site-identity}"
 SOURCE_CA_SECRET="${GRID_CA_SECRET_NAME:-grid-ca}"
 CHART_FILE="${PRAXIS_GATEWAY_CHART_FILE:-}"
 CHART_SHA256="${PRAXIS_GATEWAY_CHART_SHA256:-}"
-CHART_VERSION="${PRAXIS_GATEWAY_CHART_VERSION:-0.2.2}"
+CHART_VERSION="${PRAXIS_GATEWAY_CHART_VERSION:-}"
 SOURCE_REVISION="${PRAXIS_GRID_SOURCE_REVISION:-}"
 IMAGE="${PRAXIS_GATEWAY_IMAGE:-}"
 PRAXIS_CONFIG_FILE="${GRID_GATEWAY_PRAXIS_CONFIG_FILE:-}"
@@ -52,6 +54,7 @@ MEMORY_REQUEST="${GRID_GATEWAY_MEMORY_REQUEST:-128Mi}"
 CPU_LIMIT="${GRID_GATEWAY_CPU_LIMIT:-500m}"
 MEMORY_LIMIT="${GRID_GATEWAY_MEMORY_LIMIT:-512Mi}"
 TIMEOUT="${GRID_GATEWAY_TIMEOUT:-8m}"
+RUNTIME_READY_TIMEOUT_SECONDS="${GRID_GATEWAY_RUNTIME_TIMEOUT_SECONDS:-300}"
 EVIDENCE_DIR="${GRID_GATEWAY_EVIDENCE_DIR:-}"
 tmpdir=""
 
@@ -63,6 +66,18 @@ oc() {
 helm() {
   if [[ -z "$KUBE_CONTEXT" ]]; then KUBE_CONTEXT="$(command oc config current-context)"; fi
   command helm --kube-context="$KUBE_CONTEXT" "$@"
+}
+
+render_gateway_object_annotations() {
+  case "$CLUSTER_PLATFORM" in
+    openshift) return 0 ;;
+    kind)
+      [[ "$CLUSTER_ENV" == kind ]] || return 2
+      [[ "$GATEWAY_CONTROLLER_NAME" == istio.io/gateway-controller ]] || return 2
+      printf '%s\n' '  annotations:' '    networking.istio.io/service-type: ClusterIP'
+      ;;
+    *) return 2 ;;
+  esac
 }
 
 if [[ "$MODE" == plan ]]; then
@@ -96,6 +111,10 @@ type -P helm >/dev/null || { printf 'helm executable is required\n' >&2; exit 2;
 }
 [[ -n "$EXPECTED_API_SERVER" && -n "$RUN_LABEL" && -n "$SOURCE_REVISION" ]] || {
   printf 'EXPECTED_API_SERVER, GRID_RUN_LABEL, and PRAXIS_GRID_SOURCE_REVISION are required\n' >&2
+  exit 2
+}
+[[ "$RUNTIME_READY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || {
+  printf 'GRID_GATEWAY_RUNTIME_TIMEOUT_SECONDS must be an integer from 1 through 9999\n' >&2
   exit 2
 }
 [[ "$IMAGE" =~ ^(.+)@(sha256:[0-9a-fA-F]{64})$ ]] || {
@@ -299,11 +318,25 @@ observed_chart_sha="$(sha256sum "$CHART_FILE" | awk '{print $1}')"
   exit 1
 }
 chart_metadata="$(helm show chart "$CHART_FILE")"
-grep -Fq "version: $CHART_VERSION" <<<"$chart_metadata" || {
-  CURRENT_FAILURE='Praxis Gateway chart version mismatch'
-  printf 'chart version mismatch\n' >&2
+observed_chart_name="$(awk -F': ' '$1 == "name" { print $2; exit }' <<<"$chart_metadata")"
+observed_chart_version="$(awk -F': ' '$1 == "version" { print $2; exit }' <<<"$chart_metadata")"
+[[ "$observed_chart_name" == praxis-gateway ]] || {
+  CURRENT_FAILURE="Praxis Gateway chart name mismatch: observed ${observed_chart_name:-missing}"
+  printf 'Praxis Gateway chart archive has an unexpected name: %s\n' "${observed_chart_name:-missing}" >&2
   exit 1
 }
+[[ -n "$observed_chart_version" ]] || {
+  CURRENT_FAILURE='Praxis Gateway chart archive does not declare a version'
+  printf 'Praxis Gateway chart archive does not declare a version\n' >&2
+  exit 1
+}
+if [[ -z "$CHART_VERSION" ]]; then
+  CHART_VERSION="$observed_chart_version"
+elif [[ "$observed_chart_version" != "$CHART_VERSION" ]]; then
+  CURRENT_FAILURE="Praxis Gateway chart version mismatch: expected $CHART_VERSION, observed $observed_chart_version"
+  printf 'chart version mismatch: expected %s, observed %s\n' "$CHART_VERSION" "$observed_chart_version" >&2
+  exit 1
+fi
 
 CURRENT_PHASE=api-access
 context="$KUBE_CONTEXT"
@@ -348,6 +381,18 @@ jq -e 'any(.status.conditions[]?; .type=="Accepted" and .status=="True")' \
   printf 'GatewayClass is not Accepted\n' >&2
   exit 1
 }
+GATEWAY_CONTROLLER_NAME="$(jq -er '.spec.controllerName | select(type=="string" and length>0)' "$EVIDENCE_DIR/gatewayclass.json")"
+if [[ "$CLUSTER_PLATFORM" != openshift && "$CLUSTER_PLATFORM" != kind ]]; then
+  CURRENT_FAILURE='GRID_LLMD_CLUSTER_PLATFORM must be openshift or kind'
+  printf '%s\n' "$CURRENT_FAILURE" >&2
+  exit 2
+fi
+GATEWAY_OBJECT_ANNOTATIONS="$(render_gateway_object_annotations)" || {
+  CURRENT_FAILURE='Kind task Gateway requires CLUSTER_ENV=kind and the Istio Gateway controller'
+  printf '%s\n' "$CURRENT_FAILURE" >&2
+  exit 2
+}
+printf '%s\n' "$GATEWAY_OBJECT_ANNOTATIONS" >"$EVIDENCE_DIR/gateway-object-annotations.txt"
 oc get gridnetwork "$GRID_NETWORK_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/gridnetwork.json"
 jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' \
   "$EVIDENCE_DIR/gridnetwork.json" >/dev/null || {
@@ -442,7 +487,24 @@ fi
 
 CURRENT_PHASE=render-review
 praxis_config_map_name=""
-if [[ "$CONFIG_SOURCE" == byo && ( -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ) ]]; then praxis_config_map_name="$PRAXIS_CONFIG_MAP_NAME"; fi
+rendered_praxis_config_map_name=""
+if [[ "$CONFIG_SOURCE" == byo && ( -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ) ]]; then
+  praxis_config_map_name="$PRAXIS_CONFIG_MAP_NAME"
+  if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]] &&
+     gateway_deployment_json="$(oc get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o json 2>/dev/null)"; then
+    active_configmap_for_render="$(jq -er '[.spec.template.spec.volumes[]?|select(.name=="config")|.configMap.name] | if length==1 then .[0] else error("Gateway has no unique active Praxis config ConfigMap") end' <<<"$gateway_deployment_json")" || {
+      CURRENT_FAILURE='Gateway Deployment does not identify one active Praxis ConfigMap slot before Helm render'
+      printf 'Gateway Deployment must reference exactly one active Praxis ConfigMap slot before Helm render\n' >&2
+      exit 1
+    }
+    if [[ "$active_configmap_for_render" == grid-consumer-config-* ]]; then
+      praxis_config_map_name="$(python3 "$SCRIPT_DIR/select-grid-gateway-configmap.py" \
+        "$PRAXIS_CONFIG_MAP_NAME" "$active_configmap_for_render" "${SERVICE_NAME}-config")"
+    fi
+    unset active_configmap_for_render gateway_deployment_json
+  fi
+  rendered_praxis_config_map_name="$praxis_config_map_name"
+fi
 BYO_MOUNT_RECONCILIATION_VALUES=""
 if [[ "$CONFIG_SOURCE" == byo && "$MOUNT_RECONCILIATION_ENABLED" == true ]]; then
   BYO_MOUNT_RECONCILIATION_VALUES="$(cat <<YAML
@@ -632,21 +694,65 @@ if [[ -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
         exit 1
       }
       if [[ "$active_configmap_name" != "$PRAXIS_CONFIG_MAP_NAME" ]]; then
-        [[ "$active_configmap_name" == grid-consumer-config-* ]] || {
-          CURRENT_FAILURE='active Praxis ConfigMap is neither the configured Grid base nor a Grid double-buffered slot'
-          printf 'active Praxis ConfigMap is outside the configured base and Grid double-buffered slot names\n' >&2
-          exit 1
-        }
-        external_configmap_json="$(oc get configmap "$active_configmap_name" -n "$NAMESPACE" -o json)"
-        jq -e --arg network "$GRID_NETWORK_NAME" --arg gateway "$SERVICE_NAME" '
-          .metadata.labels["app.kubernetes.io/managed-by"]=="grid-operator" and
-          .metadata.labels["grid.praxis.fast/network"]==$network and
-          .metadata.labels["grid.praxis.fast/gateway"]==$gateway
-        ' <<<"$external_configmap_json" >/dev/null || {
-          CURRENT_FAILURE='active double-buffered Praxis ConfigMap is not owned by the matching task GridNetwork and Gateway'
-          printf 'active double-buffered Praxis ConfigMap ownership does not match the task GridNetwork and Gateway\n' >&2
-          exit 1
-        }
+        if [[ "$active_configmap_name" == "${SERVICE_NAME}-config" ]]; then
+          # The first operator handoff starts with the checked bootstrap
+          # ConfigMap mounted. It may be explicitly run-owned before Helm or
+          # Helm-owned; accept only one of those exact ownership records.
+          jq -e --arg run "$RUN_LABEL" --arg release "$RELEASE_NAME" '
+            .metadata.labels["praxis.fast/qualification-run"]==$run and
+            .metadata.labels["app.kubernetes.io/instance"]==$release
+          ' <<<"$gateway_deployment_json" >/dev/null &&
+          bootstrap_configmap_json="$(oc get configmap "$active_configmap_name" -n "$NAMESPACE" -o json)" &&
+          jq -e --arg run "$RUN_LABEL" --arg release "$RELEASE_NAME" --arg namespace "$NAMESPACE" '
+            .metadata.labels["praxis.fast/qualification-run"]==$run and
+            (
+              (.metadata.labels["app.kubernetes.io/managed-by"]=="grid-llmd-e2e-run" and
+               .metadata.labels["app.kubernetes.io/part-of"]=="grid-llmd-e2e") or
+              (.metadata.labels["app.kubernetes.io/managed-by"]=="Helm" and
+               .metadata.labels["app.kubernetes.io/instance"]==$release and
+               .metadata.annotations["meta.helm.sh/release-name"]==$release and
+               .metadata.annotations["meta.helm.sh/release-namespace"]==$namespace)
+            )
+          ' <<<"$bootstrap_configmap_json" >/dev/null || {
+            CURRENT_FAILURE='active bootstrap Praxis ConfigMap is neither owned by this task run nor by the matching Helm release'
+            printf 'active bootstrap Praxis ConfigMap ownership does not match this task run or Helm release\n' >&2
+            exit 1
+          }
+          bootstrap_config_sha="$(jq -j -er '.data["praxis.yaml"]' <<<"$bootstrap_configmap_json" | sha256sum | awk '{print $1}')"
+          jq --arg sha "$bootstrap_config_sha" \
+            '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,labels:.metadata.labels,annotations:.metadata.annotations},dataKeys:(.data|keys),praxisYamlSha256:$sha,role:"active-same-run-bootstrap"}' \
+            <<<"$bootstrap_configmap_json" >"$EVIDENCE_DIR/active-bootstrap-configmap-metadata.json"
+          # During the transition the live Pod still has bootstrap mounted, so
+          # validate the Grid-generated target ConfigMap that Helm is about to
+          # mount. The active bootstrap map is recorded above, never treated
+          # as evidence that the target contains routing config.
+          external_configmap_json="$base_configmap_json"
+          unset bootstrap_config_sha
+          unset bootstrap_configmap_json
+        else
+          [[ "$active_configmap_name" == grid-consumer-config-* ]] || {
+            CURRENT_FAILURE='active Praxis ConfigMap is neither the configured Grid base, same-run Helm bootstrap, nor a Grid double-buffered slot'
+            printf 'active Praxis ConfigMap is outside the configured base, same-run Helm bootstrap, and Grid double-buffered slot names\n' >&2
+            exit 1
+          }
+          external_configmap_json="$(oc get configmap "$active_configmap_name" -n "$NAMESPACE" -o json)"
+          jq -e --arg network "$GRID_NETWORK_NAME" --arg gateway "$SERVICE_NAME" '
+            .metadata.labels["app.kubernetes.io/managed-by"]=="grid-operator" and
+            .metadata.labels["grid.praxis.fast/network"]==$network and
+            .metadata.labels["grid.praxis.fast/gateway"]==$gateway
+          ' <<<"$external_configmap_json" >/dev/null || {
+            CURRENT_FAILURE='active double-buffered Praxis ConfigMap is not owned by the matching task GridNetwork and Gateway'
+            printf 'active double-buffered Praxis ConfigMap ownership does not match the task GridNetwork and Gateway\n' >&2
+            exit 1
+          }
+        # Helm's upgrade is also the final handoff that may release its old
+        # TLS projection. Mount the exact double-buffered config that Grid has
+        # already reconciled with the delegated Secret paths. The configured
+        # base ConfigMap is only the operator's stable write target; it can be
+        # a stale slot after Grid has staged a content-addressed replacement.
+        praxis_config_map_name="$(python3 "$SCRIPT_DIR/select-grid-gateway-configmap.py" \
+          "$PRAXIS_CONFIG_MAP_NAME" "$active_configmap_name" "${SERVICE_NAME}-config")"
+        fi
       else
         external_configmap_json="$base_configmap_json"
       fi
@@ -682,8 +788,14 @@ if [[ -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
     jq --arg liveSha "$live_config_sha" --arg sourceSha "$source_config_sha" --arg endpointsSha "$endpoint_inventory_sha" \
       --arg validation "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json")" \
       --arg configuredBase "$PRAXIS_CONFIG_MAP_NAME" --arg activeName "$active_configmap_name" \
-      '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels},configuredBaseConfigMapName:$configuredBase,activeConfigMapName:$activeName,usesDoubleBufferedGridSlot:($configuredBase!=$activeName),dataKeys:(.data|keys),praxisYamlLiveSha256:$liveSha,priorSourceSnapshotSha256:(if $sourceSha=="" then null else $sourceSha end),expectedEndpointInventorySha256:$endpointsSha,gridGenerated:true,validationStatus:$validation}' \
+      --arg chartName "$praxis_config_map_name" \
+      '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,resourceVersion:.metadata.resourceVersion,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels},configuredBaseConfigMapName:$configuredBase,activeConfigMapName:$activeName,helmMountedConfigMapName:$chartName,usesDoubleBufferedGridSlot:($configuredBase!=$activeName),dataKeys:(.data|keys),praxisYamlLiveSha256:$liveSha,priorSourceSnapshotSha256:(if $sourceSha=="" then null else $sourceSha end),expectedEndpointInventorySha256:$endpointsSha,gridGenerated:true,validationStatus:$validation}' \
       <<<"$external_configmap_json" >"$EVIDENCE_DIR/external-praxis-configmap-metadata.json"
+    [[ "$praxis_config_map_name" == "$rendered_praxis_config_map_name" ]] || {
+      CURRENT_FAILURE='active Grid Praxis ConfigMap changed after Helm values were rendered'
+      printf 'active Grid Praxis ConfigMap changed during preflight; rerender before any cluster mutation\n' >&2
+      exit 1
+    }
     unset external_configmap_json
   else
   cat >"$EVIDENCE_DIR/praxis-config.yaml" <<YAML
@@ -755,6 +867,7 @@ kind: Gateway
 metadata:
   name: $GATEWAY_NAME
   namespace: $NAMESPACE
+$GATEWAY_OBJECT_ANNOTATIONS
   labels:
     app.kubernetes.io/part-of: grid-llmd-e2e
     app.kubernetes.io/managed-by: grid-llmd-e2e-run
@@ -822,6 +935,8 @@ cat >"$EVIDENCE_DIR/INVOCATION.md" <<EOF
 - API server: $server
 - API readiness: $ready
 - API TLS mode: $API_TLS_MODE
+- Cluster platform: $CLUSTER_PLATFORM
+- Gateway data-plane Service annotation: $(if [[ -n "$GATEWAY_OBJECT_ANNOTATIONS" ]]; then printf 'Kind Istio ClusterIP'; else printf 'controller default'; fi)
 - Run label: $RUN_LABEL
 - Grid source revision: $SOURCE_REVISION
 - Chart version/archive SHA-256: $CHART_VERSION / $observed_chart_sha
@@ -835,6 +950,7 @@ cat >"$EVIDENCE_DIR/INVOCATION.md" <<EOF
 - GridNetwork/site: $GRID_NETWORK_NAME / $GRID_SITE_NAME
 - Resource requests/limits: CPU $CPU_REQUEST/$CPU_LIMIT; memory $MEMORY_REQUEST/$MEMORY_LIMIT
 - Praxis config: $(if [[ "$BOOTSTRAP_MODE" == true && "$(jq -r '.status' "$EVIDENCE_DIR/external-praxis-config-validation.json" 2>/dev/null || true)" == checked_bootstrap ]]; then printf 'checked external 503 bootstrap ConfigMap; Grid-generated config is not yet qualified'; elif [[ "$CONFIG_SOURCE" == operator ]]; then printf 'Grid operator-generated consumer config; this chart source does not mount its routing overlay'; elif [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf 'Grid-generated configured base %s and live Deployment slot %s; active content is structurally validated for overlay reload and both expected pool endpoints' "$PRAXIS_CONFIG_MAP_NAME" "$(jq -r '.activeConfigMapName' "$EVIDENCE_DIR/external-praxis-configmap-metadata.json")"; elif [[ -n "$PRAXIS_CONFIG_FILE" ]]; then printf 'task-owned BYO ConfigMap %s; source SHA-256 is recorded separately' "$PRAXIS_CONFIG_MAP_NAME"; else printf 'bootstrap responder only; signal routing is not configured'; fi)
+- Helm-mounted Praxis ConfigMap: $(if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then printf '%s' "$praxis_config_map_name"; else printf 'not external'; fi)
 - Grid overlay ConfigMap: ${OVERLAY_CONFIGMAP:-not mounted}
 
 This phase creates only the task-owned Gateway path. It does not deploy inference workloads, ExtProc, or send inference traffic.
@@ -968,19 +1084,22 @@ deadline=$((SECONDS + ${GRID_GATEWAY_READINESS_TIMEOUT_SECONDS:-480}))
 while ((SECONDS < deadline)); do
   if oc get gateway "$GATEWAY_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/gateway.json" 2>/dev/null &&
      jq -e --arg class "$GATEWAY_CLASS" --arg host "$HOSTNAME" --arg tls "$TLS_SECRET_NAME" \
+       --arg controller "$GATEWAY_CONTROLLER_NAME" \
        '.metadata.generation as $g |
-        [.status.conditions[]?|select(.type=="Accepted" or .type=="Programmed")] as $cs |
-        ($cs|length)==2 and all($cs[]; .status=="True" and .observedGeneration==$g) and
+        any(.status.conditions[]?; .type=="Accepted" and .status=="True" and .observedGeneration==$g) and
+        (if $controller=="istio.io/gateway-controller" then true else
+          any(.status.conditions[]?; .type=="Programmed" and .status=="True" and .observedGeneration==$g) end) and
         .spec.gatewayClassName==$class and
         any(.spec.listeners[]?; .name=="https" and .hostname==$host and .port==443 and .protocol=="HTTPS" and .tls.mode=="Terminate" and any(.tls.certificateRefs[]?;.name==$tls)) and
         any(.status.listeners[]?; .name=="https" and (.attachedRoutes // 0)>=1 and all(.conditions[]?|select(.type=="Accepted" or .type=="Programmed" or .type=="ResolvedRefs"); .status=="True" and .observedGeneration==$g))' \
        "$EVIDENCE_DIR/gateway.json" >/dev/null; then
     if oc get httproute "$HTTPROUTE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/httproute.json" 2>/dev/null &&
        jq -e --arg ns "$NAMESPACE" --arg parent "$GATEWAY_NAME" --arg host "$HOSTNAME" \
+         --arg controller "$GATEWAY_CONTROLLER_NAME" \
          --arg svc "$SERVICE_NAME" --argjson port "$SERVICE_PORT" \
          '.metadata.generation as $g |
           any(.status.parents[]?;
-            .controllerName=="openshift.io/gateway-controller/v1" and
+            .controllerName==$controller and
             .parentRef.name==$parent and
             ((.parentRef.namespace // $ns)==$ns) and
             all(.conditions[]?|select(.type=="Accepted" or .type=="ResolvedRefs"); .status=="True" and .observedGeneration==$g) and
@@ -1003,6 +1122,34 @@ CURRENT_PHASE=rollout-stability
 oc rollout status deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE" --timeout="$TIMEOUT" \
   >"$EVIDENCE_DIR/rollout-status.txt"
 
+# A completed Deployment rollout can briefly overlap with a terminating Pod.
+# Keep the exact-one-active-Pod/imageID assertion, but poll it to convergence.
+pod_attempts="$EVIDENCE_DIR/gateway-pod-readiness-attempts.jsonl"
+: >"$pod_attempts"
+pod_deadline=$((SECONDS + RUNTIME_READY_TIMEOUT_SECONDS))
+gateway_pod_ready=false
+while ((SECONDS < pod_deadline)); do
+  if oc get pods -n "$NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" -o json |
+    jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,node:.spec.nodeName,conditions:.status.conditions,ownerReferences:.metadata.ownerReferences,specContainers:[.spec.containers[]?|{name,image}],containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
+      >"$EVIDENCE_DIR/pods.json"; then
+    jq -c --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{observedAt:$observedAt,pods:[.[]|{name,uid,deletionTimestamp,phase,node,specContainers,containers:[.containers[]|{name,image,imageID,ready,restartCount}]}]}' \
+      "$EVIDENCE_DIR/pods.json" >>"$pod_attempts"
+    if jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" \
+      -f "$SCRIPT_DIR/single-ready-pinned-pod.jq" "$EVIDENCE_DIR/pods.json" >/dev/null; then
+      gateway_pod_ready=true
+      break
+    fi
+  fi
+  sleep 5
+done
+[[ "$gateway_pod_ready" == true ]] || {
+  CURRENT_FAILURE='Praxis Gateway active Pod set did not converge to one Ready Pod with the configured image pin and matching runtime digest'
+  printf 'Praxis Gateway Pod set did not converge to one active Ready Pod with the pinned runtime digest within %ss; see readiness attempts\n' \
+    "$RUNTIME_READY_TIMEOUT_SECONDS" >&2
+  exit 1
+}
+
 oc get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/deployment.json"
 deployment_revision="$(jq -er '.metadata.annotations["deployment.kubernetes.io/revision"]' "$EVIDENCE_DIR/deployment.json")"
 oc get replicasets -n "$NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" -o json |
@@ -1014,13 +1161,51 @@ current_replicaset="$(jq -er --arg revision "$deployment_revision" '
 ' "$EVIDENCE_DIR/replicasets.json")"
 printf '%s\n' "$current_replicaset" >"$EVIDENCE_DIR/current-replicaset.txt"
 oc get pods -n "$NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" -o json |
-  jq --arg rs "$current_replicaset" '[.items[]|select(any(.metadata.ownerReferences[]?;.kind=="ReplicaSet" and .name==$rs))|{name:.metadata.name,uid:.metadata.uid,phase:.status.phase,node:.spec.nodeName,conditions:.status.conditions,containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
+  jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,node:.spec.nodeName,conditions:.status.conditions,ownerReferences:.metadata.ownerReferences,specContainers:[.spec.containers[]?|{name,image}],containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
   >"$EVIDENCE_DIR/pods.json"
 oc get service "$SERVICE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/service.json"
 oc get endpoints "$SERVICE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/endpoints.json"
 oc get endpointslices -n "$NAMESPACE" -l kubernetes.io/service-name="$SERVICE_NAME" -o json \
   | jq '[.items[]|{name:.metadata.name,ports:.ports,endpoints:[.endpoints[]?|{addresses,conditions,targetRef:{kind:.targetRef.kind,name:.targetRef.name,uid:.targetRef.uid}}]}]' \
   >"$EVIDENCE_DIR/endpointslices.json"
+oc get services -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$GATEWAY_NAME" -o json \
+  >"$EVIDENCE_DIR/gateway-proxy-services.json"
+jq -e --arg run "$RUN_LABEL" --arg name "$GATEWAY_NAME" '
+  [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and .metadata.labels["gateway.networking.k8s.io/gateway-name"]==$name)] as $services |
+  ($services|length)==1 and $services[0].spec.clusterIP!="" and
+  any($services[0].spec.ports[]?;.port==443)
+' "$EVIDENCE_DIR/gateway-proxy-services.json" \
+  >"$EVIDENCE_DIR/gateway-proxy-service-readiness.json" || {
+  CURRENT_FAILURE='Kind GatewayClass did not create its run-owned data-plane Service on TLS port 443'
+  printf 'Gateway API data-plane Service is absent or has no ClusterIP/443 listener\n' >&2
+  exit 1
+}
+gateway_proxy_service="$(jq -er --arg run "$RUN_LABEL" --arg name "$GATEWAY_NAME" '[.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and .metadata.labels["gateway.networking.k8s.io/gateway-name"]==$name)]|.[0].metadata.name' "$EVIDENCE_DIR/gateway-proxy-services.json")"
+gateway_proxy_attempts="$EVIDENCE_DIR/gateway-proxy-readiness-attempts.jsonl"
+: >"$gateway_proxy_attempts"
+: >"$EVIDENCE_DIR/gateway-proxy-endpointslice-get-errors.log"
+gateway_proxy_deadline=$((SECONDS + RUNTIME_READY_TIMEOUT_SECONDS))
+gateway_proxy_ready=false
+while ((SECONDS < gateway_proxy_deadline)); do
+  if oc get endpointslices -n "$NAMESPACE" -l "kubernetes.io/service-name=$gateway_proxy_service" -o json \
+    >"$EVIDENCE_DIR/gateway-proxy-endpointslices.json" 2>>"$EVIDENCE_DIR/gateway-proxy-endpointslice-get-errors.log"; then
+    jq -c --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{observedAt:$observedAt,slices:[.items[]|{name:.metadata.name,ports:[.ports[]?|{name,port}],endpoints:[.endpoints[]?|{ready:.conditions.ready,addressesPresent:((.addresses//[])|length>0),targetRef:{kind:.targetRef.kind,name:.targetRef.name,uid:.targetRef.uid}}]}]}' \
+      "$EVIDENCE_DIR/gateway-proxy-endpointslices.json" >>"$gateway_proxy_attempts"
+    if jq -e -f "$SCRIPT_DIR/single-ready-gateway-endpoint.jq" \
+      "$EVIDENCE_DIR/gateway-proxy-endpointslices.json" >/dev/null; then
+      gateway_proxy_ready=true
+      break
+    fi
+  fi
+  sleep 5
+done
+[[ "$gateway_proxy_ready" == true ]] || {
+  CURRENT_FAILURE='Gateway API data-plane Service has no unique Ready endpoint on TLS port 443'
+  printf 'Gateway API data-plane Service did not converge to one Ready EndpointSlice endpoint on 443 within %ss; see readiness attempts\n' \
+    "$RUNTIME_READY_TIMEOUT_SECONDS" >&2
+  exit 1
+}
 jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" \
   '.status.observedGeneration==.metadata.generation and .status.readyReplicas==1 and .status.availableReplicas==1 and all(.spec.template.spec.containers[];.image==$image)' \
   "$EVIDENCE_DIR/deployment.json" >/dev/null || {
@@ -1029,10 +1214,10 @@ jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" \
   exit 1
 }
 jq -e --arg image "$IMAGE" --arg digest "$IMAGE_DIGEST" \
-  'length==1 and .[0].phase=="Running" and all(.[0].containers[];.ready==true and .image==$image and (.imageID|endswith($digest)))' \
+  -f "$SCRIPT_DIR/single-ready-pinned-pod.jq" \
   "$EVIDENCE_DIR/pods.json" >/dev/null || {
-  CURRENT_FAILURE='Praxis Gateway runtime Pod imageID does not match the immutable image pin'
-  printf 'Praxis Gateway runtime Pod is not Ready at the locked image digest\n' >&2
+  CURRENT_FAILURE='Praxis Gateway does not have exactly one active Ready Pod with the configured image pin and matching runtime digest'
+  printf 'Praxis Gateway active Pod set or runtime image digest does not match the immutable image pin\n' >&2
   exit 1
 }
 jq -e '.subsets|any(.[];.addresses|length>0)' "$EVIDENCE_DIR/endpoints.json" >/dev/null || {
@@ -1041,9 +1226,11 @@ jq -e '.subsets|any(.[];.addresses|length>0)' "$EVIDENCE_DIR/endpoints.json" >/d
   exit 1
 }
 jq -e --arg class "$GATEWAY_CLASS" --arg host "$HOSTNAME" --arg tls "$TLS_SECRET_NAME" \
+  --arg controller "$GATEWAY_CONTROLLER_NAME" \
   '.metadata.generation as $g |
-   [.status.conditions[]?|select(.type=="Accepted" or .type=="Programmed")] as $cs |
-   ($cs|length)==2 and all($cs[]; .status=="True" and .observedGeneration==$g) and
+   any(.status.conditions[]?; .type=="Accepted" and .status=="True" and .observedGeneration==$g) and
+   (if $controller=="istio.io/gateway-controller" then true else
+     any(.status.conditions[]?; .type=="Programmed" and .status=="True" and .observedGeneration==$g) end) and
    .spec.gatewayClassName==$class and
    any(.spec.listeners[]?; .name=="https" and .hostname==$host and .port==443 and .protocol=="HTTPS" and .tls.mode=="Terminate" and any(.tls.certificateRefs[]?;.name==$tls)) and
    any(.status.listeners[]?; .name=="https" and (.attachedRoutes // 0)>=1 and all(.conditions[]?|select(.type=="Accepted" or .type=="Programmed" or .type=="ResolvedRefs"); .status=="True" and .observedGeneration==$g))' \
@@ -1053,10 +1240,11 @@ jq -e --arg class "$GATEWAY_CLASS" --arg host "$HOSTNAME" --arg tls "$TLS_SECRET
   exit 1
 }
 jq -e --arg ns "$NAMESPACE" --arg parent "$GATEWAY_NAME" --arg host "$HOSTNAME" \
+  --arg controller "$GATEWAY_CONTROLLER_NAME" \
   --arg svc "$SERVICE_NAME" --argjson port "$SERVICE_PORT" \
   '.metadata.generation as $g |
    any(.status.parents[]?;
-     .controllerName=="openshift.io/gateway-controller/v1" and
+     .controllerName==$controller and
      .parentRef.name==$parent and ((.parentRef.namespace // $ns)==$ns) and
      all(.conditions[]?|select(.type=="Accepted" or .type=="ResolvedRefs"); .status=="True" and .observedGeneration==$g) and
      ([.conditions[]?|select(.type=="Accepted" or .type=="ResolvedRefs")]|length)==2
@@ -1098,7 +1286,7 @@ cat >"$EVIDENCE_DIR/source-lock.md" <<EOF
 - Chart archive SHA-256: $observed_chart_sha
 - Chart archive in this evidence directory: $(basename "$EVIDENCE_DIR/praxis-gateway-$CHART_VERSION.tgz")
 - Runtime image: $IMAGE
-- Runtime imageID: $(jq -r --arg image "$IMAGE" '.[0].containers[]|select(.image==$image)|.imageID' "$EVIDENCE_DIR/pods.json")
+- Runtime imageID: $(jq -r '.[0].containers[0].imageID' "$EVIDENCE_DIR/pods.json")
 - Run label: $RUN_LABEL
 - Deployment namespace: $NAMESPACE
 - Gateway API object/class: $GATEWAY_NAME / $GATEWAY_CLASS

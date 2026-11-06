@@ -48,6 +48,10 @@ const DEFAULT_PROVIDER_HEADER: &str = "x-grid-llmd-provider-gateway";
 const DEFAULT_BACKEND_HEADER: &str = "x-ai-demo-provider-gateway";
 const FULL_REQUIRED_GATES: [&str; 6] = ["rhoai", "maas", "grid", "enrollment", "gateway", "llminferenceservice"];
 const ROUTING_SMOKE_REQUIRED_GATES: [&str; 5] = ["rhoai", "maas", "grid", "gateway", "llminferenceservice"];
+const KIND_FULL_REQUIRED_GATES: [&str; 5] = ["maas", "grid", "enrollment", "gateway", "llminferenceservice"];
+const KIND_ROUTING_SMOKE_REQUIRED_GATES: [&str; 4] = ["maas", "grid", "gateway", "llminferenceservice"];
+const SUPPORTED_INTEGRATION_GATES: [&str; 6] =
+    ["rhoai", "maas", "grid", "enrollment", "gateway", "llminferenceservice"];
 const REQUIRED_SOURCE_COMPONENTS: [&str; 7] = [
     "grid",
     "praxis-ai-grid-operator",
@@ -196,6 +200,14 @@ struct GridLlmdArgs {
     #[arg(long, env = "KUBE_CONTEXT")]
     context: Option<String>,
 
+    /// Expected API server identity forwarded to task-owned signal hooks.
+    #[arg(long, env = "EXPECTED_API_SERVER")]
+    expected_api_server: Option<String>,
+
+    /// Run ownership label used by task-owned simulator and failure hooks.
+    #[arg(long, env = "GRID_RUN_LABEL")]
+    run_label: Option<String>,
+
     /// Namespace containing the task-owned qualification objects.
     #[arg(long, env = "GRID_LLMD_NAMESPACE", default_value = "")]
     namespace: String,
@@ -222,9 +234,17 @@ struct GridLlmdArgs {
     #[arg(long, env = "SOURCE_MODE", value_enum, default_value_t = SourceMode::Main)]
     source_mode: SourceMode,
 
+    /// Consume a source lock produced by the deployment run instead of resolving moving refs again.
+    #[arg(long, env = "GRID_LLMD_SOURCE_LOCKS_FILE")]
+    source_locks_file: Option<PathBuf>,
+
     /// Include odh-gitops in clean source resolution for platform-manifest runs.
     #[arg(long, env = "E2E_USE_PLATFORM_MANIFESTS", default_value_t = true)]
     platform_manifests: bool,
+
+    /// Cluster platform under test. Kind replaces OpenShift-only readiness checks with Kubernetes node/storage checks.
+    #[arg(long, env = "GRID_LLMD_CLUSTER_PLATFORM", value_enum, default_value_t = ClusterPlatform::OpenShift)]
+    cluster_platform: ClusterPlatform,
 
     /// Cluster classification used to constrain the dev-only API TLS opt-in.
     #[arg(long, env = "CLUSTER_ENV")]
@@ -487,13 +507,15 @@ struct GridLlmdArgs {
     ipp_resources: Vec<String>,
 
     /// Executable that applies deterministic llm-d-sim pressure and waits for
-    /// the Grid overlay to converge. It receives --context, --namespace, and
-    /// --evidence-dir arguments and must emit a JSON simulator-pod report.
+    /// the Grid overlay to converge. It receives --context, --namespace,
+    /// --evidence-dir, and a trailing `pressure` phase argument, then emits a
+    /// JSON simulator-pod report.
     #[arg(long, env = "GRID_LLMD_PRESSURE_HOOK")]
     pressure_hook: Option<PathBuf>,
 
     /// Executable that removes pressure and waits for route recovery. It
-    /// receives the same arguments and JSON report contract as --pressure-hook.
+    /// receives the same arguments with a trailing `recovery` phase argument
+    /// and JSON report contract as --pressure-hook.
     #[arg(long, env = "GRID_LLMD_RECOVERY_HOOK")]
     recovery_hook: Option<PathBuf>,
 
@@ -591,6 +613,39 @@ enum Mode {
     Run,
     /// Collect post-failure diagnostics without issuing inference traffic.
     Collect,
+}
+
+/// Platform-specific prerequisite contract for the native routing lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum ClusterPlatform {
+    /// RHOAI/OpenShift existing-cluster qualification.
+    #[default]
+    #[value(name = "openshift")]
+    OpenShift,
+    /// Local Kind qualification with upstream Kubernetes dependencies.
+    Kind,
+}
+
+impl ClusterPlatform {
+    /// Stable report spelling.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenShift => "openshift",
+            Self::Kind => "kind",
+        }
+    }
+
+    /// Integration resources required for this platform and qualification scope.
+    const fn required_gates(self, scope: QualificationScope) -> &'static [&'static str] {
+        match self {
+            Self::OpenShift => scope.required_gates(),
+            Self::Kind => match scope {
+                QualificationScope::Full => &KIND_FULL_REQUIRED_GATES,
+                QualificationScope::RoutingSmoke => &KIND_ROUTING_SMOKE_REQUIRED_GATES,
+            },
+        }
+    }
 }
 
 /// Scope of the qualification claim made by one runner invocation.
@@ -1122,6 +1177,7 @@ struct Report {
     source_mode: SourceMode,
     source_resolution_status: String,
     platform_manifests: bool,
+    cluster_platform: ClusterPlatform,
     qualification_scope: QualificationScope,
     enrollment_qualification: String,
     capacity_baseline: String,
@@ -1226,7 +1282,8 @@ impl Report {
             } else {
                 "pending".to_owned()
             },
-            platform_manifests: args.platform_manifests,
+            platform_manifests: args.platform_manifests && args.cluster_platform != ClusterPlatform::Kind,
+            cluster_platform: args.cluster_platform,
             qualification_scope: args.qualification_scope,
             enrollment_qualification: args.qualification_scope.enrollment_qualification().to_owned(),
             capacity_baseline: if args.resource_profile.is_reduced_dev() {
@@ -1430,6 +1487,58 @@ fn record_source_locks(evidence_dir: &Path, report: &mut Report) -> Result<(), S
     Ok(())
 }
 
+fn copy_run_source_locks(args: &GridLlmdArgs, evidence_dir: &Path, scenario: &str) -> Result<(), String> {
+    let Some(source_path) = args.source_locks_file.as_deref() else {
+        return Ok(());
+    };
+    let source: Value =
+        serde_json::from_slice(&fs::read(source_path).map_err(|error| format!("read run source locks: {error}"))?)
+            .map_err(|error| format!("decode run source locks: {error}"))?;
+    validate_run_source_locks(&source, args.source_mode, scenario)?;
+    let destination = evidence_dir.join("source-locks.json");
+    if destination.exists() {
+        return Err("source-lock evidence already exists; refusing to overwrite".to_owned());
+    }
+    fs::copy(source_path, &destination).map_err(|error| format!("copy run source locks: {error}"))?;
+    set_private_permissions(&destination, 0o600)?;
+    Ok(())
+}
+
+fn validate_run_source_locks(source: &Value, source_mode: SourceMode, scenario: &str) -> Result<(), String> {
+    if source["schema"].as_str() != Some("praxis-extproc.source-locks-run/v1")
+        || source["scenario"].as_str() != Some(scenario)
+        || source["source_mode"].as_str() != Some(source_mode.as_str())
+    {
+        return Err(format!(
+            "provided source lock must use scenario {scenario:?} and SOURCE_MODE={}",
+            source_mode.as_str()
+        ));
+    }
+    let components = source["components"]
+        .as_object()
+        .ok_or_else(|| "provided source lock has no component map".to_owned())?;
+    if components.is_empty() {
+        return Err("provided source lock contains no resolved components".to_owned());
+    }
+    for (name, record) in components {
+        let revision = record["resolved_sha"].as_str().unwrap_or_default();
+        let context = record["build_context_sha256"].as_str().unwrap_or_default();
+        let valid_patch = record["source_patch_sha256"].as_str().is_some_and(is_sha256_hex)
+            && record["base_build_context_sha256"].as_str().is_some_and(is_sha256_hex)
+            && record["patched_build_context_sha256"]
+                .as_str()
+                .is_some_and(is_sha256_hex);
+        if !is_git_commit_sha(revision)
+            || !is_sha256_hex(context)
+            || record["branch_state"].as_str() != Some("detached")
+            || (record["resolved_worktree_clean"].as_bool() != Some(true) && !valid_patch)
+        {
+            return Err(format!("provided source lock has invalid provenance for {name}"));
+        }
+    }
+    Ok(())
+}
+
 fn write_source_resolution_blocker(evidence_dir: &Path, report: &mut Report, error: &str) -> Result<(), String> {
     report.checks.push(Check {
         name: "source-resolution".to_owned(),
@@ -1546,12 +1655,32 @@ fn run_grid_llmd(args: &GridLlmdArgs) -> Result<(), String> {
         prompt: args.prompt.clone(),
     });
     let mut report = Report::new(args, context, started_epoch_seconds);
-    let _source_worktrees = if args.mode == Mode::Plan {
+    let source_scenario = if args.cluster_platform == ClusterPlatform::Kind {
+        "grid-llmd-kind"
+    } else {
+        "grid-llmd"
+    };
+    let source_platform_manifests = args.platform_manifests && args.cluster_platform != ClusterPlatform::Kind;
+    let _source_worktrees: Option<TempDir> = if args.mode == Mode::Plan {
         None
     } else {
-        let worktrees =
-            match resolve_clean_sources("grid-llmd", args.source_mode, args.platform_manifests, &evidence_dir) {
-                Ok(worktrees) => worktrees,
+        let worktrees = if args.source_locks_file.is_some() {
+            if let Err(error) = copy_run_source_locks(args, &evidence_dir, source_scenario) {
+                write_source_resolution_blocker(&evidence_dir, &mut report, &error)?;
+                return Err(format!(
+                    "source lock consumption blocked; evidence: {}",
+                    evidence_dir.display()
+                ));
+            }
+            None
+        } else {
+            match resolve_clean_sources(
+                source_scenario,
+                args.source_mode,
+                source_platform_manifests,
+                &evidence_dir,
+            ) {
+                Ok(worktrees) => Some(worktrees),
                 Err(error) => {
                     write_source_resolution_blocker(&evidence_dir, &mut report, &error)?;
                     return Err(format!(
@@ -1559,7 +1688,8 @@ fn run_grid_llmd(args: &GridLlmdArgs) -> Result<(), String> {
                         evidence_dir.display()
                     ));
                 },
-            };
+            }
+        };
         if let Err(error) = record_source_locks(&evidence_dir, &mut report) {
             write_source_resolution_blocker(&evidence_dir, &mut report, &error)?;
             return Err(format!(
@@ -1567,7 +1697,7 @@ fn run_grid_llmd(args: &GridLlmdArgs) -> Result<(), String> {
                 evidence_dir.display()
             ));
         }
-        Some(worktrees)
+        worktrees
     };
 
     if args.mode != Mode::Plan {
@@ -1701,7 +1831,7 @@ fn plan(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path) -> Result
         name: "source-selection".to_owned(),
         status: "pass".to_owned(),
         detail: format!(
-            "SOURCE_MODE={} requested; source resolution is performed in non-plan runs before cluster access; platform manifests={}",
+            "SOURCE_MODE={} requested; sources resolve before cluster access unless --source-locks-file supplies the deployment lock; platform manifests={}",
             args.source_mode.as_str(),
             args.platform_manifests
         ),
@@ -1723,7 +1853,7 @@ fn plan(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path) -> Result
         EPP metric/queue capacity: `{}` / `{}` via `{}`\nGrid provider A/B: `{}` / `{}`\n\
         source revisions: `{}`\nimage pins: `{}`\n\
         required assertions:\n\
-        - MaaS/RHOAI platform readiness (ExternalModel translation is out of scope)\n\
+        - Kind API, MaaS authorization, and serving readiness (ExternalModel translation is out of scope)\n\
         - GridNetwork overlay distribution and serving Gateway consumed revision\n\
         - EPP metric transition and deterministic simulator control/recovery\n\
         - A-to-B-to-A provider attribution and ExtProc-owned marker(s)\n\
@@ -1787,8 +1917,13 @@ fn plan(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path) -> Result
 fn preflight(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path) -> Result<(), String> {
     let context = args.context.clone().unwrap_or_default();
     check_kubectl(report, evidence_dir, &context)?;
-    check_openshift_prerequisites(report, evidence_dir, &context)?;
-    check_cluster_capacity(args, report, evidence_dir, &context)?;
+    match args.cluster_platform {
+        ClusterPlatform::OpenShift => {
+            check_openshift_prerequisites(report, evidence_dir, &context)?;
+            check_cluster_capacity(args, report, evidence_dir, &context)?;
+        },
+        ClusterPlatform::Kind => check_kind_prerequisites(report, evidence_dir, &context)?,
+    }
     check_integration_gates(args, report, evidence_dir, &context)?;
     check_grid_gateway_route(args, report, evidence_dir, &context)?;
     if args.qualification_scope == QualificationScope::RoutingSmoke {
@@ -2353,6 +2488,12 @@ fn validate_run_inputs(args: &GridLlmdArgs, report: &mut Report) {
         missing.push("--extproc-body-oracle as a valid response header name");
     }
     validate_transition_request_inputs(args, &mut missing);
+    validate_simulator_hook_identity_inputs(
+        args.require_signal_transition,
+        args.expected_api_server.as_deref(),
+        args.run_label.as_deref(),
+        &mut missing,
+    );
     if args.extproc_filter_resources.len() < args.expected_extproc_hops {
         missing.push("one --extproc-filter-resource per configured ExtProc hop");
     }
@@ -2400,6 +2541,23 @@ fn validate_run_inputs(args: &GridLlmdArgs, report: &mut Report) {
         },
         observed_epoch_seconds: epoch_seconds(),
     });
+}
+
+fn validate_simulator_hook_identity_inputs(
+    require_signal_transition: bool,
+    expected_api_server: Option<&str>,
+    run_label: Option<&str>,
+    missing: &mut Vec<&'static str>,
+) {
+    if !require_signal_transition {
+        return;
+    }
+    if expected_api_server.is_none_or(str::is_empty) {
+        missing.push("--expected-api-server for signal-hook cluster identity");
+    }
+    if run_label.is_none_or(str::is_empty) {
+        missing.push("--run-label for simulator-control ownership");
+    }
 }
 
 fn gateway_request_path(args: &GridLlmdArgs) -> String {
@@ -2644,7 +2802,8 @@ fn sample_epp_metrics(
             ),
         ]);
     }
-    let capture = run_command_owned("timeout", &hook_args)?;
+    let identity_environment = expected_api_server_environment(args.expected_api_server.as_deref());
+    let capture = run_command_owned_with_environment("timeout", &hook_args, &identity_environment)?;
     write_capture(evidence_dir, &format!("epp-metrics-hook-{phase}"), &capture)?;
     if !capture.success() {
         add_blocked_check(
@@ -4204,7 +4363,8 @@ fn wait_for_gateway_revision(
             "--phase".to_owned(),
             phase.to_owned(),
         ];
-        let capture = run_command_owned("timeout", &hook_args)?;
+        let identity_environment = expected_api_server_environment(args.expected_api_server.as_deref());
+        let capture = run_command_owned_with_environment("timeout", &hook_args, &identity_environment)?;
         write_capture(
             evidence_dir,
             &format!("gateway-revision-hook-{phase}-{attempt}"),
@@ -4599,6 +4759,204 @@ fn check_cluster_capacity(
     Ok(())
 }
 
+/// Verify the Kubernetes-native prerequisites used by the isolated Kind profile.
+/// RHOAI ClusterVersion/ClusterOperator and OpenShift worker-role gates do not exist on ordinary Kind.
+fn check_kind_prerequisites(report: &mut Report, evidence_dir: &Path, context: &str) -> Result<(), String> {
+    let readyz = run_command("kubectl", &["--context", context, "get", "--raw=/readyz"])?;
+    write_capture(evidence_dir, "kind-api-readyz", &readyz)?;
+    let api_ready = readyz.success() && readyz.stdout().trim() == "ok";
+    record_boolean_check(
+        report,
+        "kind/api-readyz",
+        api_ready,
+        if api_ready {
+            "Kind Kubernetes API /readyz returned ok".to_owned()
+        } else {
+            format!(
+                "Kind Kubernetes API /readyz did not return ok; exit status {}",
+                readyz.status()
+            )
+        },
+    );
+
+    let version = run_command("kubectl", &["--context", context, "version", "-o", "json"])?;
+    write_capture(evidence_dir, "kind-kubernetes-version", &version)?;
+    let server_version = if version.success() {
+        serde_json::from_str::<Value>(&version.stdout())
+            .ok()
+            .and_then(|document| {
+                document
+                    .pointer("/serverVersion/gitVersion")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    };
+    record_boolean_check(
+        report,
+        "kind/kubernetes-version",
+        server_version.is_some(),
+        server_version.as_ref().map_or_else(
+            || {
+                format!(
+                    "Kubernetes server version was unavailable; exit status {}",
+                    version.status()
+                )
+            },
+            |value| format!("Kubernetes server version {value}"),
+        ),
+    );
+
+    let nodes_capture = run_command("kubectl", &["--context", context, "get", "nodes", "-o", "json"])?;
+    write_capture(evidence_dir, "kind-nodes", &nodes_capture)?;
+    if !nodes_capture.success() {
+        return Err(format!("read Kind node inventory: {}", nodes_capture.stderr()));
+    }
+    let nodes: Value =
+        serde_json::from_str(&nodes_capture.stdout()).map_err(|error| format!("parse Kind node inventory: {error}"))?;
+    let node_records = nodes
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|node| {
+            let ready = node
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .is_some_and(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition.get("type").and_then(Value::as_str) == Some("Ready")
+                            && condition.get("status").and_then(Value::as_str) == Some("True")
+                    })
+                });
+            let allocatable = node.pointer("/status/allocatable");
+            let cpu = allocatable
+                .and_then(|value| value.get("cpu"))
+                .and_then(Value::as_str)
+                .and_then(parse_cpu_millis);
+            let memory = allocatable
+                .and_then(|value| value.get("memory"))
+                .and_then(Value::as_str)
+                .and_then(parse_memory_bytes);
+            serde_json::json!({
+                "name": node.pointer("/metadata/name").and_then(Value::as_str),
+                "ready": ready,
+                "schedulable": node.pointer("/spec/unschedulable").and_then(Value::as_bool) != Some(true),
+                "allocatableCpuMilli": cpu,
+                "allocatableMemoryBytes": memory,
+            })
+        })
+        .collect::<Vec<_>>();
+    let schedulable_ready_nodes = node_records
+        .iter()
+        .filter(|node| node["ready"] == true && node["schedulable"] == true)
+        .count();
+    let capacity_complete = node_records.iter().all(|node| {
+        node["allocatableCpuMilli"].as_u64().is_some() && node["allocatableMemoryBytes"].as_u64().is_some()
+    });
+    record_boolean_check(
+        report,
+        "kind/node-readiness-and-capacity",
+        !node_records.is_empty() && schedulable_ready_nodes >= 1 && capacity_complete,
+        format!(
+            "{} nodes observed, {schedulable_ready_nodes} Ready and schedulable, allocatable CPU/memory recorded; Kind does not use OpenShift worker-role thresholds",
+            node_records.len()
+        ),
+    );
+
+    let pending_capture = run_command(
+        "kubectl",
+        &[
+            "--context",
+            context,
+            "get",
+            "pods",
+            "--all-namespaces",
+            "--field-selector=status.phase=Pending",
+            "-o",
+            "json",
+        ],
+    )?;
+    write_capture(evidence_dir, "kind-pending-pods", &pending_capture)?;
+    if !pending_capture.success() {
+        return Err(format!("read Kind Pending Pods: {}", pending_capture.stderr()));
+    }
+    let pending: Value = serde_json::from_str(&pending_capture.stdout())
+        .map_err(|error| format!("parse Kind Pending Pod inventory: {error}"))?;
+    let pending_records = pending
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|pod| {
+            serde_json::json!({
+                "namespace": pod.pointer("/metadata/namespace").and_then(Value::as_str),
+                "name": pod.pointer("/metadata/name").and_then(Value::as_str),
+                "node": pod.pointer("/spec/nodeName").and_then(Value::as_str),
+                "reason": pod.pointer("/status/reason").and_then(Value::as_str),
+                "message": pod.pointer("/status/message").and_then(Value::as_str),
+            })
+        })
+        .collect::<Vec<_>>();
+    record_boolean_check(
+        report,
+        "kind/zero-pending-pods",
+        pending_records.is_empty(),
+        format!("{} cluster-wide Pending Pods", pending_records.len()),
+    );
+
+    let storage = run_command(
+        "kubectl",
+        &["--context", context, "get", "storageclasses", "-o", "json"],
+    )?;
+    write_capture(evidence_dir, "kind-storage-classes", &storage)?;
+    let storage_classes: Value = if storage.success() {
+        serde_json::from_str(&storage.stdout()).map_err(|error| format!("parse Kind StorageClasses: {error}"))?
+    } else {
+        Value::Null
+    };
+    let dynamic_defaults = storage_classes
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|class| is_default_dynamic_storage_class(class))
+        .filter_map(|class| {
+            class
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    record_boolean_check(
+        report,
+        "kind/default-storage",
+        storage.success() && !dynamic_defaults.is_empty(),
+        if storage.success() {
+            format!("dynamic default StorageClass(es): {}", dynamic_defaults.join(", "))
+        } else {
+            format!("read Kind StorageClasses failed; exit status {}", storage.status())
+        },
+    );
+
+    write_json_private(
+        &evidence_dir.join("kind-platform-prerequisites.json"),
+        &serde_json::json!({
+            "clusterPlatform": ClusterPlatform::Kind.as_str(),
+            "kubernetesServerVersion": server_version,
+            "apiReadyz": api_ready,
+            "nodeCount": node_records.len(),
+            "schedulableReadyNodes": schedulable_ready_nodes,
+            "nodes": node_records,
+            "pendingPods": pending_records,
+            "dynamicDefaultStorageClasses": dynamic_defaults,
+            "openshiftClusterVersionAndClusterOperators": "not-applicable-to-kind",
+        }),
+    )?;
+    Ok(())
+}
+
 fn parse_cpu_millis(value: &str) -> Option<u64> {
     if let Some(millis) = value.strip_suffix('m') {
         if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -4985,7 +5343,7 @@ fn check_integration_gates(
     evidence_dir: &Path,
     context: &str,
 ) -> Result<(), String> {
-    let required_gates = args.qualification_scope.required_gates();
+    let required_gates = args.cluster_platform.required_gates(args.qualification_scope);
     if args.gate_resources.is_empty() {
         return Err(format!(
             "non-plan modes require --gate-resource values for scope {}: {}",
@@ -5005,10 +5363,10 @@ fn check_integration_gates(
         let resource_ref = parse_resource_ref(resource, &namespace)?;
         let kind = resource_ref.kind.as_str();
         let name = resource_ref.name.as_str();
-        if !FULL_REQUIRED_GATES.contains(&gate) {
+        if !SUPPORTED_INTEGRATION_GATES.contains(&gate) {
             return Err(format!(
                 "unknown integration gate {gate:?}; expected {}",
-                FULL_REQUIRED_GATES.join(", ")
+                SUPPORTED_INTEGRATION_GATES.join(", ")
             ));
         }
         validate_gate_resource_contract(gate, kind, condition)?;
@@ -5021,16 +5379,20 @@ fn check_integration_gates(
         } else {
             Some(resource_ref.namespace.as_str())
         };
-        check_resource(
-            report,
-            evidence_dir,
-            context,
-            resource_namespace,
-            kind,
-            name,
-            &format!("gate/{gate}"),
-            condition,
-        )?;
+        if args.cluster_platform == ClusterPlatform::Kind && gate == "gateway" {
+            check_kind_gateway_gate(report, evidence_dir, context, &resource_ref)?;
+        } else {
+            check_resource(
+                report,
+                evidence_dir,
+                context,
+                resource_namespace,
+                kind,
+                name,
+                &format!("gate/{gate}"),
+                condition,
+            )?;
+        }
     }
     for required in required_gates {
         if !seen.contains(required) {
@@ -5043,6 +5405,67 @@ fn check_integration_gates(
         }
     }
     Ok(())
+}
+
+fn check_kind_gateway_gate(
+    report: &mut Report,
+    evidence_dir: &Path,
+    context: &str,
+    gateway_ref: &ResourceRef,
+) -> Result<(), String> {
+    let capture = get_resource(
+        evidence_dir,
+        context,
+        Some(&gateway_ref.namespace),
+        &gateway_ref.kind,
+        &gateway_ref.name,
+        "kind-gateway-listener",
+    )?;
+    let ready = capture.success()
+        && serde_json::from_str::<Value>(&capture.stdout())
+            .is_ok_and(|gateway| kind_gateway_listener_is_programmed(&gateway));
+    report.checks.push(Check {
+        name: "gate/gateway".to_owned(),
+        status: if ready { "pass" } else { "blocked" }.to_owned(),
+        detail: if ready {
+            format!(
+                "Gateway {}/{} has a current Accepted inference listener with Programmed and ResolvedRefs true and at least one attached route; a LoadBalancer address is not required on Kind",
+                gateway_ref.namespace, gateway_ref.name
+            )
+        } else {
+            format!(
+                "Gateway {}/{} has no current Accepted/Programmed/ResolvedRefs listener with an attached route",
+                gateway_ref.namespace, gateway_ref.name
+            )
+        },
+        observed_epoch_seconds: epoch_seconds(),
+    });
+    Ok(())
+}
+
+fn kind_gateway_listener_is_programmed(gateway: &Value) -> bool {
+    let generation = gateway.pointer("/metadata/generation").and_then(Value::as_u64);
+    let Some(generation) = generation else {
+        return false;
+    };
+    let current_condition = |conditions: &Value, condition_type: &str| {
+        conditions.as_array().is_some_and(|items| {
+            items.iter().any(|condition| {
+                condition["type"].as_str() == Some(condition_type)
+                    && condition["status"].as_str() == Some("True")
+                    && condition["observedGeneration"].as_u64() == Some(generation)
+            })
+        })
+    };
+    current_condition(&gateway["status"]["conditions"], "Accepted")
+        && gateway["status"]["listeners"].as_array().is_some_and(|listeners| {
+            listeners.iter().any(|listener| {
+                listener["attachedRoutes"].as_u64().is_some_and(|routes| routes > 0)
+                    && current_condition(&listener["conditions"], "Accepted")
+                    && current_condition(&listener["conditions"], "Programmed")
+                    && current_condition(&listener["conditions"], "ResolvedRefs")
+            })
+        })
 }
 
 fn is_cluster_scoped_gate_resource_kind(kind: &str) -> bool {
@@ -5598,7 +6021,7 @@ fn check_provider_transport(
         "--provider-trust".to_owned(),
         trust_source.to_owned(),
     ];
-    let capture = run_hook_command(args, hook, evidence_dir, &extra_args, None)?;
+    let capture = run_hook_command(args, hook, evidence_dir, &extra_args, None, None)?;
     write_capture(evidence_dir, "provider-transport-hook", &capture)?;
     if !capture.success() {
         add_blocked_check(report, "maas/provider-transport-tls", "provider transport hook failed");
@@ -5785,15 +6208,15 @@ fn check_source_and_image_pins(args: &GridLlmdArgs, report: &mut Report) {
     let (runtime_digests, runtime_errors) = parse_component_pins(&args.runtime_image_digests, PinKind::Sha256);
     let mut errors = image_errors;
     errors.extend(runtime_errors);
-    let ipp_present = report.runtime_images.iter().any(|record| {
-        let identity = format!("{} {} {}", record.image, record.container, record.pod).to_ascii_lowercase();
-        identity.contains("payload-processing") || identity.contains("/ipp") || identity.ends_with("ipp")
-    });
+    let ipp_present = report
+        .runtime_images
+        .iter()
+        .any(|record| runtime_image_looks_like_ipp_in_namespace(record, &args.namespace));
     if ipp_present && !image_pins.contains_key("ipp") {
         errors.push("IPP runtime detected but no immutable ipp image pin was supplied".to_owned());
     }
-    if image_pins.contains_key("ipp") && !sources.contains_key("ipp") {
-        errors.push("IPP image pin supplied without an ipp source revision".to_owned());
+    if image_pins.contains_key("ipp") && !sources.contains_key("ipp") && !sources.contains_key("praxis-extproc") {
+        errors.push("IPP image pin supplied without an IPP or Praxis ExtProc source revision".to_owned());
     }
     let missing_images = required_images
         .iter()
@@ -5917,8 +6340,20 @@ fn is_sha256_digest(value: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+fn runtime_image_looks_like_ipp_in_namespace(record: &RuntimeImageRecord, namespace: &str) -> bool {
+    if record.namespace != namespace {
+        return false;
+    }
+    let identity = format!("{} {} {}", record.image, record.container, record.pod).to_ascii_lowercase();
+    identity.contains("payload-processing") || identity.contains("/ipp") || identity.ends_with("ipp")
+}
+
 fn is_git_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn sha256_digest(value: &[u8]) -> String {
@@ -7249,6 +7684,9 @@ fn check_pool_route_contract(
     write_capture(evidence_dir, "pool-route-contract-hook", &capture)?;
     let summary = serde_json::from_str::<Value>(&capture.stdout()).ok();
     let passed = capture.success() && summary.as_ref().is_some_and(|value| value["status"] == "PASS");
+    let attribution_headers_match = summary
+        .as_ref()
+        .is_some_and(|value| pool_route_attribution_headers_match(value, &args.provider_header, &args.backend_header));
     let detail = summary.as_ref().and_then(|value| value["detail"].as_str()).map_or_else(
         || "route-contract hook did not return a passing JSON report; see captured hook output".to_owned(),
         str::to_owned,
@@ -7259,7 +7697,44 @@ fn check_pool_route_contract(
         detail,
         observed_epoch_seconds: epoch_seconds(),
     });
+    record_boolean_check(
+        report,
+        "serving/attribution-header-contract",
+        attribution_headers_match,
+        format!(
+            "configured provider/backend response headers {:?}/{:?} match the router and both provider-proxy contracts",
+            args.provider_header, args.backend_header
+        ),
+    );
     Ok(())
+}
+
+fn pool_route_attribution_headers_match(summary: &Value, provider_header: &str, backend_header: &str) -> bool {
+    let Some(oracle) = summary["attributionOracle"].as_array() else {
+        return false;
+    };
+    let Some(provider_proxy_contracts) = summary["providerProxyContracts"].as_array() else {
+        return false;
+    };
+    let Some(expected_provider_header) = oracle.first().and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(expected_backend_header) = oracle.get(1).and_then(Value::as_str) else {
+        return false;
+    };
+    oracle.len() == 2
+        && !provider_header.eq_ignore_ascii_case(backend_header)
+        && provider_header.eq_ignore_ascii_case(expected_provider_header)
+        && backend_header.eq_ignore_ascii_case(expected_backend_header)
+        && provider_proxy_contracts.len() == 2
+        && provider_proxy_contracts.iter().all(|contract| {
+            contract["providerResponseHeader"]
+                .as_str()
+                .is_some_and(|header| provider_header.eq_ignore_ascii_case(header))
+                && contract["backendResponseHeader"]
+                    .as_str()
+                    .is_some_and(|header| backend_header.eq_ignore_ascii_case(header))
+        })
 }
 
 fn check_pool_backend_identity_separation(report: &mut Report, pools: &[ServingPoolRecord], expected_count: usize) {
@@ -7712,10 +8187,10 @@ fn check_ipp_inventory(
             );
         },
         IppState::Absent => {
-            let runtime_ipp_image_found = report.runtime_images.iter().any(|record| {
-                let identity = format!("{} {} {}", record.image, record.container, record.pod).to_ascii_lowercase();
-                identity.contains("payload-processing") || identity.contains("/ipp") || identity.ends_with("ipp")
-            });
+            let runtime_ipp_image_found = report
+                .runtime_images
+                .iter()
+                .any(|record| runtime_image_looks_like_ipp_in_namespace(record, &args.namespace));
             record_boolean_check(
                 report,
                 "serving/ipp-inventory",
@@ -7723,7 +8198,7 @@ fn check_ipp_inventory(
                 if runtime_ipp_image_found {
                     "caller declared IPP absent, but a captured serving-path image looks like IPP".to_owned()
                 } else if args.ipp_resources.is_empty() {
-                    "caller verified IPP is absent from this serving path; captured serving-path runtime images contain no IPP identity".to_owned()
+                    "caller verified IPP is absent from this serving path; task-namespace runtime images contain no IPP identity".to_owned()
                 } else {
                     "--ipp-resource was supplied while --ipp-state=absent".to_owned()
                 },
@@ -8073,6 +8548,17 @@ fn record_pod_images(report: &mut Report, json: &str) {
     let Ok(object) = serde_json::from_str::<Value>(json) else {
         return;
     };
+    for record in runtime_image_records_from_pods(&object) {
+        if !report.runtime_images.iter().any(|existing| {
+            existing.pod == record.pod && existing.container == record.container && !existing.image_id.is_empty()
+        }) {
+            report.runtime_images.push(record);
+        }
+    }
+}
+
+fn runtime_image_records_from_pods(object: &Value) -> Vec<RuntimeImageRecord> {
+    let mut records = Vec::new();
     for pod in object["items"].as_array().into_iter().flatten() {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or_default();
         let pod_name = pod["metadata"]["name"].as_str().unwrap_or_default();
@@ -8083,23 +8569,32 @@ fn record_pod_images(report: &mut Report, json: &str) {
                     condition["type"].as_str() == Some("Ready") && condition["status"].as_str() == Some("True")
                 })
             });
-        for container in pod["status"]["containerStatuses"].as_array().into_iter().flatten() {
-            let record = RuntimeImageRecord {
-                namespace: namespace.to_owned(),
-                pod: pod_name.to_owned(),
-                pod_uid: pod_uid.to_owned(),
-                container: container["name"].as_str().unwrap_or_default().to_owned(),
-                image: container["image"].as_str().unwrap_or_default().to_owned(),
-                image_id: container["imageID"].as_str().unwrap_or_default().to_owned(),
-                ready: pod_ready && container["ready"].as_bool() == Some(true),
-            };
-            if !report.runtime_images.iter().any(|existing| {
-                existing.pod == record.pod && existing.container == record.container && !existing.image_id.is_empty()
-            }) {
-                report.runtime_images.push(record);
+        for (spec_key, status_key) in [
+            ("containers", "containerStatuses"),
+            ("initContainers", "initContainerStatuses"),
+        ] {
+            for status in pod["status"][status_key].as_array().into_iter().flatten() {
+                let name = status["name"].as_str().unwrap_or_default();
+                let declared_image = pod["spec"][spec_key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|spec| spec["name"].as_str() == Some(name))
+                    .and_then(|spec| spec["image"].as_str())
+                    .unwrap_or_else(|| status["image"].as_str().unwrap_or_default());
+                records.push(RuntimeImageRecord {
+                    namespace: namespace.to_owned(),
+                    pod: pod_name.to_owned(),
+                    pod_uid: pod_uid.to_owned(),
+                    container: name.to_owned(),
+                    image: declared_image.to_owned(),
+                    image_id: status["imageID"].as_str().unwrap_or_default().to_owned(),
+                    ready: pod_ready && status["ready"].as_bool() == Some(true),
+                });
             }
         }
     }
+    records
 }
 
 fn run_hook(
@@ -8110,7 +8605,8 @@ fn run_hook(
     phase: &str,
     pressure_pool: Option<&str>,
 ) -> Result<String, String> {
-    let capture = run_hook_command(args, hook, evidence_dir, &[], pressure_pool)?;
+    let phase_args = signal_hook_phase_args(phase);
+    let capture = run_hook_command(args, hook, evidence_dir, &phase_args, Some(phase), pressure_pool)?;
     write_capture(evidence_dir, &format!("hook-{phase}"), &capture)?;
     let passed = capture.success();
     let stdout = capture.stdout();
@@ -8131,11 +8627,100 @@ fn run_hook(
     }
 }
 
+fn signal_hook_phase_args(phase: &str) -> Vec<String> {
+    match phase {
+        "pressure" | "recovery" => vec![phase.to_owned()],
+        _ => Vec::new(),
+    }
+}
+
+fn signal_hook_environment(
+    control_resources: &[String],
+    pool_model_resources: &[String],
+    metric_name: &str,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "GRID_LLMD_SIMULATOR_CONTROL_RESOURCES".to_owned(),
+            control_resources.join(","),
+        ),
+        (
+            "GRID_LLMD_POOL_MODEL_RESOURCES".to_owned(),
+            pool_model_resources.join(","),
+        ),
+        ("GRID_SIGNAL_METRIC".to_owned(), metric_name.to_owned()),
+        ("EPP_QUEUE_METRIC".to_owned(), metric_name.to_owned()),
+    ]
+}
+
+fn expected_api_server_environment(expected_api_server: Option<&str>) -> Vec<(String, String)> {
+    expected_api_server
+        .map(|server| vec![("EXPECTED_API_SERVER".to_owned(), server.to_owned())])
+        .unwrap_or_default()
+}
+
+fn hook_resource_name(resource: Option<&str>, namespace: &str, default: &str) -> String {
+    resource
+        .and_then(|value| parse_resource_ref(value, namespace).ok())
+        .map_or_else(|| default.to_owned(), |reference| reference.name)
+}
+
+fn failure_closed_hook_environment(args: &GridLlmdArgs) -> Vec<(String, String)> {
+    let gateway_path = gateway_request_path(args);
+    let gateway_ca_file = args
+        .gateway_ca_file
+        .as_ref()
+        .map_or_else(String::new, |path| path.display().to_string());
+    let route_name = hook_resource_name(
+        args.httproute_resource.as_deref(),
+        &args.namespace,
+        "grid-llmd-inference",
+    );
+    let filter_name = hook_resource_name(
+        args.extproc_filter_resources.first().map(String::as_str),
+        &args.namespace,
+        "praxis-grid-llmd-extproc",
+    );
+    gateway_failure_hook_environment(
+        args.gateway_url.as_deref().unwrap_or_default(),
+        args.gateway_connect_to.as_deref().unwrap_or_default(),
+        &gateway_ca_file,
+        &gateway_path,
+        &args.model,
+        args.timeout_seconds,
+        &route_name,
+        &filter_name,
+    )
+}
+
+fn gateway_failure_hook_environment(
+    url: &str,
+    connect_to: &str,
+    ca_file: &str,
+    path: &str,
+    model: &str,
+    timeout_seconds: u64,
+    route: &str,
+    filter: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("GRID_LLMD_GATEWAY_URL".to_owned(), url.to_owned()),
+        ("GRID_LLMD_GATEWAY_CONNECT_TO".to_owned(), connect_to.to_owned()),
+        ("GRID_LLMD_GATEWAY_CA_FILE".to_owned(), ca_file.to_owned()),
+        ("GRID_LLMD_GATEWAY_PATH".to_owned(), path.to_owned()),
+        ("GRID_LLMD_MODEL".to_owned(), model.to_owned()),
+        ("GRID_LLMD_TIMEOUT_SECONDS".to_owned(), timeout_seconds.to_string()),
+        ("GRID_LLMD_HTTPROUTE_NAME".to_owned(), route.to_owned()),
+        ("GRID_LLMD_EXTPROC_ENVOYFILTER".to_owned(), filter.to_owned()),
+    ]
+}
+
 fn run_hook_command(
     args: &GridLlmdArgs,
     hook: &Path,
     evidence_dir: &Path,
     extra_args: &[String],
+    hook_phase: Option<&str>,
     pressure_pool: Option<&str>,
 ) -> Result<CommandCapture, String> {
     let hook_args = [
@@ -8153,7 +8738,26 @@ fn run_hook_command(
     command.args(extra_args);
     if let Some(pressure_pool) = pressure_pool {
         command.env("GRID_LLMD_PRESSURE_POOL", pressure_pool);
+        for (name, value) in signal_hook_environment(
+            &args.simulator_control_resources,
+            &args.pool_model_resources,
+            args.epp_metric_name.as_deref().unwrap_or_default(),
+        ) {
+            command.env(name, value);
+        }
     }
+    if hook_phase == Some("failure-closed") {
+        for (name, value) in failure_closed_hook_environment(args) {
+            command.env(name, value);
+        }
+    }
+    for (name, value) in expected_api_server_environment(args.expected_api_server.as_deref()) {
+        command.env(name, value);
+    }
+    if let Some(run_label) = args.run_label.as_deref() {
+        command.env("GRID_RUN_LABEL", run_label);
+    }
+    command.env("GRID_LLMD_CLUSTER_PLATFORM", args.cluster_platform.as_str());
     if let Some(config) = KUBE_COMMAND_CONFIG.get() {
         if let Some(kubeconfig) = config.kubeconfig.as_ref() {
             command.env("KUBECONFIG", kubeconfig);
@@ -8594,6 +9198,14 @@ fn run_command(program: &str, args: &[&str]) -> Result<CommandCapture, String> {
 }
 
 fn run_command_owned(program: impl AsRef<Path>, args: &[String]) -> Result<CommandCapture, String> {
+    run_command_owned_with_environment(program, args, &[])
+}
+
+fn run_command_owned_with_environment(
+    program: impl AsRef<Path>,
+    args: &[String],
+    additional_environment: &[(String, String)],
+) -> Result<CommandCapture, String> {
     let mut command = Command::new(program.as_ref());
     if let Some(config) = KUBE_COMMAND_CONFIG.get() {
         if let Some(kubeconfig) = config.kubeconfig.as_ref() {
@@ -8619,6 +9231,9 @@ fn run_command_owned(program: impl AsRef<Path>, args: &[String]) -> Result<Comma
                 command.arg("--insecure-skip-tls-verify=true");
             }
         }
+    }
+    for (name, value) in additional_environment {
+        command.env(name, value);
     }
     let output = command
         .args(args)
@@ -9218,6 +9833,214 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provided_kind_source_lock_validates_clean_and_recorded_patched_components() {
+        let lock = serde_json::json!({
+            "schema": "praxis-extproc.source-locks-run/v1",
+            "scenario": "grid-llmd-kind",
+            "source_mode": "main",
+            "components": {
+                "grid": {
+                    "resolved_sha": "a".repeat(40),
+                    "build_context_sha256": "b".repeat(64),
+                    "branch_state": "detached",
+                    "resolved_worktree_clean": true
+                },
+                "maas": {
+                    "resolved_sha": "c".repeat(40),
+                    "build_context_sha256": "d".repeat(64),
+                    "branch_state": "detached",
+                    "resolved_worktree_clean": false,
+                    "source_patch_sha256": "e".repeat(64),
+                    "base_build_context_sha256": "f".repeat(64),
+                    "patched_build_context_sha256": "1".repeat(64)
+                }
+            }
+        });
+
+        assert!(validate_run_source_locks(&lock, SourceMode::Main, "grid-llmd-kind").is_ok());
+        assert!(validate_run_source_locks(&lock, SourceMode::Locked, "grid-llmd-kind").is_err());
+        assert!(validate_run_source_locks(&lock, SourceMode::Main, "grid-llmd").is_err());
+
+        let mut invalid = lock;
+        invalid["components"]["grid"]["resolved_worktree_clean"] = serde_json::json!(false);
+        assert!(validate_run_source_locks(&invalid, SourceMode::Main, "grid-llmd-kind").is_err());
+    }
+
+    #[test]
+    fn route_attribution_headers_must_match_the_router_and_both_provider_proxies() {
+        let summary = serde_json::json!({
+            "attributionOracle": ["x-ai-demo-provider-gateway", "x-ai-inference-provider"],
+            "providerProxyContracts": [
+                {
+                    "providerResponseHeader": "x-ai-demo-provider-gateway",
+                    "backendResponseHeader": "x-ai-inference-provider"
+                },
+                {
+                    "providerResponseHeader": "x-ai-demo-provider-gateway",
+                    "backendResponseHeader": "x-ai-inference-provider"
+                }
+            ]
+        });
+
+        assert!(pool_route_attribution_headers_match(
+            &summary,
+            "X-AI-DEMO-PROVIDER-GATEWAY",
+            "x-ai-inference-provider"
+        ));
+        assert!(!pool_route_attribution_headers_match(
+            &summary,
+            "x-grid-llmd-provider-gateway",
+            "x-ai-demo-provider-gateway"
+        ));
+        assert!(!pool_route_attribution_headers_match(
+            &summary,
+            "x-ai-demo-provider-gateway",
+            "x-wrong-backend"
+        ));
+
+        let mut inconsistent = summary;
+        inconsistent["providerProxyContracts"][1]["backendResponseHeader"] = serde_json::json!("x-other-backend");
+        assert!(!pool_route_attribution_headers_match(
+            &inconsistent,
+            "x-ai-demo-provider-gateway",
+            "x-ai-inference-provider"
+        ));
+    }
+
+    #[test]
+    fn signal_hooks_require_expected_cluster_and_run_identity_before_traffic() {
+        let mut missing = Vec::new();
+        validate_simulator_hook_identity_inputs(true, None, None, &mut missing);
+        assert_eq!(
+            missing,
+            vec![
+                "--expected-api-server for signal-hook cluster identity",
+                "--run-label for simulator-control ownership"
+            ]
+        );
+
+        let mut configured = Vec::new();
+        validate_simulator_hook_identity_inputs(
+            true,
+            Some("https://127.0.0.1:6443"),
+            Some("run-20261102"),
+            &mut configured,
+        );
+        assert!(configured.is_empty());
+
+        let mut baseline_only = Vec::new();
+        validate_simulator_hook_identity_inputs(false, None, None, &mut baseline_only);
+        assert!(baseline_only.is_empty());
+    }
+
+    #[test]
+    fn simulator_signal_hooks_receive_their_phase_subcommand() {
+        assert_eq!(signal_hook_phase_args("pressure"), vec!["pressure"]);
+        assert_eq!(signal_hook_phase_args("recovery"), vec!["recovery"]);
+        assert!(signal_hook_phase_args("failure-closed").is_empty());
+    }
+
+    #[test]
+    fn simulator_signal_hooks_receive_owned_controls_and_pool_model_mapping() {
+        let environment = signal_hook_environment(
+            &[
+                "grid-task/configmap/pool-a-control#config.yaml@pool-a-inference-pool".to_owned(),
+                "grid-task/configmap/pool-b-control#config.yaml@pool-b-inference-pool".to_owned(),
+            ],
+            &[
+                "pool-a-inference-pool=grid-task/llminferenceservice/pool-a".to_owned(),
+                "pool-b-inference-pool=grid-task/llminferenceservice/pool-b".to_owned(),
+            ],
+            "llm_d_epp_average_queue_size",
+        );
+        assert_eq!(
+            environment,
+            vec![
+                (
+                    "GRID_LLMD_SIMULATOR_CONTROL_RESOURCES".to_owned(),
+                    "grid-task/configmap/pool-a-control#config.yaml@pool-a-inference-pool,grid-task/configmap/pool-b-control#config.yaml@pool-b-inference-pool".to_owned(),
+                ),
+                (
+                    "GRID_LLMD_POOL_MODEL_RESOURCES".to_owned(),
+                    "pool-a-inference-pool=grid-task/llminferenceservice/pool-a,pool-b-inference-pool=grid-task/llminferenceservice/pool-b".to_owned(),
+                ),
+                (
+                    "GRID_SIGNAL_METRIC".to_owned(),
+                    "llm_d_epp_average_queue_size".to_owned(),
+                ),
+                (
+                    "EPP_QUEUE_METRIC".to_owned(),
+                    "llm_d_epp_average_queue_size".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn expected_api_server_is_forwarded_to_owned_hooks() {
+        assert_eq!(
+            expected_api_server_environment(Some("https://127.0.0.1:6443")),
+            vec![("EXPECTED_API_SERVER".to_owned(), "https://127.0.0.1:6443".to_owned(),)]
+        );
+        assert!(expected_api_server_environment(None).is_empty());
+    }
+
+    #[test]
+    fn failure_closed_hook_receives_the_verified_gateway_request_contract() {
+        let environment = gateway_failure_hook_environment(
+            "https://grid-llmd-site.grid.internal",
+            "grid-llmd-site.grid.internal:443:127.0.0.1:19443",
+            "/private/grid-ca.crt",
+            "/publishers/grid-task/models/grid-test-model/v1/chat/completions",
+            "grid-test-model",
+            90,
+            "grid-llmd-inference",
+            "praxis-grid-llmd-extproc",
+        );
+        assert_eq!(
+            environment[0],
+            (
+                "GRID_LLMD_GATEWAY_URL".to_owned(),
+                "https://grid-llmd-site.grid.internal".to_owned()
+            )
+        );
+        assert_eq!(environment[1].0, "GRID_LLMD_GATEWAY_CONNECT_TO");
+        assert_eq!(
+            environment[2],
+            (
+                "GRID_LLMD_GATEWAY_CA_FILE".to_owned(),
+                "/private/grid-ca.crt".to_owned()
+            )
+        );
+        assert_eq!(
+            environment[3],
+            (
+                "GRID_LLMD_GATEWAY_PATH".to_owned(),
+                "/publishers/grid-task/models/grid-test-model/v1/chat/completions".to_owned()
+            )
+        );
+        assert_eq!(
+            environment[4],
+            ("GRID_LLMD_MODEL".to_owned(), "grid-test-model".to_owned())
+        );
+        assert_eq!(
+            environment[5],
+            ("GRID_LLMD_TIMEOUT_SECONDS".to_owned(), "90".to_owned())
+        );
+        assert_eq!(
+            environment[6],
+            ("GRID_LLMD_HTTPROUTE_NAME".to_owned(), "grid-llmd-inference".to_owned())
+        );
+        assert_eq!(
+            environment[7],
+            (
+                "GRID_LLMD_EXTPROC_ENVOYFILTER".to_owned(),
+                "praxis-grid-llmd-extproc".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn simulator_receipt_requires_the_unique_request_id_on_a_completion_log() {
         let request_id = "grid-llmd-1234-5678-baseline";
         assert!(simulator_completion_log_matches(
@@ -9235,6 +10058,81 @@ mod tests {
         assert!(!simulator_completion_log_matches(
             "I1028 16:00:00 simulator.go:401] Finished processing request id=anything",
             ""
+        ));
+    }
+
+    #[test]
+    fn runtime_image_records_pair_the_declared_image_with_the_runtime_image_id() {
+        let document = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "namespace": "task",
+                    "name": "gateway-abc",
+                    "uid": "pod-uid"
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "praxis",
+                        "image": "registry.example/grid-gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{
+                        "name": "praxis",
+                        "image": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "imageID": "docker-pullable://registry.example/grid-gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "ready": true
+                    }]
+                }
+            }]
+        });
+
+        let records = runtime_image_records_from_pods(&document);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].image,
+            "registry.example/grid-gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            runtime_image_digest(&records[0].image_id).as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(records[0].ready);
+    }
+
+    #[test]
+    fn ipp_detection_ignores_maas_payload_processors_outside_the_task_namespace() {
+        let platform_processor = RuntimeImageRecord {
+            namespace: "maas-system".to_owned(),
+            pod: "payload-processing-abc".to_owned(),
+            pod_uid: "platform-pod-uid".to_owned(),
+            container: "payload-processing".to_owned(),
+            image: "registry.example/praxis-extproc@sha256:abc".to_owned(),
+            image_id: "sha256:abc".to_owned(),
+            ready: true,
+        };
+        assert!(!runtime_image_looks_like_ipp_in_namespace(
+            &platform_processor,
+            "grid-llmd-e2e-r5"
+        ));
+    }
+
+    #[test]
+    fn ipp_detection_keeps_task_namespace_serving_evidence_scoped() {
+        let ipp_runtime = RuntimeImageRecord {
+            namespace: "grid-llmd-e2e-r5".to_owned(),
+            pod: "pool-a-ipp-proxy-abc".to_owned(),
+            pod_uid: "task-pod-uid".to_owned(),
+            container: "ipp-proxy".to_owned(),
+            image: "registry.example/praxis/ipp-proxy@sha256:abc".to_owned(),
+            image_id: "sha256:abc".to_owned(),
+            ready: true,
+        };
+        assert!(runtime_image_looks_like_ipp_in_namespace(
+            &ipp_runtime,
+            "grid-llmd-e2e-r5"
         ));
     }
 
@@ -9521,6 +10419,48 @@ mod tests {
             status_from_states(QualificationScope::RoutingSmoke, false, true, false),
             "blocked"
         );
+    }
+
+    #[test]
+    fn kind_gates_replace_rhoai_with_kubernetes_native_prerequisites() {
+        let openshift = ClusterPlatform::OpenShift.required_gates(QualificationScope::RoutingSmoke);
+        let kind = ClusterPlatform::Kind.required_gates(QualificationScope::RoutingSmoke);
+        assert!(openshift.contains(&"rhoai"));
+        assert!(!kind.contains(&"rhoai"));
+        assert!(kind.contains(&"maas"));
+        assert!(kind.contains(&"grid"));
+        assert!(kind.contains(&"gateway"));
+        assert!(kind.contains(&"llminferenceservice"));
+        assert_eq!(ClusterPlatform::Kind.as_str(), "kind");
+    }
+
+    #[test]
+    fn kind_gateway_gate_uses_listener_readiness_without_a_load_balancer_address() {
+        let gateway = serde_json::json!({
+            "metadata": {"generation": 4},
+            "status": {
+                "conditions": [
+                    {"type": "Accepted", "status": "True", "observedGeneration": 4},
+                    {"type": "Programmed", "status": "False", "observedGeneration": 4}
+                ],
+                "listeners": [{
+                    "name": "https",
+                    "attachedRoutes": 1,
+                    "conditions": [
+                        {"type": "Accepted", "status": "True", "observedGeneration": 4},
+                        {"type": "Programmed", "status": "True", "observedGeneration": 4},
+                        {"type": "ResolvedRefs", "status": "True", "observedGeneration": 4}
+                    ]
+                }]
+            }
+        });
+        assert!(kind_gateway_listener_is_programmed(&gateway));
+        let mut stale = gateway.clone();
+        stale["status"]["listeners"][0]["conditions"][1]["observedGeneration"] = 3.into();
+        assert!(!kind_gateway_listener_is_programmed(&stale));
+        let mut unattached = gateway;
+        unattached["status"]["listeners"][0]["attachedRoutes"] = 0.into();
+        assert!(!kind_gateway_listener_is_programmed(&unattached));
     }
 
     #[test]
@@ -10017,10 +10957,10 @@ mod tests {
 
     #[test]
     fn extproc_response_marker_can_require_the_exact_run_value() {
-        let headers = "HTTP/2 200\r\nX-Praxis-ExtProc-Response: run-4iz0fvk\r\n";
+        let headers = "HTTP/2 200\r\nX-Praxis-ExtProc-Response: run-kind-123\r\n";
         assert!(extproc_header_expectation_matches(
             headers,
-            "X-Praxis-ExtProc-Response=run-4iz0fvk"
+            "X-Praxis-ExtProc-Response=run-kind-123"
         ));
         assert!(!extproc_header_expectation_matches(
             headers,
@@ -10028,9 +10968,9 @@ mod tests {
         ));
         assert!(!extproc_header_expectation_matches(
             "HTTP/2 200\r\nX-Praxis-ExtProc-Response: \r\n",
-            "X-Praxis-ExtProc-Response=run-4iz0fvk"
+            "X-Praxis-ExtProc-Response=run-kind-123"
         ));
-        assert!(!extproc_header_expectation_matches(headers, "bad header=run-4iz0fvk"));
+        assert!(!extproc_header_expectation_matches(headers, "bad header=run-kind-123"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 # Delete task Grid CRs while their operator is live, then uninstall the release.
 set -Eeuo pipefail
 umask 077
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MODE="${GRID_OPERATOR_CLEANUP_MODE:-plan}"
 EXPECTED_API_SERVER="${EXPECTED_API_SERVER:-}"
@@ -195,7 +196,7 @@ await_operator_ready() {
        oc get pods -n "$RELEASE_NAMESPACE" -l app.kubernetes.io/instance="$RELEASE_NAME" -o json >"$raw_pods" 2>/dev/null; then
       jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,generation:.metadata.generation,labels:.metadata.labels},spec:{replicas:.spec.replicas,images:[.spec.template.spec.containers[].image]},status:{observedGeneration:.status.observedGeneration,readyReplicas:.status.readyReplicas,availableReplicas:.status.availableReplicas,conditions:.status.conditions}}' \
         "$raw_deployment" >"$EVIDENCE_DIR/operator-deployment-${prefix}.json"
-      jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
+      jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,specContainers:[.spec.containers[]?|{name,image}],containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount}]}]' \
         "$raw_pods" >"$EVIDENCE_DIR/operator-pods-${prefix}.json"
       deployment_ready=false
       pod_ready=false
@@ -205,8 +206,7 @@ await_operator_ready() {
          any(.status.conditions[]?;.type=="Available" and .status=="True")' \
         "$EVIDENCE_DIR/operator-deployment-${prefix}.json" >/dev/null 2>&1 && deployment_ready=true
       jq -e --arg image "$OPERATOR_IMAGE" --arg digest "${OPERATOR_IMAGE##*@}" \
-        'length==1 and .[0].deletionTimestamp==null and .[0].phase=="Running" and
-         all(.[0].containers[];.ready==true and .image==$image and (.imageID|endswith($digest)))' \
+        -f "$SCRIPT_DIR/single-ready-pinned-pod.jq" \
         "$EVIDENCE_DIR/operator-pods-${prefix}.json" >/dev/null 2>&1 && pod_ready=true
       jq -cn --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson deploymentReady "$deployment_ready" \
         --argjson podReady "$pod_ready" --arg generation "$(jq -r '.metadata.generation' "$EVIDENCE_DIR/operator-deployment-${prefix}.json")" \

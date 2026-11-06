@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-python3 - "$SCRIPT_DIR/deploy-grid-providers.sh" "$SCRIPT_DIR/deploy-serving-pools.sh" "$SCRIPT_DIR/README.md" <<'PY'
+python3 - "$SCRIPT_DIR/deploy-grid-providers.sh" "$SCRIPT_DIR/deploy-serving-pools.sh" "$SCRIPT_DIR/KIND.md" <<'PY'
 from pathlib import Path
 import json
 import subprocess
@@ -31,6 +31,12 @@ required = (
     'pool_name="$expected_pool_name"',
     'poolLabel:{name:$poolName}',
     'strict runs must use authenticated HTTPS metrics',
+    'CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"',
+    'GRID_LLMD_CLUSTER_PLATFORM=kind requires CLUSTER_ENV=kind',
+    'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev or the explicit Kind platform',
+    '"$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind',
+    'HTTP EPP metrics require the reduced-dev ephemeral-dev or explicit Kind profile',
+    'authenticated EPP metrics request over HTTP outside explicit reduced-dev ephemeral-dev or Kind mode',
     'queueCapacity:$queueCapacity',
     'staleMetricsSeconds:$staleMetricsSeconds',
     'metricsConfig:{endpoint:$metrics',
@@ -62,6 +68,10 @@ required = (
     'write_source_lock',
     'cleanup_task_providers',
     'capture_failure_state || true',
+    'oc get llminferenceservice "$pool" -n "$NAMESPACE" -o json',
+    '.spec.router.gateway.refs[0].namespace // .metadata.namespace',
+    'kind=="Gateway" and .uid==$uid',
+    'oc get endpointslices -n "$gateway_namespace" -l "kubernetes.io/service-name=$service"',
     'all(.[];(.address|type=="string") and (.address|contains(".svc.cluster.local:")) and .transport.mode=="plaintext")',
 )
 missing = [item for item in required if item not in providers]
@@ -258,11 +268,14 @@ pool_a = apply.index('apply_one_pool "$POOL_A"')
 if gate > pool_a:
     raise SystemExit("serving-pool apply bypasses the post-DSCI readiness gate")
 
-serving_position = readme.find("SERVING_POOLS_MODE=apply")
-provider_position = readme.find("GRID_PROVIDERS_MODE=apply")
-qualification_position = readme.find("cargo run --locked -p xtask -- e2e grid-llmd")
-if provider_position < 0 or not (serving_position < provider_position < qualification_position):
-    raise SystemExit("runbook must apply both serving pools, register providers, then run inference qualification")
+pool_a_position = readme.find("Pool A's actual")
+pool_b_position = readme.find("Repeat independently for Pool B")
+provider_position = readme.find("register both providers")
+traffic_position = readme.find("Run the bounded traffic sequence")
+if min(pool_a_position, pool_b_position, provider_position, traffic_position) < 0 or not (
+    pool_a_position < pool_b_position < provider_position < traffic_position
+):
+    raise SystemExit("Kind runbook must prove both independent pools before providers and traffic")
 
 print("downstream CRD discovery, digest pins, owned provider resources, EPP signal metrics, and current overlay qualification: PASS")
 PY

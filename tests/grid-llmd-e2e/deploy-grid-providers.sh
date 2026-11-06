@@ -10,6 +10,7 @@ MODE="${GRID_PROVIDERS_MODE:-plan}"
 EXPECTED_API_SERVER="${EXPECTED_API_SERVER:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 CLUSTER_ENV="${CLUSTER_ENV:-}"
+CLUSTER_PLATFORM="${GRID_LLMD_CLUSTER_PLATFORM:-openshift}"
 ALLOW_INSECURE_DEV_API="${ALLOW_INSECURE_DEV_API:-false}"
 RESOURCE_PROFILE="${RESOURCE_PROFILE:-strict}"
 NAMESPACE="${GRID_RESOURCE_NAMESPACE:-grid-llmd-e2e}"
@@ -73,11 +74,13 @@ EPP metrics require bearer authentication. The helper uses a short-lived
 TokenRequest for the downstream Grid operator's dedicated metrics-scraper
 ServiceAccount, passes it only through curl stdin, and never writes or logs the
 token. HTTP bearer transport is allowed only for the explicit reduced-dev
-profile on an ephemeral development cluster; strict runs must use HTTPS.
+profile on an ephemeral development cluster or explicit Kind platform; strict
+runs must use HTTPS. Kind's metrics hop remains bearer-authenticated.
 
 Modes: plan, apply, verify, cleanup. The resource profile is strict by default;
-reduced-dev requires CLUSTER_ENV=ephemeral-dev. API TLS bypass additionally
-requires ALLOW_INSECURE_DEV_API=true. This helper never sends inference traffic.
+reduced-dev requires CLUSTER_ENV=ephemeral-dev or GRID_LLMD_CLUSTER_PLATFORM=kind
+with CLUSTER_ENV=kind. API TLS bypass additionally requires
+ALLOW_INSECURE_DEV_API=true. This helper never sends inference traffic.
 PLAN
   exit 0
 fi
@@ -86,10 +89,18 @@ for bin in oc jq awk sha256sum curl python3; do
   command -v "$bin" >/dev/null || { printf '%s is required\n' "$bin" >&2; exit 2; }
 done
 [[ "$MODE" =~ ^(apply|verify|cleanup)$ ]] || { printf 'unsupported mode: %s\n' "$MODE" >&2; exit 2; }
+[[ "$CLUSTER_PLATFORM" == openshift || "$CLUSTER_PLATFORM" == kind ]] || {
+  printf 'GRID_LLMD_CLUSTER_PLATFORM must be openshift or kind\n' >&2; exit 2;
+}
+if [[ "$CLUSTER_PLATFORM" == kind ]]; then
+  [[ "$CLUSTER_ENV" == kind ]] || { printf 'GRID_LLMD_CLUSTER_PLATFORM=kind requires CLUSTER_ENV=kind\n' >&2; exit 2; }
+fi
 [[ -n "$EXPECTED_API_SERVER" && -n "$KUBE_CONTEXT" ]] || { printf 'EXPECTED_API_SERVER and KUBE_CONTEXT are required\n' >&2; exit 2; }
 [[ "$RESOURCE_PROFILE" == strict || "$RESOURCE_PROFILE" == reduced-dev ]] || { printf 'RESOURCE_PROFILE must be strict or reduced-dev\n' >&2; exit 2; }
 if [[ "$RESOURCE_PROFILE" == reduced-dev ]]; then
-  [[ "$CLUSTER_ENV" == ephemeral-dev ]] || { printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev\n' >&2; exit 2; }
+  [[ "$CLUSTER_ENV" == ephemeral-dev || ("$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind) ]] || {
+    printf 'RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev or the explicit Kind platform\n' >&2; exit 2;
+  }
 fi
 [[ -n "$RUN_LABEL" && "$RUN_LABEL" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]] || {
   printf 'GRID_RUN_LABEL must be a valid non-empty Kubernetes label value\n' >&2; exit 2;
@@ -274,23 +285,49 @@ capture_network_and_site() {
 }
 
 resolve_gateway_service() {
-  local pool="$1" gateway="$2" gateway_json listener_port services matches service port host
+  local pool="$1" gateway="$2" llmisvc_json gateway_namespace gateway_uid gateway_json listener_port services matches service port host endpointslices
   gateway_json="$EVIDENCE_DIR/$pool-gateway.json"
-  oc get gateway "$gateway" -n "$NAMESPACE" -o json >"$gateway_json"
-  jq -e '.metadata.generation as $g | any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g) and any(.status.conditions[]?;.type=="Programmed" and .status=="True" and .observedGeneration==$g)' "$gateway_json" >/dev/null || {
-    log "pool Gateway $gateway is not Accepted/Programmed at current generation"; return 1;
+  llmisvc_json="$EVIDENCE_DIR/$pool-llmisvc-gateway-ref.json"
+  oc get llminferenceservice "$pool" -n "$NAMESPACE" -o json >"$llmisvc_json"
+  jq -e --arg gateway "$gateway" --arg run "$RUN_LABEL" '
+    .metadata.labels["praxis.fast/qualification-run"]==$run and
+    ([.spec.router.gateway.refs[]?] as $refs | ($refs|length)==1 and $refs[0].name==$gateway)
+  ' "$llmisvc_json" >/dev/null || {
+    log "LLMInferenceService $pool is not run-owned or does not reference exactly the configured pool Gateway $gateway"; return 1;
   }
+  gateway_namespace="$(jq -er '.spec.router.gateway.refs[0].namespace // .metadata.namespace' "$llmisvc_json")"
+  oc get gateway "$gateway" -n "$gateway_namespace" -o json >"$gateway_json"
+  jq -e --arg run "$RUN_LABEL" '
+    .metadata.generation as $g |
+    .metadata.labels["praxis.fast/qualification-run"]==$run and
+    any(.status.conditions[]?;.type=="Accepted" and .status=="True" and .observedGeneration==$g) and
+    any(.status.conditions[]?;.type=="Programmed" and .status=="True" and .observedGeneration==$g) and
+    any(.status.listeners[]?;.name=="inference" and (.attachedRoutes // 0)>0 and
+      all(.conditions[]?|select(.type=="Accepted" or .type=="Programmed" or .type=="ResolvedRefs");.status=="True" and .observedGeneration==$g))
+  ' "$gateway_json" >/dev/null || {
+    log "LLMInferenceService-selected pool Gateway $gateway_namespace/$gateway is not run-owned, Accepted/Programmed, and attached to a current inference route"; return 1;
+  }
+  gateway_uid="$(jq -er '.metadata.uid' "$gateway_json")"
   listener_port="$(jq -r '[.spec.listeners[]?|select(.name=="inference")|.port][0] // empty' "$gateway_json")"
   [[ "$listener_port" =~ ^[0-9]+$ ]] || { log "pool Gateway $gateway lacks its inference listener"; return 1; }
-  services="$(oc get services -n "$NAMESPACE" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json)"
-  matches="$(jq --argjson listener "$listener_port" '[.items[]|select(any(.spec.ports[]?;.port==$listener))|{name:.metadata.name,ports:.spec.ports,labels:.metadata.labels,annotations:.metadata.annotations}]' <<<"$services")"
-  [[ "$(jq 'length' <<<"$matches")" == 1 ]] || { log "Gateway $gateway does not have exactly one listener Service on port $listener_port"; return 1; }
+  services="$(oc get services -n "$gateway_namespace" -l "gateway.networking.k8s.io/gateway-name=$gateway" -o json)"
+  matches="$(jq --arg run "$RUN_LABEL" --arg gateway "$gateway" --arg uid "$gateway_uid" --argjson listener "$listener_port" '
+    [.items[]|select(.metadata.labels["praxis.fast/qualification-run"]==$run and
+      .metadata.labels["gateway.networking.k8s.io/gateway-name"]==$gateway and
+      any(.metadata.ownerReferences[]?;.kind=="Gateway" and .uid==$uid) and
+      any(.spec.ports[]?;.port==$listener))|{name:.metadata.name,uid:.metadata.uid,ports:.spec.ports,labels:.metadata.labels,ownerReferences:.metadata.ownerReferences,annotations:.metadata.annotations}]
+  ' <<<"$services")"
+  [[ "$(jq 'length' <<<"$matches")" == 1 ]] || { log "LLMInferenceService-selected Gateway $gateway_namespace/$gateway does not have exactly one run-owned listener Service on port $listener_port"; return 1; }
   service="$(jq -r '.[0].name' <<<"$matches")"
   port="$(jq -r --argjson listener "$listener_port" '.[0].ports[]|select(.port==$listener)|.port' <<<"$matches")"
-  host="$service.$NAMESPACE.svc.cluster.local:$port"
-  jq -n --arg pool "$pool" --arg gateway "$gateway" --arg service "$service" --arg host "$host" \
-    --argjson listenerPort "$listener_port" --argjson service "$matches" \
-    '{pool:$pool,gateway:$gateway,service:$service,listenerPort:$listenerPort,providerEndpoint:("http://"+$host),serviceEvidence:$service}' \
+  host="$service.$gateway_namespace.svc.cluster.local:$port"
+  endpointslices="$(oc get endpointslices -n "$gateway_namespace" -l "kubernetes.io/service-name=$service" -o json)"
+  jq -e '[.items[].endpoints[]?|select(.conditions.ready==true and (.addresses|length)>0)]|length>0' <<<"$endpointslices" >/dev/null || {
+    log "pool Gateway Service $gateway_namespace/$service has no Ready EndpointSlice address"; return 1;
+  }
+  jq -n --arg pool "$pool" --arg gateway "$gateway" --arg gatewayNamespace "$gateway_namespace" --arg gatewayUID "$gateway_uid" --arg serviceName "$service" --arg host "$host" \
+    --argjson listenerPort "$listener_port" --argjson serviceObject "$(jq '.[0]' <<<"$matches")" --argjson endpointslices "$endpointslices" \
+    '{pool:$pool,gateway:$gateway,gatewayNamespace:$gatewayNamespace,gatewayUID:$gatewayUID,service:$serviceName,serviceUID:$serviceObject.uid,listenerPort:$listenerPort,providerEndpoint:("http://"+$host),serviceEvidence:$serviceObject,readyEndpointSlices:[$endpointslices.items[]|{name:.metadata.name,ports:.ports,ready:[.endpoints[]?|select(.conditions.ready==true)|{addresses,targetRef:{kind:.targetRef.kind,name:.targetRef.name,uid:.targetRef.uid}}]}]}' \
     >"$EVIDENCE_DIR/$pool-gateway-service.json"
 }
 
@@ -327,8 +364,8 @@ capture_metrics_contract() {
   local pool="$1" expected_pool_name="$2" service="$3" remote_port="$4" local_port forward_pid attempt ok=false raw token
   raw="$EVIDENCE_DIR/$pool-epp-metrics-raw.txt"
   CURRENT_PHASE="$pool-epp-metrics-contract"
-  if [[ "$RESOURCE_PROFILE" != reduced-dev || "$CLUSTER_ENV" != ephemeral-dev ]]; then
-    log 'HTTP EPP metrics require the reduced-dev ephemeral-cluster profile; strict runs must use authenticated HTTPS metrics'
+  if [[ "$RESOURCE_PROFILE" != reduced-dev || ! ("$CLUSTER_ENV" == ephemeral-dev || ("$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind)) ]]; then
+    log 'HTTP EPP metrics require the reduced-dev ephemeral-dev or explicit Kind profile; strict runs must use authenticated HTTPS metrics'
     return 1
   fi
   if ! token="$(oc create token "$METRICS_SCRAPER_SERVICE_ACCOUNT" -n "$GRID_OPERATOR_NAMESPACE" --duration=10m 2>/dev/null)" || [[ -z "$token" ]]; then
@@ -385,8 +422,8 @@ write_provider_manifest() {
   output="$EVIDENCE_DIR/$provider-inferenceprovider.json"
   case "$metrics_endpoint" in
     http://*)
-      [[ "$RESOURCE_PROFILE" == reduced-dev && "$CLUSTER_ENV" == ephemeral-dev ]] || {
-        log 'refusing to send an authenticated EPP metrics request over HTTP outside explicit reduced-dev ephemeral mode'
+      [[ "$RESOURCE_PROFILE" == reduced-dev && ("$CLUSTER_ENV" == ephemeral-dev || ("$CLUSTER_PLATFORM" == kind && "$CLUSTER_ENV" == kind)) ]] || {
+        log 'refusing to send an authenticated EPP metrics request over HTTP outside explicit reduced-dev ephemeral-dev or Kind mode'
         return 1
       }
       allow_plaintext=true
@@ -596,11 +633,12 @@ verify_grid_operator_runtime() {
     (.spec.template.spec.containers|length)>0 and all(.spec.template.spec.containers[];.image==$image)
   ' "$deployment" >/dev/null || { log 'downstream Grid operator Deployment is not current/Available on the pinned image'; return 1; }
   oc get pods -n "$GRID_OPERATOR_NAMESPACE" -l "app.kubernetes.io/instance=$GRID_OPERATOR_RELEASE_NAME" -o json |
-    jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,phase:.status.phase,containers:[.status.containerStatuses[]?|{name,image,imageID,ready}]}]' >"$pods"
+    jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,specContainers:[.spec.containers[]?|{name,image}],containers:[.status.containerStatuses[]?|{name,image,imageID,ready}]}]' >"$pods"
   local digest="${GRID_OPERATOR_IMAGE##*@}"
   jq -e --arg image "$GRID_OPERATOR_IMAGE" --arg digest "$digest" '
-    length==1 and .[0].phase=="Running" and length>0 and
-    all(.[0].containers[];.ready==true and .image==$image and (.imageID|endswith($digest)))
+    length==1 and .[0].deletionTimestamp==null and .[0].phase=="Running" and
+    ([.[0].specContainers[]]|length)==1 and .[0].specContainers[0].image==$image and
+    ([.[0].containers[]]|length)==1 and all(.[0].containers[];.ready==true and (.imageID|endswith($digest)))
   ' "$pods" >/dev/null || { log 'downstream Grid operator Pod imageID does not match the pinned digest'; return 1; }
   operator_sa="$(jq -r '.spec.template.spec.serviceAccountName // empty' "$deployment")"
   METRICS_SCRAPER_SERVICE_ACCOUNT="$(jq -r '[.spec.template.spec.containers[].env[]?|select(.name=="GRID_METRICS_SCRAPER_SERVICE_ACCOUNT")|.value][0] // empty' "$deployment")"

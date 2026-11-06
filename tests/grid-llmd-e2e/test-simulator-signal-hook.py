@@ -2,7 +2,10 @@
 """Local contract tests for the live simulator signal hooks."""
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 
 SCRIPT = Path(__file__).with_name("simulator-signal-hook.py")
 SPEC = importlib.util.spec_from_file_location("simulator_signal_hook", SCRIPT)
@@ -11,13 +14,135 @@ HOOK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HOOK)
 
 
+def check_phase_wrappers_forward_xtask_arguments() -> None:
+    script_dir = SCRIPT.parent
+    with tempfile.TemporaryDirectory(prefix="simulator-hook-wrapper-") as temporary:
+        temp_dir = Path(temporary)
+        fake_python = temp_dir / "python3"
+        fake_python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n', encoding="utf-8")
+        fake_python.chmod(0o755)
+        capture = temp_dir / "args.txt"
+        environment = os.environ.copy()
+        environment["PATH"] = f"{temp_dir}{os.pathsep}{environment['PATH']}"
+        environment["CAPTURE_ARGS"] = str(capture)
+
+        for wrapper_name, phase in (
+            ("simulator-pressure-hook.sh", "pressure"),
+            ("simulator-recovery-hook.sh", "recovery"),
+        ):
+            wrapper = script_dir / wrapper_name
+            result = subprocess.run(
+                [
+                    str(wrapper),
+                    "--context",
+                    "test-context",
+                    "--namespace",
+                    "test-namespace",
+                    "--evidence-dir",
+                    "/tmp/evidence",
+                    phase,
+                ],
+                check=False,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, result.stderr
+            assert capture.read_text(encoding="utf-8").splitlines() == [
+                str(SCRIPT.resolve()),
+                "--context",
+                "test-context",
+                "--namespace",
+                "test-namespace",
+                "--evidence-dir",
+                "/tmp/evidence",
+                phase,
+            ]
+
+
 def main() -> None:
+    check_phase_wrappers_forward_xtask_arguments()
+    phase, parsed = HOOK.parse_hook_args(
+        [
+            "--context",
+            "kind-context",
+            "--namespace",
+            "grid-llmd-e2e",
+            "--evidence-dir",
+            "/tmp/evidence",
+            "pressure",
+        ]
+    )
+    assert phase == "pressure"
+    assert parsed.context == "kind-context"
+    phase, _ = HOOK.parse_hook_args(
+        ["recovery", "--context", "kind-context", "--namespace", "grid-llmd-e2e", "--evidence-dir", "/tmp/evidence"]
+    )
+    assert phase == "recovery"
+
     ref = HOOK.parse_control_reference(
         "grid-llmd-e2e/configmap/pool-a-simulator-control#config.yaml@pool-a",
         "grid-llmd-e2e",
     )
     assert ref["identity"] == "grid-llmd-e2e/configmap/pool-a-simulator-control#config.yaml"
     assert ref["pool"] == "pool-a"
+    assert HOOK.CONTROL_RESOURCE_MANAGER == "grid-llmd-e2e-run"
+    reference = {**ref, "simulatorPool": "pool-a"}
+    HOOK.validate_control_ownership(
+        {
+            "app.kubernetes.io/managed-by": HOOK.CONTROL_RESOURCE_MANAGER,
+            "praxis.fast/qualification-run": "run-1",
+            "praxis.fast/simulator-pool": "pool-a",
+        },
+        reference,
+        "run-1",
+        HOOK.CONTROL_RESOURCE_MANAGER,
+    )
+    HOOK.validate_control_ownership(
+        {
+            "app.kubernetes.io/managed-by": "grid-llmd-e2e-run",
+            "praxis.fast/qualification-run": "run-2",
+            "praxis.fast/simulator-pool": "pool-a",
+        },
+        reference,
+        "run-2",
+        "grid-llmd-e2e-run",
+    )
+    for labels, run_label, managed_by in (
+        (
+            {
+                "app.kubernetes.io/managed-by": "grid-llmd-kind",
+                "praxis.fast/qualification-run": "other-run",
+                "praxis.fast/simulator-pool": "pool-a",
+            },
+            "run-1",
+            HOOK.CONTROL_RESOURCE_MANAGER,
+        ),
+        (
+            {
+                "app.kubernetes.io/managed-by": "grid-llmd-kind",
+                "praxis.fast/qualification-run": "run-1",
+                "praxis.fast/simulator-pool": "pool-b",
+            },
+            "run-1",
+            HOOK.CONTROL_RESOURCE_MANAGER,
+        ),
+        (
+            {
+                "app.kubernetes.io/managed-by": "different-manager",
+                "praxis.fast/qualification-run": "run-1",
+                "praxis.fast/simulator-pool": "pool-a",
+            },
+            "run-1",
+            HOOK.CONTROL_RESOURCE_MANAGER,
+        ),
+    ):
+        try:
+            HOOK.validate_control_ownership(labels, reference, run_label, managed_by)
+        except HOOK.HookError:
+            pass
+        else:
+            raise AssertionError("control ownership mismatch was accepted")
     config = """model: "grid-test-model"
 served-model-name:
 - "pool-a"

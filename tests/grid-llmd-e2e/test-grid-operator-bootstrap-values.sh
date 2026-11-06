@@ -39,6 +39,15 @@ from pathlib import Path
 import sys
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
+namespace_start = source.index("ensure_owned_namespace() {")
+namespace_end = source.index("\nensure_internal_image_pull_access() {", namespace_start)
+namespace_helper = source[namespace_start:namespace_end]
+ownership_check = namespace_helper.index('[[ "$owner" == "$RUN_LABEL" ]]')
+shared_label = namespace_helper.rindex('oc label namespace "$namespace" app.kubernetes.io/part-of=grid-llmd-e2e')
+if not ownership_check < shared_label:
+    raise SystemExit("existing namespace must pass the run-ownership check before adding the shared component label")
+if 'app.kubernetes.io/managed-by=grid-llmd-e2e-run' in namespace_helper[shared_label:]:
+    raise SystemExit("relabeling an existing namespace must preserve its original managed-by label")
 required = (
     'command helm --kube-context="$KUBE_CONTEXT" "$@"',
     'helm list -n "$RELEASE_NAMESPACE" --filter "^$RELEASE_NAME$" -o json',
@@ -47,6 +56,7 @@ required = (
     'Render performs read-only ownership checks and server-side dry-run only',
     'mode:"render",status:"rendered",clusterMutated:false',
     'GRID_PRAXIS_SITE_ROUTER="${GRID_PRAXIS_SITE_ROUTER:-intelligentRoute}"',
+    'CHART_VERSION="${GRID_OPERATOR_CHART_VERSION:-}"',
     'Set GRID_PRAXIS_SITE_ROUTER=gridSiteRoute during bootstrap to select the future',
     'siteRouter: $GRID_PRAXIS_SITE_ROUTER',
     'grid_signals=poll',
@@ -55,7 +65,11 @@ required = (
     '    enabled: false',
     'generated GRID_PRAXIS_SITE_ROUTER=gridSiteRoute requires GRID_PRAXIS_CONFIG_MOUNT_RECONCILIATION=true',
     "grep -Fq 'mode: \"poll\"' <<<\"$network_render\"",
-    "grep -Fq 'name: grid-operator' <<<\"$chart_metadata\"",
+    '[[ "$observed_chart_name" == grid-operator ]]',
+    'observed_chart_version="$(awk -F\': \' \'$1 == "version" { print $2; exit }\' <<<"$chart_metadata")"',
+    'if [[ -z "$CHART_VERSION" ]]; then',
+    'CHART_VERSION="$observed_chart_version"',
+    'operator chart version mismatch: expected $CHART_VERSION, observed $observed_chart_version',
     'grid_crd_render_count="$(grep -c \'^kind: CustomResourceDefinition$\'',
     "grep -Eq '^kind: (GridNetwork|GridSite|InferenceProvider)$'",
     "CURRENT_PHASE=helm-crd-bootstrap",

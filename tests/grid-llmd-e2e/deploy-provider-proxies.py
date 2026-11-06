@@ -93,26 +93,168 @@ def overlay_candidates(context: str, namespace: str, network_name: str, gateway_
     return status, mapped
 
 
-def gateway_backend(context: str, namespace: str, gateway_name: str, pool: str) -> str:
+def resolve_gateway_backend_objects(
+    llmisvc: dict,
+    gateway: dict,
+    services: list[dict],
+    endpoint_slices: list[dict],
+    run_label: str,
+    gateway_name: str,
+    pool: str,
+    port: int = 8080,
+) -> dict:
+    """Resolve only the current Gateway actually selected by the LLMInferenceService."""
+    require_owned(llmisvc, run_label, f"LLMInferenceService/{pool}")
+    refs = llmisvc.get("spec", {}).get("router", {}).get("gateway", {}).get("refs", [])
+    if len(refs) != 1 or refs[0].get("name") != gateway_name:
+        raise RuntimeError(f"LLMInferenceService/{pool} does not select exactly Gateway/{gateway_name}")
+    gateway_namespace = refs[0].get("namespace") or llmisvc.get("metadata", {}).get("namespace")
+    metadata = gateway.get("metadata", {})
+    if metadata.get("name") != gateway_name or metadata.get("namespace") != gateway_namespace:
+        raise RuntimeError(f"LLMInferenceService/{pool} selected Gateway identity does not match the live Gateway object")
+    require_owned(gateway, run_label, f"Gateway/{gateway_namespace}/{gateway_name}")
+    generation = metadata.get("generation")
+    conditions = gateway.get("status", {}).get("conditions", [])
+    for condition_type in ("Accepted", "Programmed"):
+        if not any(
+            item.get("type") == condition_type
+            and item.get("status") == "True"
+            and item.get("observedGeneration") == generation
+            for item in conditions
+        ):
+            raise RuntimeError(f"Gateway/{gateway_namespace}/{gateway_name} lacks current {condition_type}=True")
+    listeners = [item for item in gateway.get("status", {}).get("listeners", []) if item.get("name") == "inference"]
+    if len(listeners) != 1 or not isinstance(listeners[0].get("attachedRoutes"), int) or listeners[0]["attachedRoutes"] < 1:
+        raise RuntimeError(f"Gateway/{gateway_namespace}/{gateway_name} has no attached inference route")
+    for condition_type in ("Accepted", "Programmed", "ResolvedRefs"):
+        if not any(
+            item.get("type") == condition_type
+            and item.get("status") == "True"
+            and item.get("observedGeneration") == generation
+            for item in listeners[0].get("conditions", [])
+        ):
+            raise RuntimeError(f"Gateway/{gateway_namespace}/{gateway_name} inference listener lacks current {condition_type}=True")
+
+    matching_services = []
+    for service in services:
+        service_metadata = service.get("metadata", {})
+        if (
+            service_metadata.get("namespace") == gateway_namespace
+            and service_metadata.get("labels", {}).get("praxis.fast/qualification-run") == run_label
+            and service_metadata.get("labels", {}).get("gateway.networking.k8s.io/gateway-name") == gateway_name
+            and any(
+                owner.get("kind") == "Gateway" and owner.get("uid") == metadata.get("uid")
+                for owner in service_metadata.get("ownerReferences", [])
+            )
+            and any(item.get("port") == port for item in service.get("spec", {}).get("ports", []))
+        ):
+            matching_services.append(service)
+    if len(matching_services) != 1:
+        raise RuntimeError(f"Gateway/{gateway_namespace}/{gateway_name} has no unique run-owned listener Service on port {port}")
+    service = matching_services[0]
+    service_name = service["metadata"]["name"]
+    ready_endpoints = []
+    for endpoint_slice in endpoint_slices:
+        if endpoint_slice.get("metadata", {}).get("labels", {}).get("kubernetes.io/service-name") != service_name:
+            continue
+        ready_endpoints.extend(
+            {
+                "addresses": endpoint.get("addresses", []),
+                "targetRef": endpoint.get("targetRef", {}),
+            }
+            for endpoint in endpoint_slice.get("endpoints", [])
+            if endpoint.get("conditions", {}).get("ready") is True and endpoint.get("addresses")
+        )
+    if not ready_endpoints:
+        raise RuntimeError(f"Gateway Service {gateway_namespace}/{service_name} has no Ready EndpointSlice address")
+    return {
+        "gateway": gateway_name,
+        "gatewayNamespace": gateway_namespace,
+        "gatewayUID": metadata.get("uid"),
+        "service": service_name,
+        "serviceUID": service.get("metadata", {}).get("uid"),
+        "port": port,
+        "endpoint": f"{service_name}.{gateway_namespace}.svc.cluster.local:{port}",
+        "readyEndpoints": ready_endpoints,
+    }
+
+
+def validate_site_server_name(san_output: str, server_name: str) -> list[str]:
+    """Require the provider-hop SNI to be present in the current GridSite leaf certificate."""
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", server_name):
+        raise RuntimeError("provider-hop SNI must be a DNS server name")
+    names = re.findall(r"DNS:([^,\s]+)", san_output)
+    if server_name not in names:
+        raise RuntimeError("provider-hop SNI does not match a DNS SAN on the current GridSite identity")
+    return names
+
+
+def make_grid_endpoint_inventories(proxies: list[dict], namespace: str, server_name: str) -> tuple[list[dict], list[dict]]:
+    """Render Grid-owned consumer endpoints and its matching mTLS hop allowlist."""
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace):
+        raise RuntimeError("provider proxy namespace is not DNS-safe")
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", server_name):
+        raise RuntimeError("provider-hop SNI must be a DNS server name")
+    if len(proxies) != 2:
+        raise RuntimeError("exactly two Ready provider proxies are required for the Grid endpoint inventory")
+    endpoints = []
+    hops = []
+    seen = set()
+    for proxy in proxies:
+        cluster = proxy.get("provider")
+        pool = proxy.get("pool")
+        service = proxy.get("service") or f"praxis-provider-{pool}"
+        if not isinstance(cluster, str) or not cluster or cluster in seen:
+            raise RuntimeError("provider proxy inventory must contain two unique provider cluster identities")
+        if pool not in {"pool-a", "pool-b"} or service != f"praxis-provider-{pool}":
+            raise RuntimeError("provider proxy inventory does not map exactly one Service to each task pool")
+        if proxy.get("readyEndpointCount", 1) != 1:
+            raise RuntimeError(f"provider proxy Service/{service} has no unique Ready endpoint")
+        seen.add(cluster)
+        transport = {"mode": "mutual_tls", "sni": server_name}
+        endpoints.append(
+            {
+                "cluster": cluster,
+                "address": f"{service}.{namespace}.svc.cluster.local:8443",
+                "transport": transport,
+            }
+        )
+        hops.append({"cluster": cluster, "transport": {"mode": "mutual_tls", "sni": server_name}})
+    if {proxy.get("pool") for proxy in proxies} != {"pool-a", "pool-b"}:
+        raise RuntimeError("provider proxy inventory must cover Pool A and Pool B exactly once")
+    endpoints.sort(key=lambda item: item["cluster"])
+    hops.sort(key=lambda item: item["cluster"])
+    return endpoints, hops
+
+
+def gateway_backend(context: str, model_namespace: str, gateway_name: str, pool: str, run_label: str) -> dict:
+    llmisvc = get_json(context, "-n", model_namespace, "get", "llminferenceservice", pool)
+    refs = llmisvc.get("spec", {}).get("router", {}).get("gateway", {}).get("refs", [])
+    if len(refs) != 1 or refs[0].get("name") != gateway_name:
+        raise RuntimeError(f"LLMInferenceService/{pool} does not select exactly Gateway/{gateway_name}")
+    gateway_namespace = refs[0].get("namespace") or model_namespace
+    gateway = get_json(context, "-n", gateway_namespace, "get", "gateway", gateway_name)
     services = get_json(
         context,
         "-n",
-        namespace,
+        gateway_namespace,
         "get",
         "services",
         "-l",
         f"gateway.networking.k8s.io/gateway-name={gateway_name}",
     ).get("items", [])
-    matches = [service for service in services if any(port.get("port") == 8080 for port in service.get("spec", {}).get("ports", []))]
-    if len(matches) != 1:
-        raise RuntimeError(f"pool {pool} Gateway has no unique generated Service on port 8080")
-    service = matches[0]
-    port = next(item["port"] for item in service["spec"]["ports"] if item.get("port") == 8080)
-    return f"{service['metadata']['name']}.{namespace}.svc.cluster.local:{port}"
+    endpoint_slices = get_json(
+        context,
+        "-n",
+        gateway_namespace,
+        "get",
+        "endpointslices",
+    ).get("items", [])
+    return resolve_gateway_backend_objects(llmisvc, gateway, services, endpoint_slices, run_label, gateway_name, pool)
 
 
 def make_provider_config(
-    site_name: str,
+    client_certificate_digest: str,
     provider: str,
     candidate_id: str,
     model: str,
@@ -122,6 +264,16 @@ def make_provider_config(
     credential_namespace: str,
     credential_name: str,
 ) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", client_certificate_digest):
+        raise RuntimeError("GridSite client certificate must have a SHA-256 DER digest")
+    chat_path_suffix = "/v1/chat/completions"
+    if not request_path.endswith(chat_path_suffix):
+        raise RuntimeError("provider request path must end in /v1/chat/completions")
+    model_route_path = request_path[: -len(chat_path_suffix)]
+    match = re.fullmatch(r"/publishers/[^/]+/models/([^/]+)", model_route_path)
+    if match is None or match.group(1) != model:
+        raise RuntimeError("provider request path must identify the configured publisher model")
+    gateway_model_name = model_route_path.removeprefix("/")
     config = {
         "insecure_options": {"allow_private_endpoints": True, "allow_private_upstreams": True},
         "listeners": [
@@ -140,7 +292,7 @@ def make_provider_config(
             {
                 "name": "provider-inference",
                 "filters": [
-                    {"filter": "peer_identity_trust", "trusted_peers": [{"organization": site_name}]},
+                    {"filter": "peer_identity_trust", "trusted_peers": [{"cert_digest": client_certificate_digest}]},
                     {"filter": "json_body_field", "field": "model", "header": "X-Model"},
                     {
                         "filter": "provider_route",
@@ -163,6 +315,14 @@ def make_provider_config(
                                 },
                             }
                         ],
+                    },
+                    # The Grid publisher URL selects the scored candidate above.
+                    # MaaS authorization and the KServe model route then consume
+                    # the native OpenAI path plus its trusted model header.
+                    {"filter": "path_rewrite", "strip_prefix": model_route_path},
+                    {
+                        "filter": "headers",
+                        "request_set": [{"name": "X-Gateway-Model-Name", "value": gateway_model_name}],
                     },
                     {
                         "filter": "credential_inject",
@@ -234,6 +394,7 @@ def resources(
                 "spec": {
                     "automountServiceAccountToken": False,
                     "serviceAccountName": client_service_account,
+                    "securityContext": {"fsGroup": 101, "fsGroupChangePolicy": "OnRootMismatch"},
                     "containers": [
                         {
                             "name": "praxis-ai",
@@ -256,8 +417,8 @@ def resources(
                     ],
                     "volumes": [
                         {"name": "config", "configMap": {"name": name, "defaultMode": 292}},
-                        {"name": "identity", "secret": {"secretName": identity_secret, "defaultMode": 292, "items": [{"key": "tls.crt", "path": "tls.crt"}, {"key": "tls.key", "path": "tls.key"}]}},
-                        {"name": "ca", "secret": {"secretName": ca_secret, "defaultMode": 292, "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+                        {"name": "identity", "secret": {"secretName": identity_secret, "defaultMode": 288, "items": [{"key": "tls.crt", "path": "tls.crt"}, {"key": "tls.key", "path": "tls.key"}]}},
+                        {"name": "ca", "secret": {"secretName": ca_secret, "defaultMode": 288, "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
                         {
                             "name": "provider-token",
                             "projected": {
@@ -309,6 +470,15 @@ def check_live_deployment(
     if deployment.get("status", {}).get("observedGeneration") != generation or deployment.get("status", {}).get("updatedReplicas") != 1 or deployment.get("status", {}).get("availableReplicas") != 1:
         raise RuntimeError(f"provider proxy Deployment/{name} has not converged to one available replica")
     pod_spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
+    if pod_spec.get("securityContext", {}).get("fsGroup") != 101:
+        raise RuntimeError(f"provider proxy {pool} does not mount Grid TLS material with the runtime group")
+    secret_modes = {
+        volume.get("name"): volume.get("secret", {}).get("defaultMode")
+        for volume in pod_spec.get("volumes", [])
+        if volume.get("name") in {"identity", "ca"}
+    }
+    if secret_modes != {"identity": 288, "ca": 288}:
+        raise RuntimeError(f"provider proxy {pool} TLS Secret files are not group-readable and private")
     projected_token = [
         source.get("serviceAccountToken", {})
         for volume in pod_spec.get("volumes", [])
@@ -392,6 +562,8 @@ def main() -> int:
 
     if not re.fullmatch(r".+@sha256:[0-9a-f]{64}", args.image):
         raise RuntimeError("provider proxy image must be pinned to an immutable SHA-256 digest")
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", args.site_server_name):
+        raise RuntimeError("--site-server-name must be a DNS server name")
     evidence = Path(args.evidence_dir)
     evidence.mkdir(parents=True, exist_ok=True)
     os.chmod(evidence, 0o700)
@@ -437,26 +609,36 @@ def main() -> int:
         cert_file = Path(temporary) / "tls.crt"
         cert_file.write_bytes(cert_bytes)
         subject = subprocess.run(["openssl", "x509", "-in", str(cert_file), "-noout", "-subject", "-nameopt", "RFC2253"], capture_output=True, text=True, check=True).stdout.strip()
+        san_output = subprocess.run(["openssl", "x509", "-in", str(cert_file), "-noout", "-ext", "subjectAltName"], capture_output=True, text=True, check=True).stdout
+        der = subprocess.run(["openssl", "x509", "-in", str(cert_file), "-outform", "DER"], capture_output=True, check=True).stdout
+    client_certificate_digest = hashlib.sha256(der).hexdigest()
     if not re.search(rf"(?:^|,)O={re.escape(args.site)}(?:,|$)", subject.removeprefix("subject=")):
         raise RuntimeError("current GridSite certificate organization does not match provider peer_identity_trust")
+    certificate_sans = validate_site_server_name(san_output, args.site_server_name)
     (evidence / "provider-proxy-peer-certificate-subject.txt").write_text(subject + "\n", encoding="utf-8")
+    (evidence / "provider-proxy-site-certificate-dns-sans.json").write_text(json.dumps(sorted(certificate_sans), indent=2) + "\n", encoding="utf-8")
+    (evidence / "provider-proxy-client-certificate-sha256.txt").write_text(client_certificate_digest + "\n", encoding="utf-8")
 
     providers = {f"{args.provider_prefix}-pool-a", f"{args.provider_prefix}-pool-b"}
     provider_objects = {name: current_provider(args.context, name, args.run_label) for name in providers}
     overlay_status, candidates = overlay_candidates(args.context, args.namespace, args.network, args.gateway, args.model, providers)
     if any(candidate.get("site") != args.site for candidate in candidates.values()):
         raise RuntimeError("current overlay candidate site does not match the task GridSite")
-    backends = {
-        "pool-a": gateway_backend(args.context, args.namespace, args.pool_a_gateway, "pool-a"),
-        "pool-b": gateway_backend(args.context, args.namespace, args.pool_b_gateway, "pool-b"),
+    backend_targets = {
+        "pool-a": gateway_backend(args.context, args.model_namespace, args.pool_a_gateway, "pool-a", args.run_label),
+        "pool-b": gateway_backend(args.context, args.model_namespace, args.pool_b_gateway, "pool-b", args.run_label),
     }
+    backends = {pool: target["endpoint"] for pool, target in backend_targets.items()}
+    (evidence / "provider-proxy-pool-gateway-targets.json").write_text(
+        json.dumps(backend_targets, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     request_path = f"/publishers/{args.model_namespace}/models/{args.model}/v1/chat/completions"
     provider_to_pool = {f"{args.provider_prefix}-pool-a": "pool-a", f"{args.provider_prefix}-pool-b": "pool-b"}
     summaries = []
     for provider, pool in provider_to_pool.items():
         candidate = candidates[provider]
         config_text = make_provider_config(
-            args.site,
+            client_certificate_digest,
             provider,
             candidate["stable_id"],
             args.model,
@@ -511,12 +693,20 @@ def main() -> int:
                 "candidateStableId": candidate["stable_id"],
                 "site": candidate["site"],
                 "backendEndpoint": backends[pool],
+                "backendGatewayTarget": backend_targets[pool],
                 "requestPath": request_path,
                 "providerResponseHeader": "x-ai-demo-provider-gateway",
                 "backendResponseHeader": "x-ai-inference-provider",
                 "backendAuth": "projected task ServiceAccount TokenRequest; token bytes not recorded",
             }
         )
+    cluster_endpoints, provider_hops = make_grid_endpoint_inventories(summaries, args.namespace, args.site_server_name)
+    cluster_endpoints_path = evidence / "grid-praxis-cluster-endpoints.json"
+    provider_hops_path = evidence / "grid-provider-hop-endpoints.json"
+    cluster_endpoints_path.write_text(json.dumps(cluster_endpoints, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    provider_hops_path.write_text(json.dumps(provider_hops, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(cluster_endpoints_path, 0o600)
+    os.chmod(provider_hops_path, 0o600)
     report = {
         "status": "PASS" if args.apply else "RENDERED",
         "apiServer": server,
@@ -527,6 +717,9 @@ def main() -> int:
         "overlayContentDigest": overlay_status.get("contentDigest"),
         "overlayConfigMapResourceVersion": overlay_status.get("configMapResourceVersion"),
         "providerProxies": summaries,
+        "gridPraxisClusterEndpointsFile": cluster_endpoints_path.name,
+        "gridProviderHopEndpointsFile": provider_hops_path.name,
+        "providerHopSni": args.site_server_name,
         "tlsSecretValuesRecorded": False,
         "inferenceTrafficSent": False,
     }

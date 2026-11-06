@@ -23,6 +23,10 @@ required = {
     "accepted task HTTPRoute": 'type=="Accepted" and .status=="True"',
     "resolved task HTTPRoute": 'type=="ResolvedRefs" and .status=="True"',
     "run-owned Gateway readiness": 'oc get gateway "$GATEWAY_NAME" -n "$NAMESPACE" -o json',
+    "platform-specific Gateway readiness": 'case "$CLUSTER_PLATFORM" in',
+    "Kind listener readiness instead of LoadBalancer address": 'all(["Accepted","Programmed","ResolvedRefs"][];',
+    "Kind requires an attached Gateway route": '($listener.attachedRoutes//0)>0',
+    "runner selects the exact cluster platform": 'GRID_LLMD_CLUSTER_PLATFORM',
     "run-owned backend Service": 'oc get service "$BACKEND_NAME" -n "$BACKEND_NAMESPACE" -o json',
     "ExtProc endpoint ready before injection": 'READY_ENDPOINTS_BEFORE" == 1',
     "only task ExtProc scale-down": 'oc scale "deployment/$DEPLOYMENT_NAME" -n "$NAMESPACE" --replicas=0',
@@ -48,7 +52,7 @@ required = {
     "simulator receipt is excluded": '"$SIMULATOR_RECEIPT_COUNT" == 0',
     "simulator evidence is independently read": 'oc logs "$SIM_POD" -n "$NAMESPACE" -c "$SIM_CONTAINER"',
     "simulator images are pinned and runtime matched": 'endswith($digest)',
-    "simulator inventory excludes pool EPP Pods": 'any(.spec.containers[]?;.image|test("/llm-d-sim@sha256:[0-9a-f]{64}$"))',
+    "simulator inventory accepts pinned llm-d-sim image names": "SIMULATOR_IMAGE_RE='/(llm-d-sim|llm-d-inference-sim)@sha256:[0-9a-f]{64}$'",
     "response details are sanitized and recorded": 'http-response-details.json',
     "ExtProc Pod identity is snapshotted": 'extproc-pod-before.json',
     "ExtProc endpoints are snapshotted": 'extproc-endpoints-before.json',
@@ -66,5 +70,20 @@ if source.index("summarize_failure_response.py") > source.index('if [[ -n "$RESP
     raise SystemExit("failure-closed response details must be preserved before response-ID validation")
 if forbidden:
     raise SystemExit("failure-closed hook must not mutate filters or shared resources: " + ", ".join(forbidden))
+import re
+image_pattern = re.compile(r"/(llm-d-sim|llm-d-inference-sim)@sha256:[0-9a-f]{64}$")
+digest = "a" * 64
+for image in (
+    f"registry.local:5000/task/llm-d-sim@sha256:{digest}",
+    f"registry.local:5000/task/llm-d-inference-sim@sha256:{digest}",
+):
+    if not image_pattern.search(image):
+        raise SystemExit("simulator image pattern rejected a supported immutable image")
+for image in (
+    "registry.local:5000/task/llm-d-sim:latest",
+    f"registry.local:5000/task/unrelated-sim@sha256:{digest}",
+):
+    if image_pattern.search(image):
+        raise SystemExit("simulator image pattern accepted a floating or unrelated image")
 print("ExtProc failure-closed task-ownership, TLS, correlation, counters, and restoration contract: PASS")
 PY
