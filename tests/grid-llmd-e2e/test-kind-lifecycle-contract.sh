@@ -66,6 +66,7 @@ if any(position < 0 for position in cleanup_positions) or cleanup_positions != s
 for required in (
     'KIND_CAPACITY_PROFILE',
     'mkdir -p "$RUN_DIR" "$STATE_DIR" "$SOURCE_ROOT" "$RUN_DIR/logs" "$RUN_DIR/phase-metrics"',
+    'KIND_STATE_DIR="$STATE_DIR/kind"',
     'capture_diagnostics',
     'sanitize_diagnostics.py',
     'qualification_rc',
