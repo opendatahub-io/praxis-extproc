@@ -102,6 +102,8 @@ for required in (
 
 if 'ACTIVE_PHASE="$name"' not in lifecycle or lifecycle.index('ACTIVE_PHASE="$name"') < lifecycle.index('if ((rc != 0)); then'):
     raise SystemExit("lifecycle failure records must preserve the failed phase name")
+if 'if [[ "${cmd[0]}" == "$SCRIPT_DIR/"*.sh ]]; then' not in lifecycle or 'cmd=(bash "${cmd[@]}")' not in lifecycle:
+    raise SystemExit("lifecycle dispatcher must invoke repository shell helpers through Bash regardless of file mode")
 if 'originalLifecycleResultPreserved:true' not in lifecycle or 'cluster or kubeconfig unavailable before application cleanup' not in lifecycle or 'ACTIVE_PHASE=cleanup-retry' not in lifecycle:
     raise SystemExit("failure cleanup must preserve the primary failure and state whether natural cleanup was possible")
 if 'stage:$stage' not in lifecycle or 'CLEANUP_STAGE=kind-registry-network-destroy' not in lifecycle or 'Cleanup retry failed at stage %s' not in lifecycle:

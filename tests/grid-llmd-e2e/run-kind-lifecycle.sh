@@ -162,6 +162,12 @@ run_phase() {
   [[ "${1:-}" == -- ]] && shift
   cmd=("$@")
   ((${#cmd[@]})) || { printf 'run_phase %s has no command\n' "$name" >&2; return 2; }
+  # Repository helper scripts are not all marked executable. Invoke helpers
+  # from this directory through Bash so behavior does not depend on checkout
+  # file modes (which caused phases to fail with exit 126).
+  if [[ "${cmd[0]}" == "$SCRIPT_DIR/"*.sh ]]; then
+    cmd=(bash "${cmd[@]}")
+  fi
   phase_start "$name"
   local logfile="$RUN_DIR/logs/$name.log" rc=0
   (
