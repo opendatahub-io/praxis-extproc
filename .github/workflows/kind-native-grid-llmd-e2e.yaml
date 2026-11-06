@@ -62,7 +62,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y podman skopeo jq iproute2 shellcheck python3-pip
+          sudo apt-get install -y podman skopeo jq iproute2 ripgrep shellcheck python3-pip
           mkdir -p "$RUNNER_TEMP/kind-tools"
           tool_dir="$RUNNER_TEMP/kind-tools"
           cd "$tool_dir"
@@ -110,7 +110,7 @@ jobs:
             printf '\n-- installed tool versions --\n'
             kind version; kubectl version --client --output=yaml; helm version --short
             kustomize version; oc version --client; podman version; skopeo --version; cargo --version
-            dpkg-query -W -f='${binary:Package}=${Version}\n' podman skopeo jq iproute2 python3-pip
+            dpkg-query -W -f='${binary:Package}=${Version}\n' podman skopeo jq iproute2 ripgrep shellcheck python3-pip
           } >"$RUNNER_TEMP/kind-runner-capacity.txt"
           cat "$RUNNER_TEMP/kind-runner-capacity.txt"
 

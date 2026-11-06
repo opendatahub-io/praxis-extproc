@@ -90,9 +90,14 @@ for required in (
     'if: always()',
     'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
     'Remove private state after artifact upload',
+    'apt-get install -y podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
+    'dpkg-query -W -f=\'${binary:Package}=${Version}\\n\' podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
 ):
     if required not in workflow:
         raise SystemExit(f"workflow contract is missing: {required}")
+
+if 'ACTIVE_PHASE="$name"' not in lifecycle or lifecycle.index('ACTIVE_PHASE="$name"') < lifecycle.index('if ((rc != 0)); then'):
+    raise SystemExit("lifecycle failure records must preserve the failed phase name")
 
 print("Kind lifecycle orchestration and workflow contract passed")
 PY

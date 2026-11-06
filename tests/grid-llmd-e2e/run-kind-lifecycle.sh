@@ -173,13 +173,16 @@ run_phase() {
   python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$logfile" >"$logfile.sanitized"
   mv "$logfile.sanitized" "$logfile"
   phase_end "$rc" || true
-  ACTIVE_PHASE="$previous_phase"
-  PHASE_START="$previous_start"
   if ((rc != 0)); then
+    # Keep the failed phase active so the top-level failure record does not
+    # misattribute the failure to the caller's previous phase.
+    ACTIVE_PHASE="$name"
     printf 'Phase %s failed (exit %s); sanitized log: %s\n' "$name" "$rc" "$logfile" >&2
     tail -n 60 "$logfile" >&2 || true
     return "$rc"
   fi
+  ACTIVE_PHASE="$previous_phase"
+  PHASE_START="$previous_start"
 }
 
 write_resource_sample() {
