@@ -18,6 +18,12 @@ checks = (
     'serving.kserve.io",version:"v1alpha2"',
     'maas-controller-lease-rbac-can-i.txt',
     'verify_kind_capacity',
+    'if [[ "$MODE" == platform ]]; then',
+    'verify_capacity_mode',
+    'verify_platform',
+    'Platform-only readiness gate passed; task namespace and serving-pool graph are not required at this phase',
+    'unsupported mode: %s',
+    '^(platform|build|apply|verify|collect|cleanup)$',
     'WAIVED_FOR_KIND_DEV_SMOKE',
     'task_owned_count="$(jq --arg ns "$NAMESPACE" --arg run "$RUN_LABEL"',
     'Found $task_owned_count LLMInferenceServices owned by this task/run',
@@ -48,6 +54,13 @@ checks = (
 missing = [item for item in checks if item not in source]
 if missing:
     print("Kind serving path contract missing: " + repr(missing), file=sys.stderr)
+    raise SystemExit(1)
+
+platform_gate = source.split('if [[ "$MODE" == platform ]]; then', 1)[1].split('\nfi\n', 1)[0]
+namespace_check = source.index('verify_namespace\n', source.index('api_access\nwrite_invocation'))
+platform_check = source.index('if [[ "$MODE" == platform ]]; then', source.index('api_access\nwrite_invocation'))
+if not platform_check < namespace_check or 'verify_all' in platform_gate:
+    print("platform-only mode must verify dependencies without requiring a task namespace or serving pools", file=sys.stderr)
     raise SystemExit(1)
 
 configure = source.split('configure_llmisvc_transport() {', 1)[1]

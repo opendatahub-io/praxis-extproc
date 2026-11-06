@@ -96,6 +96,7 @@ for required in (
     'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
     'Remove private state after artifact upload',
     'workflow-cleanup-retry.log',
+    'KIND_CLEANUP_CONTEXT=workflow-retry KIND_PRIVATE_STATE_DIR="$state_dir"',
     'python3 tests/grid-llmd-e2e/sanitize_diagnostics.py',
     'apt-get install -y podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
     'dpkg-query -W -f=\'${binary:Package}=${Version}\\n\' podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
@@ -111,6 +112,24 @@ if 'AIGC_CONTROLLER_KUSTOMIZATION="$AIGC_SOURCE/config/self/default"' not in lif
     raise SystemExit("AIGC bootstrap must use the supported config/self/default kustomization from current main")
 if 'kustomize build "$AIGC_SOURCE/config/default"' in lifecycle:
     raise SystemExit("AIGC bootstrap must not use the removed config/default path")
+platform_readiness = lifecycle.split('SERVING_POOLS_MODE=platform', 1)
+if len(platform_readiness) != 2 or 'SERVING_POOLS_MODE=verify SERVING_POOL_SELECTION=both SERVING_POOLS_EVIDENCE_DIR="$RUN_DIR/platform/platform-gate"' in lifecycle:
+    raise SystemExit("platform readiness must use platform-only verification before creating the task namespace")
+if 'KIND_CLEANUP_CONTEXT=qualification KIND_PRIVATE_STATE_DIR="$STATE_DIR"' not in lifecycle:
+    raise SystemExit("in-run cleanup must explicitly be recorded as qualification natural cleanup")
+if 'naturalCleanup:$cleanupStatus' in lifecycle:
+    raise SystemExit("final result must not encode the cleanup status string as the natural-cleanup value")
+if 'naturalCleanup:$naturalCleanup' not in lifecycle:
+    raise SystemExit("final result must record natural cleanup as a verified boolean")
+cleanup_start = lifecycle.index('if [[ "$MODE" == cleanup ]]')
+cleanup_end = lifecycle.index('export SOURCE_MODE=main', cleanup_start)
+cleanup = lifecycle[cleanup_start:cleanup_end]
+if "'{status:\"PASS\",runId:$run,cluster:$cluster,naturalCleanup:true}'" in cleanup:
+    raise SystemExit("cleanup must not claim natural finalization unconditionally")
+if 'gridNetworkWithdrawalCompleted:$gridNetworkWithdrawalCompleted' not in cleanup or 'taskNamespaceRemoved:$taskNamespaceRemoved' not in cleanup:
+    raise SystemExit("cleanup result must carry GridNetwork withdrawal and task-namespace removal evidence")
+if 'phase_start workflow-cleanup-retry' not in cleanup or 'if [[ "$CLEANUP_CONTEXT" == qualification ]]' not in cleanup:
+    raise SystemExit("failure cleanup retry must be recorded separately from natural qualification cleanup")
 aigc_start = lifecycle.index('phase_start aigc-controller-bootstrap')
 aigc_kustomize = lifecycle.index('kustomize build "$AIGC_CONTROLLER_KUSTOMIZATION"')
 aigc_end = lifecycle.index('phase_end 0', aigc_kustomize)

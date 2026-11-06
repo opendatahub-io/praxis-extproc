@@ -248,7 +248,8 @@ consumer configuration, install ExtProc, or modify shared Grid, MaaS, or ingress
 resources. Install the run-owned pool Gateways before this helper. Apply mode sets the
 supported DSCI LLMInferenceService TLS field to the HTTP protocol required by this
 InferencePool path and saves the original state for cleanup.
-Modes: plan, build, apply, verify, collect, cleanup.
+Modes: plan, platform (API/capacity/platform gates only), build, apply, verify,
+collect, cleanup. Platform mode does not require the task namespace or pools.
 API TLS bypass requires CLUSTER_ENV=ephemeral-dev and ALLOW_INSECURE_DEV_API=true.
 PLAN
   exit 0
@@ -258,7 +259,7 @@ for bin in oc jq awk sha256sum sed timeout python3; do
   command -v "$bin" >/dev/null || { printf '%s is required\n' "$bin" >&2; exit 2; }
 done
 python3 -c 'import yaml' >/dev/null 2>&1 || { printf 'PyYAML is required for sanitized EPP Pod YAML evidence\n' >&2; exit 2; }
-[[ "$MODE" =~ ^(build|apply|verify|collect|cleanup)$ ]] || { printf 'unsupported mode: %s\n' "$MODE" >&2; exit 2; }
+[[ "$MODE" =~ ^(platform|build|apply|verify|collect|cleanup)$ ]] || { printf 'unsupported mode: %s\n' "$MODE" >&2; exit 2; }
 [[ "$SERVING_POOL_SELECTION" == both || "$SERVING_POOL_SELECTION" == pool-a || "$SERVING_POOL_SELECTION" == pool-b ]] || {
   printf 'SERVING_POOL_SELECTION must be both, pool-a, or pool-b\n' >&2; exit 2;
 }
@@ -1752,6 +1753,12 @@ cleanup_owned() {
 
 api_access
 write_invocation
+if [[ "$MODE" == platform ]]; then
+  verify_capacity_mode
+  verify_platform
+  log 'Platform-only readiness gate passed; task namespace and serving-pool graph are not required at this phase'
+  exit 0
+fi
 if [[ "$MODE" == build || "$MODE" == apply ]]; then verify_capacity_mode; fi
 verify_namespace
 capture_inventory

@@ -136,7 +136,7 @@ jobs:
           if [[ -s "$state_dir/lifecycle.env" ]]; then
             cleanup_log="$evidence/workflow-cleanup-retry.log"
             cleanup_rc=0
-            KIND_PRIVATE_STATE_DIR="$state_dir" \
+            KIND_CLEANUP_CONTEXT=workflow-retry KIND_PRIVATE_STATE_DIR="$state_dir" \
               bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode cleanup \
               >"$cleanup_log" 2>&1 || cleanup_rc=$?
             python3 tests/grid-llmd-e2e/sanitize_diagnostics.py \

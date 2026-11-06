@@ -9,6 +9,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODE=run
+CLEANUP_CONTEXT="${KIND_CLEANUP_CONTEXT:-workflow-retry}"
 if (($#)); then
   case "$1" in
     --mode) MODE="${2:?}"; shift 2 ;;
@@ -309,6 +310,10 @@ chart_sha256() {
 }
 
 if [[ "$MODE" == cleanup ]]; then
+  [[ "$CLEANUP_CONTEXT" == qualification || "$CLEANUP_CONTEXT" == workflow-retry ]] || {
+    printf 'KIND_CLEANUP_CONTEXT must be qualification or workflow-retry\n' >&2
+    exit 2
+  }
   CLEANUP_STAGE=cleanup-retry-started
   ACTIVE_PHASE=cleanup-retry
   mkdir -p "$RUN_DIR/cleanup"
@@ -322,9 +327,21 @@ if [[ "$MODE" == cleanup ]]; then
      ! docker container inspect "$REGISTRY_NAME" >/dev/null 2>&1 && \
      ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
     CLEANUP_STAGE=already-cleaned-confirmed
+    natural_cleanup=false
+    if [[ -s "$RUN_DIR/cleanup/RESULT.json" ]] && \
+       jq -e '.naturalCleanup==true' "$RUN_DIR/cleanup/RESULT.json" >/dev/null 2>&1; then
+      natural_cleanup=true
+    fi
     jq -n --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
-      '{status:"PASS",runId:$run,cluster:$cluster,naturalCleanup:true,alreadyCleanedByLifecycle:true}' \
+      --argjson naturalCleanup "$natural_cleanup" \
+      '{status:"PASS",runId:$run,cluster:$cluster,clusterInfrastructureRemoved:true,naturalCleanup:$naturalCleanup,alreadyCleanedByLifecycle:true}' \
       >"$RUN_DIR/cleanup/RESULT.json"
+    if [[ "$CLEANUP_CONTEXT" == qualification ]]; then
+      [[ "$natural_cleanup" == true ]] || exit 1
+    else
+      phase_start workflow-cleanup-retry
+      phase_end 0
+    fi
     exit 0
   fi
   if [[ -f "$BOOTSTRAP_EVIDENCE/run-id.txt" && ! -f "$KUBECONFIG" ]] && \
@@ -338,6 +355,16 @@ if [[ "$MODE" == cleanup ]]; then
       >"$RUN_DIR/logs/kubeconfig-recovery.log" 2>&1
     chmod 0600 "$KUBECONFIG"
   fi
+  provider_cleanup_required=false
+  provider_cleanup_passed=false
+  serving_cleanup_required=false
+  serving_cleanup_passed=false
+  grid_withdrawal_passed=false
+  task_namespace_cleanup_passed=false
+  provider_cleanup_dir=""
+  serving_cleanup_dir=""
+  grid_cleanup_dir=""
+  task_namespace_cleanup_dir=""
   set +e
   cleanup_rc=0
   if [[ -f "$BOOTSTRAP_EVIDENCE/run-id.txt" && -f "$KUBECONFIG" ]]; then
@@ -371,24 +398,44 @@ if [[ "$MODE" == cleanup ]]; then
     export PRAXIS_GATEWAY_CHART_FILE PRAXIS_GATEWAY_CHART_SHA256
     export GRID_RESOURCE_NAMESPACE GRID_GATEWAY_HOSTNAME="$SITE_HOSTNAME"
     if [[ -f "$RUN_DIR/grid/providers/grid-praxis-cluster-endpoints.json" ]]; then
+      provider_cleanup_required=true
       CLEANUP_STAGE=provider-cleanup
-      GRID_PROVIDERS_MODE=cleanup GRID_PROVIDERS_EVIDENCE_DIR="$RUN_DIR/cleanup/providers-$(date -u +%H%M%S)" \
+      provider_cleanup_dir="$RUN_DIR/cleanup/providers-$(date -u +%H%M%S)"
+      GRID_PROVIDERS_MODE=cleanup GRID_PROVIDERS_EVIDENCE_DIR="$provider_cleanup_dir" \
         bash "$(helper deploy-grid-providers.sh)" || cleanup_rc=$?
+      if [[ -s "$provider_cleanup_dir/RESULT.json" ]] && jq -e '.status=="CLEANED"' "$provider_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
+        provider_cleanup_passed=true
+      fi
     fi
     if [[ -d "$RUN_DIR/serving/pool-a" || -d "$RUN_DIR/serving/pool-b" ]]; then
+      serving_cleanup_required=true
       CLEANUP_STAGE=serving-pool-cleanup
-      KIND_SERVING_CLEANUP_MODE=fresh KIND_SERVING_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/serving-$(date -u +%H%M%S)" \
+      serving_cleanup_dir="$RUN_DIR/cleanup/serving-$(date -u +%H%M%S)"
+      KIND_SERVING_CLEANUP_MODE=fresh KIND_SERVING_CLEANUP_EVIDENCE_DIR="$serving_cleanup_dir" \
         bash "$(helper cleanup-kind-serving.sh)" || cleanup_rc=$?
+      if [[ -s "$serving_cleanup_dir/RESULT.json" ]] && jq -e '.status=="serving-resources-removed"' "$serving_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
+        serving_cleanup_passed=true
+      fi
     fi
     if [[ -f "$RUN_DIR/grid/operator-bootstrap/RESULT.json" ]]; then
       CLEANUP_STAGE=grid-operator-cleanup
-      GRID_OPERATOR_CLEANUP_MODE=cleanup GRID_OPERATOR_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/grid-operator-$(date -u +%H%M%S)" \
+      grid_cleanup_dir="$RUN_DIR/cleanup/grid-operator-$(date -u +%H%M%S)"
+      GRID_OPERATOR_CLEANUP_MODE=cleanup GRID_OPERATOR_CLEANUP_EVIDENCE_DIR="$grid_cleanup_dir" \
         bash "$(helper cleanup-grid-operator.sh)" || cleanup_rc=$?
+      if [[ -s "$grid_cleanup_dir/RESULT.json" ]] && jq -e '.status=="passed" and .gridNetwork.withdrawalFinalizerObserved==true and .gridNetwork.operatorReceiptObserved==true' \
+        "$grid_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
+        grid_withdrawal_passed=true
+      fi
     fi
     if [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" ]]; then
       CLEANUP_STAGE=task-namespace-cleanup
-      KIND_TASK_CLEANUP_MODE=fresh KIND_TASK_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/task-namespace-$(date -u +%H%M%S)" \
+      task_namespace_cleanup_dir="$RUN_DIR/cleanup/task-namespace-$(date -u +%H%M%S)"
+      KIND_TASK_CLEANUP_MODE=fresh KIND_TASK_CLEANUP_EVIDENCE_DIR="$task_namespace_cleanup_dir" \
         bash "$(helper cleanup-kind-task-namespace.sh)" || cleanup_rc=$?
+      if [[ -s "$task_namespace_cleanup_dir/RESULT.json" ]] && jq -e '.status=="task-gateway-and-namespace-removed" and .naturalGridWithdrawalWasVerifiedBeforeCleanup==true and .manualFinalizerRemoval==false' \
+        "$task_namespace_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
+        task_namespace_cleanup_passed=true
+      fi
     fi
     # On a failed run, the natural application cleanup attempt is preserved
     # above; the exact run-owned cluster is still removed so no workload leaks.
@@ -411,13 +458,21 @@ if [[ "$MODE" == cleanup ]]; then
         KIND_REGISTRY_CONTAINER="$REGISTRY_NAME" KIND_REGISTRY_NETWORK="$NETWORK_NAME" \
         KUBECONFIG="$KUBECONFIG" bash "$(helper destroy-kind-environment.sh)" || cleanup_rc=$?
       CLEANUP_STAGE=kind-destroy-without-api-finished
-      jq -n --arg status FAIL --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
-        '{status:$status,runId:$run,cluster:$cluster,naturalCleanup:false,reason:"cluster or kubeconfig unavailable before application cleanup"}' \
-        >"$RUN_DIR/cleanup/RESULT.json"
-      if ((cleanup_rc != 0)); then exit "$cleanup_rc"; fi
+      if ((cleanup_rc != 0)); then
+        jq -n --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" --argjson exitCode "$cleanup_rc" \
+          '{status:"FAIL",runId:$run,cluster:$cluster,clusterInfrastructureRemoved:false,naturalCleanup:false,exitCode:$exitCode,reason:"cluster or kubeconfig unavailable before application cleanup"}' \
+          >"$RUN_DIR/cleanup/RESULT.json"
+        exit "$cleanup_rc"
+      fi
       # The primary lifecycle already failed. Report cleanup success when all
       # remaining run-owned infrastructure was removed, while keeping natural
       # application cleanup explicitly unproven in cleanup/RESULT.json.
+      jq -n --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
+        '{status:"PASS",runId:$run,cluster:$cluster,clusterInfrastructureRemoved:true,naturalCleanup:false,reason:"cluster or kubeconfig unavailable before application cleanup"}' \
+        >"$RUN_DIR/cleanup/RESULT.json"
+      if [[ "$CLEANUP_CONTEXT" == qualification ]]; then exit 1; fi
+      phase_start workflow-cleanup-retry
+      phase_end 0
       exit 0
     fi
     printf '{"status":"NOT_APPLICABLE","reason":"run-owned Kind bootstrap was not created"}\n' >"$RUN_DIR/cleanup/RESULT.json"
@@ -425,10 +480,28 @@ if [[ "$MODE" == cleanup ]]; then
   set -e
   if ((cleanup_rc != 0)); then exit "$cleanup_rc"; fi
   CLEANUP_STAGE=cleanup-result-writing
+  natural_cleanup=false
+  if [[ "$grid_withdrawal_passed" == true && "$task_namespace_cleanup_passed" == true &&
+        ("$provider_cleanup_required" == false || "$provider_cleanup_passed" == true) &&
+        ("$serving_cleanup_required" == false || "$serving_cleanup_passed" == true) ]]; then
+    natural_cleanup=true
+  fi
   jq -n --arg status PASS --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
-    '{status:$status,runId:$run,cluster:$cluster,naturalCleanup:true}' >"$RUN_DIR/cleanup/RESULT.json"
-  phase_start natural-cleanup
-  phase_end 0
+    --argjson naturalCleanup "$natural_cleanup" \
+    --argjson providersRemoved "$provider_cleanup_passed" \
+    --argjson servingResourcesRemoved "$serving_cleanup_passed" \
+    --argjson gridNetworkWithdrawalCompleted "$grid_withdrawal_passed" \
+    --argjson taskNamespaceRemoved "$task_namespace_cleanup_passed" \
+    '{status:$status,runId:$run,cluster:$cluster,clusterInfrastructureRemoved:true,naturalCleanup:$naturalCleanup,applicationCleanup:{providersRemoved:$providersRemoved,servingResourcesRemoved:$servingResourcesRemoved,gridNetworkWithdrawalCompleted:$gridNetworkWithdrawalCompleted,taskNamespaceRemoved:$taskNamespaceRemoved}}' \
+    >"$RUN_DIR/cleanup/RESULT.json"
+  if [[ "$CLEANUP_CONTEXT" == qualification ]]; then
+    if [[ "$natural_cleanup" != true ]]; then
+      exit 1
+    fi
+  else
+    phase_start workflow-cleanup-retry
+    phase_end 0
+  fi
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'evidence_dir=%s\n' "$RUN_DIR" >>"$GITHUB_OUTPUT"; fi
   exit 0
 fi
@@ -673,7 +746,7 @@ export SOURCE_LOCKS_FILE="$RUN_DIR/source-resolution/source-locks.json"
 export SOURCE_LOCKS_MD="$RUN_DIR/source-resolution/source-locks.md"
 export GRID_RUN_LABEL="$RUN_ID" EXPECTED_API_SERVER KUBE_CONTEXT
 export GRID_RESOURCE_NAMESPACE="$TASK_NAMESPACE"
-SERVING_POOLS_MODE=verify SERVING_POOL_SELECTION=both SERVING_POOLS_EVIDENCE_DIR="$RUN_DIR/platform/platform-gate" \
+SERVING_POOLS_MODE=platform SERVING_POOL_SELECTION=both SERVING_POOLS_EVIDENCE_DIR="$RUN_DIR/platform/platform-gate" \
   run_phase platform-readiness -- "$(helper deploy-serving-pools.sh)"
 
 phase_start task-namespace
@@ -1028,7 +1101,7 @@ phase_end 0
 
 phase_start natural-cleanup
 set +e
-KIND_PRIVATE_STATE_DIR="$STATE_DIR" bash "$SCRIPT_DIR/run-kind-lifecycle.sh" --mode cleanup \
+KIND_CLEANUP_CONTEXT=qualification KIND_PRIVATE_STATE_DIR="$STATE_DIR" bash "$SCRIPT_DIR/run-kind-lifecycle.sh" --mode cleanup \
   >"$RUN_DIR/logs/natural-cleanup.log" 2>&1
 cleanup_rc=$?
 set -e
@@ -1039,12 +1112,14 @@ write_resource_sample
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'evidence_dir=%s\n' "$RUN_DIR" >>"$GITHUB_OUTPUT"; fi
 
 write_final_result() {
-  local result_status="$1"
+  local result_status="$1" cleanup_status natural_cleanup
+  cleanup_status="$(jq -r '.status // "unknown"' "$RUN_DIR/cleanup/RESULT.json" 2>/dev/null || printf unknown)"
+  natural_cleanup="$(jq -r '.naturalCleanup // false' "$RUN_DIR/cleanup/RESULT.json" 2>/dev/null || printf false)"
   jq -n --arg status "$result_status" --arg run "$RUN_ID" \
     --arg sourceLock "$RUN_DIR/source-resolution/source-locks.json" \
-    --arg phaseLedger "$RUN_DIR/PHASES.jsonl" --arg cluster "$CLUSTER_NAME" \
-    --arg cleanupStatus "$(jq -r '.status // "unknown"' "$RUN_DIR/cleanup/RESULT.json" 2>/dev/null || printf unknown)" \
-    '{status:$status,qualificationScope:"routing-smoke",enrollment:"not-qualified",runId:$run,cluster:$cluster,sourceLock:$sourceLock,phaseLedger:$phaseLedger,naturalCleanup:$cleanupStatus}' \
+    --arg phaseLedger "$RUN_DIR/PHASES.jsonl" --arg cluster "$CLUSTER_NAME" --arg cleanupStatus "$cleanup_status" \
+    --argjson naturalCleanup "$natural_cleanup" \
+    '{status:$status,qualificationScope:"routing-smoke",enrollment:"not-qualified",runId:$run,cluster:$cluster,sourceLock:$sourceLock,phaseLedger:$phaseLedger,cleanupStatus:$cleanupStatus,naturalCleanup:$naturalCleanup}' \
     >"$RUN_DIR/RESULT.json"
   python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$RUN_DIR/RESULT.json" >"$RUN_DIR/RESULT.json.sanitized"
   mv "$RUN_DIR/RESULT.json.sanitized" "$RUN_DIR/RESULT.json"
