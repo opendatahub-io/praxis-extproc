@@ -1,0 +1,21 @@
+# Bootstrap contract copied from the pinned Grid operator consumer-config fixture.
+# The operator replaces this task-owned 503 config with the rendered consumer
+# config after the matching GridNetwork and provider endpoints are ready.
+listeners:
+  - name: public
+    address: "0.0.0.0:8080"
+    filter_chains: [consumer-chain]
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: static_response
+        status: 503
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: Retry-After
+            value: "5"
+        body: '{"error":{"message":"the gateway is starting","type":"service_unavailable"}}'
+admin:
+  metrics_address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

@@ -24,6 +24,7 @@ start deploying alongside Envoy.
 - [IPP → Praxis Migration](docs/migration-ipp-to-praxis.md): moving from the Go Inference Payload Processor
 - [FIPS](docs/fips.md): the image is the FIPS build; what it leaves out, host prerequisites, `PRAXIS_REQUIRE_FIPS`, and the runtime proof on a FIPS host
 - [Development](docs/development.md): building, testing, contributing
+- [Grid and llm-d E2E](tests/grid-llmd-e2e/README.md): qualify simulator-backed, signal-driven routing through Praxis ExtProc
 - [Conventions](docs/conventions.md): coding standards
 
 ## Contributing
