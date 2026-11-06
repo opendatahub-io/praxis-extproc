@@ -54,8 +54,8 @@ spec:
           env:
             # Pair tonic decode with server.max_body_bytes (10 MiB) + 1 MiB
             # ProcessingRequest framing headroom. Leaving the binary default
-            # (~33 MiB) would allocate before the 413 path and OOM the 256 MiB
-            # pre-processing budget under max_requests=8.
+            # (~33 MiB) would allocate before the 413 path and inflate peak
+            # RSS under max_requests=8 (see RHAIENG-8104).
             - name: GRPC_MAX_RECV_MSG_SIZE
               value: "11Mi"
           resources:
