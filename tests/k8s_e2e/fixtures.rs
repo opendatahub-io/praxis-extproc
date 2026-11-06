@@ -47,18 +47,25 @@ async fn ensure_gateway_ready_at(ready: &'static tokio::sync::OnceCell<bool>, ur
 
 /// Send a chat completion request with the given model and content.
 pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Response {
+    chat_completion_with_headers(model, content, &[]).await
+}
+
+/// Chat completion with extra request headers (e.g. a conflicting routing header).
+pub(crate) async fn chat_completion_with_headers(
+    model: &str,
+    content: &str,
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
-
-    client
-        .post(&url)
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": content}]
-        }))
-        .send()
-        .await
-        .expect("request failed")
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": content}]
+    }));
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.send().await.expect("request failed")
 }
 
 /// Assert that IPP response mutations are present.

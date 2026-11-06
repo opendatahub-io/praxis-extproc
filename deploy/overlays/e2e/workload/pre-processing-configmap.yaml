@@ -17,13 +17,12 @@ data:
     filter_chains:
       - name: bbr
         filters:
-          # Promote body "model" into X-Gateway-Model-Name; `unless` trusts an
-          # existing header. For untrusted ingress, drop it and strip the header
-          # with `headers request_remove` before json_body.
+          # Mirror ODH production BBR: strip any caller-supplied routing header
+          # so routing identity always comes from the JSON body.
+          - filter: headers
+            request_remove:
+              - X-Gateway-Model-Name
           - filter: json_body
-            conditions:
-              - unless:
-                  headers_present: ["X-Gateway-Model-Name"]
             request_extract:
               - pointer: /model
                 header: X-Gateway-Model-Name
