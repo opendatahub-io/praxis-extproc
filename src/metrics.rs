@@ -584,4 +584,311 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK, "healthz should always return 200");
     }
+
+    // -------------------------------------------------------------------------
+    // TokenReview + SubjectAccessReview
+    //
+    // The coverage job has no cluster. `serve_metrics` only reaches Kubernetes
+    // when it is given a client, so these tests point one at a loopback API.
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    struct Reply {
+        status: StatusCode,
+        body: &'static str,
+    }
+
+    fn created(body: &'static str) -> Reply {
+        Reply {
+            status: StatusCode::CREATED,
+            body,
+        }
+    }
+
+    fn api_failure() -> Reply {
+        Reply {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"denied","code":400}"#,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Seen(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl Seen {
+        fn record(&self, path: &str, body: &str) {
+            self.0.lock().unwrap().push((path.to_owned(), body.to_owned()));
+        }
+
+        fn contains(&self, path_suffix: &str, needle: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, body)| path.ends_with(path_suffix) && body.contains(needle))
+        }
+    }
+
+    async fn kube_client(token_review: Reply, subject_access: Reply) -> (kube::Client, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Seen::default();
+        tokio::spawn(accept_api(listener, seen.clone(), token_review, subject_access));
+        let mut config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        config.connect_timeout = Some(std::time::Duration::from_secs(2));
+        config.default_retry = false;
+        let client = kube::Client::try_from(config).unwrap();
+        (client, seen)
+    }
+
+    async fn accept_api(listener: tokio::net::TcpListener, seen: Seen, token_review: Reply, subject_access: Reply) {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request| {
+                    let seen = seen.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            api_response(request, seen, token_review, subject_access).await,
+                        )
+                    }
+                });
+                drop(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await,
+                );
+            });
+        }
+    }
+
+    async fn api_response(
+        request: Request<hyper::body::Incoming>,
+        seen: Seen,
+        token_review: Reply,
+        subject_access: Reply,
+    ) -> Response<Full<Bytes>> {
+        let path = request.uri().path().to_owned();
+        let collected = http_body_util::BodyExt::collect(request.into_body()).await.ok();
+        let body = collected.map(|collected| String::from_utf8_lossy(&collected.to_bytes()).into_owned());
+        seen.record(&path, body.as_deref().unwrap_or(""));
+        json_reply(reply_for(&path, token_review, subject_access))
+    }
+
+    fn reply_for(path: &str, token_review: Reply, subject_access: Reply) -> Reply {
+        if path.ends_with("/tokenreviews") {
+            token_review
+        } else if path.ends_with("/subjectaccessreviews") {
+            subject_access
+        } else {
+            Reply {
+                status: StatusCode::NOT_FOUND,
+                body: "{}",
+            }
+        }
+    }
+
+    fn json_reply(reply: Reply) -> Response<Full<Bytes>> {
+        let mut response = Response::new(Full::new(Bytes::from(reply.body)));
+        *response.status_mut() = reply.status;
+        response
+            .headers_mut()
+            .insert(hyper::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        response
+    }
+
+    async fn scrape(client: &kube::Client, authorization: Option<&str>) -> (StatusCode, String) {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let mut builder = Request::builder().uri("/metrics");
+        if let Some(value) = authorization {
+            builder = builder.header(hyper::header::AUTHORIZATION, value);
+        }
+        let response = serve_metrics(&builder.body(()).unwrap(), &handle, Some(client)).await;
+        let status = response.status();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn assert_outcome(
+        token_review: Reply,
+        subject_access: Reply,
+        authorization: Option<&str>,
+        status: StatusCode,
+        body: &str,
+    ) {
+        let (client, _) = kube_client(token_review, subject_access).await;
+        let (got_status, got_body) = scrape(&client, authorization).await;
+        assert_eq!(got_status, status, "metrics status");
+        assert_eq!(got_body, body, "metrics body");
+    }
+
+    #[tokio::test]
+    async fn metrics_without_bearer_is_unauthorized() {
+        assert_outcome(
+            created(TOKEN_REJECTED),
+            created(SAR_DENIED),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn metrics_with_non_bearer_scheme_is_unauthorized() {
+        assert_outcome(
+            created(TOKEN_REJECTED),
+            created(SAR_DENIED),
+            Some("Basic dXNlcjpwYXNz"),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejected_token_is_unauthorized() {
+        assert_outcome(
+            created(TOKEN_REJECTED),
+            created(SAR_DENIED),
+            Some("Bearer secret-token"),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_review_without_status_is_an_internal_error() {
+        assert_outcome(
+            created(TOKEN_NO_STATUS),
+            created(SAR_DENIED),
+            Some("Bearer secret-token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_review_without_authenticated_is_an_internal_error() {
+        assert_outcome(
+            created(TOKEN_NO_FLAG),
+            created(SAR_DENIED),
+            Some("Bearer secret-token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn token_review_api_error_is_an_internal_error() {
+        assert_outcome(
+            api_failure(),
+            created(SAR_DENIED),
+            Some("Bearer secret-token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn denied_subject_access_review_is_forbidden() {
+        let (client, seen) = kube_client(created(TOKEN_ALICE), created(SAR_DENIED)).await;
+        let (status, body) = scrape(&client, Some("Bearer secret-token")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "SAR allowed=false is 403");
+        assert_eq!(body, "forbidden", "forbidden body");
+        assert!(
+            seen.contains("/tokenreviews", "secret-token"),
+            "TokenReview receives the bearer"
+        );
+        assert!(
+            seen.contains("/subjectaccessreviews", "alice"),
+            "SAR receives the TokenReview username"
+        );
+        assert!(
+            seen.contains("/subjectaccessreviews", "readers"),
+            "SAR receives the TokenReview groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_token_renders_metrics() {
+        let (client, seen) = kube_client(created(TOKEN_ALICE), created(SAR_ALLOWED)).await;
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let request = Request::builder()
+            .uri("/metrics")
+            .header(hyper::header::AUTHORIZATION, "Bearer secret-token")
+            .body(())
+            .unwrap();
+        let response = serve_metrics(&request, &handle, Some(&client)).await;
+        assert_eq!(response.status(), StatusCode::OK, "allowed GET /metrics is 200");
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            bytes.as_ref(),
+            handle.render().as_bytes(),
+            "body is the Prometheus render"
+        );
+        assert!(
+            seen.contains("/subjectaccessreviews", "alice"),
+            "SAR receives the TokenReview username"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_without_user_identity_still_renders_when_allowed() {
+        assert_outcome(
+            created(TOKEN_NO_USER),
+            created(SAR_ALLOWED),
+            Some("Bearer secret-token"),
+            StatusCode::OK,
+            "",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subject_access_review_without_status_is_an_internal_error() {
+        assert_outcome(
+            created(TOKEN_ALICE),
+            created(SAR_NO_STATUS),
+            Some("Bearer secret-token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subject_access_review_api_error_is_an_internal_error() {
+        assert_outcome(
+            created(TOKEN_ALICE),
+            api_failure(),
+            Some("Bearer secret-token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .await;
+    }
+
+    const TOKEN_ALICE: &str = r#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,"user":{"username":"alice","groups":["readers"]}}}"#;
+    const TOKEN_NO_USER: &str =
+        r#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true}}"#;
+    const TOKEN_REJECTED: &str =
+        r#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":false}}"#;
+    const TOKEN_NO_STATUS: &str = r#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview"}"#;
+    const TOKEN_NO_FLAG: &str = r#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{}}"#;
+    const SAR_ALLOWED: &str =
+        r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview","status":{"allowed":true}}"#;
+    const SAR_DENIED: &str =
+        r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview","status":{"allowed":false}}"#;
+    const SAR_NO_STATUS: &str = r#"{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview"}"#;
 }
