@@ -83,6 +83,7 @@ for required in (
     'workflow_dispatch:',
     'runs-on: ubuntu-24.04',
     'KIND_CAPACITY_PROFILE: gha-standard-4cpu',
+    'export PATH="$tool_dir:$HOME/.local/bin:$PATH"',
     'timeout --signal=TERM',
     'if: always()',
     'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',

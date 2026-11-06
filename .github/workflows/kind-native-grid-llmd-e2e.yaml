@@ -93,6 +93,7 @@ jobs:
 
           python3 -m pip install --user --break-system-packages PyYAML==6.0.2
           echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          export PATH="$tool_dir:$HOME/.local/bin:$PATH"
           rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.96.0
 
