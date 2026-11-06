@@ -34,15 +34,21 @@ class PrepareKindImageSourcesTests(unittest.TestCase):
         self.git(maas, "init", "-q")
         self.git(maas, "config", "user.email", "test@example.invalid")
         self.git(maas, "config", "user.name", "test")
-        (maas / "controller.yaml").write_text("secretName: old\n", encoding="utf-8")
+        base_content = "".join(f"key-{index}: value\n" for index in range(1, 8)) + "secretName: old\nlast: value\n"
+        (maas / "controller.yaml").write_text(base_content, encoding="utf-8")
         self.git(maas, "add", "controller.yaml")
         self.git(maas, "commit", "-qm", "source")
+        patch_base_sha = self.git(maas, "rev-parse", "HEAD")
+        self.git(maas, "checkout", "--detach", patch_base_sha)
+        (maas / "controller.yaml").write_text(base_content.replace("secretName: old\n", "secretName: corrected\n"), encoding="utf-8")
+        patch = self.root / "maas.patch"
+        patch.write_bytes(subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", "--full-index", patch_base_sha]))
+        self.git(maas, "checkout", "--", "controller.yaml")
+        (maas / "controller.yaml").write_text("unrelated: moved-source\n" + base_content, encoding="utf-8")
+        self.git(maas, "add", "controller.yaml")
+        self.git(maas, "commit", "-qm", "unrelated upstream line movement")
         sha = self.git(maas, "rev-parse", "HEAD")
         self.git(maas, "checkout", "--detach", sha)
-        (maas / "controller.yaml").write_text("secretName: corrected\n", encoding="utf-8")
-        patch = self.root / "maas.patch"
-        patch.write_bytes(subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", "--full-index", sha]))
-        self.git(maas, "checkout", "--", "controller.yaml")
 
         source_locks = self.root / "source-locks.json"
         source_lock = {
@@ -66,12 +72,14 @@ class PrepareKindImageSourcesTests(unittest.TestCase):
 
         result = prepare_sources.prepare(source_locks, self.root / "worktrees", patch, output)
 
-        patch_sha = hashlib.sha256(patch.read_bytes()).hexdigest()
+        patch_sha = hashlib.sha256(prepare_sources.canonicalize(patch.read_bytes())).hexdigest()
         self.assertEqual(result["source_patch_sha256"], patch_sha)
+        self.assertEqual(result["source_patch_file_sha256"], hashlib.sha256(patch.read_bytes()).hexdigest())
         patched_lock = json.loads(source_locks.read_text(encoding="utf-8"))["components"]["maas"]
         self.assertEqual(patched_lock["source_patch_sha256"], patch_sha)
         diff = subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", "--full-index", sha])
-        self.assertEqual(diff, patch.read_bytes())
+        self.assertNotEqual(diff, patch.read_bytes())
+        self.assertEqual(prepare_sources.canonicalize(diff), prepare_sources.canonicalize(patch.read_bytes()))
         api_lock = json.loads((output / "maas-api-build-locks.json").read_text(encoding="utf-8"))
         api_root = Path(api_lock["components"]["maas"]["worktree_path"])
         self.assertEqual(self.git(api_root, "rev-parse", "HEAD"), sha)

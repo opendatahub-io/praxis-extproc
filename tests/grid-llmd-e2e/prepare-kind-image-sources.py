@@ -12,6 +12,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+SHARED_HELPERS = Path(__file__).resolve().parents[1] / "shared"
+sys.path.insert(0, str(SHARED_HELPERS))
+from canonicalize_source_patch import canonicalize  # noqa: E402
+
 
 PATCH_PREFIX = b"praxis-extproc-build-context-with-patch-v1\0"
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -76,7 +80,9 @@ def prepare(source_locks: Path, worktree_root: Path, patch_file: Path, output_di
     if base_context != maas["build_context_sha256"]:
         raise PreparationError("MaaS archive differs from the resolved source lock")
     patch_bytes = patch_file.read_bytes()
-    patch_sha = hashlib.sha256(patch_bytes).hexdigest()
+    patch_file_sha = hashlib.sha256(patch_bytes).hexdigest()
+    canonical_patch = canonicalize(patch_bytes)
+    patch_sha = hashlib.sha256(canonical_patch).hexdigest()
     if not patch_bytes:
         raise PreparationError("MaaS patch is empty")
     try:
@@ -84,12 +90,14 @@ def prepare(source_locks: Path, worktree_root: Path, patch_file: Path, output_di
         subprocess.run(["git", "-C", str(maas_root), "apply", str(patch_file)], check=True, capture_output=True)
     except subprocess.CalledProcessError as error:
         raise PreparationError("Kind MaaS patch does not apply to the resolved source") from error
-    # Full object IDs keep the rendered patch independent of repository-local
-    # abbreviation settings and shallow-clone object availability.
+    # Compare the exact changed files, diff content, and context while ignoring
+    # only upstream-dependent blob IDs and hunk positions. Those vary when
+    # unrelated lines are added before the patched code.
     actual_diff = git(maas_root, "diff", "--binary", "--full-index", maas_sha, binary=True)
     assert isinstance(actual_diff, bytes)
-    if hashlib.sha256(actual_diff).hexdigest() != patch_sha:
-        raise PreparationError("applied MaaS diff is not byte-identical to the packaged patch")
+    canonical_actual_diff = canonicalize(actual_diff)
+    if canonical_actual_diff != canonical_patch:
+        raise PreparationError("applied MaaS diff content differs from the packaged patch")
     patched_context = hashlib.sha256(PATCH_PREFIX + bytes.fromhex(base_context) + bytes.fromhex(patch_sha)).hexdigest()
     maas.update(
         {
@@ -126,8 +134,10 @@ def prepare(source_locks: Path, worktree_root: Path, patch_file: Path, output_di
         "source_sha": maas_sha,
         "source_remote": maas["remote_url"],
         "patch_repository_path": "tests/grid-llmd-e2e/patches/maas-kind-cleanup-tls.patch",
+        "source_patch_file_sha256": patch_file_sha,
         "source_patch_sha256": patch_sha,
-        "applied_diff_sha256": hashlib.sha256(actual_diff).hexdigest(),
+        "applied_diff_sha256": hashlib.sha256(canonical_actual_diff).hexdigest(),
+        "applied_git_diff_sha256": hashlib.sha256(actual_diff).hexdigest(),
         "base_build_context_sha256": base_context,
         "patched_build_context_sha256": patched_context,
         "maas_api_build_context_sha256": api_context,

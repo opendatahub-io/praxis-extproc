@@ -108,8 +108,8 @@ if [[ -n "$LOCKED_SOURCE_PATCH_SHA256" ]]; then
     printf 'patched source lock requires SOURCE_PATCH_FILE and a valid source_patch_sha256\n' >&2
     exit 2
   }
-  source_patch_sha256="$(sha256sum "$SOURCE_PATCH_FILE" | awk '{print $1}')"
-  actual_diff_sha256="$(git -C "$SOURCE_WORKTREE" diff --binary --full-index "$SOURCE_SHA" | sha256sum | awk '{print $1}')"
+  source_patch_sha256="$(python3 "$SCRIPT_DIR/canonicalize_source_patch.py" --sha256 "$SOURCE_PATCH_FILE")"
+  actual_diff_sha256="$(git -C "$SOURCE_WORKTREE" diff --binary --full-index "$SOURCE_SHA" | python3 "$SCRIPT_DIR/canonicalize_source_patch.py" --sha256)"
   actual_untracked="$(git -C "$SOURCE_WORKTREE" ls-files --others --exclude-standard)"
   [[ "$source_patch_sha256" == "$LOCKED_SOURCE_PATCH_SHA256" && "$actual_diff_sha256" == "$LOCKED_SOURCE_PATCH_SHA256" && -z "$actual_untracked" && -n "$actual_status" ]] || {
     printf 'patched image source must match the locked source patch exactly and contain no untracked files\n' >&2

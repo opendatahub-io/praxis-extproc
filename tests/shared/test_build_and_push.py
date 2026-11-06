@@ -91,6 +91,8 @@ class BuildAndPushTests(unittest.TestCase):
         self.assertIn('record.get("source_patch_sha256") or "-"', SCRIPT)
         self.assertIn('record.get("patched_build_context_sha256", "")', SCRIPT)
         self.assertIn('git -C "$SOURCE_WORKTREE" diff --binary --full-index "$SOURCE_SHA"', SCRIPT)
+        self.assertIn('canonicalize_source_patch.py" --sha256 "$SOURCE_PATCH_FILE"', SCRIPT)
+        self.assertIn('canonicalize_source_patch.py" --sha256)', SCRIPT)
         self.assertIn('actual_diff_sha256" == "$LOCKED_SOURCE_PATCH_SHA256"', SCRIPT)
         self.assertIn('org.praxis.source-patch.sha256=$source_patch_sha256', SCRIPT)
         self.assertIn('--source-patch-sha256 "$source_patch_sha256"', SCRIPT)
