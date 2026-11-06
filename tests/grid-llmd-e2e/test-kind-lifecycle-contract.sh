@@ -5,6 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIFECYCLE="$SCRIPT_DIR/run-kind-lifecycle.sh"
 WORKFLOW="$SCRIPT_DIR/../../.github/workflows/kind-native-grid-llmd-e2e.yaml"
+BUILDER="$SCRIPT_DIR/../shared/build_and_push.sh"
 
 bash -n "$LIFECYCLE" "$SCRIPT_DIR/destroy-kind-environment.sh"
 bash "$LIFECYCLE" --help >/dev/null
@@ -19,12 +20,13 @@ set -e
   exit 1
 }
 
-python3 - "$LIFECYCLE" "$WORKFLOW" <<'PY'
+python3 - "$LIFECYCLE" "$WORKFLOW" "$BUILDER" <<'PY'
 import sys
 from pathlib import Path
 
 lifecycle = Path(sys.argv[1]).read_text(encoding="utf-8")
 workflow = Path(sys.argv[2]).read_text(encoding="utf-8")
+builder = Path(sys.argv[3]).read_text(encoding="utf-8")
 
 ordered_phases = (
     'run_phase kind-cluster-and-registry',
@@ -102,6 +104,16 @@ if 'ACTIVE_PHASE="$name"' not in lifecycle or lifecycle.index('ACTIVE_PHASE="$na
     raise SystemExit("lifecycle failure records must preserve the failed phase name")
 if 'originalLifecycleResultPreserved:true' not in lifecycle or 'cluster or kubeconfig unavailable before application cleanup' not in lifecycle or 'ACTIVE_PHASE=cleanup-retry' not in lifecycle:
     raise SystemExit("failure cleanup must preserve the primary failure and state whether natural cleanup was possible")
+if 'stage:$stage' not in lifecycle or 'CLEANUP_STAGE=kind-registry-network-destroy' not in lifecycle or 'Cleanup retry failed at stage %s' not in lifecycle:
+    raise SystemExit("cleanup retry failures must record a sanitized, actionable failure stage")
+
+source_validation = builder.index('[[ "$actual_head" == "$SOURCE_SHA" && -z "$actual_branch" ]]')
+permission_fix = builder.index('make_build_context_readable "$BUILD_CONTEXT_DIR"')
+container_build = builder.index('"$CONTAINER_ENGINE" "${build_args[@]}" >"$EVIDENCE_DIR/build-$COMPONENT.log" 2>&1')
+if not source_validation < permission_fix < container_build:
+    raise SystemExit("build-context readability must be restored only after source validation and before image build")
+if 'find "$context_dir" -name .git -prune -o -type d -exec chmod a+rx {} +' not in builder or 'find "$context_dir" -name .git -prune -o -type f -exec chmod a+r {} +' not in builder:
+    raise SystemExit("build-context readability must include directories and files while excluding Git metadata")
 
 print("Kind lifecycle orchestration and workflow contract passed")
 PY

@@ -133,6 +133,7 @@ PHASE_START=0
 PORT_FORWARD_PID=""
 MONITOR_PID=""
 DISK_INITIAL_AVAILABLE_BYTES=""
+CLEANUP_STAGE=not-cleanup
 
 phase_log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$RUN_DIR/RUN-LOG.md"; }
 phase_start() {
@@ -247,9 +248,10 @@ on_exit() {
   if ((rc != 0)) && [[ -d "$RUN_DIR" ]]; then
     capture_diagnostics
     if [[ "$MODE" == cleanup ]]; then
-      phase_log "CLEANUP-RETRY-FAILED phase=$ACTIVE_PHASE exit=$rc; original lifecycle result preserved"
-      jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
-        '{status:$status,phase:$phase,runId:$run,exitCode:$exitCode,originalLifecycleResultPreserved:true}' \
+      phase_log "CLEANUP-RETRY-FAILED phase=$ACTIVE_PHASE stage=$CLEANUP_STAGE exit=$rc; original lifecycle result preserved"
+      printf 'Cleanup retry failed at stage %s (exit %s); original lifecycle result preserved\n' "$CLEANUP_STAGE" "$rc" >&2
+      jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg stage "$CLEANUP_STAGE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
+        '{status:$status,phase:$phase,stage:$stage,runId:$run,exitCode:$exitCode,originalLifecycleResultPreserved:true}' \
         >"$RUN_DIR/cleanup/RETRY-FAILURE.json"
     else
       phase_log "FAILED phase=$ACTIVE_PHASE exit=$rc; run-owned cluster retained for workflow cleanup step"
@@ -274,6 +276,7 @@ image_metadata() { printf '%s/images/%s/build-metadata-%s.json' "$RUN_DIR" "$1" 
 fresh_evidence() { mkdir -p "$(dirname "$1")"; [[ ! -e "$1" ]] || { printf 'evidence path already exists: %s\n' "$1" >&2; return 2; }; }
 
 if [[ "$MODE" == cleanup ]]; then
+  CLEANUP_STAGE=cleanup-retry-started
   ACTIVE_PHASE=cleanup-retry
   mkdir -p "$RUN_DIR/cleanup"
   # The lifecycle run performs cleanup before reporting success. The workflow's
@@ -285,6 +288,7 @@ if [[ "$MODE" == cleanup ]]; then
      ! kind get clusters 2>/dev/null | grep -Fxq "$CLUSTER_NAME" && \
      ! docker container inspect "$REGISTRY_NAME" >/dev/null 2>&1 && \
      ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+    CLEANUP_STAGE=already-cleaned-confirmed
     jq -n --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
       '{status:"PASS",runId:$run,cluster:$cluster,naturalCleanup:true,alreadyCleanedByLifecycle:true}' \
       >"$RUN_DIR/cleanup/RESULT.json"
@@ -295,6 +299,7 @@ if [[ "$MODE" == cleanup ]]; then
     [[ "$(<"$BOOTSTRAP_EVIDENCE/run-id.txt")" == "$RUN_ID" ]] || {
       printf 'bootstrap run ID mismatch; refusing to recover the private kubeconfig\n' >&2; exit 2;
     }
+    CLEANUP_STAGE=private-kubeconfig-recovery
     mkdir -p "$(dirname "$KUBECONFIG")"
     kind export kubeconfig --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG" \
       >"$RUN_DIR/logs/kubeconfig-recovery.log" 2>&1
@@ -303,6 +308,7 @@ if [[ "$MODE" == cleanup ]]; then
   set +e
   cleanup_rc=0
   if [[ -f "$BOOTSTRAP_EVIDENCE/run-id.txt" && -f "$KUBECONFIG" ]]; then
+    CLEANUP_STAGE=exporting-cleanup-environment
     EXPECTED_API_SERVER="$(kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)"
     export KUBECONFIG KUBE_CONTEXT EXPECTED_API_SERVER GRID_RUN_LABEL="$RUN_ID" E2E_RUN_ID="$RUN_ID"
     export GRID_LLMD_CLUSTER_PLATFORM=kind CLUSTER_ENV=kind RESOURCE_PROFILE=reduced-dev
@@ -330,38 +336,46 @@ if [[ "$MODE" == cleanup ]]; then
     export PRAXIS_GATEWAY_CHART_FILE PRAXIS_GATEWAY_CHART_SHA256
     export GRID_RESOURCE_NAMESPACE GRID_GATEWAY_HOSTNAME="$SITE_HOSTNAME"
     if [[ -f "$RUN_DIR/grid/providers/grid-praxis-cluster-endpoints.json" ]]; then
+      CLEANUP_STAGE=provider-cleanup
       GRID_PROVIDERS_MODE=cleanup GRID_PROVIDERS_EVIDENCE_DIR="$RUN_DIR/cleanup/providers-$(date -u +%H%M%S)" \
         bash "$(helper deploy-grid-providers.sh)" || cleanup_rc=$?
     fi
     if [[ -d "$RUN_DIR/serving/pool-a" || -d "$RUN_DIR/serving/pool-b" ]]; then
+      CLEANUP_STAGE=serving-pool-cleanup
       KIND_SERVING_CLEANUP_MODE=fresh KIND_SERVING_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/serving-$(date -u +%H%M%S)" \
         bash "$(helper cleanup-kind-serving.sh)" || cleanup_rc=$?
     fi
     if [[ -f "$RUN_DIR/grid/operator-bootstrap/RESULT.json" ]]; then
+      CLEANUP_STAGE=grid-operator-cleanup
       GRID_OPERATOR_CLEANUP_MODE=cleanup GRID_OPERATOR_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/grid-operator-$(date -u +%H%M%S)" \
         bash "$(helper cleanup-grid-operator.sh)" || cleanup_rc=$?
     fi
     if [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" ]]; then
+      CLEANUP_STAGE=task-namespace-cleanup
       KIND_TASK_CLEANUP_MODE=fresh KIND_TASK_CLEANUP_EVIDENCE_DIR="$RUN_DIR/cleanup/task-namespace-$(date -u +%H%M%S)" \
         bash "$(helper cleanup-kind-task-namespace.sh)" || cleanup_rc=$?
     fi
     # On a failed run, the natural application cleanup attempt is preserved
     # above; the exact run-owned cluster is still removed so no workload leaks.
+    CLEANUP_STAGE=kind-registry-network-destroy
     KIND_DESTROY_EVIDENCE_DIR="$RUN_DIR/cleanup/destroy-kind" \
       KIND_ENV_EVIDENCE_DIR="$BOOTSTRAP_EVIDENCE" KIND_STATE_DIR="$KIND_STATE_DIR" \
       E2E_RUN_ID="$RUN_ID" KIND_CLUSTER_NAME="$CLUSTER_NAME" \
       KIND_REGISTRY_CONTAINER="$REGISTRY_NAME" KIND_REGISTRY_NETWORK="$NETWORK_NAME" \
       KUBECONFIG="$KUBECONFIG" bash "$(helper destroy-kind-environment.sh)" || cleanup_rc=$?
+    CLEANUP_STAGE=kind-registry-network-destroy-finished
   else
     if [[ -f "$BOOTSTRAP_EVIDENCE/run-id.txt" ]]; then
       # The cluster disappeared before the natural application cleanup could be
       # observed. Remove only its recorded Docker resources, but keep this run
       # failed because finalizer ordering was not proven.
+      CLEANUP_STAGE=kind-destroy-without-api
       KIND_DESTROY_EVIDENCE_DIR="$RUN_DIR/cleanup/destroy-kind" \
         KIND_ENV_EVIDENCE_DIR="$BOOTSTRAP_EVIDENCE" KIND_STATE_DIR="$KIND_STATE_DIR" \
         E2E_RUN_ID="$RUN_ID" KIND_CLUSTER_NAME="$CLUSTER_NAME" \
         KIND_REGISTRY_CONTAINER="$REGISTRY_NAME" KIND_REGISTRY_NETWORK="$NETWORK_NAME" \
         KUBECONFIG="$KUBECONFIG" bash "$(helper destroy-kind-environment.sh)" || cleanup_rc=$?
+      CLEANUP_STAGE=kind-destroy-without-api-finished
       jq -n --arg status FAIL --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
         '{status:$status,runId:$run,cluster:$cluster,naturalCleanup:false,reason:"cluster or kubeconfig unavailable before application cleanup"}' \
         >"$RUN_DIR/cleanup/RESULT.json"
@@ -375,6 +389,7 @@ if [[ "$MODE" == cleanup ]]; then
   fi
   set -e
   if ((cleanup_rc != 0)); then exit "$cleanup_rc"; fi
+  CLEANUP_STAGE=cleanup-result-writing
   jq -n --arg status PASS --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
     '{status:$status,runId:$run,cluster:$cluster,naturalCleanup:true}' >"$RUN_DIR/cleanup/RESULT.json"
   phase_start natural-cleanup

@@ -184,6 +184,18 @@ PY
   [[ "$BUILD_CONTEXT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { printf 'subtree build-context hash is invalid\n' >&2; exit 2; }
 fi
 
+# The lifecycle uses umask 077 to protect state and evidence. That also leaves
+# detached worktree source files mode 0600, which some non-root image builders
+# preserve inside the build context. Restore source readability only after the
+# immutable source/patch checks above. Keep the parent worktree private and do
+# not change Git metadata.
+make_build_context_readable() {
+  local context_dir="$1"
+  find "$context_dir" -name .git -prune -o -type d -exec chmod a+rx {} +
+  find "$context_dir" -name .git -prune -o -type f -exec chmod a+r {} +
+}
+make_build_context_readable "$BUILD_CONTEXT_DIR"
+
 mkdir -p "$EVIDENCE_DIR"
 chmod 0700 "$EVIDENCE_DIR"
 tag="$IMAGE_REPOSITORY:e2e-$RUN_ID-${SOURCE_SHA:0:12}"
