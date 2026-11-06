@@ -42,11 +42,59 @@ server="$(k config view --minify -o json | jq -er '.clusters[0].cluster.server')
 [[ "$server" == "$API" && "$(k get --raw=/readyz)" == *ok* ]] || fail 'API server identity or /readyz check failed'
 k get namespace maas-system -o json >"$EVIDENCE/namespace.json"
 jq -e --arg run "$RUN" '.metadata.labels["praxis.kind/run"]==$run' "$EVIDENCE/namespace.json" >/dev/null || fail 'maas-system is not owned by this run'
-k get config default -n maas-system -o json >"$EVIDENCE/config.json"
-config_uid="$(jq -er '.metadata.uid' "$EVIDENCE/config.json")"
-k get service maas-api -n maas-system -o json >"$EVIDENCE/service.json"
+deadline=$((SECONDS + TIMEOUT))
+
+# MaaS main bootstraps AITenant/models-as-a-service on a 30-second retry. The
+# first Config/default reconciliation can therefore precede both the default
+# AITenant and MaasTenantConfig. Wait for their aggregate, current-generation
+# Config Ready condition before looking for the API operands it owns.
+config_ready=false
+config_uid=""
+attempt=0
+: >"$EVIDENCE/config-readiness-polls.tsv"
+while (( SECONDS < deadline )); do
+  attempt=$((attempt + 1))
+  if k get config default -n maas-system -o json >"$EVIDENCE/config.json" 2>"$EVIDENCE/config-get-error.txt"; then
+    config_uid="$(jq -r '.metadata.uid // ""' "$EVIDENCE/config.json")"
+    ready="$(jq -r '.metadata.generation as $g | any(.status.conditions[]?;.type=="Ready" and .status=="True" and .observedGeneration==$g)' "$EVIDENCE/config.json")"
+    reason="$(jq -r '[.status.conditions[]?|select(.type=="Ready")][0].reason // "missing-ready-condition"' "$EVIDENCE/config.json")"
+    printf '%s\tready=%s\treason=%s\n' "$attempt" "$ready" "$reason" >>"$EVIDENCE/config-readiness-polls.tsv"
+    if [[ "$ready" == true ]]; then config_ready=true; break; fi
+  else
+    printf '%s\tconfig=not-yet-created\n' "$attempt" >>"$EVIDENCE/config-readiness-polls.tsv"
+  fi
+  sleep 2
+done
+[[ "$config_ready" == true && -n "$config_uid" ]] || fail "MaaS Config/default did not reach current-generation Ready (default AITenant and MaasTenantConfig) within ${TIMEOUT}s"
+
+# Retain source-defined default tenant evidence without copying token or
+# Secret data into the evidence directory.
+k get aitenant models-as-a-service -n ai-tenants -o json |
+  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,generation:.metadata.generation},status:{phase:.status.phase,conditions:.status.conditions}}' \
+    >"$EVIDENCE/default-aitenant.json"
+k get maastenantconfig default-tenant -n models-as-a-service -o json |
+  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,generation:.metadata.generation},status:{phase:.status.phase,conditions:.status.conditions}}' \
+    >"$EVIDENCE/default-maas-tenant-config.json"
+
+# Controller SSA can trail Config Ready by a short interval; wait for the
+# controller-owned Service rather than turning normal convergence into a
+# NotFound failure.
+service_ready=false
+attempt=0
+: >"$EVIDENCE/service-readiness-polls.tsv"
+while (( SECONDS < deadline )); do
+  attempt=$((attempt + 1))
+  if k get service maas-api -n maas-system -o json >"$EVIDENCE/service.json" 2>/dev/null; then
+    service_ready=true
+    break
+  fi
+  printf '%s\tservice=not-yet-created\n' "$attempt" >>"$EVIDENCE/service-readiness-polls.tsv"
+  sleep 2
+done
+[[ "$service_ready" == true ]] || fail "controller-owned MaaS API Service was not created after Config/default became Ready within ${TIMEOUT}s"
 jq -e --arg uid "$config_uid" 'any(.metadata.ownerReferences[]?;.kind=="Config" and .name=="default" and .uid==$uid)' "$EVIDENCE/service.json" >/dev/null || fail 'MaaS API Service is not owned by the live Config/default'
-deadline=$((SECONDS + TIMEOUT)); passed=false
+
+passed=false
 while (( SECONDS < deadline )); do
   if k get deployment maas-api -n maas-system -o json >"$EVIDENCE/deployment-live.json" 2>/dev/null && \
      k get pods -n maas-system -l app.kubernetes.io/name=maas-api -o json >"$EVIDENCE/pods-live.json" 2>/dev/null && \
@@ -61,13 +109,25 @@ while (( SECONDS < deadline )); do
   sleep 2
 done
 [[ "$passed" == true ]] || fail "controller-owned MaaS API did not become Ready with its pinned runtime image within ${TIMEOUT}s"
-k get httproute maas-api-route -n maas-system -o json >"$EVIDENCE/route.json"
-jq -e --arg uid "$config_uid" --arg gateway maas-default-gateway '
-  any(.metadata.ownerReferences[]?;.kind=="Config" and .name=="default" and .uid==$uid) and
-  any(.spec.parentRefs[]?;.name==$gateway) and
-  any(.status.parents[]?.conditions[]?;.type=="Accepted" and .status=="True") and
-  any(.status.parents[]?.conditions[]?;.type=="ResolvedRefs" and .status=="True")
-' "$EVIDENCE/route.json" >/dev/null || fail 'controller-owned MaaS API HTTPRoute is not accepted/resolved by the default Gateway'
+route_ready=false
+attempt=0
+: >"$EVIDENCE/route-readiness-polls.tsv"
+while (( SECONDS < deadline )); do
+  attempt=$((attempt + 1))
+  if k get httproute maas-api-route -n maas-system -o json >"$EVIDENCE/route.json" 2>/dev/null && \
+    jq -e --arg uid "$config_uid" --arg gateway maas-default-gateway '
+      any(.metadata.ownerReferences[]?;.kind=="Config" and .name=="default" and .uid==$uid) and
+      any(.spec.parentRefs[]?;.name==$gateway) and
+      any(.status.parents[]?.conditions[]?;.type=="Accepted" and .status=="True") and
+      any(.status.parents[]?.conditions[]?;.type=="ResolvedRefs" and .status=="True")
+    ' "$EVIDENCE/route.json" >/dev/null; then
+    route_ready=true
+    break
+  fi
+  printf '%s\troute=not-current-accepted-resolved\n' "$attempt" >>"$EVIDENCE/route-readiness-polls.tsv"
+  sleep 2
+done
+[[ "$route_ready" == true ]] || fail "controller-owned MaaS API HTTPRoute was not accepted/resolved by the default Gateway within ${TIMEOUT}s"
 jq -n --arg run "$RUN" --arg image "$IMAGE" --arg configUID "$config_uid" --arg deploymentUID "$(jq -r '.metadata.uid' "$EVIDENCE/deployment-live.json")" \
   '{status:"PASS",run:$run,owner:"MaaS controller via Config/default",configUID:$configUID,deploymentUID:$deploymentUID,image:$image,currentGeneration:true,oneReadyReplica:true,digestMatchedImageID:true,oneReadyServiceEndpoint:true,routeAcceptedAndResolved:true,secretValuesRecorded:false}' >"$EVIDENCE/RESULT.json"
 echo 'MaaS controller-owned API and route passed current-generation, owner, imageID, endpoint, and route gates'
