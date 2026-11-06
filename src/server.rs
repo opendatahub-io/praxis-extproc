@@ -442,6 +442,9 @@ pub(super) struct CarriedContext {
 
     /// Typed per-filter state.
     pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+
+    /// Response buffering requested by filters during the headers phase.
+    pub(super) response_body_mode: Option<praxis_filter::BodyMode>,
 }
 
 /// A context holding hydrated cross-phase state.
@@ -470,6 +473,9 @@ impl<'a> HydratedContext<'a> {
         ctx.executed_filter_indices = carried.executed_filter_indices;
         ctx.filter_metadata = carried.filter_metadata;
         ctx.filter_state = carried.filter_state;
+        if let Some(mode) = carried.response_body_mode {
+            ctx.response_body_mode = mode;
+        }
         Ok(Self { ctx })
     }
 
@@ -497,6 +503,7 @@ impl<'a> HydratedContext<'a> {
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
+            response_body_mode: Some(self.ctx.response_body_mode),
         });
         Ok(())
     }

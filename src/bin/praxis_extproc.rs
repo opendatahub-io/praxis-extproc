@@ -33,6 +33,11 @@ struct Cli {
     #[arg(short, long, default_value = "praxis-extproc.yaml")]
     config: String,
 
+    /// Run the gated SSE backend used by Kubernetes qualification tests.
+    #[cfg(feature = "k8s-e2e")]
+    #[arg(long)]
+    e2e_sse_backend: bool,
+
     /// Override the gRPC listen address.
     #[arg(long)]
     grpc_address: Option<String>,
@@ -59,10 +64,19 @@ async fn main() {
     init_tracing();
     let cli = Cli::parse();
 
-    if let Err(e) = Box::pin(run(cli)).await {
+    if let Err(e) = Box::pin(run_command(cli)).await {
         error!(error = %e, "fatal");
         process::exit(1);
     }
+}
+
+/// Dispatch the qualification fixture or the ExtProc server.
+async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "k8s-e2e")]
+    if cli.e2e_sse_backend {
+        return Ok(praxis_extproc::e2e::sse_backend::serve().await?);
+    }
+    Box::pin(run(cli)).await
 }
 
 // -----------------------------------------------------------------------------
@@ -97,7 +111,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     if cli.validate {
-        return validate_config(&fips, &registry, pipeline, limits);
+        resolve_addresses(&cli, &cfg)?;
+        return validate_config(&cfg.server, &fips, &registry, pipeline, limits);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
@@ -120,12 +135,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
 }
 
-/// `--validate` path: FIPS refusal, pipeline build, and already-resolved limits.
+/// `--validate` path after listener resolution: FIPS refusal, pipeline build,
+/// TLS, and already-resolved limits.
 ///
 /// Soft-warns when [`BodyLimits::max_recv`] cannot carry a BUFFERED body at the
 /// accumulation ceiling, but still exits successfully (`0`) so operators can
 /// catch the misconfig without blocking startup scripts.
 fn validate_config(
+    server_cfg: &config::ServerConfig,
     fips: &praxis_extproc::fips::Status,
     registry: &praxis_filter::FilterRegistry,
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
@@ -135,6 +152,7 @@ fn validate_config(
         return Err(reason.into());
     }
     pipeline?;
+    drop(tls::build_tls_config(&server_cfg.tls)?);
     warn_if_buffered_body_cannot_fit_recv(limits);
     info!(
         max_body_bytes = ?limits.max_body,

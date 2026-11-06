@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streaming-oracle
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: streaming-oracle
+  template:
+    metadata:
+      labels:
+        app: streaming-oracle
+    spec:
+      containers:
+        - name: backend
+          image: docker.io/library/praxis-extproc:dev
+          imagePullPolicy: Never
+          args: ["--e2e-sse-backend"]
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streaming-oracle
+  namespace: llm
+spec:
+  selector:
+    app: streaming-oracle
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
