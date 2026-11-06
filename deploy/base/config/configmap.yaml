@@ -29,8 +29,8 @@ data:
       - name: bbr
         filters:
           # Strip any caller-supplied routing header before promoting body
-          # "model". Trusting the header under ExtProc fail-open would let
-          # clients steer KServe pool routes (see ai-gateway-controller#217).
+          # "model" so routing identity always comes from the JSON body.
+          # Pre-auth ExtProc is fail-closed; this strip remains defense in depth.
           - filter: headers
             request_remove:
               - X-Gateway-Model-Name
