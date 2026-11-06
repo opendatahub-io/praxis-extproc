@@ -142,7 +142,7 @@ phase_start() {
   phase_log "START $ACTIVE_PHASE"
 }
 phase_end() {
-  local rc="$1" end duration logfile
+  local rc="$1" end duration
   end="$(date +%s)"
   duration=$((end - PHASE_START))
   jq -cn --arg phase "$ACTIVE_PHASE" --arg status "$([[ "$rc" == 0 ]] && printf PASS || printf FAIL)" \
@@ -152,7 +152,28 @@ phase_end() {
     '{phase:$phase,status:$status,startedAt:$startedAt,finishedAt:$finishedAt,exitCode:$exitCode,durationSeconds:$durationSeconds}' \
     >>"$RUN_DIR/PHASES.jsonl"
   phase_log "END $ACTIVE_PHASE exit=$rc duration_seconds=$duration"
+  if [[ "$rc" == 0 ]]; then
+    ACTIVE_PHASE=""
+    PHASE_START=""
+  fi
   [[ "$rc" == 0 ]] || return "$rc"
+}
+record_unclosed_failure_phase() {
+  local rc="$1" end duration last_phase="" last_status=""
+  [[ -n "$ACTIVE_PHASE" && -n "$PHASE_START" ]] || return 0
+  if [[ -s "$RUN_DIR/PHASES.jsonl" ]]; then
+    read -r last_phase last_status < <(jq -r '[.phase // "", .status // ""] | @tsv' <(tail -n 1 "$RUN_DIR/PHASES.jsonl"))
+  fi
+  if [[ "$last_phase" == "$ACTIVE_PHASE" && "$last_status" == FAIL ]]; then
+    return 0
+  fi
+  end="$(date +%s)"
+  duration=$((end - PHASE_START))
+  jq -cn --arg phase "$ACTIVE_PHASE" --arg startedAt "$(date -u -d "@$PHASE_START" +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg finishedAt "$(date -u -d "@$end" +%Y-%m-%dT%H:%M:%SZ)" --argjson exitCode "$rc" --argjson durationSeconds "$duration" \
+    '{phase:$phase,status:"FAIL",startedAt:$startedAt,finishedAt:$finishedAt,exitCode:$exitCode,durationSeconds:$durationSeconds}' \
+    >>"$RUN_DIR/PHASES.jsonl"
+  phase_log "END $ACTIVE_PHASE exit=$rc duration_seconds=$duration"
 }
 run_phase() {
   local name="$1"; shift
@@ -260,6 +281,7 @@ on_exit() {
         '{status:$status,phase:$phase,stage:$stage,runId:$run,exitCode:$exitCode,originalLifecycleResultPreserved:true}' \
         >"$RUN_DIR/cleanup/RETRY-FAILURE.json"
     else
+      record_unclosed_failure_phase "$rc"
       phase_log "FAILED phase=$ACTIVE_PHASE exit=$rc; run-owned cluster retained for workflow cleanup step"
       jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
         '{status:$status,phase:$phase,runId:$run,exitCode:$exitCode,naturalCleanup:false,diagnosticsCaptured:true}' >"$RUN_DIR/RESULT.json"
@@ -491,7 +513,7 @@ export GRID_RESOURCE_NAMESPACE="$TASK_NAMESPACE" GRID_OPERATOR_NAMESPACE="$OPERA
 export GRID_NETWORK_NAME="$GRID_NETWORK" GRID_SITE_NAME="$GRID_SITE" GRID_RUN_LABEL="$RUN_ID"
 export GRID_LLMD_CLUSTER_PLATFORM=kind CLUSTER_ENV=kind RESOURCE_PROFILE=reduced-dev
 
-phase_start base-dependencies
+phase_start kind-base-dependencies
 ISTIO_ARCHIVE="$STATE_DIR/istioctl.tar.gz"
 curl --fail --location --silent --show-error --max-time 120 \
   https://github.com/istio/istio/releases/download/1.28.0/istioctl-1.28.0-linux-amd64.tar.gz \
@@ -502,6 +524,7 @@ run_phase base-dependencies -- "$(helper install-kind-base-dependencies.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" \
   --expected-api-server "$EXPECTED_API_SERVER" --istioctl "$STATE_DIR/istioctl" \
   --evidence-dir "$RUN_DIR/cluster/base-dependencies"
+phase_end 0
 
 run_phase platform-namespaces -- "$(helper create-kind-platform-namespaces.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
@@ -517,6 +540,7 @@ run_phase kserve-controller -- "$(helper install-kind-kserve.sh)" \
   --image-build-metadata "$(image_metadata kserve-llmisvc-controller)" \
   --evidence-dir "$RUN_DIR/platform/kserve-install"
 
+phase_start postgres-image-mirror
 REGISTRY_PORT="$(<"$BOOTSTRAP_EVIDENCE/registry-port.txt")"
 REGISTRY_PUSH="127.0.0.1:$REGISTRY_PORT"
 POSTGRES_SOURCE_TAG="docker.io/library/postgres:16-alpine"
@@ -545,6 +569,7 @@ run_phase maas-database -- "$(helper install-kind-maas-database.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
   --run-id "$RUN_ID" --image "$POSTGRES_IMAGE" --state-dir "$STATE_DIR/postgres" \
   --evidence-dir "$RUN_DIR/platform/postgres"
+phase_end 0
 
 KIND_MAAS_TENANT_CA_MODE=prepare-issuer \
 KIND_MAAS_TENANT_CA_STATE_FILE="$STATE_DIR/tenant-ca-state.json" \
@@ -577,10 +602,17 @@ KIND_MAAS_CLEANUP_MODE=prepare KIND_MAAS_CLEANUP_STATE_FILE="$STATE_DIR/maas-cle
   KIND_MAAS_CA_SOURCE_SECRET=maas-api-serving-cert KIND_MAAS_API_SERVICE_HOST=maas-api.maas-system.svc \
   run_phase maas-cleanup-preparation -- "$(helper prepare-kind-maas-cleanup.sh)"
 
+phase_start aigc-controller-bootstrap
 AIGC_SOURCE="$(source_dir aigc)"
 AIGC_BUNDLE_NAME="kind-praxis-extproc-$SHORT_ID"
 AIGC_BUNDLE="$RUN_DIR/platform/aigc-manifest-bundle.yaml"
-kustomize build "$AIGC_SOURCE/config/default" >"$STATE_DIR/aigc-controller-source.yaml"
+AIGC_CONTROLLER_KUSTOMIZATION="$AIGC_SOURCE/config/self/default"
+[[ -f "$AIGC_CONTROLLER_KUSTOMIZATION/kustomization.yaml" ]] || {
+  printf 'locked AIGC source has no supported controller kustomization: %s\n' "$AIGC_CONTROLLER_KUSTOMIZATION" >&2
+  exit 1
+}
+kustomize build "$AIGC_CONTROLLER_KUSTOMIZATION" >"$STATE_DIR/aigc-controller-source.yaml" \
+  2>"$RUN_DIR/logs/aigc-controller-source-render.log"
 python3 "$SCRIPT_DIR/render_kind_aigc_manifest_bundle.py" \
   --source-dir "$AIGC_SOURCE/config/manifests/praxis-extproc/overlays/odh" \
   --output "$AIGC_BUNDLE" --run-id "$RUN_ID" --namespace opendatahub --name "$AIGC_BUNDLE_NAME" \
@@ -600,6 +632,7 @@ kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" apply -f "$RUN_DIR/
   >"$RUN_DIR/platform/aigc-controller-apply.txt"
 kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" rollout status deployment/ai-gateway-controller \
   -n opendatahub --timeout=5m >"$RUN_DIR/platform/aigc-controller-rollout.txt"
+phase_end 0
 KIND_MAAS_GATEWAY_EVIDENCE_DIR="$RUN_DIR/platform/maas-gateway-verify" \
   KIND_MAAS_GATEWAY_TIMEOUT_SECONDS=300 \
   run_phase maas-gateway-verify -- "$(helper install-kind-maas-gateway.sh)" \
@@ -612,6 +645,7 @@ run_phase payload-egress -- "$(helper install-kind-payload-istiod-egress.sh)" \
   --run-id "$RUN_ID" --evidence-dir "$RUN_DIR/platform/payload-istiod-egress"
 # Create the normal MaaS default tenant through its API; MaaS/AIGC own the
 # resulting MaasTenantConfig and payload readiness conditions.
+phase_start maas-default-tenant-bootstrap
 cat >"$RUN_DIR/platform/default-aitenant.yaml" <<EOF
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: AITenant
@@ -633,6 +667,7 @@ run_phase maas-platform-ready -- "$(helper verify-kind-maas-api.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
   --run-id "$RUN_ID" --image "$(image_ref maas-api)" --mode platform-ready \
   --evidence-dir "$RUN_DIR/platform/maas-platform-readiness"
+phase_end 0
 export CLUSTER_ENV=kind RESOURCE_PROFILE=reduced-dev GRID_LLMD_CLUSTER_PLATFORM=kind
 export SOURCE_LOCKS_FILE="$RUN_DIR/source-resolution/source-locks.json"
 export SOURCE_LOCKS_MD="$RUN_DIR/source-resolution/source-locks.md"

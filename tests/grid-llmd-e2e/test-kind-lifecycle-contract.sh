@@ -22,6 +22,9 @@ set -e
 
 python3 - "$LIFECYCLE" "$WORKFLOW" "$BUILDER" <<'PY'
 import sys
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 lifecycle = Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -102,6 +105,45 @@ for required in (
 
 if 'ACTIVE_PHASE="$name"' not in lifecycle or lifecycle.index('ACTIVE_PHASE="$name"') < lifecycle.index('if ((rc != 0)); then'):
     raise SystemExit("lifecycle failure records must preserve the failed phase name")
+if 'record_unclosed_failure_phase "$rc"' not in lifecycle:
+    raise SystemExit("direct lifecycle command failures must be appended to PHASES.jsonl before diagnostics capture")
+if 'AIGC_CONTROLLER_KUSTOMIZATION="$AIGC_SOURCE/config/self/default"' not in lifecycle:
+    raise SystemExit("AIGC bootstrap must use the supported config/self/default kustomization from current main")
+if 'kustomize build "$AIGC_SOURCE/config/default"' in lifecycle:
+    raise SystemExit("AIGC bootstrap must not use the removed config/default path")
+aigc_start = lifecycle.index('phase_start aigc-controller-bootstrap')
+aigc_kustomize = lifecycle.index('kustomize build "$AIGC_CONTROLLER_KUSTOMIZATION"')
+aigc_end = lifecycle.index('phase_end 0', aigc_kustomize)
+if not aigc_start < aigc_kustomize < aigc_end:
+    raise SystemExit("AIGC source rendering and install must be inside a separately reported phase")
+phase_end_function = lifecycle.split('phase_end() {', 1)[1].split('record_unclosed_failure_phase()', 1)[0]
+if 'ACTIVE_PHASE=""' not in phase_end_function or 'PHASE_START=""' not in phase_end_function:
+    raise SystemExit("completed lifecycle phases must clear their active state")
+phase_functions = lifecycle[lifecycle.index('phase_log() {'):lifecycle.index('run_phase() {')]
+with tempfile.TemporaryDirectory(prefix="kind-phase-contract-") as temp_dir:
+    env = os.environ.copy()
+    env["RUN_DIR"] = temp_dir
+    phase_harness = f'''set -Eeuo pipefail
+ACTIVE_PHASE=""
+PHASE_START=""
+{phase_functions}
+mkdir -p "$RUN_DIR"
+: >"$RUN_DIR/RUN-LOG.md"
+: >"$RUN_DIR/PHASES.jsonl"
+phase_start completed-phase
+phase_end 0
+[[ -z "$ACTIVE_PHASE" && -z "$PHASE_START" ]]
+phase_start direct-command-failure
+record_unclosed_failure_phase 9
+[[ "$(jq -s 'length' "$RUN_DIR/PHASES.jsonl")" == 2 ]]
+jq -es '.[1].phase=="direct-command-failure" and .[1].status=="FAIL" and .[1].exitCode==9' "$RUN_DIR/PHASES.jsonl" >/dev/null
+phase_start dispatched-command-failure
+phase_end 7 || true
+ACTIVE_PHASE=dispatched-command-failure
+record_unclosed_failure_phase 7
+[[ "$(jq -s 'length' "$RUN_DIR/PHASES.jsonl")" == 3 ]]
+'''
+    subprocess.run(["bash"], input=phase_harness, text=True, env=env, check=True)
 if 'if [[ "${cmd[0]}" == "$SCRIPT_DIR/"*.sh ]]; then' not in lifecycle or 'cmd=(bash "${cmd[@]}")' not in lifecycle:
     raise SystemExit("lifecycle dispatcher must invoke repository shell helpers through Bash regardless of file mode")
 if 'originalLifecycleResultPreserved:true' not in lifecycle or 'cluster or kubeconfig unavailable before application cleanup' not in lifecycle or 'ACTIVE_PHASE=cleanup-retry' not in lifecycle:
