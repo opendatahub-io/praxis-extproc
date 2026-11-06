@@ -59,6 +59,16 @@ async fn empty_final_body_frame_checks_and_releases_the_buffered_document() {
             {
                 responses.push(response);
             }
+            if mode == BodySendMode::FullDuplexStreamed {
+                let Some(ResponseMessage::ResponseBody(body)) = &responses.last().unwrap().response else {
+                    panic!("the final FDS message must carry a response body");
+                };
+                let mutation = body.response.as_ref().unwrap().body_mutation.as_ref().unwrap();
+                assert!(
+                    matches!(&mutation.mutation, Some(body_mutation::Mutation::StreamedResponse(body)) if body.end_of_stream),
+                    "the final FDS mutation must be StreamedResponse with EOS set"
+                );
+            }
             let output: serde_json::Value = serde_json::from_slice(&body_bytes(&responses)).unwrap();
             let calls = harness.calls();
             assert_eq!(calls.len(), 1, "{mode:?}: exactly one complete Output check");
