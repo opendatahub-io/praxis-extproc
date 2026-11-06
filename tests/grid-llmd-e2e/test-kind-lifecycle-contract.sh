@@ -171,6 +171,10 @@ if 'stage:$stage' not in lifecycle or 'CLEANUP_STAGE=kind-registry-network-destr
     raise SystemExit("cleanup retry failures must record a sanitized, actionable failure stage")
 if '[[ -n "$chart_file" && -f "$chart_file" ]] || return 0' not in lifecycle or 'GRID_OPERATOR_CHART_SHA256="$(chart_sha256 "$GRID_OPERATOR_CHART_FILE")"' not in lifecycle or 'PRAXIS_GATEWAY_CHART_SHA256="$(chart_sha256 "$PRAXIS_GATEWAY_CHART_FILE")"' not in lifecycle:
     raise SystemExit("cleanup retry must tolerate absent optional charts without tripping the ERR trap")
+if '[[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" && -f "$RUN_DIR/grid/operator-bootstrap/RESULT.json" ]]' not in cleanup:
+    raise SystemExit("full task cleanup must run only after Grid operator installation, when Grid CRDs and natural withdrawal can be verified")
+if 'pre-grid-task-namespace-not-applicable' not in cleanup or 'naturalGridWithdrawalVerified:false' not in cleanup:
+    raise SystemExit("pre-Grid failure cleanup must record task namespace removal by cluster teardown without claiming natural Grid cleanup")
 
 source_validation = builder.index('[[ "$actual_head" == "$SOURCE_SHA" && -z "$actual_branch" ]]')
 permission_fix = builder.index('make_build_context_readable "$BUILD_CONTEXT_DIR"')

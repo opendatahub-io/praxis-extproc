@@ -427,7 +427,7 @@ if [[ "$MODE" == cleanup ]]; then
         grid_withdrawal_passed=true
       fi
     fi
-    if [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" ]]; then
+    if [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" && -f "$RUN_DIR/grid/operator-bootstrap/RESULT.json" ]]; then
       CLEANUP_STAGE=task-namespace-cleanup
       task_namespace_cleanup_dir="$RUN_DIR/cleanup/task-namespace-$(date -u +%H%M%S)"
       KIND_TASK_CLEANUP_MODE=fresh KIND_TASK_CLEANUP_EVIDENCE_DIR="$task_namespace_cleanup_dir" \
@@ -436,6 +436,20 @@ if [[ "$MODE" == cleanup ]]; then
         "$task_namespace_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
         task_namespace_cleanup_passed=true
       fi
+    elif [[ -f "$RUN_DIR/platform/task-namespace/RESULT.json" ]]; then
+      # Before Grid operator installation there cannot be a GridNetwork
+      # withdrawal proof. Do not invoke the full task cleanup contract (which
+      # requires Grid CRDs); record that the run-owned namespace will be
+      # removed with this isolated Kind cluster, without claiming natural
+      # application cleanup.
+      CLEANUP_STAGE=pre-grid-task-namespace-not-applicable
+      task_namespace_cleanup_dir="$RUN_DIR/cleanup/task-namespace-pre-grid-$(date -u +%H%M%S)"
+      mkdir -p "$task_namespace_cleanup_dir"
+      jq -n --arg run "$RUN_ID" --arg namespace "$TASK_NAMESPACE" \
+        '{status:"not-applicable",runId:$run,namespace:$namespace,naturalGridWithdrawalVerified:false,
+          reason:"Grid operator and GridNetwork were not installed; run-owned namespace is removed with the isolated Kind cluster"}' \
+        >"$task_namespace_cleanup_dir/RESULT.json"
+      phase_log "Task namespace cleanup is not applicable before Grid installation; namespace will be removed with the run-owned Kind cluster"
     fi
     # On a failed run, the natural application cleanup attempt is preserved
     # above; the exact run-owned cluster is still removed so no workload leaks.

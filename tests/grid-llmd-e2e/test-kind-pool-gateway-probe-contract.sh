@@ -36,7 +36,10 @@ checks = (
     '.path.value=="/v1/api-keys"',
     '.name==$service and .port==8443',
     'API_URL="http://127.0.0.1:$GATEWAY_LOCAL_PORT/v1/api-keys"',
-    'kubectl port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY"',
+    'GATEWAY_LOCAL_PORT="$(python3 -c',
+    'command kubectl --context="$KUBE_CONTEXT" port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY"',
+    'wait_port_forward "$GATEWAY_FORWARD_PID" "$GATEWAY_LOCAL_PORT" pool-Gateway "$EVIDENCE_DIR/pool-gateway-port-forward.log"',
+    'rg -Fq "Forwarding from 127.0.0.1:$port ->" "$logfile"',
     'grid-llmd-$POOL-setup',
     'resolvedModelAlias',
     'MODEL_ALIAS="$(jq -er \'.status.resolvedModelAlias\' "$EVIDENCE_DIR/maasmodelref.json")"',
@@ -93,6 +96,10 @@ if 'curl -k' in text or 'insecure' in text or 'skip-tls' in text:
 
 if 'port-forward --address 127.0.0.1 -n maas-system "svc/$API_SERVICE"' in text:
     print("MaaS API key operations must traverse the pool Gateway AuthPolicy", file=sys.stderr)
+    raise SystemExit(1)
+
+if 'kubectl port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY"' in text:
+    print("Gateway port-forward must be a direct kubectl process so its PID can be stopped", file=sys.stderr)
     raise SystemExit(1)
 
 if 'X-MaaS-Username' in text or 'X-MaaS-Identity' in text:

@@ -21,7 +21,7 @@ TOKEN=""
 API_KEY=""
 API_KEY_ID=""
 API_URL=""
-GATEWAY_LOCAL_PORT=19444
+GATEWAY_LOCAL_PORT=""
 GATEWAY_FORWARD_PID=""
 KEY_REVOKED=false
 PROBE_ID=""
@@ -300,24 +300,30 @@ jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]=
 TOKEN="$(kubectl create token "$PROBE_SERVICE_ACCOUNT" -n "$TASK_NAMESPACE" --duration=10m --audience=https://kubernetes.default.svc)"
 [[ -n "$TOKEN" ]] || { printf 'Kubernetes TokenRequest returned an empty token\n' >&2; exit 1; }
 
-kubectl port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY" "$GATEWAY_LOCAL_PORT:443" \
+# Pick a local free port for each probe and launch kubectl directly so the
+# recorded PID owns the port-forward process and the EXIT trap can reap it.
+GATEWAY_LOCAL_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+command kubectl --context="$KUBE_CONTEXT" port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY" "$GATEWAY_LOCAL_PORT:443" \
   >"$EVIDENCE_DIR/pool-gateway-port-forward.log" 2>&1 &
 GATEWAY_FORWARD_PID="$!"
 API_URL="http://127.0.0.1:$GATEWAY_LOCAL_PORT/v1/api-keys"
 
 wait_port_forward() {
-  local pid="$1" port="$2" name="$3" deadline
+  local pid="$1" port="$2" name="$3" logfile="$4" deadline
   deadline=$((SECONDS + 30))
   while (( SECONDS <= deadline )); do
     kill -0 "$pid" 2>/dev/null || { printf '%s port-forward exited before becoming ready\n' "$name" >&2; return 1; }
-    if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then return 0; fi
+    if rg -Fq "Forwarding from 127.0.0.1:$port ->" "$logfile" && \
+      timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      return 0
+    fi
     (( SECONDS < deadline )) || break
     sleep 1
   done
   printf '%s port-forward did not bind local port %s within 30s\n' "$name" "$port" >&2
   return 1
 }
-wait_port_forward "$GATEWAY_FORWARD_PID" "$GATEWAY_LOCAL_PORT" pool-Gateway
+wait_port_forward "$GATEWAY_FORWARD_PID" "$GATEWAY_LOCAL_PORT" pool-Gateway "$EVIDENCE_DIR/pool-gateway-port-forward.log"
 
 key_name="grid-llmd-$POOL-setup-$(date -u +%Y%m%dT%H%M%SZ)"
 key_body="$(jq -cn --arg name "$key_name" --arg sub "$SUBSCRIPTION" --arg run "$RUN_LABEL" \
