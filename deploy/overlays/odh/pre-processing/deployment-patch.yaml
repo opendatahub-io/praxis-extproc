@@ -34,6 +34,9 @@
 - op: add
   path: /spec/template/spec/serviceAccountName
   value: payload-processing
+- op: add
+  path: /spec/template/spec/automountServiceAccountToken
+  value: true
 - op: replace
   path: /spec/template/spec/volumes/1/secret/secretName
   value: payload-pre-processing-tls
