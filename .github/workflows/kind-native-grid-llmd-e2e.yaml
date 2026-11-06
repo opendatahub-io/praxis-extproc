@@ -131,9 +131,19 @@ jobs:
         run: |
           set -Eeuo pipefail
           state_dir="$RUNNER_TEMP/grid-llmd-kind-run/private-state"
+          evidence="$RUNNER_TEMP/grid-llmd-kind-run/evidence"
+          mkdir -p "$evidence"
           if [[ -s "$state_dir/lifecycle.env" ]]; then
+            cleanup_log="$evidence/workflow-cleanup-retry.log"
+            cleanup_rc=0
             KIND_PRIVATE_STATE_DIR="$state_dir" \
-              bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode cleanup
+              bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode cleanup \
+              >"$cleanup_log" 2>&1 || cleanup_rc=$?
+            python3 tests/grid-llmd-e2e/sanitize_diagnostics.py \
+              <"$cleanup_log" >"$cleanup_log.sanitized"
+            mv "$cleanup_log.sanitized" "$cleanup_log"
+            cat "$cleanup_log"
+            exit "$cleanup_rc"
           else
             printf 'No lifecycle journal exists; provisioning did not create resumable run state.\n'
           fi

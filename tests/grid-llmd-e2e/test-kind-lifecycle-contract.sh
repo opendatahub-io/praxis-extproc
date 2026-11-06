@@ -90,6 +90,8 @@ for required in (
     'if: always()',
     'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9',
     'Remove private state after artifact upload',
+    'workflow-cleanup-retry.log',
+    'python3 tests/grid-llmd-e2e/sanitize_diagnostics.py',
     'apt-get install -y podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
     'dpkg-query -W -f=\'${binary:Package}=${Version}\\n\' podman skopeo jq iproute2 ripgrep shellcheck python3-pip',
 ):
@@ -98,6 +100,8 @@ for required in (
 
 if 'ACTIVE_PHASE="$name"' not in lifecycle or lifecycle.index('ACTIVE_PHASE="$name"') < lifecycle.index('if ((rc != 0)); then'):
     raise SystemExit("lifecycle failure records must preserve the failed phase name")
+if 'originalLifecycleResultPreserved:true' not in lifecycle or 'cluster or kubeconfig unavailable before application cleanup' not in lifecycle or 'ACTIVE_PHASE=cleanup-retry' not in lifecycle:
+    raise SystemExit("failure cleanup must preserve the primary failure and state whether natural cleanup was possible")
 
 print("Kind lifecycle orchestration and workflow contract passed")
 PY

@@ -84,7 +84,9 @@ def prepare(source_locks: Path, worktree_root: Path, patch_file: Path, output_di
         subprocess.run(["git", "-C", str(maas_root), "apply", str(patch_file)], check=True, capture_output=True)
     except subprocess.CalledProcessError as error:
         raise PreparationError("Kind MaaS patch does not apply to the resolved source") from error
-    actual_diff = git(maas_root, "diff", "--binary", maas_sha, binary=True)
+    # Full object IDs keep the rendered patch independent of repository-local
+    # abbreviation settings and shallow-clone object availability.
+    actual_diff = git(maas_root, "diff", "--binary", "--full-index", maas_sha, binary=True)
     assert isinstance(actual_diff, bytes)
     if hashlib.sha256(actual_diff).hexdigest() != patch_sha:
         raise PreparationError("applied MaaS diff is not byte-identical to the packaged patch")

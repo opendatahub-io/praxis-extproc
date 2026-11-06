@@ -41,7 +41,7 @@ class PrepareKindImageSourcesTests(unittest.TestCase):
         self.git(maas, "checkout", "--detach", sha)
         (maas / "controller.yaml").write_text("secretName: corrected\n", encoding="utf-8")
         patch = self.root / "maas.patch"
-        patch.write_bytes(subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", sha]))
+        patch.write_bytes(subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", "--full-index", sha]))
         self.git(maas, "checkout", "--", "controller.yaml")
 
         source_locks = self.root / "source-locks.json"
@@ -70,7 +70,7 @@ class PrepareKindImageSourcesTests(unittest.TestCase):
         self.assertEqual(result["source_patch_sha256"], patch_sha)
         patched_lock = json.loads(source_locks.read_text(encoding="utf-8"))["components"]["maas"]
         self.assertEqual(patched_lock["source_patch_sha256"], patch_sha)
-        diff = subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", sha])
+        diff = subprocess.check_output(["git", "-C", str(maas), "diff", "--binary", "--full-index", sha])
         self.assertEqual(diff, patch.read_bytes())
         api_lock = json.loads((output / "maas-api-build-locks.json").read_text(encoding="utf-8"))
         api_root = Path(api_lock["components"]["maas"]["worktree_path"])

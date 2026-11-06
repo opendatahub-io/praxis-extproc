@@ -246,9 +246,16 @@ on_exit() {
   stop_background
   if ((rc != 0)) && [[ -d "$RUN_DIR" ]]; then
     capture_diagnostics
-    phase_log "FAILED phase=$ACTIVE_PHASE exit=$rc; run-owned cluster retained for workflow cleanup step"
-    jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
-      '{status:$status,phase:$phase,runId:$run,exitCode:$exitCode,naturalCleanup:false,diagnosticsCaptured:true}' >"$RUN_DIR/RESULT.json"
+    if [[ "$MODE" == cleanup ]]; then
+      phase_log "CLEANUP-RETRY-FAILED phase=$ACTIVE_PHASE exit=$rc; original lifecycle result preserved"
+      jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
+        '{status:$status,phase:$phase,runId:$run,exitCode:$exitCode,originalLifecycleResultPreserved:true}' \
+        >"$RUN_DIR/cleanup/RETRY-FAILURE.json"
+    else
+      phase_log "FAILED phase=$ACTIVE_PHASE exit=$rc; run-owned cluster retained for workflow cleanup step"
+      jq -n --arg status FAIL --arg phase "$ACTIVE_PHASE" --arg run "$RUN_ID" --argjson exitCode "$rc" \
+        '{status:$status,phase:$phase,runId:$run,exitCode:$exitCode,naturalCleanup:false,diagnosticsCaptured:true}' >"$RUN_DIR/RESULT.json"
+    fi
   fi
   exit "$rc"
 }
@@ -267,6 +274,7 @@ image_metadata() { printf '%s/images/%s/build-metadata-%s.json' "$RUN_DIR" "$1" 
 fresh_evidence() { mkdir -p "$(dirname "$1")"; [[ ! -e "$1" ]] || { printf 'evidence path already exists: %s\n' "$1" >&2; return 2; }; }
 
 if [[ "$MODE" == cleanup ]]; then
+  ACTIVE_PHASE=cleanup-retry
   mkdir -p "$RUN_DIR/cleanup"
   # The lifecycle run performs cleanup before reporting success. The workflow's
   # unconditional cleanup step can then verify that exact recorded teardown
@@ -357,8 +365,11 @@ if [[ "$MODE" == cleanup ]]; then
       jq -n --arg status FAIL --arg run "$RUN_ID" --arg cluster "$CLUSTER_NAME" \
         '{status:$status,runId:$run,cluster:$cluster,naturalCleanup:false,reason:"cluster or kubeconfig unavailable before application cleanup"}' \
         >"$RUN_DIR/cleanup/RESULT.json"
-      ((cleanup_rc == 0)) || exit "$cleanup_rc"
-      exit 1
+      if ((cleanup_rc != 0)); then exit "$cleanup_rc"; fi
+      # The primary lifecycle already failed. Report cleanup success when all
+      # remaining run-owned infrastructure was removed, while keeping natural
+      # application cleanup explicitly unproven in cleanup/RESULT.json.
+      exit 0
     fi
     printf '{"status":"NOT_APPLICABLE","reason":"run-owned Kind bootstrap was not created"}\n' >"$RUN_DIR/cleanup/RESULT.json"
   fi

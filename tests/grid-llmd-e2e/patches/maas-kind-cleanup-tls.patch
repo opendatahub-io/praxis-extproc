@@ -1,5 +1,5 @@
 diff --git a/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml b/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
-index fe7cc3c5..6f11c8a6 100644
+index fe7cc3c53b5dee1ea4e63a9e7242893e04be3c5c..6f11c8a6c6697af6c738e649ed39edab8e6be5bc 100644
 --- a/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
 +++ b/deployment/base/maas-api/overlays/tls/cronjob-cleanup-patch.yaml
 @@ -22,5 +22,6 @@ spec:
@@ -11,10 +11,10 @@ index fe7cc3c5..6f11c8a6 100644
 -              curl -sf --cacert /etc/pki/maas-api/service-ca.crt -X POST -H "Authorization: Bearer ${TOKEN}" https://maas-api:8443/internal/v1/api-keys/cleanup
 +              curl -sf --cacert /etc/pki/maas-api/service-ca.crt -X POST -H "Authorization: Bearer ${TOKEN}" "https://maas-api.${POD_NAMESPACE}.svc:8443/internal/v1/api-keys/cleanup"
 diff --git a/maas-controller/pkg/platform/tenantreconcile/constants.go b/maas-controller/pkg/platform/tenantreconcile/constants.go
-index 3fb66a9c..62b2fcec 100644
+index 394e4257aa90c5b64bc296924291eaeeb8790b6a..5d8f01736f2d381ba6e71c97081e7dc4e700cee7 100644
 --- a/maas-controller/pkg/platform/tenantreconcile/constants.go
 +++ b/maas-controller/pkg/platform/tenantreconcile/constants.go
-@@ -335,6 +335,17 @@ func MaaSAPIServingCertName(tenantID string) string {
+@@ -367,6 +367,17 @@ func MaaSAPIServingCertName(tenantID string) string {
  	return resourceNameForTenant(baseMaaSAPIServingCertName, tenantID)
  }
  
@@ -33,7 +33,7 @@ index 3fb66a9c..62b2fcec 100644
  	return resourceNameForTenant(PayloadProcessingReaderClusterRoleBindingName, tenantID)
  }
 diff --git a/maas-controller/pkg/platform/tenantreconcile/naming_test.go b/maas-controller/pkg/platform/tenantreconcile/naming_test.go
-index 84ccb281..3637a01a 100644
+index 84ccb281f7784883d0eaa4615e8618adcfbaa547..3637a01ad910839905c0e8ee6fbb6998f149092a 100644
 --- a/maas-controller/pkg/platform/tenantreconcile/naming_test.go
 +++ b/maas-controller/pkg/platform/tenantreconcile/naming_test.go
 @@ -141,6 +141,22 @@ func TestMaaSAPIGatewayNetworkPolicyNameDefaultDoesNotCollide(t *testing.T) {
@@ -60,10 +60,10 @@ index 84ccb281..3637a01a 100644
  	tests := []struct {
  		name             string
 diff --git a/maas-controller/pkg/platform/tenantreconcile/params.go b/maas-controller/pkg/platform/tenantreconcile/params.go
-index bb200ca0..6e4cd19f 100644
+index 9ca262be3213218abb89a0da71271e2435b06e8e..f255eec3d3e6e95fcd0ac48e4cc546ef1a4b9480 100644
 --- a/maas-controller/pkg/platform/tenantreconcile/params.go
 +++ b/maas-controller/pkg/platform/tenantreconcile/params.go
-@@ -949,7 +949,7 @@ func patchMaaSAPIServingCert(log logr.Logger, r *unstructured.Unstructured, para
+@@ -1025,7 +1025,7 @@ func patchMaaSAPIServingCert(log logr.Logger, r *unstructured.Unstructured, para
  	certName := MaaSAPIServingCertName(tenantID)
  	r.SetName(certName)
  
@@ -72,7 +72,7 @@ index bb200ca0..6e4cd19f 100644
  	if err := unstructured.SetNestedField(r.Object, secretName, "spec", "secretName"); err != nil {
  		return fmt.Errorf("patch Certificate secretName: %w", err)
  	}
-@@ -1191,7 +1191,8 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
+@@ -1301,7 +1301,8 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
  		return fmt.Errorf("patch cleanup CronJob image: %w", err)
  	}
  
@@ -82,7 +82,7 @@ index bb200ca0..6e4cd19f 100644
  	containers, found, err := unstructured.NestedSlice(r.Object,
  		"spec", "jobTemplate", "spec", "template", "spec", "containers")
  	if err != nil {
-@@ -1205,15 +1206,17 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
+@@ -1315,15 +1316,17 @@ func patchCleanupCronJobImage(log logr.Logger, r *unstructured.Unstructured, par
  		command, ok := container["command"].([]any)
  		if ok && len(command) > 0 {
  			tenantServiceName := MaaSAPIServiceName(params.TenantIdentifier)
@@ -108,10 +108,10 @@ index bb200ca0..6e4cd19f 100644
  			}
  			if modified {
 diff --git a/maas-controller/pkg/platform/tenantreconcile/params_test.go b/maas-controller/pkg/platform/tenantreconcile/params_test.go
-index d7e8e1d9..276f1252 100644
+index fb2eacbc0c9a27c64ce213e63c41706ca6487132..4101e83079870f49a04f320df12526f36ba785a6 100644
 --- a/maas-controller/pkg/platform/tenantreconcile/params_test.go
 +++ b/maas-controller/pkg/platform/tenantreconcile/params_test.go
-@@ -291,6 +291,9 @@ func TestApplyPlatformParamsWithRenderedOverlay(t *testing.T) {
+@@ -366,6 +366,9 @@ func TestApplyPlatformParamsWithRenderedOverlay(t *testing.T) {
  
  	if cleanupCronJob := findResource(resources, GVKCronJob, MaaSAPIKeyCleanupCronJobName(tenantID)); cleanupCronJob != nil {
  		assert.Equal(t, params.MaaSAPIKeyCleanupImage, requireContainerImage(t, cleanupCronJob, "spec", "jobTemplate", "spec", "template", "spec", "containers"))
@@ -121,7 +121,7 @@ index d7e8e1d9..276f1252 100644
  	}
  
  	httpRoute := requireResource(t, resources, GVKHTTPRoute, MaaSAPIRouteName(tenantID))
-@@ -559,6 +562,8 @@ func TestAPIKeyCleanupCronJobUserPerPlatform(t *testing.T) {
+@@ -639,6 +642,8 @@ func TestAPIKeyCleanupCronJobUserPerPlatform(t *testing.T) {
  		t.Run(tc.overlay, func(t *testing.T) {
  			resources := renderPlatformOverlayResources(t, tc.overlay, "tenant-ns")
  			cronJob := requireResource(t, resources, GVKCronJob, MaaSAPIKeyCleanupCronJobName(""))
@@ -130,7 +130,7 @@ index d7e8e1d9..276f1252 100644
  			podSecurity, found, err := unstructured.NestedMap(cronJob.Object,
  				"spec", "jobTemplate", "spec", "template", "spec", "securityContext")
  			require.NoError(t, err)
-@@ -984,6 +989,30 @@ func requireContainerImage(t *testing.T, r *unstructured.Unstructured, fields ..
+@@ -1069,6 +1074,30 @@ func requireContainerImage(t *testing.T, r *unstructured.Unstructured, fields ..
  	return image
  }
  
@@ -161,7 +161,7 @@ index d7e8e1d9..276f1252 100644
  func requireContainerResources(t *testing.T, dep *unstructured.Unstructured) (requests, limits map[string]any) {
  	t.Helper()
  
-@@ -1259,7 +1288,7 @@ func TestPatchMaaSAPIServingCert_MultiTenant(t *testing.T) {
+@@ -1344,7 +1373,7 @@ func TestPatchMaaSAPIServingCert_MultiTenant(t *testing.T) {
  	assert.Equal(t, "maas-api-serving-cert-redteam", cert.GetName())
  
  	secretName, _, _ := unstructured.NestedString(cert.Object, "spec", "secretName")
@@ -171,7 +171,7 @@ index d7e8e1d9..276f1252 100644
  	dnsNames, _, _ := unstructured.NestedStringSlice(cert.Object, "spec", "dnsNames")
  	assert.Equal(t, []string{
 diff --git a/maas-controller/pkg/platform/tenantreconcile/postrender.go b/maas-controller/pkg/platform/tenantreconcile/postrender.go
-index e547a76a..35221055 100644
+index 8cf6f1ea074128019a5a28edfab7207b8db3da8e..2b8771525dea0b961bb54eaec90a0605ff7f3ae5 100644
 --- a/maas-controller/pkg/platform/tenantreconcile/postrender.go
 +++ b/maas-controller/pkg/platform/tenantreconcile/postrender.go
 @@ -123,12 +123,7 @@ func configureDestinationRule(log logr.Logger, resource *unstructured.Unstructur
