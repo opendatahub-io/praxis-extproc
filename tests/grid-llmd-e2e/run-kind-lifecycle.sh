@@ -274,6 +274,11 @@ image_repo() { local ref; ref="$(image_ref "$1")"; printf '%s\n' "${ref%@*}"; }
 image_provenance() { printf '%s/images/%s/image-provenance-%s.json' "$RUN_DIR" "$1" "$1"; }
 image_metadata() { printf '%s/images/%s/build-metadata-%s.json' "$RUN_DIR" "$1" "$1"; }
 fresh_evidence() { mkdir -p "$(dirname "$1")"; [[ ! -e "$1" ]] || { printf 'evidence path already exists: %s\n' "$1" >&2; return 2; }; }
+chart_sha256() {
+  local chart_file="$1"
+  [[ -n "$chart_file" && -f "$chart_file" ]] || return 0
+  sha256sum -- "$chart_file" | awk '{print $1}'
+}
 
 if [[ "$MODE" == cleanup ]]; then
   CLEANUP_STAGE=cleanup-retry-started
@@ -327,9 +332,11 @@ if [[ "$MODE" == cleanup ]]; then
     SIMULATOR_IMAGE="$(image_ref llm-d-sim 2>/dev/null || true)"
     EXTPROC_IMAGE="$(image_ref extproc 2>/dev/null || true)"
     GRID_OPERATOR_CHART_FILE="$(find "$STATE_DIR/charts/grid-operator" -maxdepth 1 -type f -name 'grid-operator-*.tgz' -print -quit 2>/dev/null || true)"
-    GRID_OPERATOR_CHART_SHA256="$(sha256sum "$GRID_OPERATOR_CHART_FILE" 2>/dev/null | awk '{print $1}')"
+    CLEANUP_STAGE=grid-operator-chart-checksum
+    GRID_OPERATOR_CHART_SHA256="$(chart_sha256 "$GRID_OPERATOR_CHART_FILE")"
     PRAXIS_GATEWAY_CHART_FILE="$(find "$STATE_DIR/charts/praxis-gateway" -maxdepth 1 -type f -name 'praxis-gateway-*.tgz' -print -quit 2>/dev/null || true)"
-    PRAXIS_GATEWAY_CHART_SHA256="$(sha256sum "$PRAXIS_GATEWAY_CHART_FILE" 2>/dev/null | awk '{print $1}')"
+    CLEANUP_STAGE=praxis-gateway-chart-checksum
+    PRAXIS_GATEWAY_CHART_SHA256="$(chart_sha256 "$PRAXIS_GATEWAY_CHART_FILE")"
     export GRID_OPERATOR_CHART_FILE GRID_OPERATOR_IMAGE GRID_OPERATOR_SOURCE_REVISION GRID_GATEWAY_SOURCE_REVISION GRID_SOURCE_REVISION
     export EPP_SOURCE_REVISION SIMULATOR_SOURCE_REVISION EXTPROC_SOURCE_REVISION
     export EPP_IMAGE SIMULATOR_IMAGE EXTPROC_IMAGE GRID_OPERATOR_CHART_SHA256

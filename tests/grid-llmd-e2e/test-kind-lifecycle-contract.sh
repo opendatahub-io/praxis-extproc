@@ -106,6 +106,8 @@ if 'originalLifecycleResultPreserved:true' not in lifecycle or 'cluster or kubec
     raise SystemExit("failure cleanup must preserve the primary failure and state whether natural cleanup was possible")
 if 'stage:$stage' not in lifecycle or 'CLEANUP_STAGE=kind-registry-network-destroy' not in lifecycle or 'Cleanup retry failed at stage %s' not in lifecycle:
     raise SystemExit("cleanup retry failures must record a sanitized, actionable failure stage")
+if '[[ -n "$chart_file" && -f "$chart_file" ]] || return 0' not in lifecycle or 'GRID_OPERATOR_CHART_SHA256="$(chart_sha256 "$GRID_OPERATOR_CHART_FILE")"' not in lifecycle or 'PRAXIS_GATEWAY_CHART_SHA256="$(chart_sha256 "$PRAXIS_GATEWAY_CHART_FILE")"' not in lifecycle:
+    raise SystemExit("cleanup retry must tolerate absent optional charts without tripping the ERR trap")
 
 source_validation = builder.index('[[ "$actual_head" == "$SOURCE_SHA" && -z "$actual_branch" ]]')
 permission_fix = builder.index('make_build_context_readable "$BUILD_CONTEXT_DIR"')

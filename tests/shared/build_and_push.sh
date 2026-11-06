@@ -109,7 +109,7 @@ if [[ -n "$LOCKED_SOURCE_PATCH_SHA256" ]]; then
     exit 2
   }
   source_patch_sha256="$(sha256sum "$SOURCE_PATCH_FILE" | awk '{print $1}')"
-  actual_diff_sha256="$(git -C "$SOURCE_WORKTREE" diff --binary "$SOURCE_SHA" | sha256sum | awk '{print $1}')"
+  actual_diff_sha256="$(git -C "$SOURCE_WORKTREE" diff --binary --full-index "$SOURCE_SHA" | sha256sum | awk '{print $1}')"
   actual_untracked="$(git -C "$SOURCE_WORKTREE" ls-files --others --exclude-standard)"
   [[ "$source_patch_sha256" == "$LOCKED_SOURCE_PATCH_SHA256" && "$actual_diff_sha256" == "$LOCKED_SOURCE_PATCH_SHA256" && -z "$actual_untracked" && -n "$actual_status" ]] || {
     printf 'patched image source must match the locked source patch exactly and contain no untracked files\n' >&2
