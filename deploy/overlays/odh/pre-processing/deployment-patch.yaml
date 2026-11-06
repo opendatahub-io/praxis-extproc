@@ -22,8 +22,9 @@
   path: /spec/template/spec/containers/0/resources
   value:
     requests:
-      # BBR holds the buffered JSON body while promoting model headers; size for
-      # at least one 32 MiB request without OOM-kill.
+      # BBR holds the buffered JSON body while promoting model headers. Budget
+      # assumes max_body_bytes 10 MiB × max_requests 8 with GRPC_MAX_RECV 11Mi
+      # (see base Deployment env) under this 256 MiB limit.
       memory: "64Mi"
       cpu: "25m"
     limits:

@@ -5,7 +5,6 @@ namespace: istio-system
 
 resources:
   - ../../../base
-  - tls-secret.yaml
   - pre-processing-configmap.yaml
   - pre-processing-deployment.yaml
   - pre-processing-service.yaml
@@ -24,6 +23,10 @@ patches:
       kind: ConfigMap
       name: payload-processing-plugins
   - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: payload-processing
+  - path: tls-volume-patch.yaml
     target:
       kind: Deployment
       name: payload-processing

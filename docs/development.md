@@ -73,19 +73,19 @@ examples/
   branch-chains.yaml   # Branch chain example
 deploy/
   base/                # Shared Kustomize base
-    instance/          # Deployment + Service (hardened, non-root; TLS Secret volume)
+    instance/          # Deployment + Service (TLS volume; no OpenShift serving-cert)
     config/            # ConfigMap with BBR + IPP filter chains (provided TLS)
-  testdata/tls/        # Source PEMs for KIND/demo TLS Secret minting
+  testdata/tls/        # Optional local PEMs for provided-TLS experiments (gitignored keys)
   overlays/
     demo/              # Local KIND development overlay
-      workload/        # Namespace, TLS-disabled config + minted tls-secret.yaml
+      workload/        # Namespace, tls.mode none; strips base TLS volume
       test/            # Echo backend, Gateway, HTTPRoute, EnvoyFilter
     odh/               # OpenDataHub production overlay
       rbac/            # ServiceAccount only (no API reader binding)
       networking/      # NetworkPolicy (ingress/egress restrictions)
-      pre-processing/  # Second Deployment for pre-auth model extraction
-      after/           # Post-auth Deployment + DestinationRule (TLS)
-    e2e/workload/      # KIND e2e; ships tls-secret.yaml for base TLS volume
+      pre-processing/  # Second Deployment + OpenShift serving-cert annotation
+      after/           # Post-auth Deployment + DestinationRule + serving-cert
+    e2e/workload/      # KIND e2e; self_signed TLS; strips base TLS volume
 hack/
   kind-config.yaml     # KIND cluster configuration
   setup-kind.sh        # KIND cluster setup script
