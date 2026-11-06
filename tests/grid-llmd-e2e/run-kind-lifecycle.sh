@@ -64,7 +64,7 @@ if [[ "$MODE" == run ]]; then
     printf 'run root already exists; refusing reuse: %s\n' "$RUN_ROOT" >&2
     exit 2
   fi
-  mkdir -p "$RUN_DIR" "$STATE_DIR" "$RUN_DIR/logs" "$RUN_DIR/phase-metrics"
+  mkdir -p "$RUN_DIR" "$STATE_DIR" "$SOURCE_ROOT" "$RUN_DIR/logs" "$RUN_DIR/phase-metrics"
   chmod 0700 "$RUN_ROOT" "$RUN_DIR" "$STATE_DIR" "$SOURCE_ROOT"
   : >"$RUN_DIR/PHASES.jsonl"
   chmod 0600 "$RUN_DIR/PHASES.jsonl"
