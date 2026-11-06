@@ -8,7 +8,7 @@
 //! `SubjectAccessReview` authentication. Health probes at `/healthz`
 //! are always unauthenticated.
 
-use std::{future::Future, net::SocketAddr, sync::OnceLock};
+use std::{future::Future, net::SocketAddr, sync::OnceLock, time::Duration};
 
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes};
@@ -139,9 +139,39 @@ enum AuthnOutcome {
     /// Token is invalid or expired (authentication denied by the API server).
     NotAuthenticated,
     /// The Kubernetes API call itself failed (network error, missing RBAC,
-    /// malformed response). The caller should return 500, not 401, because
-    /// the server cannot determine whether the token is valid.
+    /// malformed response, or timeout). The caller should return 500, not 401,
+    /// because the server cannot determine whether the token is valid.
     ApiError(String),
+}
+
+/// Bound for one `TokenReview` or `SubjectAccessReview` round trip.
+///
+/// kube 5 leaves [`kube::Config::read_timeout`] unset (connect is 30s, write
+/// is 295s). A peer that accepts and stays silent would otherwise keep the
+/// scrape task alive until the HTTP client disconnects.
+const KUBERNETES_API_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Post one review object and fail when the API server stays silent.
+///
+/// [`kube::Client::try_default`] does not set a read timeout, so this bound
+/// is what stops a stalled control plane from pinning the scrape task.
+async fn kubernetes_create<K>(api: &kube::Api<K>, object: &K, call: &str) -> Result<K, String>
+where
+    K: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Sync,
+{
+    let created = tokio::time::timeout(
+        KUBERNETES_API_TIMEOUT,
+        api.create(&kube::api::PostParams::default(), object),
+    )
+    .await;
+    match created {
+        Ok(Ok(created)) => Ok(created),
+        Ok(Err(error)) => Err(format!("{call} API call failed: {error}")),
+        Err(_elapsed) => Err(format!(
+            "{call} API call timed out after {}s",
+            KUBERNETES_API_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Validate a bearer token via the Kubernetes `TokenReview` API.
@@ -151,7 +181,8 @@ enum AuthnOutcome {
 /// with the identity on success, [`AuthnOutcome::NotAuthenticated`] when
 /// the token is invalid or expired, and [`AuthnOutcome::ApiError`] when
 /// the API call itself fails (network, RBAC misconfiguration, malformed
-/// response) — callers must return 500 for that case, not 401.
+/// response, or no response within [`KUBERNETES_API_TIMEOUT`]) — callers
+/// must return 500 for that case, not 401.
 async fn authenticate_token(client: &kube::Client, token: &str) -> AuthnOutcome {
     use k8s_openapi::api::authentication::v1::TokenReview;
 
@@ -164,9 +195,9 @@ async fn authenticate_token(client: &kube::Client, token: &str) -> AuthnOutcome 
     };
 
     let api: kube::Api<TokenReview> = kube::Api::all(client.clone());
-    let result = match api.create(&kube::api::PostParams::default(), &review).await {
-        Ok(r) => r,
-        Err(e) => return AuthnOutcome::ApiError(format!("TokenReview API call failed: {e}")),
+    let result = match kubernetes_create(&api, &review, "TokenReview").await {
+        Ok(created) => created,
+        Err(error) => return AuthnOutcome::ApiError(error),
     };
 
     let Some(status) = result.status else {
@@ -199,7 +230,7 @@ struct TokenReviewResult {
 ///
 /// # Errors
 ///
-/// Returns an error if the API call fails (network, RBAC, etc.).
+/// Returns an error if the API call fails (network, RBAC, timeout, etc.).
 async fn authorize_metrics_access(client: &kube::Client, username: &str, groups: &[String]) -> Result<bool, String> {
     use k8s_openapi::api::authorization::v1::{NonResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec};
 
@@ -217,10 +248,7 @@ async fn authorize_metrics_access(client: &kube::Client, username: &str, groups:
     };
 
     let api: kube::Api<SubjectAccessReview> = kube::Api::all(client.clone());
-    let result = api
-        .create(&kube::api::PostParams::default(), &sar)
-        .await
-        .map_err(|e| format!("SubjectAccessReview API call failed: {e}"))?;
+    let result = kubernetes_create(&api, &sar, "SubjectAccessReview").await?;
 
     let status = result.status.ok_or("SubjectAccessReview response missing status")?;
     Ok(status.allowed)
@@ -635,7 +663,7 @@ mod tests {
         let seen = Seen::default();
         tokio::spawn(accept_api(listener, seen.clone(), token_review, subject_access));
         let mut config = kube::Config::new(format!("http://{address}").parse().unwrap());
-        config.connect_timeout = Some(std::time::Duration::from_secs(2));
+        config.connect_timeout = Some(Duration::from_secs(2));
         config.default_retry = false;
         let client = kube::Client::try_from(config).unwrap();
         (client, seen)
@@ -783,6 +811,32 @@ mod tests {
             "internal error",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn stalled_token_review_is_an_internal_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(hold_accepted_connections(listener));
+        let mut config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        config.connect_timeout = Some(Duration::from_secs(2));
+        config.default_retry = false;
+        let client = kube::Client::try_from(config).unwrap();
+        let finished =
+            tokio::time::timeout(Duration::from_secs(15), scrape(&client, Some("Bearer secret-token"))).await;
+        assert!(finished.is_ok(), "a silent API server must not hold the scrape open");
+        let (status, body) = finished.unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "stalled TokenReview is 500");
+        assert_eq!(body, "internal error", "stalled TokenReview body");
+    }
+
+    async fn hold_accepted_connections(listener: tokio::net::TcpListener) {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _held = stream;
+                std::future::pending::<()>().await;
+            });
+        }
     }
 
     #[tokio::test]
