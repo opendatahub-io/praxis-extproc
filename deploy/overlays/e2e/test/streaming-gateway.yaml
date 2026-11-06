@@ -24,6 +24,23 @@ spec:
   rules:
     - matches:
         - path:
+            type: Exact
+            value: /v1/chat/completions
+          headers:
+            - name: x-e2e-streaming-oracle
+              value: "true"
+        - path:
+            type: Exact
+            value: /oracle/release
+        - path:
+            type: Exact
+            value: /oracle/started
+      backendRefs:
+        - name: streaming-oracle
+          namespace: llm
+          port: 8080
+    - matches:
+        - path:
             type: PathPrefix
             value: /v1/chat/completions
       backendRefs:

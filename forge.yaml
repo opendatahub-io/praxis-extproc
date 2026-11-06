@@ -123,7 +123,17 @@ spec:
           condition: available
           timeout: "120s"
         - type: wait
+          resource: deployment/external-model
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: deployment/nemo-mock
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/streaming-oracle
           namespace: llm
           condition: available
           timeout: "120s"

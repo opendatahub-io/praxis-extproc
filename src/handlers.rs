@@ -164,6 +164,9 @@ pub(crate) async fn handle_request_headers(
     }
 
     let envoy_headers = extract_header_list(&headers);
+    if let Some(rejection) = reject_ambiguous_guardrail_selection(&envoy_headers) {
+        return Ok(vec![rejection]);
+    }
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
@@ -321,6 +324,36 @@ fn reject_streamed_request_over_limit(
     }
     state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(chunk_len);
     None
+}
+
+/// Refuse ambiguous gateway selection metadata before filters can disagree on it.
+fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<ProcessingResponse> {
+    let mut names = std::collections::HashSet::new();
+    for header in headers {
+        let name = header.key.to_ascii_lowercase();
+        if !is_guardrail_selection_header(&name) {
+            continue;
+        }
+        let value = if header.raw_value.is_empty() {
+            header.value.as_bytes()
+        } else {
+            &header.raw_value
+        };
+        if !names.insert(name) || !matches!(value, b"true" | b"false") {
+            let rejection = praxis_filter::Rejection::status(400)
+                .with_body(b"guardrail selection headers must be unique boolean values".to_vec());
+            return Some(response::immediate(adapter::rejection_to_immediate(&rejection)));
+        }
+    }
+    None
+}
+
+/// Recognize phase selectors and the controller's SHA-256 check identifiers.
+fn is_guardrail_selection_header(name: &str) -> bool {
+    name.strip_prefix("x-aigateway-guardrail-").is_some_and(|suffix| {
+        matches!(suffix, "input" | "output")
+            || (suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
 }
 
 /// Build a fail-closed local response for an unsupported request-processing path.

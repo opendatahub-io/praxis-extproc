@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
   - gateway.yaml
   - streaming-gateway.yaml
+  - streaming-oracle.yaml
   - envoyfilter.yaml
   - internal-model.yaml
   - nemo-mock.yaml

@@ -1,5 +1,5 @@
 .PHONY: all build release check clean \
-	test test-integration lint fmt doc audit \
+	test test-integration test-envoy lint fmt doc audit \
 	coverage-check \
 	require-container-engine require-podman require-go require-oc \
 	container container-release images kind-up kind-down smoke-test \
@@ -61,6 +61,14 @@ test:
 test-integration:
 	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
 
+# Loopback HTTP qualification uses the product executable with its shipped
+# feature set. No Kubernetes cluster or externally hosted model is involved.
+ENVOY_TEST_BIN ?= $(CURDIR)/target/tools/envoy-1.37.0
+export ENVOY_TEST_BIN
+test-envoy:
+	bash hack/scripts/install-test-envoy.sh "$$ENVOY_TEST_BIN"
+	ENVOY_BIN="$$ENVOY_TEST_BIN" cargo test $(FIPS_CARGO_ARGS) --features integration --test guardrails_transport envoy:: $(_NOCAPTURE)
+
 # ---------------------------------------------------------------------------
 # Quality
 # ---------------------------------------------------------------------------
@@ -80,7 +88,7 @@ audit:
 	cargo deny check
 
 coverage-check:
-	cargo llvm-cov --fail-under-lines 80
+	cargo llvm-cov --fail-under-lines 93
 
 # ---------------------------------------------------------------------------
 # Container
@@ -457,12 +465,12 @@ FORGE_CONFIG := forge.yaml
 INFERENCE_SIM_IMAGE ?= ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
 FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONTAINER_ENGINE))"
 
-# ext-proc body mode under test: fds (default) or buffered.
+# ext-proc body mode under test: fds (default), buffered, or streamed.
 MODE             ?= fds
 E2E_KIND_CONTEXT ?= kind-praxis-e2e
 
 e2e-setup:
-	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
+	@case "$(MODE)" in fds|buffered|streamed) ;; *) echo "MODE must be fds, buffered, or streamed (got '$(MODE)')"; exit 1;; esac
 	$(MAKE) container-release FIPS_FEATURES="$(FIPS_FEATURES),k8s-e2e"
 	$(FORGE_CMD) cluster create e2e
 	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
@@ -473,7 +481,7 @@ e2e-teardown:
 	$(FORGE_CMD) cluster delete e2e
 
 e2e-test:
-	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
+	@case "$(MODE)" in fds|buffered|streamed) ;; *) echo "MODE must be fds, buffered, or streamed (got '$(MODE)')"; exit 1;; esac
 	E2E_BODY_MODE=$(MODE) bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
@@ -522,7 +530,7 @@ help:
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name (default: praxis-extproc)"
 	@echo "  EXTPROC_IMAGE      container image tag (default: docker.io/library/praxis-extproc:dev)"
-	@echo "  MODE               ext-proc body mode: fds (default), buffered"
+	@echo "  MODE               ext-proc body mode: fds (default), buffered, streamed"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + lint + test + audit"
@@ -542,7 +550,7 @@ help:
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
-	@echo "  coverage-check   fail if line coverage < 80%%"
+	@echo "  coverage-check   fail if line coverage < 93%%"
 	@echo ""
 	@echo "Container (the product image is the FIPS build on UBI 9):"
 	@echo "  container         debug image (in-container cargo)"
@@ -573,7 +581,7 @@ help:
 	@echo "  manifests-openshift kubectl kustomize deploy/overlays/openshift"
 	@echo ""
 	@echo "E2E (Forge):"
-	@echo "  e2e-setup        create Kind cluster + install all stacks (MODE=fds|buffered; k8s-e2e features)"
+	@echo "  e2e-setup        create Kind cluster + install all stacks (MODE=fds|buffered|streamed; k8s-e2e features)"
 	@echo "  e2e-teardown     delete Kind e2e cluster"
 	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""
