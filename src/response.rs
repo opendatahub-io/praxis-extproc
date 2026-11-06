@@ -10,9 +10,9 @@
 //! [`ProcessingResponse`]: praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse
 
 use praxis_proto::envoy::service::ext_proc::v3::{
-    BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse, ProcessingResponse,
-    StreamedBodyResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
-    processing_response::Response,
+    BodyMutation, BodyResponse, BodySendMode, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse,
+    ProcessingMode, ProcessingResponse, StreamedBodyResponse, TrailersResponse, body_mutation,
+    common_response::ResponseStatus, processing_mode::HeaderSendMode, processing_response::Response,
 };
 
 // -----------------------------------------------------------------------------
@@ -94,6 +94,20 @@ pub(crate) fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingRes
         })),
         ..Default::default()
     }
+}
+
+/// Add a response-body STREAMED override to a request-headers response.
+pub(crate) fn set_response_mode_streamed(response: &mut ProcessingResponse, request_body_mode: BodyMode) -> bool {
+    if !matches!(response.response, Some(Response::RequestHeaders(_))) {
+        return false;
+    }
+    response.mode_override = Some(ProcessingMode {
+        response_header_mode: HeaderSendMode::Send.into(),
+        request_body_mode: request_body_mode as i32,
+        response_body_mode: BodySendMode::Streamed.into(),
+        ..Default::default()
+    });
+    true
 }
 
 /// Build a [`ProcessingResponse`] for the response headers phase.
@@ -549,6 +563,20 @@ mod tests {
             matches!(resp.response, Some(Response::ResponseHeaders(_))),
             "should be ResponseHeaders variant"
         );
+    }
+
+    #[test]
+    fn streamed_mode_override_sends_response_headers() {
+        let mut response = request_headers(None);
+
+        assert!(set_response_mode_streamed(&mut response, BodyMode::Buffered));
+
+        let Some(mode) = response.mode_override else {
+            panic!("streamed mode override");
+        };
+        assert_eq!(mode.response_header_mode, HeaderSendMode::Send as i32);
+        assert_eq!(mode.request_body_mode, BodyMode::Buffered as i32);
+        assert_eq!(mode.response_body_mode, BodySendMode::Streamed as i32);
     }
 
     #[test]

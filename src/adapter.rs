@@ -417,7 +417,7 @@ pub(crate) fn response_status(headers: &[HeaderValue]) -> Option<u16> {
 }
 
 /// Extract string value from a [`HeaderValue`], preferring `raw_value`.
-fn header_value_str(hv: &HeaderValue) -> &str {
+pub(crate) fn header_value_str(hv: &HeaderValue) -> &str {
     if hv.raw_value.is_empty() {
         &hv.value
     } else {

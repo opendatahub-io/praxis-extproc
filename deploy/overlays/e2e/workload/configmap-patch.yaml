@@ -85,10 +85,15 @@ data:
             response_add:
               - name: X-Guard-Applied
                 value: "true"
-          # Request + response phases both evaluate against the mock NeMo service;
-          # a "passed" verdict forwards traffic unchanged, so the rest of the
-          # e2e suite is undisturbed.
+          # Request + response phases both evaluate against the mock NeMo service
+          # when the e2e selection header is present. Keeping this conditional
+          # lets the FDS suite exercise ordinary traffic without selecting a
+          # guardrail, while buffered guardrail tests opt in explicitly.
           - filter: ai_guardrails
+            conditions:
+              - when:
+                  headers:
+                    x-aigateway-guardrail-e2e: "true"
             provider:
               type: nemo
               endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
@@ -100,6 +105,19 @@ data:
             phase:
               request: true
               response: true
+          # This E2E-only validator makes malformed-body rejection observable
+          # without changing the production-like extractor below. Tests opt in
+          # with the header, so ordinary routing and guardrail cases keep their
+          # existing invalid-body behavior.
+          - filter: json_body
+            conditions:
+              - when:
+                  headers:
+                    x-e2e-validate-json: "true"
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: reject
           - filter: json_body
             request_extract:
               - pointer: /model

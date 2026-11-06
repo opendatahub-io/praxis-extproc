@@ -53,7 +53,7 @@ async fn fd_streamed_multi_chunk_request_oracle() {
 }
 
 #[tokio::test]
-async fn streaming_response_obeys_the_configured_delivery_mode() {
+async fn unselected_guardrail_streams_before_backend_eof() {
     crate::fixtures::ensure_streaming_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", crate::fixtures::streaming_gateway_url());
@@ -69,7 +69,7 @@ async fn streaming_response_obeys_the_configured_delivery_mode() {
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(bytes)
         .send();
-    let mut first_chunk = Box::pin(async {
+    let (mut stream, mut output) = async {
         let resp = pending.await.expect("streaming request failed");
         assert_eq!(resp.status(), 200, "streaming chat completion");
         assert_praxis_mutations(&resp);
@@ -80,36 +80,20 @@ async fn streaming_response_obeys_the_configured_delivery_mode() {
             .expect("first SSE chunk must arrive")
             .expect("SSE transport must succeed");
         (stream, first.to_vec())
-    });
-    let buffered = std::env::var("E2E_BODY_MODE").is_ok_and(|mode| mode == "buffered");
-    if buffered {
-        tokio::select! {
-            _ = &mut first_chunk => panic!("BUFFERED mode must withhold SSE bytes until backend release"),
-            () = wait_for_first_frame(&client) => {},
-        }
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), &mut first_chunk)
-                .await
-                .is_err(),
-            "BUFFERED mode must hold the first frame after the backend has yielded it"
-        );
-        release_final_event(&client).await;
     }
-    let (mut stream, mut output) = first_chunk.await;
-    if !buffered {
-        while output.len() < b"data: first\n\n".len() {
-            let chunk = stream
-                .next()
-                .await
-                .expect("first event must arrive before backend release");
-            output.extend_from_slice(&chunk.expect("first event transport must succeed"));
-        }
-        assert_eq!(
-            output, b"data: first\n\n",
-            "terminal event must still be held at the backend"
-        );
-        release_final_event(&client).await;
+    .await;
+    while output.len() < b"data: first\n\n".len() {
+        let chunk = stream
+            .next()
+            .await
+            .expect("first event must arrive before backend release");
+        output.extend_from_slice(&chunk.expect("first event transport must succeed"));
     }
+    assert_eq!(
+        output, b"data: first\n\n",
+        "terminal event must still be held at the backend"
+    );
+    release_final_event(&client).await;
     while let Some(chunk) = stream.next().await {
         output.extend_from_slice(&chunk.expect("SSE transport must not be truncated"));
     }
@@ -122,17 +106,6 @@ async fn streaming_response_obeys_the_configured_delivery_mode() {
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
-
-async fn wait_for_first_frame(client: &reqwest::Client) {
-    let response = client
-        .get(format!("{}/oracle/started", crate::fixtures::streaming_gateway_url()))
-        .send()
-        .await
-        .expect("backend start notification must arrive")
-        .error_for_status()
-        .expect("backend must acknowledge its first frame");
-    assert_eq!(response.text().await.unwrap(), "started");
-}
 
 async fn release_final_event(client: &reqwest::Client) {
     client

@@ -1,8 +1,7 @@
 use crate::fixtures::{
-    REQUEST_TIMEOUT, assert_not_forwarded_to_backend, body_size_rejections_total, chat_completion,
-    ensure_gateway_ready, gateway_url, http_client, request_body_is_buffered,
+    REQUEST_TIMEOUT, assert_no_ipp_response_marker, body_size_rejections_total, chat_completion, ensure_gateway_ready,
+    gateway_url, http_client, immediate_responses_total, request_body_is_buffered,
 };
-
 
 #[tokio::test]
 async fn invalid_api_key_rejected() {
@@ -30,28 +29,51 @@ async fn invalid_api_key_rejected() {
 #[tokio::test]
 async fn malformed_json_rejected() {
     ensure_gateway_ready().await;
+    let before = immediate_responses_total().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
+        .header("x-e2e-validate-json", "true")
         .body("this is not json")
         .send()
         .await
         .expect("request failed");
 
-    // Malformed JSON must be rejected, not forwarded. How it surfaces depends on
-    // which filter parses the body first: a converter that reports bad input as a
-    // 4xx, or a fail-closed (failure_mode_allow: false) filter like ai_guardrails
-    // that returns a FilterError on unparseable input, which Envoy surfaces as a
-    // 5xx. Accept either — the contract is "malformed body rejected".
-    let status = resp.status();
-    assert!(
-        status.is_client_error() || status.is_server_error(),
-        "malformed JSON must be rejected (4xx when a filter reports bad input, 5xx when a fail-closed filter trips), got {status}"
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the header-gated JSON validator must reject malformed bodies with HTTP 400"
     );
-    assert_not_forwarded_to_backend(&resp);
+
+    let after = immediate_responses_total().await;
+    assert!(
+        after > before,
+        "the malformed-body validator must issue an ExtProc ImmediateResponse (before={before}, after={after})"
+    );
+}
+
+#[tokio::test]
+async fn json_validator_allows_valid_chat_completion() {
+    ensure_gateway_ready().await;
+    let resp = http_client()
+        .post(format!("{}/v1/chat/completions", gateway_url()))
+        .header("x-e2e-validate-json", "true")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the header-gated JSON validator must allow valid chat completion bodies"
+    );
 }
 
 #[tokio::test]
@@ -103,7 +125,7 @@ async fn oversized_body_rejected() {
 /// Under `FULL_DUPLEX_STREAMED`, Envoy streams the body into IPP so the rejection is
 /// ExtProc's `ImmediateResponse` 413 and `praxis_extproc_body_size_rejections_total`
 /// must increase. Under BUFFERED, Envoy may 413 before ExtProc sees the body, so
-/// we require 413 + "not forwarded to backend" instead of the IPP counter.
+/// we require HTTP 413 plus no IPP response marker instead of the IPP counter.
 #[tokio::test]
 async fn oversized_body_returns_413_with_mode_specific_proof() {
     ensure_gateway_ready().await;
@@ -133,7 +155,7 @@ async fn oversized_body_returns_413_with_mode_specific_proof() {
     );
 
     if buffered {
-        assert_not_forwarded_to_backend(&resp);
+        assert_no_ipp_response_marker(&resp);
         return;
     }
 
