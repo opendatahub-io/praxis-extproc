@@ -85,7 +85,7 @@ for required in (
     'KIND_CAPACITY_PROFILE: gha-standard-4cpu',
     'timeout --signal=TERM',
     'if: always()',
-    'actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18',
+    'actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce',
     'Remove private state after artifact upload',
 ):
     if required not in workflow:

@@ -180,7 +180,7 @@ jobs:
 
       - name: Upload sanitized run evidence
         if: always()
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
         with:
           name: kind-grid-llmd-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
