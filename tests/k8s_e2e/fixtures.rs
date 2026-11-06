@@ -99,6 +99,9 @@ pub(crate) fn ipp_metrics_url() -> String {
 
 /// Current value of `praxis_extproc_body_size_rejections_total` from IPP metrics.
 ///
+/// Sends [`ipp_metrics_token`] as a bearer token. A scrape without a token
+/// that passes `TokenReview` and `SubjectAccessReview` is rejected.
+///
 /// Missing samples count as `0`: Prometheus exporters often omit a counter until
 /// it has been incremented at least once.
 pub(crate) async fn body_size_rejections_total() -> u64 {
@@ -108,6 +111,7 @@ pub(crate) async fn body_size_rejections_total() -> u64 {
         .expect("build metrics HTTP client");
     let text = client
         .get(ipp_metrics_url())
+        .bearer_auth(ipp_metrics_token())
         .send()
         .await
         .expect("scrape IPP metrics")
@@ -117,6 +121,11 @@ pub(crate) async fn body_size_rejections_total() -> u64 {
         .await
         .expect("read IPP metrics body");
     parse_prometheus_counter(&text, "praxis_extproc_body_size_rejections_total").unwrap_or(0)
+}
+
+/// Bearer token for the IPP metrics scrape, minted by `hack/scripts/e2e-test.sh`.
+fn ipp_metrics_token() -> String {
+    std::env::var("IPP_METRICS_TOKEN").expect("IPP_METRICS_TOKEN is unset; hack/scripts/e2e-test.sh mints it")
 }
 
 /// Parse an unlabeled (or any-label) counter sample from Prometheus text.
