@@ -569,8 +569,8 @@ run_phase maas-api-bootstrap -- "$(helper install-kind-maas-api.sh)" \
 KIND_MAAS_API_CA_MODE=install KIND_MAAS_API_CA_STATE_FILE="$STATE_DIR/maas-api-ca-state.json" \
 KIND_MAAS_API_CA_EVIDENCE_DIR="$RUN_DIR/platform/maas-api-ca" run_phase maas-api-ca -- \
   "$(helper configure-kind-maas-api-ca.sh)"
-KIND_MAAS_TENANT_CA_MODE=install KIND_MAAS_TENANT_CA_STATE_FILE="$STATE_DIR/tenant-ca-state.json" \
-  KIND_MAAS_TENANT_CA_EVIDENCE_DIR="$RUN_DIR/platform/tenant-ca-install" run_phase tenant-ca-install -- \
+KIND_MAAS_TENANT_CA_MODE=trust KIND_MAAS_TENANT_CA_STATE_FILE="$STATE_DIR/tenant-ca-state.json" \
+  KIND_MAAS_TENANT_CA_EVIDENCE_DIR="$RUN_DIR/platform/tenant-ca-trust" run_phase tenant-ca-trust -- \
   "$(helper install-kind-maas-tenant-ca.sh)"
 KIND_MAAS_CLEANUP_MODE=prepare KIND_MAAS_CLEANUP_STATE_FILE="$STATE_DIR/maas-cleanup-state.json" \
   KIND_MAAS_CLEANUP_EVIDENCE_DIR="$RUN_DIR/platform/maas-cleanup-prep" \

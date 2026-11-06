@@ -66,5 +66,22 @@ result = subprocess.run(
 if result.returncode != 0 or "no cluster calls" not in result.stdout:
     raise SystemExit("Kind MaaS tenant CA plan mode must be non-mutating")
 
-print("Kind MaaS tenant CA issuer, private-key, ownership, and cleanup contracts: PASS")
+lifecycle = Path(sys.argv[1]).with_name("run-kind-lifecycle.sh").read_text(encoding="utf-8")
+required_lifecycle = (
+    'KIND_MAAS_TENANT_CA_MODE=prepare-issuer',
+    'KIND_MAAS_API_CA_MODE=install',
+    'KIND_MAAS_TENANT_CA_MODE=trust',
+    'run_phase tenant-ca-trust',
+)
+if any(item not in lifecycle for item in required_lifecycle):
+    raise SystemExit("Kind lifecycle must prepare the issuer once, then add Authorino tenant trust using the existing CA state")
+issuer = lifecycle.index('KIND_MAAS_TENANT_CA_MODE=prepare-issuer')
+api_ca = lifecycle.index('KIND_MAAS_API_CA_MODE=install')
+tenant_trust = lifecycle.index('KIND_MAAS_TENANT_CA_MODE=trust')
+if not issuer < api_ca < tenant_trust:
+    raise SystemExit("tenant CA issuer preparation, MaaS API CA setup, and Authorino tenant trust are out of dependency order")
+if 'KIND_MAAS_TENANT_CA_MODE=install KIND_MAAS_TENANT_CA_STATE_FILE="$STATE_DIR/tenant-ca-state.json"' in lifecycle:
+    raise SystemExit("tenant CA lifecycle must not invoke install a second time with the issuer state file")
+
+print("Kind MaaS tenant CA issuer, state reuse, Authorino trust ordering, private-key, ownership, and cleanup contracts: PASS")
 PY
