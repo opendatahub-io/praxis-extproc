@@ -71,6 +71,50 @@ async fn duplicate_or_malformed_selection_is_rejected_before_any_callout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrelated_guardrail_metadata_does_not_require_boolean_values() {
+    let harness = Harness::new(NemoReply::Pass, false).await;
+    let mut session = harness.open().await;
+    let response = session
+        .exchange(headers(vec![
+            support::header("x-aigateway-guardrail-version", "v2"),
+            support::header("X-AIGATEWAY-GUARDRAIL-VERSION", "preview"),
+            support::header("x-aigateway-guardrail-input-format", "json"),
+            support::header("x-aigateway-guardrail-input", "true"),
+        ]))
+        .await;
+    assert_eq!(
+        immediate_status(&[response]),
+        None,
+        "metadata must not be treated as selection"
+    );
+    let response = session.exchange(request("hello", false)).await;
+    assert_eq!(immediate_status(&[response]), None);
+    assert_eq!(harness.calls().len(), 1, "the actual Input selector must still run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_check_ids_and_output_selectors_still_reject_ambiguity() {
+    for name in [
+        "x-aigateway-guardrail-output".to_owned(),
+        format!("x-aigateway-guardrail-{}", "a".repeat(64)),
+    ] {
+        for selections in [
+            vec![support::header(&name, "invalid")],
+            vec![
+                support::header(&name, "true"),
+                support::header(&name.to_ascii_uppercase(), "false"),
+            ],
+        ] {
+            let harness = Harness::new(NemoReply::Pass, false).await;
+            let mut session = harness.open().await;
+            let response = session.exchange(headers(selections)).await;
+            assert_eq!(immediate_status(&[response]), Some(400), "{name}");
+            assert!(harness.calls().is_empty());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_output_cannot_be_silently_disabled_by_none_response_mode() {
     for selected in [false, true] {
         let harness = Harness::new(NemoReply::Pass, false).await;

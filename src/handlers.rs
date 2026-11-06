@@ -331,7 +331,7 @@ fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<Proce
     let mut names = std::collections::HashSet::new();
     for header in headers {
         let name = header.key.to_ascii_lowercase();
-        if !name.starts_with("x-aigateway-guardrail-") {
+        if !is_guardrail_selection_header(&name) {
             continue;
         }
         let value = if header.raw_value.is_empty() {
@@ -346,6 +346,14 @@ fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<Proce
         }
     }
     None
+}
+
+/// Recognize phase selectors and the controller's SHA-256 check identifiers.
+fn is_guardrail_selection_header(name: &str) -> bool {
+    name.strip_prefix("x-aigateway-guardrail-").is_some_and(|suffix| {
+        matches!(suffix, "input" | "output")
+            || (suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
 }
 
 /// Build a fail-closed local response for an unsupported request-processing path.
