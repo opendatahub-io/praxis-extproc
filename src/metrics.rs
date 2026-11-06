@@ -406,7 +406,7 @@ async fn serve_metrics<B: Sync>(
     match authorize_metrics_access(client, &identity.username, &identity.groups).await {
         Ok(true) => {},
         Ok(false) => {
-            warn!(user = %identity.username, "metrics access denied by SubjectAccessReview");
+            warn_denied(&identity.username);
             return response_with_status(StatusCode::FORBIDDEN, "forbidden");
         },
         Err(e) => {
@@ -416,6 +416,26 @@ async fn serve_metrics<B: Sync>(
     }
 
     Response::new(Full::new(Bytes::from(handle.render())))
+}
+
+/// Log a denial without writing a human `TokenReview` username.
+///
+/// Service accounts stay identifiable as `namespace:name`. Any other subject
+/// is omitted; log aggregation for this process is not a place for a person's
+/// name.
+fn warn_denied(username: &str) {
+    if let Some(service_account) = service_account_subject(username) {
+        warn!(service_account = %service_account, "metrics access denied by SubjectAccessReview");
+    } else {
+        warn!("metrics access denied by SubjectAccessReview");
+    }
+}
+
+/// `namespace:name` when `username` is a service account, otherwise nothing.
+fn service_account_subject(username: &str) -> Option<&str> {
+    username
+        .strip_prefix("system:serviceaccount:")
+        .filter(|account| !account.is_empty())
 }
 
 /// Extract the bearer token from the `Authorization` header.
@@ -476,6 +496,27 @@ async fn bind_listener(addr: SocketAddr) -> crate::error::Result<tokio::net::Tcp
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denial_log_keeps_service_accounts_and_drops_users() {
+        assert_eq!(
+            service_account_subject("system:serviceaccount:redhat-ods-monitoring:prometheus-k8s"),
+            Some("redhat-ods-monitoring:prometheus-k8s"),
+            "a service account is safe to log"
+        );
+        assert_eq!(service_account_subject("alice"), None, "a user name is not logged");
+        assert_eq!(
+            service_account_subject("system:admin"),
+            None,
+            "a system user is not a service account"
+        );
+        assert_eq!(
+            service_account_subject("system:serviceaccount:"),
+            None,
+            "an empty account is dropped"
+        );
+        assert_eq!(service_account_subject(""), None, "a missing username is dropped");
+    }
 
     #[test]
     fn status_class_is_bounded() {
