@@ -1,6 +1,4 @@
-use crate::fixtures::{
-    assert_praxis_mutations, chat_completion, chat_completion_with_headers, ensure_gateway_ready,
-};
+use crate::fixtures::{assert_praxis_mutations, chat_completion, chat_completion_with_headers, ensure_gateway_ready};
 
 #[tokio::test]
 async fn gpt4_routes_via_header() {
@@ -49,12 +47,7 @@ async fn unknown_model_returns_404() {
 #[tokio::test]
 async fn conflicting_routing_header_uses_body_model() {
     ensure_gateway_ready().await;
-    let resp = chat_completion_with_headers(
-        "gpt-4",
-        "hello",
-        &[("X-Gateway-Model-Name", "granite-8b")],
-    )
-    .await;
+    let resp = chat_completion_with_headers("gpt-4", "hello", &[("X-Gateway-Model-Name", "granite-8b")]).await;
 
     assert_eq!(
         resp.status(),

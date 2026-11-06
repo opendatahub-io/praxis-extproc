@@ -82,7 +82,7 @@ async fn unavailable_pre_processor_fails_closed() {
         let resp = chat_completion("gpt-4", "hello").await;
         let status = resp.status();
         // Drain body so the connection is reusable / errors are visible.
-        let _ = resp.bytes().await;
+        drop(resp.bytes().await);
         status
     };
 

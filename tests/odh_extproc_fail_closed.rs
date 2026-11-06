@@ -1,6 +1,6 @@
 //! Static checks that ODH ExtProc stays fail-closed on every pre-proc anchor.
 //!
-//! The ODH EnvoyFilter installs `ipp-pre` four times (one per Kuadrant/Istio
+//! The ODH `EnvoyFilter` installs `ipp-pre` four times (one per Kuadrant/Istio
 //! wasm subFilter name). A single variant reverting to `failure_mode_allow:
 //! true` would fail-open when the pre-processor is unavailable. Runtime e2e
 //! covers one live filter; this test locks the YAML posture for all four.
@@ -10,6 +10,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::tests_outside_test_module,
+    clippy::too_many_lines,
     reason = "unit fixture around checked-in YAML"
 )]
 
@@ -17,7 +19,7 @@ const ODH_ENVOY_FILTER: &str = include_str!("../deploy/overlays/odh/envoy-filter
 
 #[test]
 fn odh_ipp_pre_anchors_are_fail_closed() {
-    let mut ipp_pre_blocks = 0usize;
+    let mut ipp_pre_blocks = 0_usize;
     let mut in_ipp_pre = false;
     let mut saw_failure_mode = false;
 
@@ -37,10 +39,7 @@ fn odh_ipp_pre_anchors_are_fail_closed() {
             continue;
         }
         if trimmed.starts_with("name: envoy.filters.http.") && !trimmed.contains("ipp-pre") {
-            assert!(
-                saw_failure_mode,
-                "ipp-pre block ended without failure_mode_allow"
-            );
+            assert!(saw_failure_mode, "ipp-pre block ended without failure_mode_allow");
             in_ipp_pre = false;
             continue;
         }
