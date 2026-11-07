@@ -359,7 +359,10 @@ def resources(
     ca_secret: str,
     config_text: str,
     client_service_account: str,
+    cpu_request: str = "25m",
 ) -> list[dict]:
+    if not re.fullmatch(r"[1-9][0-9]*m", cpu_request):
+        raise RuntimeError("provider proxy CPU request must be a positive millicore quantity")
     name = f"praxis-provider-{pool}"
     service_name = name
     labels = {
@@ -405,7 +408,7 @@ def resources(
                             "ports": [{"name": "https", "containerPort": 8443, "protocol": "TCP"}],
                             "readinessProbe": {"exec": {"command": ["wget", "-qO-", "http://127.0.0.1:9901/healthy"]}, "initialDelaySeconds": 3, "periodSeconds": 5, "timeoutSeconds": 2, "failureThreshold": 12},
                             "livenessProbe": {"exec": {"command": ["wget", "-qO-", "http://127.0.0.1:9901/healthy"]}, "initialDelaySeconds": 10, "periodSeconds": 10, "timeoutSeconds": 2, "failureThreshold": 6},
-                            "resources": {"requests": {"cpu": "25m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
+                            "resources": {"requests": {"cpu": cpu_request, "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
                             "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}},
                             "volumeMounts": [
                                 {"name": "config", "mountPath": "/etc/praxis/praxis.yaml", "subPath": "praxis.yaml", "readOnly": True},
@@ -556,6 +559,7 @@ def main() -> int:
     parser.add_argument("--pool-a-gateway", required=True)
     parser.add_argument("--pool-b-gateway", required=True)
     parser.add_argument("--image", required=True)
+    parser.add_argument("--cpu-request", default="25m")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--evidence-dir", required=True)
     args = parser.parse_args()
@@ -658,6 +662,7 @@ def main() -> int:
             args.ca_secret,
             config_text,
             args.client_service_account,
+            args.cpu_request,
         )
         manifest_path = evidence / f"provider-proxy-{pool}.yaml"
         manifest_path.write_text("---\n".join(yaml.safe_dump(item, sort_keys=False) for item in manifest), encoding="utf-8")

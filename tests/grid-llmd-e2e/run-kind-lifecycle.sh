@@ -255,7 +255,9 @@ capture_diagnostics() {
   kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" get nodes -o json \
     | jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,conditions:.status.conditions,capacity:.status.capacity,allocatable:.status.allocatable}]' >"$dir/nodes.json" 2>&1
   kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" get pods -A -o json \
-    | jq '[.items[]|{namespace:.metadata.namespace,name:.metadata.name,uid:.metadata.uid,ownerReferences:.metadata.ownerReferences,nodeName:.spec.nodeName,phase:.status.phase,conditions:.status.conditions,containers:[.status.containerStatuses[]?|{name,ready,restartCount,state,lastState,image,imageID}]}]' >"$dir/pods.json" 2>&1
+    | jq '[.items[]|{namespace:.metadata.namespace,name:.metadata.name,uid:.metadata.uid,ownerReferences:.metadata.ownerReferences,nodeName:.spec.nodeName,deletionTimestamp:.metadata.deletionTimestamp,phase:.status.phase,conditions:.status.conditions,containers:[.status.containerStatuses[]?|{name,ready,restartCount,state,lastState,image,imageID}],containerResources:[.spec.containers[]?|{name,requests:.resources.requests,limits:.resources.limits}],initContainerResources:[.spec.initContainers[]?|{name,requests:.resources.requests,limits:.resources.limits}] }]' >"$dir/pods.json" 2>&1
+  kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" describe nodes \
+    | awk '/^Name:|^Allocated resources:|^[[:space:]]+cpu[[:space:]]|^[[:space:]]+memory[[:space:]]/' >"$dir/node-allocated-resources.txt" 2>&1
   kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" get events -A --sort-by=.lastTimestamp -o json \
     | jq '[.items[-200:][]|{namespace:.metadata.namespace,reason:.reason,type:.type,message:.message,object:.involvedObject,lastTimestamp:.lastTimestamp,count:.count}]' >"$dir/events.json" 2>&1
   kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" get deployments,statefulsets,services,endpointslices -A -o json \
@@ -1019,6 +1021,8 @@ GRID_CLIENT_IDENTITY_MODE=install GRID_CLIENT_IDENTITY_EVIDENCE_DIR="$RUN_DIR/au
 phase_end 0
 
 phase_start provider-proxies
+PROVIDER_PROXY_CPU_REQUEST=25m
+if [[ "$CAPACITY_PROFILE" == gha-standard-4cpu ]]; then PROVIDER_PROXY_CPU_REQUEST=10m; fi
 run_phase provider-proxies \
   -- python3 "$(helper deploy-provider-proxies.py)" \
   --context "$KUBE_CONTEXT" --expected-api-server "$EXPECTED_API_SERVER" \
@@ -1028,6 +1032,7 @@ run_phase provider-proxies \
   --provider-prefix "$PROVIDER_PREFIX" --model grid-test-model \
   --model-namespace "$TASK_NAMESPACE" --pool-a-gateway "$POOL_A_GATEWAY" \
   --pool-b-gateway "$POOL_B_GATEWAY" --image "$(image_ref praxis-ai)" \
+  --cpu-request "$PROVIDER_PROXY_CPU_REQUEST" \
   --apply --evidence-dir "$RUN_DIR/grid/provider-proxies"
 phase_end 0
 

@@ -231,6 +231,7 @@ assert pod_spec["securityContext"] == {"fsGroup": 101, "fsGroupChangePolicy": "O
 assert deployment["spec"]["template"]["metadata"]["annotations"]["praxis.fast/config-sha256"] == hashlib.sha256(config_text.encode()).hexdigest()
 container = pod_spec["containers"][0]
 assert container["image"].endswith("@sha256:" + "a" * 64)
+assert container["resources"] == {"requests": {"cpu": "25m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}}
 assert container["args"] == ["--config", "/etc/praxis/praxis.yaml"]
 assert container["readinessProbe"]["exec"]["command"][-1] == "http://127.0.0.1:9901/healthy"
 mounts = {item["name"]: item["mountPath"] for item in container["volumeMounts"]}
@@ -249,6 +250,38 @@ assert {item["name"]: item for item in container["volumeMounts"]}["provider-toke
     "readOnly": True,
 }
 assert service["spec"]["ports"][0]["port"] == 8443
+
+reduced_resources = PROXY.resources(
+    "run-20261027",
+    "grid-task",
+    "pool-a",
+    "provider-pool-a",
+    "registry.local/grid-task/praxis-ai@sha256:" + "a" * 64,
+    "grid-site-identity",
+    "grid-ca",
+    config_text,
+    "grid-llmd-client",
+    "10m",
+)
+reduced_container = reduced_resources[1]["spec"]["template"]["spec"]["containers"][0]
+assert reduced_container["resources"] == {"requests": {"cpu": "10m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}}
+try:
+    PROXY.resources(
+        "run-20261027",
+        "grid-task",
+        "pool-a",
+        "provider-pool-a",
+        "registry.local/grid-task/praxis-ai@sha256:" + "a" * 64,
+        "grid-site-identity",
+        "grid-ca",
+        config_text,
+        "grid-llmd-client",
+        "0m",
+    )
+except RuntimeError as error:
+    assert "positive millicore" in str(error)
+else:
+    raise AssertionError("provider proxy must reject a zero CPU request")
 
 sans = PROXY.validate_site_server_name(
     "X509v3 Subject Alternative Name:\n    DNS:grid-llmd-site.grid.internal, DNS:grid-llmd-site",

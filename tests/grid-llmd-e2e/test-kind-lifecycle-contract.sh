@@ -85,6 +85,10 @@ for required in (
     'natural-cleanup',
     'diskConsumedSinceFirstSampleBytes',
     'cgroupCpuUsageUsec',
+    'PROVIDER_PROXY_CPU_REQUEST=10m',
+    '--cpu-request "$PROVIDER_PROXY_CPU_REQUEST"',
+    'containerResources:[.spec.containers[]?',
+    'describe nodes',
 ):
     if required not in lifecycle:
         raise SystemExit(f"lifecycle driver is missing required behavior: {required}")
