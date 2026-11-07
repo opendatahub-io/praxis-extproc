@@ -13,6 +13,7 @@ POOL_SELECTION="${KIND_POOL_MAAS_AUTH_POOL:-both}"
 TENANT_NAMESPACE="${MAAS_TENANT_NAMESPACE:-ai-tenants}"
 GATEWAY_NAMESPACE="${POOL_GATEWAY_NAMESPACE:-maas-system}"
 TIMEOUT="${KIND_POOL_MAAS_AUTH_TIMEOUT:-5m}"
+CAPACITY_PROFILE="${KIND_CAPACITY_PROFILE:-full}"
 EVIDENCE_DIR="${KIND_POOL_MAAS_AUTH_EVIDENCE_DIR:-}"
 SELECTED_POOLS=()
 
@@ -51,6 +52,16 @@ case "$POOL_SELECTION" in
 esac
 [[ "$TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || { printf 'KIND_POOL_MAAS_AUTH_TIMEOUT must be an integer followed by s, m, or h\n' >&2; exit 2; }
 case "${TIMEOUT: -1}" in s) TIMEOUT_SECONDS="${TIMEOUT%?}" ;; m) TIMEOUT_SECONDS="$(( ${TIMEOUT%?} * 60 ))" ;; h) TIMEOUT_SECONDS="$(( ${TIMEOUT%?} * 3600 ))" ;; esac
+[[ "$CAPACITY_PROFILE" == full || "$CAPACITY_PROFILE" == gha-standard-4cpu ]] || {
+  printf 'KIND_CAPACITY_PROFILE must be full or gha-standard-4cpu\n' >&2; exit 2;
+}
+MAAS_API_CPU_REQUEST="${KIND_MAAS_API_CPU_REQUEST:-}"
+if [[ "$CAPACITY_PROFILE" == gha-standard-4cpu && -z "$MAAS_API_CPU_REQUEST" ]]; then
+  MAAS_API_CPU_REQUEST=10m
+fi
+[[ -z "$MAAS_API_CPU_REQUEST" || "$MAAS_API_CPU_REQUEST" =~ ^[1-9][0-9]*m$ ]] || {
+  printf 'KIND_MAAS_API_CPU_REQUEST must be a positive millicore quantity\n' >&2; exit 2;
+}
 [[ -n "$EVIDENCE_DIR" ]] || EVIDENCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/evidence/kind-pool-maas-auth-$(date -u +%Y%m%dT%H%M%SZ)"
 [[ ! -e "$EVIDENCE_DIR" ]] || { printf 'evidence path already exists: %s\n' "$EVIDENCE_DIR" >&2; exit 2; }
 mkdir -p "$EVIDENCE_DIR"
@@ -94,6 +105,87 @@ wait_resource() {
   kubectl describe "$resource" "$name" -n "$namespace" >"$snapshot.describe" 2>&1 || true
   kubectl get events -n "$namespace" --sort-by=.lastTimestamp >"$snapshot.events" 2>&1 || true
   printf '%s %s/%s did not satisfy its bounded current-generation readiness predicate\n' "$resource" "$namespace" "$name" >&2
+  return 1
+}
+
+wait_tenant_config() {
+  local pool="$1" tenant_ns="$2" aitenant_ns="$3" snapshot="$4" deadline
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+  while (( SECONDS <= deadline )); do
+    if kubectl get maastenantconfig default-tenant -n "$tenant_ns" -o json >"$snapshot" 2>"$snapshot.stderr" && \
+      jq -e --arg pool "$pool" --arg aitenant_ns "$aitenant_ns" --arg tenant_ns "$tenant_ns" '
+        .metadata.labels["ai-gateway.opendatahub.io/tenant"]==$pool and
+        .metadata.labels["maas.opendatahub.io/tenant-name"]==$pool and
+        .metadata.labels["maas.opendatahub.io/tenant-namespace"]==$tenant_ns and
+        .metadata.labels["maas.opendatahub.io/managed-by-aitenant"]=="true" and
+        .metadata.annotations["maas.opendatahub.io/aitenant-name"]==$pool and
+        .metadata.annotations["maas.opendatahub.io/aitenant-namespace"]==$aitenant_ns
+      ' "$snapshot" >/dev/null 2>&1; then
+      return 0
+    fi
+    (( SECONDS < deadline )) || break
+    sleep 3
+  done
+  kubectl describe maastenantconfig default-tenant -n "$tenant_ns" >"$snapshot.describe" 2>&1 || true
+  kubectl get events -n "$tenant_ns" --sort-by=.lastTimestamp >"$snapshot.events" 2>&1 || true
+  printf 'run-owned MaasTenantConfig %s/default-tenant did not appear before its bounded readiness gate\n' "$tenant_ns" >&2
+  return 1
+}
+
+configure_kind_tenant_api_resources() {
+  local pool="$1" tenant_ns="$2" aitenant_ns="$3" config="$4" deployment="$5" patch deadline
+  if [[ -n "$MAAS_API_CPU_REQUEST" && "$MODE" == apply ]]; then
+    kubectl get maastenantconfig default-tenant -n "$tenant_ns" -o json >"$config.before-profile.json"
+    jq -e --arg pool "$pool" --arg aitenant_ns "$aitenant_ns" --arg tenant_ns "$tenant_ns" '
+      .metadata.labels["ai-gateway.opendatahub.io/tenant"]==$pool and
+      .metadata.labels["maas.opendatahub.io/tenant-name"]==$pool and
+      .metadata.labels["maas.opendatahub.io/tenant-namespace"]==$tenant_ns and
+      .metadata.labels["maas.opendatahub.io/managed-by-aitenant"]=="true" and
+      .metadata.annotations["maas.opendatahub.io/aitenant-name"]==$pool and
+      .metadata.annotations["maas.opendatahub.io/aitenant-namespace"]==$aitenant_ns
+    ' "$config.before-profile.json" >/dev/null || {
+      printf 'refusing to adjust resource settings on a MaasTenantConfig not owned by this pool AITenant\n' >&2; return 1;
+    }
+    patch="$(jq -cn --arg cpu "$MAAS_API_CPU_REQUEST" '{spec:{maasApi:{resources:{requests:{cpu:$cpu,memory:"128Mi"},limits:{cpu:"500m",memory:"256Mi"}}}}}')"
+    printf '%s\n' "$patch" >"$config.resource-profile-patch.json"
+    kubectl patch maastenantconfig default-tenant -n "$tenant_ns" --type=merge --patch-file "$config.resource-profile-patch.json" \
+      >"$config.resource-profile-apply.txt"
+    kubectl get maastenantconfig default-tenant -n "$tenant_ns" -o json >"$config.after-profile.json"
+    jq -e --arg cpu "$MAAS_API_CPU_REQUEST" '
+      .spec.maasApi.resources.requests.cpu==$cpu and
+      .spec.maasApi.resources.requests.memory=="128Mi" and
+      .spec.maasApi.resources.limits.cpu=="500m" and
+      .spec.maasApi.resources.limits.memory=="256Mi"
+    ' "$config.after-profile.json" >/dev/null || {
+      printf 'Kind four-CPU MaaS API resource override did not persist on the run-owned MaasTenantConfig\n' >&2; return 1;
+    }
+    log "$pool MaaS API resource override recorded: request.cpu=$MAAS_API_CPU_REQUEST; memory requests and CPU/memory limits retain source defaults"
+  fi
+
+  [[ -n "$MAAS_API_CPU_REQUEST" ]] || return 0
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+  while (( SECONDS <= deadline )); do
+    if kubectl get deployment "maas-api-$pool" -n "$GATEWAY_NAMESPACE" -o json >"$deployment" 2>"$deployment.stderr" && \
+      jq -e --arg pool "$pool" --arg tenant_ns "$tenant_ns" --arg cpu "$MAAS_API_CPU_REQUEST" '
+        .metadata.labels["maas.opendatahub.io/tenant-name"]==$pool and
+        .metadata.labels["maas.opendatahub.io/tenant-namespace"]==$tenant_ns and
+        (.metadata.generation as $g | .status.observedGeneration==$g and .status.availableReplicas >= 1) and
+        any(.spec.template.spec.containers[]?;
+          .name=="maas-api" and
+          .resources.requests.cpu==$cpu and
+          .resources.requests.memory=="128Mi" and
+          .resources.limits.cpu=="500m" and
+          .resources.limits.memory=="256Mi")
+      ' "$deployment" >/dev/null 2>&1; then
+      return 0
+    fi
+    (( SECONDS < deadline )) || break
+    sleep 3
+  done
+  kubectl describe deployment "maas-api-$pool" -n "$GATEWAY_NAMESPACE" >"$deployment.describe" 2>&1 || true
+  kubectl get pods -n "$GATEWAY_NAMESPACE" -l "maas.opendatahub.io/tenant-name=$pool" -o wide >"$deployment.pods" 2>&1 || true
+  kubectl get events -n "$GATEWAY_NAMESPACE" --sort-by=.lastTimestamp >"$deployment.events" 2>&1 || true
+  printf 'tenant maas-api Deployment %s did not become available with the verified CPU resource profile\n' "$pool" >&2
   return 1
 }
 
@@ -148,6 +240,17 @@ YAML
   if [[ "$MODE" == apply ]]; then
     kubectl apply --dry-run=server -f "$aitenant_manifest" >"$EVIDENCE_DIR/$pool-aitenant-dry-run.txt"
     kubectl apply -f "$aitenant_manifest" >"$EVIDENCE_DIR/$pool-aitenant-apply.txt"
+  fi
+  if [[ -n "$MAAS_API_CPU_REQUEST" ]]; then
+    wait_resource aitenant "$pool" "$TENANT_NAMESPACE" '
+      .metadata.labels["praxis.fast/qualification-run"]==$run and
+      (.status.tenantNamespace|type=="string" and length>0) and
+      .status.gatewayRef.name==$gateway and .status.gatewayRef.namespace==$gatewayNs
+    ' "$EVIDENCE_DIR/$pool-aitenant-tenant-config-created.json" "$gateway"
+    tenant_ns="$(jq -er '.status.tenantNamespace' "$EVIDENCE_DIR/$pool-aitenant-tenant-config-created.json")"
+    wait_tenant_config "$pool" "$tenant_ns" "$TENANT_NAMESPACE" "$EVIDENCE_DIR/$pool-maastenantconfig-before-profile.json"
+    configure_kind_tenant_api_resources "$pool" "$tenant_ns" "$TENANT_NAMESPACE" \
+      "$EVIDENCE_DIR/$pool-maastenantconfig" "$EVIDENCE_DIR/$pool-maas-api-deployment-profiled.json"
   fi
   wait_resource aitenant "$pool" "$TENANT_NAMESPACE" '
     .metadata.labels["praxis.fast/qualification-run"]==$run and
