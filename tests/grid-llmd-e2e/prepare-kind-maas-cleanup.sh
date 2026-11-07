@@ -145,7 +145,7 @@ if [[ "$MODE" == prepare ]]; then
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   patch="$(jq -nc --arg uid "$controller_uid" --arg image "$image_ref" --argjson ci "$container_index" --argjson ei "$env_index" \
     '[{op:"test",path:"/metadata/uid",value:$uid},{op:"replace",path:("/spec/template/spec/containers/"+($ci|tostring)+"/env/"+($ei|tostring)),value:{name:"RELATED_IMAGE_UBI_MINIMAL_IMAGE",value:$image}}]')"
-  k patch deployment "$CONTROLLER" -n "$NAMESPACE" --type=json -p "$patch" >"$EVIDENCE_DIR/maas-controller-image-override-patch.json" || fail 'could not apply the temporary MaaS cleanup image override'
+  k patch deployment "$CONTROLLER" -n "$NAMESPACE" --type=json -p "$patch" >"$EVIDENCE_DIR/maas-controller-image-override-patch.txt" || fail 'could not apply the temporary MaaS cleanup image override'
   k rollout status deployment/"$CONTROLLER" -n "$NAMESPACE" --timeout=180s >"$EVIDENCE_DIR/maas-controller-override-rollout.txt" || fail 'MaaS controller did not converge after cleanup image override'
   k get deployment "$CONTROLLER" -n "$NAMESPACE" -o json | jq '{name:.metadata.name,uid:.metadata.uid,generation:.metadata.generation,observedGeneration:.status.observedGeneration,readyReplicas:.status.readyReplicas,cleanupImageEnv:[.spec.template.spec.containers[].env[]?|select(.name=="RELATED_IMAGE_UBI_MINIMAL_IMAGE")]}' \
     >"$EVIDENCE_DIR/maas-controller-override.json"
@@ -155,9 +155,9 @@ if [[ "$MODE" == prepare ]]; then
     --state "$EVIDENCE_DIR/maas-namespace-injection-before.json")" || fail 'could not build the guarded MaaS namespace injection patch'
   if [[ "$namespace_patch" != '[]' ]]; then
     k patch namespace "$NAMESPACE" --type=json -p "$namespace_patch" \
-      >"$EVIDENCE_DIR/maas-namespace-injection-prepare-patch.json" || fail 'could not disable classic Istio sidecar injection for MaaS cleanup Jobs'
+      >"$EVIDENCE_DIR/maas-namespace-injection-prepare-patch.txt" || fail 'could not disable classic Istio sidecar injection for MaaS cleanup Jobs'
   else
-    printf 'not-required\n' >"$EVIDENCE_DIR/maas-namespace-injection-prepare-patch.json"
+    printf 'not-required\n' >"$EVIDENCE_DIR/maas-namespace-injection-prepare-patch.txt"
   fi
   namespace_after_prepare="$(k get namespace "$NAMESPACE" -o json)" || fail 'MaaS namespace disappeared after cleanup preparation'
   printf '%s\n' "$namespace_after_prepare" | jq '{name:.metadata.name,uid:.metadata.uid,labels:{"istio-injection":.metadata.labels["istio-injection"],"istio.io/rev":.metadata.labels["istio.io/rev"],"istio.io/dataplane-mode":.metadata.labels["istio.io/dataplane-mode"]}}' \

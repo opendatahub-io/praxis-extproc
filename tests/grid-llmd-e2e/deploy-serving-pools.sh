@@ -99,6 +99,109 @@ pool_gateway_name() {
   esac
 }
 
+capture_kind_platform_pending_events() {
+  local output="$1"
+  oc get events -A --sort-by=.lastTimestamp -o json 2>/dev/null |
+    jq '[.items[-300:][]?|select(.type=="Warning" or .reason=="FailedScheduling" or .reason=="OOMKilling")|{namespace:.metadata.namespace,type,reason,message,lastTimestamp,object:.involvedObject}]' |
+    python3 "$SCRIPT_DIR/sanitize_diagnostics.py" >"$output" || true
+  chmod 0600 "$output" 2>/dev/null || true
+}
+
+wait_for_kind_pending_pods() {
+  local dir="$1" timeout_seconds=120 poll_seconds=2 started elapsed attempt=0 initial_pending=-1
+  local pending_count failed_count unschedulable_count
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  : >"$dir/pending-pod-polls.tsv"
+  started=$SECONDS
+  while :; do
+    attempt=$((attempt + 1))
+    oc get pods -A -o json >"$dir/pods-current.json"
+    jq '[.items[]|select(.status.phase=="Pending" or .status.phase=="Failed" or .status.phase=="Unknown")|{
+      namespace:.metadata.namespace,name:.metadata.name,uid:.metadata.uid,phase:.status.phase,reason:.status.reason,nodeName:.spec.nodeName,
+      ownerReferences:[.metadata.ownerReferences[]?|{kind,name}],
+      podScheduled:([.status.conditions[]?|select(.type=="PodScheduled")|{status,reason,message}][0]//{}),
+      containerStates:[.status.containerStatuses[]?|{name,ready,state}]
+    }]' "$dir/pods-current.json" >"$dir/pending-failed-pods.json"
+    pending_count="$(jq '[.[]|select(.phase=="Pending")]|length' "$dir/pending-failed-pods.json")"
+    failed_count="$(jq '[.[]|select(.phase=="Failed" or .phase=="Unknown")]|length' "$dir/pending-failed-pods.json")"
+    unschedulable_count="$(jq '[.[]|select(.phase=="Pending" and .podScheduled.status=="False" and .podScheduled.reason=="Unschedulable")]|length' "$dir/pending-failed-pods.json")"
+    ((initial_pending>=0)) || initial_pending="$pending_count"
+    elapsed=$((SECONDS - started))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" "$pending_count" "$failed_count" "$unschedulable_count" \
+      >>"$dir/pending-pod-polls.tsv"
+    if (( failed_count > 0 || unschedulable_count > 0 )); then
+      capture_kind_platform_pending_events "$dir/events-on-pending-failure.json"
+      jq -n --argjson attempts "$attempt" --argjson waited "$elapsed" --argjson pending "$pending_count" \
+        --argjson failed "$failed_count" --argjson unschedulable "$unschedulable_count" \
+        '{status:"FAIL",attempts:$attempts,waitedSeconds:$waited,pendingPods:$pending,failedOrUnknownPods:$failed,unschedulablePods:$unschedulable}' \
+        >"$dir/pending-convergence-result.json"
+      log "Kind pending-pod gate failed immediately: pending=$pending_count failedOrUnknown=$failed_count unschedulable=$unschedulable_count"
+      return 1
+    fi
+    if (( pending_count == 0 )); then
+      jq -n --argjson attempts "$attempt" --argjson waited "$elapsed" --argjson initial "$initial_pending" \
+        '{status:"PASS",attempts:$attempts,waitedSeconds:$waited,initialPendingPods:$initial,finalPendingPods:0,timeoutSeconds:120}' \
+        >"$dir/pending-convergence-result.json"
+      log "Kind pending-pod gate PASS after ${elapsed}s and $attempt polls; initialPending=$initial_pending"
+      return 0
+    fi
+    if (( elapsed >= timeout_seconds )); then
+      capture_kind_platform_pending_events "$dir/events-on-pending-failure.json"
+      jq -n --argjson attempts "$attempt" --argjson waited "$elapsed" --argjson initial "$initial_pending" \
+        --argjson pending "$pending_count" --argjson timeout "$timeout_seconds" \
+        '{status:"TIMEOUT",attempts:$attempts,waitedSeconds:$waited,initialPendingPods:$initial,finalPendingPods:$pending,timeoutSeconds:$timeout}' \
+        >"$dir/pending-convergence-result.json"
+      log "Kind pending-pod gate timed out after ${elapsed}s with $pending_count Pending Pods; see $dir/pending-failed-pods.json and events-on-pending-failure.json"
+      return 1
+    fi
+    sleep "$poll_seconds"
+  done
+}
+
+wait_for_kind_platform_deployments() {
+  local dir="$1" timeout_seconds=180 poll_seconds=2 started elapsed attempt=0 ready_count total_count=8
+  local required='["kserve/llmisvc-controller-manager","maas-system/maas-controller","maas-system/maas-api","maas-system/postgres","maas-system/payload-pre-processing","maas-system/payload-processing","opendatahub/ai-gateway-controller","kuadrant-system/authorino"]'
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  : >"$dir/platform-deployment-polls.tsv"
+  started=$SECONDS
+  while :; do
+    attempt=$((attempt + 1))
+    oc get deployments -A -o json >"$dir/deployments-current.json"
+    jq -r --argjson required "$required" '
+      $required[] as $ref |
+      ($ref|split("/")) as $parts |
+      ([.items[]|select(.metadata.namespace==$parts[0] and .metadata.name==$parts[1])][0]//null) as $d |
+      if $d!=null and ($d.status.observedGeneration//0)>=($d.metadata.generation//0) and
+         ($d.spec.replicas//0)>0 and ($d.status.readyReplicas//0)==($d.spec.replicas//0) and
+         any($d.status.conditions[]?;.type=="Available" and .status=="True")
+      then "ready\t"+$ref else "waiting\t"+$ref end
+    ' "$dir/deployments-current.json" >"$dir/platform-deployments-current.tsv"
+    ready_count="$(awk -F '\t' '$1=="ready" {n++} END {print n+0}' "$dir/platform-deployments-current.tsv")"
+    elapsed=$((SECONDS - started))
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$attempt" "$ready_count" "$total_count" \
+      >>"$dir/platform-deployment-polls.tsv"
+    if (( ready_count == total_count )); then
+      jq -n --argjson attempts "$attempt" --argjson waited "$elapsed" --argjson ready "$ready_count" \
+        '{status:"PASS",attempts:$attempts,waitedSeconds:$waited,readyDeployments:$ready,requiredDeployments:8,timeoutSeconds:180}' \
+        >"$dir/platform-deployment-readiness-result.json"
+      log "Kind required platform Deployments PASS after ${elapsed}s and $attempt polls"
+      return 0
+    fi
+    if (( elapsed >= timeout_seconds )); then
+      capture_kind_platform_pending_events "$dir/events-on-deployment-timeout.json"
+      jq -n --argjson attempts "$attempt" --argjson waited "$elapsed" --argjson ready "$ready_count" \
+        --argjson requiredCount "$total_count" --argjson timeout "$timeout_seconds" \
+        '{status:"TIMEOUT",attempts:$attempts,waitedSeconds:$waited,readyDeployments:$ready,requiredDeployments:$requiredCount,timeoutSeconds:$timeout}' \
+        >"$dir/platform-deployment-readiness-result.json"
+      log "Kind platform Deployments timed out after ${elapsed}s: $ready_count/$total_count Ready; see platform-deployments-current.tsv and events-on-deployment-timeout.json"
+      return 1
+    fi
+    sleep "$poll_seconds"
+  done
+}
+
 verify_kind_platform() {
   local dir="$1" server ready dep ns name can_i
   local deployments='[]'
@@ -112,6 +215,8 @@ verify_kind_platform() {
   oc get nodes -o json >"$dir/nodes.json"
   jq -e 'length>0 and all(.items[];.status.conditions|any(.type=="Ready" and .status=="True"))' \
     "$dir/nodes.json" >/dev/null || { log 'Kind platform has no Ready node'; return 1; }
+  wait_for_kind_platform_deployments "$dir/deployment-convergence"
+  wait_for_kind_pending_pods "$dir/pending-convergence"
   oc get pods -A -o json | jq '[.items[]|select(.status.phase=="Pending" or .status.phase=="Failed" or .status.phase=="Unknown")|{namespace:.metadata.namespace,name:.metadata.name,phase:.status.phase,reason:.status.reason}]' >"$dir/pending-failed-pods.json"
   jq -e 'length==0' "$dir/pending-failed-pods.json" >/dev/null || { log 'Kind platform has Pending/Failed/Unknown Pods'; return 1; }
   for dep in kserve/llmisvc-controller-manager maas-system/maas-controller maas-system/maas-api \
@@ -165,6 +270,7 @@ verify_kind_capacity() {
   chmod 0700 "$dir"
   oc get nodes -o json >"$dir/nodes.json"
   oc describe nodes >"$dir/node-capacity-and-allocated-requests.txt"
+  wait_for_kind_pending_pods "$dir/pending-convergence"
   oc get pods -A -o json | jq '[.items[]|select(.status.phase=="Pending" or .status.phase=="Failed" or .status.phase=="Unknown")|{namespace:.metadata.namespace,name:.metadata.name,phase:.status.phase,reason:.status.reason,nodeName:.spec.nodeName}]' >"$dir/pending-failed-pods.json"
   pending_count="$(jq 'length' "$dir/pending-failed-pods.json")"
   ready_nodes="$(jq '[.items[]|select(.status.conditions|any(.type=="Ready" and .status=="True"))]|length' "$dir/nodes.json")"

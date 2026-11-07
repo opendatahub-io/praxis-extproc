@@ -27,6 +27,8 @@ required = (
     "AITenant/$tenant remains; restore only after both revocation finalizers finish",
     "kind-maas-cleanup-state/v2",
     "namespaceInjection",
+    "maas-controller-image-override-patch.txt",
+    "maas-namespace-injection-prepare-patch.txt",
     "maas-namespace-injection-before.json",
     "maas-namespace-injection-restore-patch.json",
     "originalNamespaceInjectionLabelRestored:true",
@@ -34,6 +36,8 @@ required = (
 missing = [fragment for fragment in required if fragment not in script]
 if missing:
     raise SystemExit(f"Kind MaaS cleanup safeguards are missing: {missing}")
+if "maas-controller-image-override-patch.json" in script or "maas-namespace-injection-prepare-patch.json" in script:
+    raise SystemExit("kubectl patch status output must use .txt rather than a JSON extension")
 
 if "maas-api-ca-source.raw.json" in script or "maas-controller-before.raw.json" in script:
     raise SystemExit("the helper must not write raw Secret or Deployment payloads to evidence")
