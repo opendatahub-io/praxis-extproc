@@ -17,15 +17,20 @@ EXPECTED_API_DIGEST="${EXPECTED_API_DIGEST:-}"
 EXPECTED_RESPONSE_MODEL="${EXPECTED_RESPONSE_MODEL:-}"
 PRIVATE_STATE_DIR="${KIND_POOL_SETUP_PROBE_STATE_DIR:-}"
 EVIDENCE_DIR="${KIND_POOL_SETUP_PROBE_EVIDENCE_DIR:-}"
-TOKEN=""
 API_KEY=""
 API_KEY_ID=""
 API_URL=""
+API_TLS_HOST=""
+API_CA_FILE=""
+API_LOCAL_PORT=""
+API_FORWARD_PID=""
 GATEWAY_LOCAL_PORT=""
 GATEWAY_FORWARD_PID=""
 KEY_REVOKED=false
 PROBE_ID=""
 CLIENT_REQUEST_ID=""
+PROBE_USERNAME="kind-e2e-client"
+PROBE_GROUPS='["system:authenticated"]'
 
 kubectl() { command kubectl --context="$KUBE_CONTEXT" "$@"; }
 
@@ -34,11 +39,12 @@ if [[ "$MODE" == plan ]]; then
 Kind pool Gateway setup-probe plan (no cluster calls):
   1. Verify the run-owned KServe route, LLMInferenceService, InferencePool, MaaS tenant, model reference, policies and subscription.
   2. Verify one source-pinned simulator Pod and EPP Pod per pool, with disjoint simulator UIDs.
-  3. Mint a short-lived Kubernetes ServiceAccount token and use it to create a short-lived MaaS API key.
-  4. POST one /v1/chat/completions request with the MaaSModelRef's X-Gateway-Model-Name selector.
+  3. Use a separate verified-TLS port-forward to the pool MaaS API service to mint a short-lived key with a test identity.
+  4. POST one /v1/chat/completions request with the MaaSModelRef's canonical publisher model in the body; trusted preprocessing supplies the internal routing header.
   5. Match the response request ID to a completion receipt from the independent simulator Pod.
-  6. Revoke the ephemeral MaaS API key and stop the two run-local port forwards.
+  6. Revoke the ephemeral MaaS API key over the verified-TLS API connection and stop both run-local port forwards.
 This is a direct pool setup probe. It does not traverse Grid, a provider proxy, the task Gateway, or ExtProc and is not qualification traffic.
+Only credential provisioning uses the pool API backchannel; inference still traverses the pool Gateway's MaaS-managed authorization policy.
 PLAN
   exit 0
 fi
@@ -60,16 +66,112 @@ mkdir -p "$PRIVATE_STATE_DIR/tls" "$EVIDENCE_DIR"
 chmod 0700 "$PRIVATE_STATE_DIR" "$PRIVATE_STATE_DIR/tls" "$EVIDENCE_DIR"
 API_DEPLOYMENT="maas-api-$POOL"
 API_SERVICE="maas-api-$POOL"
+API_TLS_HOST="$API_SERVICE.maas-system.svc.cluster.local"
+API_CA_FILE="${KIND_POOL_SETUP_PROBE_API_CA_FILE:-$PRIVATE_STATE_DIR/maas-api-root-ca.crt}"
 API_ROUTE="maas-api-route-$POOL"
 GATEWAY="grid-llmd-$POOL"
 SIMULATOR_DEPLOYMENT="$POOL-kserve"
 EPP_DEPLOYMENT="$POOL-kserve-router-scheduler"
-PROBE_SERVICE_ACCOUNT="grid-llmd-$POOL-setup-client"
 MODELREF="$(if [[ "$POOL" == pool-a ]]; then printf 'grid-test-model'; else printf 'pool-b-grid-test-model'; fi)"
 SUBSCRIPTION="$POOL-grid-test-model-subscription"
 AUTH_POLICY="$POOL-grid-test-model-access"
+GATEWAY_AUTH_POLICY="$GATEWAY-maas-auth"
+AUTH_STABLE_TIMEOUT_SECONDS="${KIND_POOL_AUTH_STABLE_TIMEOUT_SECONDS:-120}"
+[[ "$AUTH_STABLE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { printf 'KIND_POOL_AUTH_STABLE_TIMEOUT_SECONDS must be a positive integer\n' >&2; exit 2; }
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$EVIDENCE_DIR/RUN-LOG.md"; }
+capture_probe_failure() {
+  local dir pod
+  [[ -n "$GATEWAY" && -n "$TASK_NAMESPACE" && -n "${TENANT_NAMESPACE:-}" ]] || return 0
+  dir="$EVIDENCE_DIR/failure-diagnostics"
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  set +e
+  kubectl get gateway "$GATEWAY" -n maas-system -o json >"$dir/pool-gateway.json" 2>&1
+  kubectl get httproute "$API_ROUTE" -n maas-system -o json >"$dir/maas-api-route.json" 2>&1
+  kubectl get httproute "$POOL-kserve-route" -n "$TASK_NAMESPACE" -o json >"$dir/kserve-route.json" 2>&1
+  kubectl get authpolicy "$GATEWAY_AUTH_POLICY" -n maas-system -o json >"$dir/gateway-auth-policy.json" 2>&1
+  kubectl get maasauthpolicy "$AUTH_POLICY" -n "$TENANT_NAMESPACE" -o json >"$dir/maas-auth-policy.json" 2>&1
+  kubectl get authpolicies.kuadrant.io -A -o json \
+    | jq '[.items[] | {namespace:.metadata.namespace,name:.metadata.name,targetRef:.spec.targetRef,conditions:[.status.conditions[]? | {type,status,observedGeneration,reason}]}]' \
+    >"$dir/all-authpolicies.json" 2>&1
+  kubectl get wasmplugin "kuadrant-$GATEWAY" -n maas-system -o json >"$dir/gateway-wasm-plugin.json" 2>&1
+  kubectl get envoyfilter "kuadrant-auth-$GATEWAY" -n maas-system -o json >"$dir/gateway-auth-envoyfilter.json" 2>&1
+  kubectl get pods,deployments,services,endpointslices -n maas-system -o json \
+    | jq '[.items[] | {kind,metadata:{name:.metadata.name,uid:.metadata.uid,labels:.metadata.labels},status:.status,spec:{selector:.spec.selector,replicas:.spec.replicas,containers:[.spec.template.spec.containers[]? | {name,image}]}}]' \
+    >"$dir/maas-routing-resources.json" 2>&1
+  for pod in $(kubectl get pods -n maas-system -l "gateway.networking.k8s.io/gateway-name=$GATEWAY" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    kubectl logs -n maas-system "pod/$pod" -c istio-proxy --since=15m >"$dir/$pod-istio-proxy.log" 2>&1
+  done
+  for pod in $(kubectl get pods -n maas-system -l "maas.opendatahub.io/tenant-instance=$API_DEPLOYMENT" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    kubectl logs -n maas-system "pod/$pod" -c maas-api --since=15m >"$dir/$pod-maas-api.log" 2>&1
+  done
+  kubectl logs -n kuadrant-system deployment/authorino --all-containers=true --since=15m >"$dir/authorino.log" 2>&1
+  for file in "$dir"/*; do
+    [[ -f "$file" ]] || continue
+    python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$file" >"$file.sanitized" 2>/dev/null && mv "$file.sanitized" "$file"
+  done
+  chmod -R go-rwx "$dir"
+  set -e
+}
+wait_for_stable_auth_policy() {
+  local deadline previous='' fingerprint stable=0 maas_policy gateway_policy policies wasm_plugin envoy_filter snapshot
+  local maas_generation gateway_generation maas_ready no_conflict gateway_current no_route_policy
+  deadline=$((SECONDS + AUTH_STABLE_TIMEOUT_SECONDS))
+  : >"$EVIDENCE_DIR/auth-policy-observations.jsonl"
+  while (( SECONDS <= deadline )); do
+    if maas_policy="$(kubectl get maasauthpolicy "$AUTH_POLICY" -n "$TENANT_NAMESPACE" -o json 2>/dev/null)" && \
+      gateway_policy="$(kubectl get authpolicy "$GATEWAY_AUTH_POLICY" -n maas-system -o json 2>/dev/null)" && \
+      policies="$(kubectl get authpolicies.kuadrant.io -A -o json 2>/dev/null)" && \
+      wasm_plugin="$(kubectl get wasmplugin "kuadrant-$GATEWAY" -n maas-system -o json 2>/dev/null)" && \
+      envoy_filter="$(kubectl get envoyfilter "kuadrant-auth-$GATEWAY" -n maas-system -o json 2>/dev/null)"; then
+      maas_generation="$(jq -r '.metadata.generation // 0' <<<"$maas_policy")"
+      gateway_generation="$(jq -r '.metadata.generation // 0' <<<"$gateway_policy")"
+      maas_ready="$(jq -r --argjson generation "$maas_generation" '[.status.conditions[]? | select(.type=="Ready" and .status=="True" and .observedGeneration==$generation)] | length > 0' <<<"$maas_policy")"
+      no_conflict="$(jq -r --argjson generation "$maas_generation" '[.status.conditions[]? | select(.type=="ConflictingAuthPolicy" and .status=="False" and .observedGeneration==$generation)] | length > 0' <<<"$maas_policy")"
+      gateway_current="$(jq -r --argjson generation "$gateway_generation" '.status.observedGeneration==$generation and ([.status.conditions[]? | select((.type=="Accepted" or .type=="Enforced") and .status=="True")] | length==2)' <<<"$gateway_policy")"
+      no_route_policy="$(jq -r --arg taskNs "$TASK_NAMESPACE" --arg route "$POOL-kserve-route" --arg apiRoute "$API_ROUTE" '[.items[]? | select(.spec.targetRef.kind=="HTTPRoute" and ((.metadata.namespace==$taskNs and .spec.targetRef.name==$route) or (.metadata.namespace=="maas-system" and .spec.targetRef.name==$apiRoute)))] | length==0' <<<"$policies")"
+      snapshot="$(jq -cn --arg taskNs "$TASK_NAMESPACE" --arg route "$POOL-kserve-route" --arg apiRoute "$API_ROUTE" \
+        --slurpfile maas <(printf '%s' "$maas_policy") \
+        --slurpfile gateway <(printf '%s' "$gateway_policy") \
+        --slurpfile policies <(printf '%s' "$policies") \
+        --slurpfile wasm <(printf '%s' "$wasm_plugin") \
+        --slurpfile filter <(printf '%s' "$envoy_filter") '
+        ($maas[0]) as $m | ($gateway[0]) as $g | ($policies[0]) as $p | ($wasm[0]) as $w | ($filter[0]) as $f |
+        {maasPolicy:{name:$m.metadata.name,generation:$m.metadata.generation,phase:$m.status.phase,conditions:[$m.status.conditions[]? | select(.type=="Ready" or .type=="ConflictingAuthPolicy") | {type,status,observedGeneration,reason}]},
+         gatewayPolicy:{name:$g.metadata.name,generation:$g.metadata.generation,observedGeneration:$g.status.observedGeneration,conditions:[$g.status.conditions[]? | select(.type=="Accepted" or .type=="Enforced") | {type,status,reason}]},
+         routePolicies:[$p.items[]? | select(.spec.targetRef.kind=="HTTPRoute" and ((.metadata.namespace==$taskNs and .spec.targetRef.name==$route) or (.metadata.namespace=="maas-system" and .spec.targetRef.name==$apiRoute))) | {namespace:.metadata.namespace,name:.metadata.name,targetRef:.spec.targetRef}],
+         wasmPlugin:{name:$w.metadata.name,generation:$w.metadata.generation,resourceVersion:$w.metadata.resourceVersion},
+         envoyFilter:{name:$f.metadata.name,generation:$f.metadata.generation,resourceVersion:$f.metadata.resourceVersion}}')"
+      fingerprint="$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')"
+      if [[ "$maas_ready" == true && "$no_conflict" == true && "$gateway_current" == true && "$no_route_policy" == true ]]; then
+        if [[ "$fingerprint" == "$previous" ]]; then stable=$((stable + 1)); else stable=1; fi
+        previous="$fingerprint"
+      else
+        stable=0
+        previous="$fingerprint"
+      fi
+      jq -cn --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg fingerprint "$fingerprint" --argjson stablePolls "$stable" \
+        --argjson ready "$( [[ "$maas_ready" == true && "$no_conflict" == true && "$gateway_current" == true && "$no_route_policy" == true ]] && printf true || printf false )" \
+        --argjson snapshot "$snapshot" '{observedAt:$observedAt,fingerprint:$fingerprint,stablePolls:$stablePolls,ready:$ready,snapshot:$snapshot}' \
+        >>"$EVIDENCE_DIR/auth-policy-observations.jsonl"
+      if (( stable >= 2 )); then
+        jq . <<<"$snapshot" >"$EVIDENCE_DIR/stable-auth-policy-state.json"
+        printf 'stable_polls=%s fingerprint=%s\n' "$stable" "$fingerprint" >"$EVIDENCE_DIR/auth-policy-readiness.txt"
+        return 0
+      fi
+    else
+      stable=0
+      previous=''
+      printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) policy read incomplete; retrying within bounded readiness window" \
+        >>"$EVIDENCE_DIR/auth-policy-readiness.txt"
+    fi
+    sleep 1
+  done
+  printf 'MaaS/Gateway authorization state did not remain current and stable for two consecutive polls within %ss\n' \
+    "$AUTH_STABLE_TIMEOUT_SECONDS" >&2
+  return 1
+}
 stop_forward() {
   local pid="$1"
   [[ -n "$pid" ]] || return 0
@@ -78,19 +180,18 @@ stop_forward() {
 }
 revoke_key() {
   local revoke_result revoke_status
-  [[ -n "$API_KEY_ID" && -n "$TOKEN" && -n "$API_URL" ]] || return 0
+  [[ -n "$API_KEY_ID" && -n "$API_LOCAL_PORT" && -n "$API_URL" && -s "$API_CA_FILE" ]] || return 0
   if revoke_result="$(curl --silent --show-error --connect-timeout 3 --max-time 15 \
-      --request DELETE --write-out $'\n%{http_code}' --config - \
-      "$API_URL/$API_KEY_ID" 2>"$EVIDENCE_DIR/key-revoke.stderr" <<EOF
-header = "Authorization: Bearer $TOKEN"
-EOF
+      --cacert "$API_CA_FILE" --resolve "$API_TLS_HOST:$API_LOCAL_PORT:127.0.0.1" \
+      --header "X-MaaS-Username: $PROBE_USERNAME" --header "X-MaaS-Group: $PROBE_GROUPS" \
+      --request DELETE --write-out $'\n%{http_code}' \
+      "$API_URL/$API_KEY_ID" 2>"$EVIDENCE_DIR/key-revoke.stderr"
     )"; then
     revoke_status="${revoke_result##*$'\n'}"
     if [[ "$revoke_status" == 200 || "$revoke_status" == 204 ]]; then
       KEY_REVOKED=true
       API_KEY_ID=""
       API_KEY=""
-      TOKEN=""
       printf '%s\n' "$revoke_status" >"$EVIDENCE_DIR/key-revocation-http-status.txt"
       return 0
     fi
@@ -102,9 +203,10 @@ EOF
 on_exit() {
   local code="$1"
   trap - EXIT INT TERM ERR
+  if (( code != 0 )) && [[ -d "$EVIDENCE_DIR" ]]; then capture_probe_failure || true; fi
   if [[ -n "$API_KEY_ID" ]]; then revoke_key || code=1; fi
+  stop_forward "$API_FORWARD_PID"
   stop_forward "$GATEWAY_FORWARD_PID"
-  TOKEN=""
   API_KEY=""
   if [[ ! -f "$EVIDENCE_DIR/RESULT.json" ]]; then
     jq -n --arg pool "$POOL" --arg evidence "$EVIDENCE_DIR" --argjson exitCode "$code" \
@@ -187,12 +289,14 @@ jq -e --arg gateway "$GATEWAY" --arg service "$API_SERVICE" '
 }
 kubectl get httproute "$POOL-kserve-route" -n "$TASK_NAMESPACE" -o json >"$EVIDENCE_DIR/kserve-httproute.json"
 route_path="/v1/chat/completions"
-jq -e --arg gateway "$GATEWAY" --arg path "$route_path" --arg model "$MODEL_ALIAS" '
+jq -e --arg gateway "$GATEWAY" --arg path "$route_path" --arg model "$MODEL_ALIAS" --arg pool "$POOL-inference-pool" '
   any(.spec.parentRefs[]?;.name==$gateway and .namespace=="maas-system") and
-  any(.spec.rules[]?.matches[]?;.path.type=="Exact" and .path.value==$path and
-    any(.headers[]?;(.name|ascii_downcase)=="x-gateway-model-name" and .type=="Exact" and .value==$model)) and
+  any(.spec.rules[]?;
+    any(.matches[]?;.path.type=="Exact" and .path.value==$path and
+      any(.headers[]?;(.name|ascii_downcase)=="x-gateway-model-name" and .type=="Exact" and .value==$model)) and
+    any(.backendRefs[]?;.kind=="InferencePool" and .name==$pool and .port==8000)) and
   any(.status.parents[]?.conditions[]?;.type=="Accepted" and .status=="True") and any(.status.parents[]?.conditions[]?;.type=="ResolvedRefs" and .status=="True")
-' "$EVIDENCE_DIR/kserve-httproute.json" >/dev/null || { printf 'KServe route does not accept the model-selected /v1/chat/completions contract\n' >&2; exit 1; }
+' "$EVIDENCE_DIR/kserve-httproute.json" >/dev/null || { printf 'KServe route does not accept the canonical publisher model header on /v1/chat/completions\n' >&2; exit 1; }
 kubectl get llminferenceservice "$POOL" -n "$TASK_NAMESPACE" -o json >"$EVIDENCE_DIR/llminferenceservice.json"
 jq -e '(.metadata.generation as $g | .status.observedGeneration==$g and any(.status.conditions[]?;.type=="Ready" and .status=="True"))' \
   "$EVIDENCE_DIR/llminferenceservice.json" >/dev/null || {
@@ -272,41 +376,7 @@ simulator_pod="$(jq -r '.items[0].metadata.name' "$EVIDENCE_DIR/$POOL-simulator-
 simulator_container="$(jq -r --arg digest "$EXPECTED_SIMULATOR_DIGEST" '.items[0].spec.containers[]|select(.image|contains("@"+$digest))|.name' "$EVIDENCE_DIR/$POOL-simulator-pods.json")"
 kubectl get service "$API_SERVICE" -n maas-system -o json >"$EVIDENCE_DIR/maas-api-service.json"
 capture_deployment maas-system "$API_DEPLOYMENT" "$EXPECTED_API_DIGEST" maas-api
-
-probe_sa_manifest="$EVIDENCE_DIR/probe-serviceaccount.yaml"
-cat >"$probe_sa_manifest" <<YAML
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: $PROBE_SERVICE_ACCOUNT
-  namespace: $TASK_NAMESPACE
-  labels:
-    app.kubernetes.io/managed-by: grid-llmd-kind
-    app.kubernetes.io/part-of: grid-llmd-e2e
-    praxis.fast/qualification-run: "$RUN_LABEL"
-automountServiceAccountToken: false
-YAML
-chmod 0600 "$probe_sa_manifest"
-if kubectl get serviceaccount "$PROBE_SERVICE_ACCOUNT" -n "$TASK_NAMESPACE" -o json >"$EVIDENCE_DIR/probe-serviceaccount-before.json" 2>/dev/null; then
-  jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run and .automountServiceAccountToken==false' \
-    "$EVIDENCE_DIR/probe-serviceaccount-before.json" >/dev/null || { printf 'refusing to use a non-run-owned or auto-mounted setup identity\n' >&2; exit 1; }
-else
-  kubectl apply --dry-run=server -f "$probe_sa_manifest" >"$EVIDENCE_DIR/probe-serviceaccount-dry-run.txt"
-  kubectl apply -f "$probe_sa_manifest" >"$EVIDENCE_DIR/probe-serviceaccount-apply.txt"
-fi
-kubectl get serviceaccount "$PROBE_SERVICE_ACCOUNT" -n "$TASK_NAMESPACE" -o json >"$EVIDENCE_DIR/probe-serviceaccount-live.json"
-jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run and .automountServiceAccountToken==false' \
-  "$EVIDENCE_DIR/probe-serviceaccount-live.json" >/dev/null || { printf 'setup identity is not run-owned with automount disabled\n' >&2; exit 1; }
-TOKEN="$(kubectl create token "$PROBE_SERVICE_ACCOUNT" -n "$TASK_NAMESPACE" --duration=10m --audience=https://kubernetes.default.svc)"
-[[ -n "$TOKEN" ]] || { printf 'Kubernetes TokenRequest returned an empty token\n' >&2; exit 1; }
-
-# Pick a local free port for each probe and launch kubectl directly so the
-# recorded PID owns the port-forward process and the EXIT trap can reap it.
-GATEWAY_LOCAL_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-command kubectl --context="$KUBE_CONTEXT" port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY" "$GATEWAY_LOCAL_PORT:443" \
-  >"$EVIDENCE_DIR/pool-gateway-port-forward.log" 2>&1 &
-GATEWAY_FORWARD_PID="$!"
-API_URL="http://127.0.0.1:$GATEWAY_LOCAL_PORT/v1/api-keys"
+wait_for_stable_auth_policy
 
 wait_port_forward() {
   local pid="$1" port="$2" name="$3" logfile="$4" deadline
@@ -323,17 +393,32 @@ wait_port_forward() {
   printf '%s port-forward did not bind local port %s within 30s\n' "$name" "$port" >&2
   return 1
 }
-wait_port_forward "$GATEWAY_FORWARD_PID" "$GATEWAY_LOCAL_PORT" pool-Gateway "$EVIDENCE_DIR/pool-gateway-port-forward.log"
+
+[[ -s "$API_CA_FILE" ]] || { printf 'run-owned MaaS API CA bundle is missing\n' >&2; exit 1; }
+API_LOCAL_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+command kubectl --context="$KUBE_CONTEXT" port-forward --address 127.0.0.1 -n maas-system "svc/$API_SERVICE" "$API_LOCAL_PORT:8443" \
+  >"$EVIDENCE_DIR/maas-api-port-forward.log" 2>&1 &
+API_FORWARD_PID="$!"
+wait_port_forward "$API_FORWARD_PID" "$API_LOCAL_PORT" pool-MaaS-API "$EVIDENCE_DIR/maas-api-port-forward.log"
+API_URL="https://$API_TLS_HOST:$API_LOCAL_PORT/v1/api-keys"
+API_HEALTH_STATUS="$(curl --silent --show-error --connect-timeout 3 --max-time 15 \
+  --cacert "$API_CA_FILE" --resolve "$API_TLS_HOST:$API_LOCAL_PORT:127.0.0.1" \
+  --output /dev/null --write-out '%{http_code}' "https://$API_TLS_HOST:$API_LOCAL_PORT/health" \
+  2>"$EVIDENCE_DIR/maas-api-health.stderr")"
+printf '%s\n' "$API_HEALTH_STATUS" >"$EVIDENCE_DIR/maas-api-direct-health-http-status.txt"
+[[ "$API_HEALTH_STATUS" == 200 ]] || { printf 'pool MaaS API failed verified TLS health check (HTTP %s)\n' "$API_HEALTH_STATUS" >&2; exit 1; }
+jq -n --arg service "$API_SERVICE" --arg serverName "$API_TLS_HOST" --arg status "$API_HEALTH_STATUS" \
+  '{service:$service,serverName:$serverName,caBundle:"private-state/maas-api-root-ca.crt",healthHttpStatus:$status,tlsVerification:"CA and DNS/SNI verified",credentialProvisioningThroughPoolGateway:false,inferenceAuthorizationThroughPoolGateway:true}' \
+  >"$EVIDENCE_DIR/maas-api-credential-provisioning-path.json"
 
 key_name="grid-llmd-$POOL-setup-$(date -u +%Y%m%dT%H%M%SZ)"
 key_body="$(jq -cn --arg name "$key_name" --arg sub "$SUBSCRIPTION" --arg run "$RUN_LABEL" \
   '{name:$name,subscription:$sub,ephemeral:true,expiresIn:"15m",labels:{"qualification-run":$run,purpose:"kind-pool-setup-probe"}}')"
 key_result="$(curl --silent --show-error --connect-timeout 3 --max-time 30 \
-  --header 'Content-Type: application/json' --data-binary "$key_body" --write-out $'\n%{http_code}' --config - "$API_URL" \
-  2>"$EVIDENCE_DIR/maas-api-key-create.stderr" <<EOF
-header = "Authorization: Bearer $TOKEN"
-EOF
-)"
+  --cacert "$API_CA_FILE" --resolve "$API_TLS_HOST:$API_LOCAL_PORT:127.0.0.1" \
+  --header 'Content-Type: application/json' --header "X-MaaS-Username: $PROBE_USERNAME" \
+  --header "X-MaaS-Group: $PROBE_GROUPS" --data-binary "$key_body" \
+  --write-out $'\n%{http_code}' "$API_URL" 2>"$EVIDENCE_DIR/maas-api-key-create.stderr")"
 key_status="${key_result##*$'\n'}"
 key_json="${key_result%$'\n'*}"
 printf '%s\n' "$key_status" >"$EVIDENCE_DIR/maas-api-key-create-http-status.txt"
@@ -353,20 +438,31 @@ unset key_result key_json
   printf 'MaaS API key is not bound to the expected ephemeral subscription\n' >&2; exit 1;
 }
 jq -n --arg id "$API_KEY_ID" --arg subscription "$issued_subscription" --arg expiresAt "$expires_at" \
-  '{keyId:$id,subscription:$subscription,ephemeral:true,expiresAt:$expiresAt,keyBytesRecorded:false}' \
+  --arg identity "$PROBE_USERNAME" --arg group "$PROBE_GROUPS" \
+  '{keyId:$id,subscription:$subscription,ephemeral:true,expiresAt:$expiresAt,keyBytesRecorded:false,issuedThrough:"verified pool MaaS API service port-forward",testIdentity:$identity,testGroups:$group}' \
   >"$EVIDENCE_DIR/maas-ephemeral-key-summary.json"
+
+# The setup identity only provisions this short-lived test key. The inference
+# request below still enters through the pool Gateway and its MaaS AuthPolicy.
+GATEWAY_LOCAL_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+command kubectl --context="$KUBE_CONTEXT" port-forward --address 127.0.0.1 -n maas-system "svc/$GATEWAY" "$GATEWAY_LOCAL_PORT:443" \
+  >"$EVIDENCE_DIR/pool-gateway-port-forward.log" 2>&1 &
+GATEWAY_FORWARD_PID="$!"
+wait_port_forward "$GATEWAY_FORWARD_PID" "$GATEWAY_LOCAL_PORT" pool-Gateway "$EVIDENCE_DIR/pool-gateway-port-forward.log"
 
 PROBE_ID="kind-setup-$POOL-$(date -u +%Y%m%dT%H%M%SZ)-$(cat /proc/sys/kernel/random/uuid)"
 CLIENT_REQUEST_ID="client-$POOL-$(cat /proc/sys/kernel/random/uuid)"
-request_path="$route_path"
-jq -n --arg model grid-test-model --arg prompt "$PROBE_ID" \
+jq -n --arg model "$MODEL_ALIAS" --arg prompt "$PROBE_ID" \
   '{model:$model,messages:[{role:"user",content:$prompt}],max_tokens:16,stream:false}' \
   >"$EVIDENCE_DIR/request.json"
+jq -n --arg model "$MODEL_ALIAS" --arg path "$route_path" \
+  '{requestModel:$model,requestPath:$path,modelSource:"MaaSModelRef.status.resolvedModelAlias",internalHeaderSource:"trusted-pre-extproc",clientSuppliedRoutingHeader:false}' \
+  >"$EVIDENCE_DIR/request-routing-contract.json"
 chmod 0600 "$EVIDENCE_DIR/request.json"
+request_path="$route_path"
 gateway_url="http://127.0.0.1:$GATEWAY_LOCAL_PORT$request_path"
 response_status="$(curl --silent --show-error --connect-timeout 3 --max-time 60 --request POST \
   --header 'Content-Type: application/json' --data-binary "@$EVIDENCE_DIR/request.json" \
-  --header "X-Gateway-Model-Name: $MODEL_ALIAS" \
   --dump-header "$EVIDENCE_DIR/response-headers-raw.txt" --output "$EVIDENCE_DIR/response.json" \
   --write-out '%{http_code}' --config - "$gateway_url" 2>"$EVIDENCE_DIR/gateway-request.stderr" <<EOF
 header = "Authorization: Bearer $API_KEY"
@@ -414,7 +510,8 @@ jq -n --arg pool "$POOL" --arg run "$RUN_LABEL" --arg probeId "$PROBE_ID" \
   --arg peerPodUID "$peer_uid" --arg simImageID "$(cat "$EVIDENCE_DIR/$POOL-simulator-runtime-imageIDs.txt")" \
   --arg peerState "$(jq -r '.peerState' "$EVIDENCE_DIR/peer-pool-state.json")" \
   --argjson pairwiseDisjointVerified "$(jq -r '.pairwiseDisjointVerified' "$EVIDENCE_DIR/peer-pool-state.json")" \
+  --arg apiTlsHost "$API_TLS_HOST" --arg apiHealthStatus "$API_HEALTH_STATUS" \
   --arg receiptLines "$receipt_lines" --arg evidence "$EVIDENCE_DIR" \
-  '{mode:"run",status:"passed",setupProbe:true,pool:$pool,run:$run,probeId:$probeId,clientRequestId:$clientRequestId,responseRequestId:$responseRequestId,httpStatus:200,responseModel:$responseModel,modelAlias:$modelAlias,requestPath:$requestPath,independentSimulatorReceipt:{matchedRequestId:$responseRequestId,pod:$simPod,podUID:$simUID,receiptLines:($receiptLines|tonumber)},peerSimulatorPodUID:$peerPodUID,peerPoolVerification:{state:$peerState,pairwiseDisjointVerified:$pairwiseDisjointVerified},simulatorImageID:$simImageID,maasEphemeralKeyRevoked:true,credentialBytesRecorded:false,requestPathScope:"pool Gateway to KServe InferencePool/EPP/simulator",gridTaskGatewayProviderProxyAndExtProcTraversed:false,qualificationTraffic:false,evidenceDirectory:$evidence}' \
+  '{mode:"run",status:"passed",setupProbe:true,pool:$pool,run:$run,probeId:$probeId,clientRequestId:$clientRequestId,responseRequestId:$responseRequestId,httpStatus:200,responseModel:$responseModel,modelAlias:$modelAlias,requestPath:$requestPath,independentSimulatorReceipt:{matchedRequestId:$responseRequestId,pod:$simPod,podUID:$simUID,receiptLines:($receiptLines|tonumber)},peerSimulatorPodUID:$peerPodUID,peerPoolVerification:{state:$peerState,pairwiseDisjointVerified:$pairwiseDisjointVerified},simulatorImageID:$simImageID,maasEphemeralKeyRevoked:true,credentialBytesRecorded:false,credentialProvisioning:{path:"pool-specific MaaS API service over verified TLS port-forward",serviceServerName:$apiTlsHost,healthHttpStatus:($apiHealthStatus|tonumber)},inferenceAuthorization:"pool Gateway MaaS AuthPolicy",requestPathScope:"pool Gateway to KServe InferencePool/EPP/simulator",gridTaskGatewayProviderProxyAndExtProcTraversed:false,qualificationTraffic:false,evidenceDirectory:$evidence}' \
   >"$EVIDENCE_DIR/RESULT.json"
 log "$POOL authorized Gateway setup probe passed with an independent simulator completion receipt; qualification traffic remains unstarted"

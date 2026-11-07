@@ -216,8 +216,11 @@ jq -e --arg repository "$IMAGE_REPOSITORY" --arg tag "$IMAGE_TAG" --arg digest "
   "$EVIDENCE_DIR/controller-pods.json" >/dev/null || fail 'KServe controller must have exactly one Ready Pod with the pinned runtime image digest'
 
 # A Deployment rollout can report Available while an old Pod remains
-# terminating in the webhook EndpointSlice. Wait for one fully converged Pod
-# and its matching Ready EndpointSlice before creating webhook-dependent CRs.
+# terminating in the webhook EndpointSlice. First wait for one fully
+# converged Pod and its matching Ready EndpointSlice. Then exercise the
+# admission path itself with server-side dry-run creates of the exact runtime
+# configuration objects. Endpoint readiness alone did not prevent the API
+# server from seeing connection-refused during the first run.
 webhook_converged=false
 : >"$EVIDENCE_DIR/webhook-convergence-polls.tsv"
 for attempt in $(seq 1 60); do
@@ -244,6 +247,37 @@ done
 [[ "$webhook_converged" == true ]] || {
   cat "$EVIDENCE_DIR/webhook-readiness-last-error.txt" >&2
   fail 'KServe webhook deployment and EndpointSlice did not converge to one current Ready Pod'
+}
+
+expected_runtime_config_count="$(rg -c '^kind: LLMInferenceServiceConfig$' "$EVIDENCE_DIR/rendered-runtime-configs.yaml")"
+[[ "$expected_runtime_config_count" =~ ^[1-9][0-9]*$ ]] || fail 'rendered KServe runtime configuration count is invalid'
+admission_attempts="${KSERVE_ADMISSION_PROBE_ATTEMPTS:-30}"
+[[ "$admission_attempts" =~ ^[1-9][0-9]*$ && "$admission_attempts" -le 60 ]] || fail 'KSERVE_ADMISSION_PROBE_ATTEMPTS must be between 1 and 60'
+admission_ready=false
+: >"$EVIDENCE_DIR/webhook-admission-probe.tsv"
+for attempt in $(seq 1 "$admission_attempts"); do
+  probe_stdout="$EVIDENCE_DIR/webhook-admission-probe-attempt-$(printf '%02d' "$attempt").stdout"
+  probe_stderr="$EVIDENCE_DIR/webhook-admission-probe-attempt-$(printf '%02d' "$attempt").stderr"
+  if k apply --dry-run=server -f "$EVIDENCE_DIR/rendered-runtime-configs.yaml" -o name \
+    >"$probe_stdout" 2>"$probe_stderr"; then
+    observed_runtime_config_count="$(rg -c '^llminferenceserviceconfig\.serving\.kserve\.io/' "$probe_stdout" || true)"
+    if [[ "$observed_runtime_config_count" == "$expected_runtime_config_count" ]]; then
+      printf '%s\t%s\tready\t%s/%s\n' "$(date -u +%FT%TZ)" "$attempt" \
+        "$observed_runtime_config_count" "$expected_runtime_config_count" >>"$EVIDENCE_DIR/webhook-admission-probe.tsv"
+      admission_ready=true
+      break
+    fi
+    printf 'expected %s server-side admitted runtime configs, observed %s\n' \
+      "$expected_runtime_config_count" "${observed_runtime_config_count:-0}" >"$probe_stderr"
+  fi
+  printf '%s\t%s\twaiting\t%s/%s\n' "$(date -u +%FT%TZ)" "$attempt" \
+    "${observed_runtime_config_count:-0}" "$expected_runtime_config_count" >>"$EVIDENCE_DIR/webhook-admission-probe.tsv"
+  unset observed_runtime_config_count
+  ((attempt == admission_attempts)) || sleep 2
+done
+[[ "$admission_ready" == true ]] || {
+  cat "$probe_stderr" >&2
+  fail 'KServe API server could not complete a server-side dry-run through the runtime-config admission webhooks'
 }
 
 for crd in inferencepools.inference.networking.k8s.io inferencepools.inference.networking.x-k8s.io; do

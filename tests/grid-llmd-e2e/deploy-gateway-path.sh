@@ -29,6 +29,7 @@ TLS_SECRET_NAME="${GRID_GATEWAY_TLS_SECRET_NAME:-grid-site-identity}"
 SOURCE_SECRET_NAMESPACE="${GRID_IDENTITY_NAMESPACE:-praxis-grid-operator-system}"
 SOURCE_IDENTITY_SECRET="${GRID_IDENTITY_SECRET_NAME:-grid-site-identity}"
 SOURCE_CA_SECRET="${GRID_CA_SECRET_NAME:-grid-ca}"
+GATEWAY_CA_SECRET_NAME="${GRID_GATEWAY_CA_SECRET_NAME:-$SOURCE_CA_SECRET}"
 CHART_FILE="${PRAXIS_GATEWAY_CHART_FILE:-}"
 CHART_SHA256="${PRAXIS_GATEWAY_CHART_SHA256:-}"
 CHART_VERSION="${PRAXIS_GATEWAY_CHART_VERSION:-}"
@@ -401,7 +402,7 @@ jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]=
   exit 1
 }
 jq -e --arg sourceNs "$SOURCE_SECRET_NAMESPACE" --arg sourceSite "$SOURCE_IDENTITY_SECRET" --arg sourceCa "$SOURCE_CA_SECRET" \
-  --arg gatewayNs "$NAMESPACE" --arg gatewaySite "$TLS_SECRET_NAME" --arg gatewayCa "$SOURCE_CA_SECRET" \
+  --arg gatewayNs "$NAMESPACE" --arg gatewaySite "$TLS_SECRET_NAME" --arg gatewayCa "$GATEWAY_CA_SECRET_NAME" \
   '((.spec.tls.siteSecretRef.namespace==$sourceNs and .spec.tls.siteSecretRef.name==$sourceSite and
      .spec.tls.caSecretRef.namespace==$sourceNs and .spec.tls.caSecretRef.name==$sourceCa) or
     (.spec.tls.siteSecretRef.namespace==$gatewayNs and .spec.tls.siteSecretRef.name==$gatewaySite and
@@ -411,6 +412,18 @@ jq -e --arg sourceNs "$SOURCE_SECRET_NAMESPACE" --arg sourceSite "$SOURCE_IDENTI
     printf 'GridNetwork TLS references match neither the exact source Secrets nor the run-owned Gateway-namespace copies\n' >&2
   exit 1
 }
+if [[ "$SOURCE_SECRET_NAMESPACE" == "$NAMESPACE" ]]; then
+  [[ "$SOURCE_IDENTITY_SECRET" != "$TLS_SECRET_NAME" ]] || {
+    CURRENT_FAILURE='co-located Gateway TLS destination must not reuse the Grid-owned source identity Secret name'
+    printf 'Gateway TLS destination Secret must have a distinct name from the co-located Grid source Secret\n' >&2
+    exit 1
+  }
+  [[ "$SOURCE_CA_SECRET" != "$GATEWAY_CA_SECRET_NAME" ]] || {
+    CURRENT_FAILURE='co-located Gateway CA destination must not reuse the Grid-owned source CA Secret name'
+    printf 'Gateway CA destination Secret must have a distinct name from the co-located Grid source Secret\n' >&2
+    exit 1
+  }
+fi
 if [[ -n "$OVERLAY_CONFIGMAP" ]]; then
   CURRENT_PHASE=grid-overlay-ownership-preflight
   jq -er --arg gateway "$SERVICE_NAME" --arg namespace "$NAMESPACE" \
@@ -556,7 +569,7 @@ mountReconciliation:
     namespace: $GRID_OPERATOR_NAMESPACE
 gridIdentity:
   tlsSecretName: $TLS_SECRET_NAME
-  caSecretName: $SOURCE_CA_SECRET
+  caSecretName: $GATEWAY_CA_SECRET_NAME
 service:
   enabled: true
   type: ClusterIP
@@ -619,7 +632,7 @@ overlay:
 $BYO_MOUNT_RECONCILIATION_VALUES
 gridIdentity:
   tlsSecretName: $TLS_SECRET_NAME
-  caSecretName: $SOURCE_CA_SECRET
+  caSecretName: $GATEWAY_CA_SECRET_NAME
 service:
   enabled: true
   type: ClusterIP
@@ -662,11 +675,14 @@ if [[ -n "$OVERLAY_CONFIGMAP" ]]; then
     exit 1
   }
 fi
-if grep -Eq '^(kind: Gateway|kind: HTTPRoute|kind: Secret)$' "$EVIDENCE_DIR/rendered-gateway.yaml"; then
-  CURRENT_FAILURE='Praxis Gateway chart unexpectedly owns a Gateway API or Secret resource'
-  printf 'Praxis Gateway chart render includes a separately owned Gateway API or Secret resource\n' >&2
-  exit 1
-fi
+python3 "$SCRIPT_DIR/validate_grid_gateway_chart_render.py" \
+  --manifest "$EVIDENCE_DIR/rendered-gateway.yaml" \
+  --release "$RELEASE_NAME" --service "$SERVICE_NAME" --run-label "$RUN_LABEL" \
+  --evidence "$EVIDENCE_DIR/chart-resource-ownership.json" || {
+    CURRENT_FAILURE='Praxis Gateway chart render contains an unsupported separately owned resource'
+    printf 'Praxis Gateway chart render ownership contract failed\n' >&2
+    exit 1
+  }
 
 if [[ -n "$PRAXIS_CONFIG_FILE" || "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
   if [[ "$PRAXIS_CONFIG_MAP_EXTERNAL" == true ]]; then
@@ -977,6 +993,8 @@ else
     printf 'task Grid CA Secret has no ca.crt key\n' >&2
     exit 1
   }
+  printf '%s\n' "$identity_json" | jq -S '{uid:.metadata.uid,type:.type,data:.data}' >"$tmpdir/source-identity-before.json"
+  printf '%s\n' "$ca_json" | jq -S '{uid:.metadata.uid,type:.type,data:.data}' >"$tmpdir/source-ca-before.json"
   printf '%s' "$(jq -r '.data["tls.crt"]' <<<"$identity_json")" | base64 -d >"$tmpdir/site.crt"
   printf '%s' "$(jq -r '.data["ca.crt"]' <<<"$ca_json")" | base64 -d >"$tmpdir/grid-ca.crt"
   openssl verify -CAfile "$tmpdir/grid-ca.crt" "$tmpdir/site.crt" >"$EVIDENCE_DIR/grid-identity-chain.txt"
@@ -994,9 +1012,9 @@ else
     printf 'task site identity certificate/key pair validation failed\n' >&2
     exit 1
   }
-  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
+  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
     <<<"$identity_json" >"$EVIDENCE_DIR/source-site-identity-metadata.json"
-  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
+  jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
     <<<"$ca_json" >"$EVIDENCE_DIR/source-grid-ca-metadata.json"
 
   CURRENT_PHASE='server-dry-run'
@@ -1038,11 +1056,11 @@ else
     jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
       <<<"$destination_identity_json" >"$EVIDENCE_DIR/destination-identity-before-metadata.json"
   fi
-  if destination_ca_json="$(oc get secret "$SOURCE_CA_SECRET" -n "$NAMESPACE" -o json 2>/dev/null)"; then
+  if destination_ca_json="$(oc get secret "$GATEWAY_CA_SECRET_NAME" -n "$NAMESPACE" -o json 2>/dev/null)"; then
     jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run and (.data|keys)==["ca.crt"]' \
       <<<"$destination_ca_json" >/dev/null || {
       CURRENT_FAILURE='same-name destination CA Secret exists without matching task ownership or public-ca-only contents'
-      printf 'destination CA Secret exists outside this run ownership\n' >&2
+    printf 'destination Gateway CA Secret exists outside this run ownership\n' >&2
       exit 1
     }
     jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
@@ -1051,9 +1069,23 @@ else
   jq --arg ns "$NAMESPACE" --arg name "$TLS_SECRET_NAME" --arg run "$RUN_LABEL" \
     '{apiVersion:"v1",kind:"Secret",metadata:{name:$name,namespace:$ns,labels:{"app.kubernetes.io/part-of":"grid-llmd-e2e","app.kubernetes.io/managed-by":"grid-llmd-e2e-run","praxis.fast/qualification-run":$run}},type:"kubernetes.io/tls",data:{"tls.crt":.data["tls.crt"],"tls.key":.data["tls.key"]}}' \
     <<<"$identity_json" | oc apply -f - >/dev/null
-  jq --arg ns "$NAMESPACE" --arg name "$SOURCE_CA_SECRET" --arg run "$RUN_LABEL" \
+  jq --arg ns "$NAMESPACE" --arg name "$GATEWAY_CA_SECRET_NAME" --arg run "$RUN_LABEL" \
     '{apiVersion:"v1",kind:"Secret",metadata:{name:$name,namespace:$ns,labels:{"app.kubernetes.io/part-of":"grid-llmd-e2e","app.kubernetes.io/managed-by":"grid-llmd-e2e-run","praxis.fast/qualification-run":$run}},type:"Opaque",data:{"ca.crt":.data["ca.crt"]}}' \
     <<<"$ca_json" | oc apply -f - >/dev/null
+  oc get secret "$SOURCE_IDENTITY_SECRET" -n "$SOURCE_SECRET_NAMESPACE" -o json |
+    jq -S '{uid:.metadata.uid,type:.type,data:.data}' >"$tmpdir/source-identity-after.json"
+  oc get secret "$SOURCE_CA_SECRET" -n "$SOURCE_SECRET_NAMESPACE" -o json |
+    jq -S '{uid:.metadata.uid,type:.type,data:.data}' >"$tmpdir/source-ca-after.json"
+  cmp -s "$tmpdir/source-identity-before.json" "$tmpdir/source-identity-after.json" || {
+    CURRENT_FAILURE='Grid-owned source site-identity Secret changed while preparing the Gateway copy'
+    printf 'Grid-owned source site-identity Secret changed during Gateway Secret preparation\n' >&2
+    exit 1
+  }
+  cmp -s "$tmpdir/source-ca-before.json" "$tmpdir/source-ca-after.json" || {
+    CURRENT_FAILURE='Grid-owned source CA Secret changed while preparing the Gateway copy'
+    printf 'Grid-owned source CA Secret changed during Gateway Secret preparation\n' >&2
+    exit 1
+  }
   unset identity_json ca_json
   unset destination_identity_json destination_ca_json
 
@@ -1270,7 +1302,7 @@ jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,generation:.met
 oc get secret "$TLS_SECRET_NAME" -n "$NAMESPACE" -o json |
   jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
   >"$EVIDENCE_DIR/task-site-identity-metadata.json"
-oc get secret "$SOURCE_CA_SECRET" -n "$NAMESPACE" -o json |
+oc get secret "$GATEWAY_CA_SECRET_NAME" -n "$NAMESPACE" -o json |
   jq '{metadata:{name:.metadata.name,namespace:.metadata.namespace,labels:.metadata.labels,annotations:.metadata.annotations,ownerReferences:.metadata.ownerReferences},type,keyNames:(.data|keys)}' \
   >"$EVIDENCE_DIR/task-grid-ca-metadata.json"
 oc get events -n "$NAMESPACE" --sort-by=.lastTimestamp >"$EVIDENCE_DIR/events.txt" 2>&1 || true

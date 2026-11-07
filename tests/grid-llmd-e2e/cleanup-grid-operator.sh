@@ -49,7 +49,7 @@ Cleanup order:
   2. Refuse cleanup while any provider references the task GridNetwork.
   3. Delete the GridNetwork using its UID precondition and wait for its withdrawal finalizer.
   4. Require the operator log to report published SWIM withdrawal and confirm the operator remains Ready.
-  5. Delete the GridSite, then uninstall the Helm release and remove its run-owned namespace.
+  5. Delete the GridSite, then uninstall the Helm release. Remove a separate operator namespace here; when the operator shares the task namespace, defer its removal until task Gateway cleanup.
   6. Verify the release and task Grid CRs are absent while Grid CRDs remain.
 PLAN
   exit 0
@@ -366,35 +366,46 @@ oc get crd -o json | jq '[.items[]|select(.metadata.name|IN("agenttoolproviders.
 jq -e 'length==5 and all(.[];.established==true)' "$EVIDENCE_DIR/grid-crds-after-uninstall.json" >/dev/null || fail 'expected retained Grid CRDs are missing or not Established'
 
 api_ready
-oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-before-delete.json" || fail 'operator namespace disappeared before its owned cleanup'
-jq -e --arg uid "$NAMESPACE_UID" --arg run "$RUN_LABEL" '.metadata.uid==$uid and .metadata.labels["praxis.fast/qualification-run"]==$run' \
-  "$EVIDENCE_DIR/operator-namespace-before-delete.json" >/dev/null || fail 'operator namespace UID/ownership changed; refusing namespace cleanup'
-delete_resource_with_uid "/api/v1/namespaces/$RELEASE_NAMESPACE" "$NAMESPACE_UID" \
-  "$EVIDENCE_DIR/operator-namespace-delete-response.json" "$EVIDENCE_DIR/operator-namespace-delete-options.json"
-deadline=$((SECONDS + ${WAIT_TIMEOUT%s}))
-: >"$EVIDENCE_DIR/operator-namespace-watch.jsonl"
-while ((SECONDS < deadline)); do
-  if oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-watch.raw.json" 2>/dev/null; then
-    jq --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{observedAt:$observedAt,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,finalizers:(.spec.finalizers//[])}' \
-      "$EVIDENCE_DIR/operator-namespace-watch.raw.json" >>"$EVIDENCE_DIR/operator-namespace-watch.jsonl"
-    jq -e --arg uid "$NAMESPACE_UID" '.metadata.uid==$uid and .metadata.deletionTimestamp!=null' \
-      "$EVIDENCE_DIR/operator-namespace-watch.raw.json" >/dev/null || fail 'operator namespace UID changed or deletion timestamp was not observed'
-  else
-    break
+operator_namespace_removed=true
+if [[ "$RELEASE_NAMESPACE" == "$RESOURCE_NAMESPACE" ]]; then
+  # The Kind topology co-locates the Grid operator with its single GridNetwork
+  # and delegated Gateway. Leave this run-owned namespace intact until the
+  # outer task cleanup removes the Gateway and its other task resources.
+  operator_namespace_removed=false
+  printf 'same run-owned task/operator namespace; defer namespace removal to task cleanup\n' \
+    >"$EVIDENCE_DIR/operator-namespace-removal-deferred.txt"
+else
+  oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-before-delete.json" || fail 'operator namespace disappeared before its owned cleanup'
+  jq -e --arg uid "$NAMESPACE_UID" --arg run "$RUN_LABEL" '.metadata.uid==$uid and .metadata.labels["praxis.fast/qualification-run"]==$run' \
+    "$EVIDENCE_DIR/operator-namespace-before-delete.json" >/dev/null || fail 'operator namespace UID/ownership changed; refusing namespace cleanup'
+  delete_resource_with_uid "/api/v1/namespaces/$RELEASE_NAMESPACE" "$NAMESPACE_UID" \
+    "$EVIDENCE_DIR/operator-namespace-delete-response.json" "$EVIDENCE_DIR/operator-namespace-delete-options.json"
+  deadline=$((SECONDS + ${WAIT_TIMEOUT%s}))
+  : >"$EVIDENCE_DIR/operator-namespace-watch.jsonl"
+  while ((SECONDS < deadline)); do
+    if oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-watch.raw.json" 2>/dev/null; then
+      jq --arg observedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{observedAt:$observedAt,uid:.metadata.uid,deletionTimestamp:.metadata.deletionTimestamp,finalizers:(.spec.finalizers//[])}' \
+        "$EVIDENCE_DIR/operator-namespace-watch.raw.json" >>"$EVIDENCE_DIR/operator-namespace-watch.jsonl"
+      jq -e --arg uid "$NAMESPACE_UID" '.metadata.uid==$uid and .metadata.deletionTimestamp!=null' \
+        "$EVIDENCE_DIR/operator-namespace-watch.raw.json" >/dev/null || fail 'operator namespace UID changed or deletion timestamp was not observed'
+    else
+      break
+    fi
+    sleep 2
+  done
+  if oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-after.json" 2>/dev/null; then
+    fail 'operator namespace cleanup did not complete before timeout'
   fi
-  sleep 2
-done
-if oc get namespace "$RELEASE_NAMESPACE" -o json >"$EVIDENCE_DIR/operator-namespace-after.json" 2>/dev/null; then
-  fail 'operator namespace cleanup did not complete before timeout'
+  require_absent namespace "$RELEASE_NAMESPACE" ""
 fi
-require_absent namespace "$RELEASE_NAMESPACE" ""
 api_ready
 
 jq -n --arg run "$RUN_LABEL" --arg api "$EXPECTED_API_SERVER" --arg network "$NETWORK_NAME" --arg networkUid "$NETWORK_UID" \
   --arg site "$SITE_NAME" --arg siteUid "$SITE_UID" --arg release "$RELEASE_NAMESPACE/$RELEASE_NAME" \
   --arg image "$OPERATOR_IMAGE" --arg evidence "$EVIDENCE_DIR" --arg resumedFrom "$RESUME_FROM" \
-  '{schema:"praxis-extproc.grid-operator-cleanup/v1",status:"passed",run:$run,apiServer:$api,gridNetwork:{name:$network,uid:$networkUid,withdrawalFinalizerObserved:true,operatorReceiptObserved:true},gridSite:{name:$site,uid:$siteUid},helmRelease:$release,operatorImage:$image,crdsRetained:true,operatorNamespaceRemoved:true,taskResourceNamespaceRemoved:false,resumedFrom:(if $resumedFrom=="" then null else $resumedFrom end),evidenceDirectory:$evidence,inferenceTrafficSent:false}' \
+  --argjson operatorNamespaceRemoved "$operator_namespace_removed" \
+  '{schema:"praxis-extproc.grid-operator-cleanup/v1",status:"passed",run:$run,apiServer:$api,gridNetwork:{name:$network,uid:$networkUid,withdrawalFinalizerObserved:true,operatorReceiptObserved:true},gridSite:{name:$site,uid:$siteUid},helmRelease:$release,operatorImage:$image,crdsRetained:true,operatorNamespaceRemoved:$operatorNamespaceRemoved,operatorNamespaceRemovalDeferredToTaskCleanup:($operatorNamespaceRemoved|not),taskResourceNamespaceRemoved:false,resumedFrom:(if $resumedFrom=="" then null else $resumedFrom end),evidenceDirectory:$evidence,inferenceTrafficSent:false}' \
   >"$EVIDENCE_DIR/RESULT.json"
 for file in "$EVIDENCE_DIR"/*; do
   if [[ -d "$file" ]]; then chmod 0700 "$file"; else chmod 0600 "$file"; fi

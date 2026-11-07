@@ -23,7 +23,7 @@ qualification, then performs ordered natural cleanup. cleanup resumes that
 run's cleanup from the private lifecycle journal after failure/cancellation.
 
 Inputs: KIND_RUN_ROOT (default: $RUNNER_TEMP/grid-llmd-kind); SOURCE_MODE must
-be main; KIND_CAPACITY_PROFILE must be gha-standard-4cpu. EXTPROC_REF selects
+be main; KIND_CAPACITY_PROFILE must be full or gha-standard-4cpu. EXTPROC_REF selects
 the checked-out feature commit on the confirmed fork (GITHUB_SHA in Actions).
 USAGE
       exit 0
@@ -34,8 +34,8 @@ fi
 [[ "$MODE" == run || "$MODE" == cleanup ]] || { printf 'mode must be run or cleanup\n' >&2; exit 2; }
 
 CAPACITY_PROFILE="${KIND_CAPACITY_PROFILE:-gha-standard-4cpu}"
-[[ "$CAPACITY_PROFILE" == gha-standard-4cpu ]] || {
-  printf 'this workflow requires the explicit gha-standard-4cpu profile\n' >&2; exit 2;
+[[ "$CAPACITY_PROFILE" == full || "$CAPACITY_PROFILE" == gha-standard-4cpu ]] || {
+  printf 'KIND_CAPACITY_PROFILE must be full for local functionality runs or gha-standard-4cpu for Actions capacity qualification\n' >&2; exit 2;
 }
 
 if [[ "$MODE" == run ]]; then
@@ -50,7 +50,11 @@ if [[ "$MODE" == run ]]; then
   REGISTRY_NAME="grid-llmd-$SHORT_ID-registry"
   NETWORK_NAME="grid-llmd-$SHORT_ID-network"
   TASK_NAMESPACE="grid-llmd-$SHORT_ID"
-  OPERATOR_NAMESPACE="praxis-grid-$SHORT_ID"
+  # Current Grid source requires its local identity Secrets in the operator
+  # namespace, while delegated Gateway mount reconciliation requires those
+  # referenced Secrets in the Gateway namespace. Keep both owners in the same
+  # run-owned namespace rather than producing a cross-namespace mismatch.
+  OPERATOR_NAMESPACE="$TASK_NAMESPACE"
   GRID_NETWORK="grid-llmd-$SHORT_ID-network"
   GRID_SITE="grid-llmd-$SHORT_ID-site"
   TASK_GATEWAY="grid-llmd-ingress"
@@ -300,6 +304,15 @@ source_dir() { jq -er --arg name "$1" '.components[$name].worktree_path' "$RUN_D
 source_context() { jq -er --arg name "$1" '.components[$name].build_context_sha256' "$RUN_DIR/source-resolution/source-locks.json"; }
 image_ref() { cat "$RUN_DIR/images/$1/image-ref.txt"; }
 image_repo() { local ref; ref="$(image_ref "$1")"; printf '%s\n' "${ref%@*}"; }
+runtime_image_digest() {
+  local ref
+  ref="$(image_ref "$1")"
+  [[ "$ref" == *@sha256:* ]] || {
+    printf 'image %s is not pinned by an immutable sha256 reference\n' "$1" >&2
+    return 1
+  }
+  printf '%s\n' "${ref##*@}"
+}
 image_provenance() { printf '%s/images/%s/image-provenance-%s.json' "$RUN_DIR" "$1" "$1"; }
 image_metadata() { printf '%s/images/%s/build-metadata-%s.json' "$RUN_DIR" "$1" "$1"; }
 fresh_evidence() { mkdir -p "$(dirname "$1")"; [[ ! -e "$1" ]] || { printf 'evidence path already exists: %s\n' "$1" >&2; return 2; }; }
@@ -411,7 +424,13 @@ if [[ "$MODE" == cleanup ]]; then
       serving_cleanup_required=true
       CLEANUP_STAGE=serving-pool-cleanup
       serving_cleanup_dir="$RUN_DIR/cleanup/serving-$(date -u +%H%M%S)"
-      KIND_SERVING_CLEANUP_MODE=fresh KIND_SERVING_CLEANUP_EVIDENCE_DIR="$serving_cleanup_dir" \
+      serving_cleanup_mode=fresh
+      if [[ "$CLEANUP_CONTEXT" == workflow-retry ]]; then
+        # A failed lifecycle may have installed only one pool. Resume cleanup
+        # inventories and removes whatever exact run-owned subset exists.
+        serving_cleanup_mode=resume
+      fi
+      KIND_SERVING_CLEANUP_MODE="$serving_cleanup_mode" KIND_SERVING_CLEANUP_EVIDENCE_DIR="$serving_cleanup_dir" \
         bash "$(helper cleanup-kind-serving.sh)" || cleanup_rc=$?
       if [[ -s "$serving_cleanup_dir/RESULT.json" ]] && jq -e '.status=="serving-resources-removed"' "$serving_cleanup_dir/RESULT.json" >/dev/null 2>&1; then
         serving_cleanup_passed=true
@@ -559,6 +578,23 @@ source "$SOURCE_ROOT/resolved-sources.env"
 cp "$RUN_DIR/source-resolution/source-locks.json" "$RUN_DIR/source-resolution/source-locks-main.json"
 chmod 0600 "$RUN_DIR/source-resolution/source-locks.json" "$RUN_DIR/source-resolution/source-locks-main.json"
 
+mkdir -p "$RUN_DIR/renderer-tests"
+phase_start payload-tls-renderer-tests
+PYTHONPATH="$SCRIPT_DIR" python3 "$SCRIPT_DIR/test_render_kind_aigc_manifest_bundle.py" \
+  >"$RUN_DIR/renderer-tests/unit-renderer.log" 2>&1
+PYTHONPATH="$SCRIPT_DIR" python3 "$SCRIPT_DIR/test_verify_kind_payload_tls_config.py" \
+  >"$RUN_DIR/renderer-tests/live-contract-checker.log" 2>&1
+bash "$SCRIPT_DIR/test-kind-payload-tls-contract.sh" \
+  >"$RUN_DIR/renderer-tests/lifecycle-contract.log" 2>&1
+python3 "$SCRIPT_DIR/test_validate_grid_gateway_chart_render.py" \
+  >"$RUN_DIR/renderer-tests/gateway-chart-resource-ownership.log" 2>&1
+bash "$SCRIPT_DIR/test-grid-gateway-path-config.sh" \
+  >"$RUN_DIR/renderer-tests/gateway-path-contract.log" 2>&1
+bash "$SCRIPT_DIR/test-render-kind-aigc-source.sh" "$(source_dir aigc)" \
+  "$RUN_DIR/renderer-tests/locked-aigc-source-render.json" \
+  >"$RUN_DIR/renderer-tests/locked-aigc-source-render.log" 2>&1
+phase_end 0
+
 run_phase kind-cluster-and-registry \
   E2E_RUN_ID="$RUN_ID" KIND_CLUSTER_NAME="$CLUSTER_NAME" \
   KIND_REGISTRY_CONTAINER="$REGISTRY_NAME" KIND_REGISTRY_NETWORK="$NETWORK_NAME" \
@@ -574,26 +610,33 @@ export E2E_RUN_ID="$RUN_ID" KIND_CLUSTER_NAME="$CLUSTER_NAME" KIND_REGISTRY_CONT
   POOL_A_GATEWAY_NAME="$POOL_A_GATEWAY" POOL_B_GATEWAY_NAME="$POOL_B_GATEWAY" \
   GRID_OPERATOR_RELEASE_NAME="$GRID_OPERATOR_RELEASE" GRID_GATEWAY_RELEASE_NAME="$GATEWAY_RELEASE"
 
+mkdir -p "$STATE_DIR/registry-auth"
+chmod 0700 "$STATE_DIR/registry-auth"
+REGISTRY_AUTH_FILE="$STATE_DIR/registry-auth/anonymous.json"
+printf '{"auths":{}}\n' >"$REGISTRY_AUTH_FILE"
+chmod 0600 "$REGISTRY_AUTH_FILE"
 run_phase kind-images-build E2E_RUN_ID="$RUN_ID" GRID_LLMD_RUN_DIR="$RUN_DIR" \
   KIND_CAPACITY_PROFILE="$CAPACITY_PROFILE" CONTAINER_ENGINE=podman \
-  IMAGE_INSPECTOR=skopeo -- "$(helper build-kind-images.sh)"
+  IMAGE_INSPECTOR=skopeo REGISTRY_AUTH_FILE="$REGISTRY_AUTH_FILE" -- "$(helper build-kind-images.sh)"
 
 # The read-only platform and pool verifiers must use this run's immutable image
 # and source locks too; they must never fall back to helper defaults.
 export SOURCE_LOCKS_FILE="$RUN_DIR/source-resolution/source-locks.json"
 export SOURCE_LOCKS_MD="$RUN_DIR/source-resolution/source-locks.md"
-GRID_GATEWAY_SOURCE_REVISION="$(source_value grid)"
+GRID_SOURCE_REVISION="$(source_value grid)"
+GRID_GATEWAY_SOURCE_REVISION="$GRID_SOURCE_REVISION"
 ODH_GRID_OPERATOR_SOURCE_REVISION="$(source_value grid-operator)"
 GRID_OPERATOR_SOURCE_REVISION="$(source_value grid-operator)"
 MAAS_SOURCE_REVISION="$(source_value maas)"
 EPP_SOURCE_REVISION="$(source_value epp)"
 SIMULATOR_SOURCE_REVISION="$(source_value llm-d-sim)"
 EXTPROC_SOURCE_REVISION="$(source_value extproc)"
+GRID_OPERATOR_IMAGE="$(image_ref grid-operator)"
 EPP_IMAGE="$(image_ref epp)"
 SIMULATOR_IMAGE="$(image_ref llm-d-sim)"
 EXTPROC_IMAGE="$(image_ref extproc)"
 SIMULATOR_IMAGE_PROVENANCE_FILE="$(image_provenance llm-d-sim)"
-export GRID_GATEWAY_SOURCE_REVISION ODH_GRID_OPERATOR_SOURCE_REVISION GRID_OPERATOR_SOURCE_REVISION
+export GRID_SOURCE_REVISION GRID_GATEWAY_SOURCE_REVISION ODH_GRID_OPERATOR_SOURCE_REVISION GRID_OPERATOR_SOURCE_REVISION GRID_OPERATOR_IMAGE
 export MAAS_SOURCE_REVISION EPP_SOURCE_REVISION SIMULATOR_SOURCE_REVISION EXTPROC_SOURCE_REVISION
 export EPP_IMAGE SIMULATOR_IMAGE EXTPROC_IMAGE SIMULATOR_IMAGE_PROVENANCE_FILE
 IMAGE_PROVENANCE_FILE="$SIMULATOR_IMAGE_PROVENANCE_FILE"
@@ -691,6 +734,18 @@ KIND_MAAS_API_CA_EVIDENCE_DIR="$RUN_DIR/platform/maas-api-ca" run_phase maas-api
 KIND_MAAS_TENANT_CA_MODE=trust KIND_MAAS_TENANT_CA_STATE_FILE="$STATE_DIR/tenant-ca-state.json" \
   KIND_MAAS_TENANT_CA_EVIDENCE_DIR="$RUN_DIR/platform/tenant-ca-trust" run_phase tenant-ca-trust -- \
   "$(helper install-kind-maas-tenant-ca.sh)"
+PAYLOAD_CA_SECRET_NAME="$(jq -er '.resources.caSecret.name' "$STATE_DIR/tenant-ca-state.json")"
+PAYLOAD_CA_SECRET_UID="$(jq -er '.resources.caSecret.uid' "$STATE_DIR/tenant-ca-state.json")"
+PAYLOAD_CA_FILE="$STATE_DIR/payload-issuer-ca.pem"
+kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" get secret "$PAYLOAD_CA_SECRET_NAME" -n cert-manager -o json \
+  | jq -er --arg uid "$PAYLOAD_CA_SECRET_UID" 'if .metadata.uid==$uid then .data["tls.crt"] else error("run CA Secret UID changed") end' \
+  | base64 -d >"$PAYLOAD_CA_FILE"
+chmod 0600 "$PAYLOAD_CA_FILE"
+payload_ca_fingerprint="$(openssl x509 -in "$PAYLOAD_CA_FILE" -noout -fingerprint -sha256 | sed 's/^[^=]*=//;s/://g')"
+[[ "$payload_ca_fingerprint" == "$(jq -er '.publicCertificateFingerprintSHA256' "$STATE_DIR/tenant-ca-state.json" | tr -d ':')" ]] || {
+  printf 'extracted payload CA does not match the run issuer fingerprint\n' >&2
+  exit 2
+}
 KIND_MAAS_CLEANUP_MODE=prepare KIND_MAAS_CLEANUP_STATE_FILE="$STATE_DIR/maas-cleanup-state.json" \
   KIND_MAAS_CLEANUP_EVIDENCE_DIR="$RUN_DIR/platform/maas-cleanup-prep" \
   KIND_MAAS_CA_SOURCE_SECRET=maas-api-serving-cert KIND_MAAS_API_SERVICE_HOST=maas-api.maas-system.svc \
@@ -710,7 +765,14 @@ kustomize build "$AIGC_CONTROLLER_KUSTOMIZATION" >"$STATE_DIR/aigc-controller-so
 python3 "$SCRIPT_DIR/render_kind_aigc_manifest_bundle.py" \
   --source-dir "$AIGC_SOURCE/config/manifests/praxis-extproc/overlays/odh" \
   --output "$AIGC_BUNDLE" --run-id "$RUN_ID" --namespace opendatahub --name "$AIGC_BUNDLE_NAME" \
+  --payload-ca-file "$PAYLOAD_CA_FILE" --certificates-output "$RUN_DIR/platform/payload-certificates.yaml" \
   >"$RUN_DIR/logs/aigc-bundle-render.log" 2>&1
+run_phase payload-certificates -- "$(helper install-kind-payload-tls.sh)" \
+  --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
+  --run-id "$RUN_ID" --namespace maas-system --issuer rhai-ca-issuer \
+  --ca-secret "$PAYLOAD_CA_SECRET_NAME" --ca-secret-uid "$PAYLOAD_CA_SECRET_UID" \
+  --ca-file "$PAYLOAD_CA_FILE" --certificates-file "$RUN_DIR/platform/payload-certificates.yaml" \
+  --evidence-dir "$RUN_DIR/platform/payload-certificates"
 python3 "$SCRIPT_DIR/render_kind_aigc_controller.py" \
   --input "$STATE_DIR/aigc-controller-source.yaml" --output "$RUN_DIR/platform/aigc-controller.yaml" \
   --run-id "$RUN_ID" --controller-image "$(image_ref aigc-controller)" \
@@ -757,6 +819,12 @@ kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" apply --dry-run=ser
   -f "$RUN_DIR/platform/default-aitenant.yaml" >"$RUN_DIR/platform/default-aitenant-dry-run.txt"
 kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" apply -f "$RUN_DIR/platform/default-aitenant.yaml" \
   >"$RUN_DIR/platform/default-aitenant-apply.txt"
+run_phase payload-tls-connectivity -- "$(helper verify-kind-payload-tls.sh)" \
+  --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
+  --run-id "$RUN_ID" --namespace maas-system --ca-file "$PAYLOAD_CA_FILE" \
+  --ca-secret-uid "$(jq -er '.metadata.uid' "$RUN_DIR/platform/payload-certificates/trust-secret-summary.json")" \
+  --issuer-ca-secret "$PAYLOAD_CA_SECRET_NAME" --issuer-ca-secret-uid "$PAYLOAD_CA_SECRET_UID" \
+  --evidence-dir "$RUN_DIR/platform/payload-tls-connectivity" --timeout-seconds 300
 run_phase maas-platform-ready -- "$(helper verify-kind-maas-api.sh)" \
   --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
   --run-id "$RUN_ID" --image "$(image_ref maas-api)" --mode platform-ready \
@@ -827,6 +895,13 @@ KIND_POOL_MAAS_AUTH_MODE=apply KIND_POOL_MAAS_AUTH_POOL=pool-a \
   run_phase pool-a-authorization -- "$(helper configure-kind-pool-maas-auth.sh)"
 phase_end 0
 
+run_phase pool-a-payload-tls -- "$(helper verify-kind-payload-tls.sh)" \
+  --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
+  --run-id "$RUN_ID" --namespace maas-system --pool pool-a --ca-file "$PAYLOAD_CA_FILE" \
+  --ca-secret-uid "$(jq -er '.metadata.uid' "$RUN_DIR/platform/payload-certificates/trust-secret-summary.json")" \
+  --issuer-ca-secret "$PAYLOAD_CA_SECRET_NAME" --issuer-ca-secret-uid "$PAYLOAD_CA_SECRET_UID" \
+  --evidence-dir "$RUN_DIR/platform/pool-a-payload-tls" --timeout-seconds 300
+
 run_pool_setup_probe() {
   local pool="$1" evidence="$RUN_DIR/setup-probes/$1" api_digest epp_digest sim_digest
   api_digest="$(image_ref maas-api)"; api_digest="${api_digest##*@}"
@@ -837,6 +912,7 @@ run_pool_setup_probe() {
     EXPECTED_API_DIGEST="$api_digest" EXPECTED_EPP_DIGEST="$epp_digest" \
     EXPECTED_SIMULATOR_DIGEST="$sim_digest" EXPECTED_RESPONSE_MODEL="$pool-response" \
     KIND_POOL_SETUP_PROBE_STATE_DIR="$STATE_DIR/setup-probe-$pool" \
+    KIND_POOL_SETUP_PROBE_API_CA_FILE="$STATE_DIR/maas-api-root-ca.crt" \
     KIND_POOL_SETUP_PROBE_EVIDENCE_DIR="$evidence" -- "$(helper probe-kind-pool-gateway.sh)"
 }
 phase_start pool-a-setup-receipt
@@ -853,6 +929,13 @@ KIND_POOL_MAAS_AUTH_MODE=apply KIND_POOL_MAAS_AUTH_POOL=pool-b \
   KIND_POOL_MAAS_AUTH_EVIDENCE_DIR="$RUN_DIR/authorization/pool-b" \
   run_phase pool-b-authorization -- "$(helper configure-kind-pool-maas-auth.sh)"
 phase_end 0
+
+run_phase pool-b-payload-tls -- "$(helper verify-kind-payload-tls.sh)" \
+  --context "$KUBE_CONTEXT" --kubeconfig "$KUBECONFIG" --expected-api-server "$EXPECTED_API_SERVER" \
+  --run-id "$RUN_ID" --namespace maas-system --pool pool-b --ca-file "$PAYLOAD_CA_FILE" \
+  --ca-secret-uid "$(jq -er '.metadata.uid' "$RUN_DIR/platform/payload-certificates/trust-secret-summary.json")" \
+  --issuer-ca-secret "$PAYLOAD_CA_SECRET_NAME" --issuer-ca-secret-uid "$PAYLOAD_CA_SECRET_UID" \
+  --evidence-dir "$RUN_DIR/platform/pool-b-payload-tls" --timeout-seconds 300
 
 phase_start pool-b-setup-receipt
 run_pool_setup_probe pool-b
@@ -882,6 +965,9 @@ GRID_IDENTITY_MODE=apply GRID_IDENTITY_TIMEOUT=300 \
   run_phase grid-identity -- "$(helper create-kind-grid-identity.sh)"
 phase_end 0
 
+# Keep the bootstrap volume pointed at the same ConfigMap the Grid operator
+# will later render. The operator validates this source before it can
+# reconcile the generated praxis.yaml mount into the Gateway Deployment.
 phase_start task-gateway-bootstrap
 GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE" \
   PRAXIS_GATEWAY_CHART_SHA256="$PRAXIS_GATEWAY_CHART_SHA256" \
@@ -890,9 +976,11 @@ GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE"
   GRID_GATEWAY_EVIDENCE_DIR="$RUN_DIR/grid/gateway-bootstrap" \
   GRID_GATEWAY_PRAXIS_CONFIG_SOURCE=byo GRID_GATEWAY_PRAXIS_CONFIG_MAP_EXTERNAL=false \
   GRID_GATEWAY_PRAXIS_CONFIG_FILE="$SCRIPT_DIR/operator-bootstrap-praxis.yaml" \
-  GRID_GATEWAY_PRAXIS_CONFIG_MAP_NAME=grid-gateway-config \
+  GRID_GATEWAY_PRAXIS_CONFIG_MAP_NAME=grid-llmd-praxis-config \
   GRID_GATEWAY_BOOTSTRAP_MODE=true GRID_GATEWAY_GRID_SERVING_ENABLED=false \
-  GRID_GATEWAY_PRAXIS_CONFIG_MOUNT_RECONCILIATION_ENABLED=false \
+  GRID_GATEWAY_MOUNT_RECONCILIATION_ENABLED=true \
+  GRID_GATEWAY_TLS_SECRET_NAME=grid-gateway-site-identity GRID_GATEWAY_CA_SECRET_NAME=grid-gateway-ca \
+  GRID_GATEWAY_RELEASE_HELM_MOUNTS=true GRID_GATEWAY_OPERATOR_NAMESPACE="$OPERATOR_NAMESPACE" \
   GRID_GATEWAY_OVERLAY_CONFIGMAP="grid-overlay-$GRID_NETWORK-grid-gateway" \
   GRID_API_GATEWAY_CLASS=istio GRID_GATEWAY_HOSTNAME="$SITE_HOSTNAME" \
   GRID_API_GATEWAY_NAME="$TASK_GATEWAY" GRID_HTTPROUTE_NAME="$TASK_HTTPROUTE" \
@@ -920,6 +1008,14 @@ GRID_PROVIDERS_MODE=apply GRID_PROVIDERS_EVIDENCE_DIR="$RUN_DIR/grid/providers" 
   SIMULATOR_MODEL_NAME=grid-test-model POOL_A_GATEWAY_NAME="$POOL_A_GATEWAY" \
   POOL_B_GATEWAY_NAME="$POOL_B_GATEWAY" \
   run_phase grid-provider-registration -- "$(helper deploy-grid-providers.sh)"
+phase_end 0
+
+phase_start client-identity
+GRID_CLIENT_IDENTITY_MODE=install GRID_CLIENT_IDENTITY_EVIDENCE_DIR="$RUN_DIR/authorization/client-identity" \
+  GRID_CLIENT_MODEL_NAME=grid-test-model GRID_CLIENT_SERVICE_ACCOUNT=grid-llmd-client \
+  GRID_CLIENT_ROLE_NAME=grid-llmd-client-inference-read \
+  GRID_CLIENT_ROLE_BINDING_NAME=grid-llmd-client-inference-read \
+  run_phase client-identity -- "$(helper deploy-grid-client-identity.sh)"
 phase_end 0
 
 phase_start provider-proxies
@@ -969,21 +1065,14 @@ GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS_GATEWAY_CHART_FILE"
   GRID_GATEWAY_EXPECTED_ENDPOINTS_FILE="$GRID_ENDPOINTS_FILE" \
   GRID_GATEWAY_OVERLAY_CONFIGMAP="$OVERLAY_CONFIGMAP" \
   GRID_GATEWAY_BOOTSTRAP_MODE=false GRID_GATEWAY_GRID_SERVING_ENABLED=false \
-  GRID_GATEWAY_PRAXIS_CONFIG_MOUNT_RECONCILIATION_ENABLED=true \
+  GRID_GATEWAY_MOUNT_RECONCILIATION_ENABLED=true \
+  GRID_GATEWAY_TLS_SECRET_NAME=grid-gateway-site-identity GRID_GATEWAY_CA_SECRET_NAME=grid-gateway-ca \
   GRID_GATEWAY_RELEASE_HELM_MOUNTS=true GRID_GATEWAY_OPERATOR_NAMESPACE="$OPERATOR_NAMESPACE" \
   GRID_GATEWAY_HOSTNAME="$SITE_HOSTNAME" GRID_API_GATEWAY_NAME="$TASK_GATEWAY" \
   GRID_HTTPROUTE_NAME="$TASK_HTTPROUTE" GRID_GATEWAY_SERVICE_NAME=grid-gateway \
   GRID_GATEWAY_SERVICE_PORT=8080 GRID_API_GATEWAY_CLASS=istio \
   GRID_IDENTITY_NAMESPACE="$OPERATOR_NAMESPACE" \
   run_phase task-gateway-grid-config -- "$(helper deploy-gateway-path.sh)"
-phase_end 0
-
-phase_start task-gateway-retry-contract
-GRID_GATEWAY_RETRY_MODE=install GRID_GATEWAY_RETRY_EVIDENCE_DIR="$RUN_DIR/grid/retry-policy" \
-  GRID_LLMD_INGRESS_GATEWAY_NAME="$TASK_GATEWAY" \
-  GRID_LLMD_GRID_GATEWAY_SERVICE="$TASK_NAMESPACE/grid-gateway" \
-  GRID_LLMD_GATEWAY_HOST="$SITE_HOSTNAME" \
-  run_phase task-gateway-retry-contract -- "$(helper disable-task-gateway-retries.sh)"
 phase_end 0
 
 phase_start extproc-filter
@@ -993,14 +1082,6 @@ GRID_EXTPROC_MODE=install GRID_EXTPROC_IMAGE="$EXTPROC_IMAGE" \
   GRID_EXTPROC_EVIDENCE_DIR="$RUN_DIR/extproc/install" \
   GRID_API_GATEWAY_NAME="$TASK_GATEWAY" \
   run_phase extproc-filter -- "$(helper deploy-extproc-filter.sh)"
-phase_end 0
-
-phase_start client-identity
-GRID_CLIENT_IDENTITY_MODE=install GRID_CLIENT_IDENTITY_EVIDENCE_DIR="$RUN_DIR/authorization/client-identity" \
-  GRID_CLIENT_MODEL_NAME=grid-test-model GRID_CLIENT_SERVICE_ACCOUNT=grid-llmd-client \
-  GRID_CLIENT_ROLE_NAME=grid-llmd-client-inference-read \
-  GRID_CLIENT_ROLE_BINDING_NAME=grid-llmd-client-inference-read \
-  run_phase client-identity -- "$(helper deploy-grid-client-identity.sh)"
 phase_end 0
 
 phase_start pretraffic-route-contract
@@ -1072,9 +1153,15 @@ export GRID_LLMD_BACKEND_HEADER=x-ai-inference-provider
 export GRID_LLMD_EXPECTED_EXTPROC_HOPS=1
 export GRID_LLMD_EXTPROC_FILTER_RESOURCES="$TASK_NAMESPACE/envoyfilter/praxis-grid-llmd-extproc"
 export GRID_LLMD_HTTPROUTE_RESOURCE="$TASK_NAMESPACE/httproute/$TASK_HTTPROUTE"
+export GRID_LLMD_GRID_SITE_RESOURCE="$TASK_NAMESPACE/gridsite/$GRID_SITE"
+export GRID_LLMD_SITE_IDENTITY_SECRET="$TASK_NAMESPACE/grid-site-identity"
+export GRID_LLMD_GRID_CA_SECRET="$TASK_NAMESPACE/grid-ca"
+export GRID_LLMD_EXPECTED_SITE_SAN="$SITE_HOSTNAME"
 export GRID_LLMD_GRID_GATEWAY_NAME=grid-gateway
-export GRID_LLMD_GRID_OPERATOR_DEPLOYMENT="$OPERATOR_NAMESPACE/deployment/grid-operator"
+export GRID_LLMD_GRID_OPERATOR_DEPLOYMENT="$OPERATOR_NAMESPACE/grid-operator"
 export GRID_LLMD_GRID_GATEWAY_SERVICE="$TASK_NAMESPACE/service/grid-gateway"
+export GRID_LLMD_DEPLOYMENTS="maas-system/maas-controller"
+export GRID_LLMD_IPP_STATE=absent
 export GRID_LLMD_GATE_RESOURCES="maas=ai-tenants/aitenant/pool-a#Ready,grid=$TASK_NAMESPACE/gridnetwork/$GRID_NETWORK#exists,gateway=$TASK_NAMESPACE/gateway/$TASK_GATEWAY#Programmed,llminferenceservice=$TASK_NAMESPACE/llminferenceservice/pool-a#Ready"
 export GRID_LLMD_POOL_RESOURCES="$TASK_NAMESPACE/inferencepool/pool-a-inference-pool#exists,$TASK_NAMESPACE/inferencepool/pool-b-inference-pool#exists"
 export GRID_LLMD_POOL_MODEL_RESOURCES="pool-a-inference-pool=$TASK_NAMESPACE/llminferenceservice/pool-a,pool-b-inference-pool=$TASK_NAMESPACE/llminferenceservice/pool-b"
@@ -1098,7 +1185,8 @@ export GRID_LLMD_EVIDENCE_DIR="$RUN_DIR/qualification"
 export GRID_LLMD_SOURCE_LOCKS_FILE="$RUN_DIR/source-resolution/source-locks.json"
 GRID_LLMD_SOURCE_REVISIONS="grid=$(source_value grid),praxis-ai-grid-operator=$(source_value grid-operator),praxis-extproc=$(source_value extproc),praxis-ai=$(source_value praxis-ai),maas=$(source_value maas),llm-d-epp=$(source_value epp),llm-d-sim=$(source_value llm-d-sim)"
 GRID_LLMD_IMAGE_PINS="praxis-ai-grid-operator=$(image_ref grid-operator),grid-gateway=$(image_ref grid-gateway),maas-controller=$(image_ref maas-controller),praxis-ai=$(image_ref praxis-ai),praxis-extproc=$(image_ref extproc),llm-d-epp=$(image_ref epp),llm-d-sim=$(image_ref llm-d-sim)"
-export GRID_LLMD_SOURCE_REVISIONS GRID_LLMD_IMAGE_PINS
+GRID_LLMD_RUNTIME_IMAGE_DIGESTS="praxis-ai-grid-operator=$(runtime_image_digest grid-operator),grid-gateway=$(runtime_image_digest grid-gateway),maas-controller=$(runtime_image_digest maas-controller),praxis-ai=$(runtime_image_digest praxis-ai),praxis-extproc=$(runtime_image_digest extproc),llm-d-epp=$(runtime_image_digest epp),llm-d-sim=$(runtime_image_digest llm-d-sim)"
+export GRID_LLMD_SOURCE_REVISIONS GRID_LLMD_IMAGE_PINS GRID_LLMD_RUNTIME_IMAGE_DIGESTS
 CLIENT_TOKEN="$(kubectl --kubeconfig="$KUBECONFIG" --context="$KUBE_CONTEXT" \
   create token grid-llmd-client -n "$TASK_NAMESPACE" --duration=1h)"
 [[ -n "$CLIENT_TOKEN" ]] || { printf 'task client TokenRequest returned empty output\n' >&2; exit 1; }

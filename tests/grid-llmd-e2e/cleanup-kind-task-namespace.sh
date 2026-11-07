@@ -14,6 +14,7 @@ SITE_NAME="${GRID_SITE_NAME:-}"
 GATEWAY_RELEASE="${GRID_GATEWAY_RELEASE_NAME:-}"
 TASK_GATEWAY="${GRID_TASK_GATEWAY_NAME:-grid-llmd-ingress}"
 EPP_CLUSTER_ROLE="${GRID_EPP_METRICS_CLUSTER_ROLE_NAME:-grid-llmd-kind-epp-auth}"
+EXTPROC_SERVICE_ACCOUNT="${GRID_EXTPROC_SERVICE_ACCOUNT_NAME:-praxis-extproc}"
 WAIT_SECONDS="${KIND_TASK_CLEANUP_WAIT_SECONDS:-300}"
 EVIDENCE_DIR="${KIND_TASK_CLEANUP_EVIDENCE_DIR:-}"
 
@@ -21,18 +22,19 @@ if [[ "$MODE" == plan ]]; then
   cat <<'PLAN'
 Plan: verify GridNetwork/GridSite/providers/LLMIServices/AITenants are absent,
 uninstall the task Gateway Helm release, wait for its Istio data plane to vanish,
-delete only the run-owned EPP metrics ClusterRole/Binding, then UID-precondition
-the run-owned task namespace delete. No finalizers are removed.
+delete only the run-owned EPP and ExtProc metrics ClusterRole/Bindings, then
+UID-precondition the run-owned task namespace delete. No finalizers are removed.
 PLAN
   exit 0
 fi
 [[ "$MODE" == fresh || "$MODE" == resume ]] || { printf 'KIND_TASK_CLEANUP_MODE must be plan, fresh, or resume\n' >&2; exit 2; }
-for bin in oc helm jq curl; do command -v "$bin" >/dev/null || { printf '%s is required\n' "$bin" >&2; exit 2; }; done
+for bin in oc helm jq curl sha256sum; do command -v "$bin" >/dev/null || { printf '%s is required\n' "$bin" >&2; exit 2; }; done
 [[ -n "$CONTEXT" && -n "$EXPECTED_SERVER" && -n "$RUN_LABEL" && -n "$NAMESPACE" && -n "$NETWORK_NAME" && -n "$SITE_NAME" && -n "$GATEWAY_RELEASE" && -n "$EVIDENCE_DIR" ]] || {
   printf 'KUBE_CONTEXT, EXPECTED_API_SERVER, GRID_RUN_LABEL, GRID_RESOURCE_NAMESPACE, GRID_NETWORK_NAME, GRID_SITE_NAME, GRID_GATEWAY_RELEASE_NAME, and KIND_TASK_CLEANUP_EVIDENCE_DIR are required\n' >&2
   exit 2
 }
 [[ "$WAIT_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || { printf 'KIND_TASK_CLEANUP_WAIT_SECONDS must be 1..9999\n' >&2; exit 2; }
+EXTPROC_METRICS_CLUSTER_ROLE="${GRID_EXTPROC_METRICS_AUTH_CLUSTER_ROLE_NAME:-praxis-extproc-metrics-auth-$(printf '%s' "$RUN_LABEL" | sha256sum | cut -c1-12)}"
 [[ ! -e "$EVIDENCE_DIR" ]] || { printf 'evidence path already exists\n' >&2; exit 2; }
 mkdir -p "$EVIDENCE_DIR"
 chmod 0700 "$EVIDENCE_DIR"
@@ -111,6 +113,21 @@ for resource in configmaps secrets serviceaccounts roles rolebindings services d
       labels:.metadata.labels,annotations:.metadata.annotations,finalizers:.metadata.finalizers,ownerReferences:.metadata.ownerReferences,
       images:[.spec.template.spec.containers[]?.image],dataKeys:(if .kind=="Secret" or .kind=="ConfigMap" then ((.data//{})|keys) else null end)}]' \
     >"$EVIDENCE_DIR/$file.json" || fail "could not snapshot $resource"
+done
+for resource in clusterroles clusterrolebindings; do
+  file="$EVIDENCE_DIR/$resource-$EXTPROC_METRICS_CLUSTER_ROLE.json"
+  if object="$(oc get "$resource" "$EXTPROC_METRICS_CLUSTER_ROLE" -o json 2>/dev/null)"; then
+    jq -e --arg run "$RUN_LABEL" '
+      .metadata.labels["praxis.fast/qualification-run"]==$run and
+      .metadata.labels["app.kubernetes.io/name"]=="praxis-extproc" and
+      .metadata.labels["app.kubernetes.io/managed-by"]=="grid-llmd-e2e-run"
+    ' <<<"$object" >/dev/null || fail "$resource/$EXTPROC_METRICS_CLUSTER_ROLE is not positively owned by this ExtProc run"
+    jq '[{kind,metadata:{name:.metadata.name,uid:.metadata.uid,generation:.metadata.generation,labels:.metadata.labels,
+      annotations:.metadata.annotations,finalizers:.metadata.finalizers},roleRef,subjects,rules}]' <<<"$object" >"$file" ||
+      fail "could not snapshot $resource/$EXTPROC_METRICS_CLUSTER_ROLE"
+  else
+    printf '[]\n' >"$file"
+  fi
 done
 
 gateway_release_was_present=false
@@ -201,6 +218,38 @@ for resource in clusterrole clusterrolebinding; do
   fi
 done
 
+# Remove only the ExtProc metrics-auth binding and role from this run. The
+# binding is checked against the exact role and namespaced ServiceAccount;
+# the role is checked against the two source-supported create permissions.
+for resource in clusterrolebinding clusterrole; do
+  file="$EVIDENCE_DIR/$resource-$EXTPROC_METRICS_CLUSTER_ROLE.json"
+  if object="$(oc get "$resource" "$EXTPROC_METRICS_CLUSTER_ROLE" -o json 2>/dev/null)"; then
+    jq -e --arg run "$RUN_LABEL" --arg sa "$EXTPROC_SERVICE_ACCOUNT" --arg ns "$NAMESPACE" \
+      --arg role "$EXTPROC_METRICS_CLUSTER_ROLE" '
+      .metadata.labels["praxis.fast/qualification-run"]==$run and
+      .metadata.labels["app.kubernetes.io/name"]=="praxis-extproc" and
+      .metadata.labels["app.kubernetes.io/managed-by"]=="grid-llmd-e2e-run" and
+      (if .kind=="ClusterRoleBinding" then
+        .roleRef.kind=="ClusterRole" and .roleRef.name==$role and
+        any(.subjects[]?;.kind=="ServiceAccount" and .name==$sa and .namespace==$ns)
+       else .kind=="ClusterRole" and
+        .rules==[{"apiGroups":["authentication.k8s.io"],"resources":["tokenreviews"],"verbs":["create"]},
+                 {"apiGroups":["authorization.k8s.io"],"resources":["subjectaccessreviews"],"verbs":["create"]}]
+       end)
+    ' <<<"$object" >/dev/null || fail "$resource/$EXTPROC_METRICS_CLUSTER_ROLE ownership or contract check failed"
+    jq '{kind,metadata:{name:.metadata.name,uid:.metadata.uid,labels:.metadata.labels,finalizers:.metadata.finalizers}}' \
+      <<<"$object" >"$file.before-delete.json"
+    oc delete "$resource" "$EXTPROC_METRICS_CLUSTER_ROLE" --wait=true --timeout="${WAIT_SECONDS}s" \
+      >"$file.delete.txt" || fail "could not delete $resource/$EXTPROC_METRICS_CLUSTER_ROLE"
+    oc get "$resource" "$EXTPROC_METRICS_CLUSTER_ROLE" --ignore-not-found -o name >"$file.after-delete.txt" ||
+      fail "could not verify deletion of $resource/$EXTPROC_METRICS_CLUSTER_ROLE"
+    [[ ! -s "$file.after-delete.txt" ]] || fail "$resource/$EXTPROC_METRICS_CLUSTER_ROLE remains after deletion"
+    printf '{"deleted":true}\n' >"$file.delete-result.json"
+  else
+    printf '{"absent":true}\n' >"$file.before-delete.json"
+  fi
+done
+
 # Submit a UID-preconditioned DELETE through a loopback API proxy.
 oc get namespace "$NAMESPACE" -o json >"$EVIDENCE_DIR/task-namespace-before-delete.json" || fail 'task namespace disappeared before final deletion'
 jq -e --arg run "$RUN_LABEL" --arg uid "$NAMESPACE_UID" '.metadata.uid==$uid and .metadata.labels["praxis.fast/qualification-run"]==$run' \
@@ -232,11 +281,13 @@ oc get namespace "$NAMESPACE" -o json >"$EVIDENCE_DIR/task-namespace-after.json"
 kill "$API_PROXY_PID" 2>/dev/null || true
 wait "$API_PROXY_PID" 2>/dev/null || true
 jq -n --arg run "$RUN_LABEL" --arg namespace "$NAMESPACE" --arg uid "$NAMESPACE_UID" --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg extprocMetricsAuthClusterRole "$EXTPROC_METRICS_CLUSTER_ROLE" \
   --argjson gatewayReleaseWasPresent "$gateway_release_was_present" \
   '{status:"task-gateway-and-namespace-removed",runLabel:$run,namespace:$namespace,namespaceUID:$uid,completedAt:$completedAt,
-    taskGatewayReleaseWasPresent:$gatewayReleaseWasPresent,naturalGridWithdrawalWasVerifiedBeforeCleanup:true,manualFinalizerRemoval:false}' >"$EVIDENCE_DIR/RESULT.json"
+    taskGatewayReleaseWasPresent:$gatewayReleaseWasPresent,naturalGridWithdrawalWasVerifiedBeforeCleanup:true,manualFinalizerRemoval:false,
+    extprocMetricsAuthClusterRole:$extprocMetricsAuthClusterRole,extprocMetricsAuthBindingRemoved:true}' >"$EVIDENCE_DIR/RESULT.json"
 if [[ "$gateway_release_was_present" == true ]]; then
-  log 'Task Gateway release, task namespace, and run-owned EPP metrics role/binding were removed; platform dependencies remain until Kind cluster deletion'
+  log 'Task Gateway release, task namespace, and run-owned EPP/ExtProc metrics roles and bindings were removed; platform dependencies remain until Kind cluster deletion'
 else
-  log 'Task Gateway release was absent and the live Gateway/HTTPRoute/data-plane inventory was empty; task namespace and run-owned EPP metrics role/binding were removed'
+  log 'Task Gateway release was absent and the live Gateway/HTTPRoute/data-plane inventory was empty; task namespace and run-owned EPP/ExtProc metrics roles and bindings were removed'
 fi

@@ -15,9 +15,12 @@ route_delete = source.find('uid_precondition_delete "/apis/gateway.networking.k8
 gateway_delete = source.find('uid_precondition_delete "/apis/gateway.networking.k8s.io/v1/namespaces/$NAMESPACE/gateways/', route_delete)
 gateway_convergence = source.rfind("gateway-controller-resource-wait.jsonl", gateway_uninstall)
 role_cleanup = source.find('for resource in clusterrole clusterrolebinding;', gateway_convergence)
-namespace_delete = source.find('namespace-delete-options.json', role_cleanup)
+extproc_role_cleanup = source.find('# Remove only the ExtProc metrics-auth binding and role from this run.', role_cleanup)
+extproc_binding_before_role = source.find('for resource in clusterrolebinding clusterrole;', extproc_role_cleanup)
+namespace_delete = source.find('namespace-delete-options.json', extproc_binding_before_role)
 namespace_wait = source.find('namespace-delete-wait.jsonl', namespace_delete)
-positions = [grid_absence, provider_absence, gateway_uninstall, route_delete, gateway_delete, gateway_convergence, role_cleanup, namespace_delete, namespace_wait]
+positions = [grid_absence, provider_absence, gateway_uninstall, route_delete, gateway_delete, gateway_convergence,
+             role_cleanup, extproc_role_cleanup, extproc_binding_before_role, namespace_delete, namespace_wait]
 if any(position < 0 for position in positions) or positions != sorted(positions):
     raise SystemExit("task cleanup must follow Grid withdrawal and serving cleanup, then remove Gateway/runtime resources, before namespace deletion")
 
@@ -36,6 +39,13 @@ required = (
     "gateway_release_was_present=false",
     "gateway_release_was_present=true",
     "live Gateway/HTTPRoute/data-plane inventory was empty",
+    'EXTPROC_METRICS_CLUSTER_ROLE="${GRID_EXTPROC_METRICS_AUTH_CLUSTER_ROLE_NAME:-praxis-extproc-metrics-auth-',
+    'any(.subjects[]?;.kind=="ServiceAccount" and .name==$sa and .namespace==$ns)',
+    '.roleRef.kind=="ClusterRole" and .roleRef.name==$role',
+    '"resources":["tokenreviews"]',
+    '"resources":["subjectaccessreviews"]',
+    '"verbs":["create"]',
+    'extprocMetricsAuthBindingRemoved:true',
 )
 missing = [fragment for fragment in required if fragment not in source]
 if missing:
@@ -49,6 +59,9 @@ no_gateway_evidence = source.find('mode:"resume-no-gateway-installed"', no_gatew
 role_cleanup = source.find('for resource in clusterrole clusterrolebinding;', no_gateway_evidence)
 if min(no_gateway, no_gateway_evidence, role_cleanup) < 0 or not no_gateway < no_gateway_evidence < role_cleanup:
     raise SystemExit("resume cleanup must prove the absent-Gateway state before continuing to namespace cleanup")
+extproc_binding_cleanup = source.find('for resource in clusterrolebinding clusterrole;', role_cleanup)
+if extproc_binding_cleanup < role_cleanup:
+    raise SystemExit("ExtProc metrics-auth RBAC must be removed only after the EPP metrics RBAC cleanup stage")
 
 print("Task cleanup supports verified resume without an installed Gateway and UID-preconditions namespace deletion: PASS")
 PY

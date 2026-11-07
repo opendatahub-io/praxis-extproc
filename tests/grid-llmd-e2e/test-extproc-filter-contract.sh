@@ -16,6 +16,22 @@ required = (
     '.components.extproc.resolved_sha==$sha and .components.extproc.resolved_worktree_clean==true',
     '.verified==true and .source_sha==$sha and .image==$image and .oci_revision_label==$sha',
     'praxis.fast/qualification-run',
+    'METRICS_AUTH_CLUSTER_ROLE="${GRID_EXTPROC_METRICS_AUTH_CLUSTER_ROLE_NAME:-praxis-extproc-metrics-auth-',
+    'capture_runtime_diagnostics() {',
+    'oc logs "$pod" -n "$NAMESPACE" -c praxis-extproc --timestamps',
+    'oc logs "$pod" -n "$NAMESPACE" -c praxis-extproc --previous --timestamps',
+    'sanitize_diagnostics.py',
+    'kind: ServiceAccount',
+    'automountServiceAccountToken: true',
+    'kind: ClusterRole',
+    'resources: [tokenreviews]',
+    'resources: [subjectaccessreviews]',
+    'verbs: [create]',
+    'kind: ClusterRoleBinding',
+    'name: $SERVICE_ACCOUNT_NAME',
+    'serviceAccountName: $SERVICE_ACCOUNT_NAME',
+    'metrics_auth:',
+    'enabled: true',
     'response_set:',
     'name: X-Praxis-ExtProc-Response',
     '- filter: e2e_body_oracle',
@@ -47,6 +63,36 @@ required = (
 missing = [item for item in required if item not in source]
 if missing:
     print("ExtProc deployment contract is incomplete: " + repr(missing), file=sys.stderr)
+    raise SystemExit(1)
+if 'automountServiceAccountToken: false' in source:
+    print("ExtProc metrics authentication requires the workload's projected ServiceAccount token", file=sys.stderr)
+    raise SystemExit(1)
+failure_capture_start = source.index('capture_failure() {')
+failure_capture_end = source.index('\n}\ntrap', failure_capture_start)
+failure_capture = source[failure_capture_start:failure_capture_end]
+if failure_capture.find('capture_runtime_diagnostics || true') < 0 or \
+   failure_capture.find('capture_runtime_diagnostics || true') > failure_capture.find('Praxis ExtProc $MODE stopped'):
+    print("ExtProc failures must capture sanitized runtime diagnostics before recording the failed result", file=sys.stderr)
+    raise SystemExit(1)
+
+manifest_start = source.index('cat >"$EVIDENCE_DIR/extproc-resources.yaml"')
+manifest_end = source.index('sha256sum "$EVIDENCE_DIR/extproc-resources.yaml"', manifest_start)
+manifest = source[manifest_start:manifest_end]
+expected_kinds = (
+    'kind: ConfigMap\n',
+    'kind: ServiceAccount\n',
+    'kind: ClusterRole\n',
+    'kind: ClusterRoleBinding\n',
+    'kind: Deployment\n',
+    'kind: Service\n',
+    'kind: EnvoyFilter\n',
+)
+kind_positions = [manifest.find(kind) for kind in expected_kinds]
+if any(position < 0 for position in kind_positions) or kind_positions != sorted(kind_positions):
+    print("server-dry-run manifest must include the complete ordered ExtProc identity, RBAC, workload, and filter resources", file=sys.stderr)
+    raise SystemExit(1)
+if 'clusterrole/$METRICS_AUTH_CLUSTER_ROLE' not in source or 'clusterrolebinding/$METRICS_AUTH_CLUSTER_ROLE' not in source:
+    print("run-owned cluster-scoped metrics-auth resources require ownership preflight", file=sys.stderr)
     raise SystemExit(1)
 
 render = source.index('if [[ "$MODE" == render ]]; then')

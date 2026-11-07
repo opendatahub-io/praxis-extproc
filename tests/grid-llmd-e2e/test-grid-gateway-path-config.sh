@@ -24,6 +24,13 @@ checks = (
     'GRID_SERVING_ENABLED="${GRID_GATEWAY_GRID_SERVING_ENABLED:-false}"',
     'RELEASE_HELM_MOUNTS="${GRID_GATEWAY_RELEASE_HELM_MOUNTS:-$MOUNT_RECONCILIATION_ENABLED}"',
     'HOSTNAME="${GRID_GATEWAY_HOSTNAME:-${GRID_SITE_NAME}.grid.internal}"',
+    'GATEWAY_CA_SECRET_NAME="${GRID_GATEWAY_CA_SECRET_NAME:-$SOURCE_CA_SECRET}"',
+    'co-located Gateway TLS destination must not reuse the Grid-owned source identity Secret name',
+    'co-located Gateway CA destination must not reuse the Grid-owned source CA Secret name',
+    '--arg gatewayCa "$GATEWAY_CA_SECRET_NAME"',
+    'caSecretName: $GATEWAY_CA_SECRET_NAME',
+    'destination_ca_json="$(oc get secret "$GATEWAY_CA_SECRET_NAME" -n "$NAMESPACE" -o json 2>/dev/null)"',
+    'jq --arg ns "$NAMESPACE" --arg name "$GATEWAY_CA_SECRET_NAME" --arg run "$RUN_LABEL"',
     'command helm --kube-context="$KUBE_CONTEXT" "$@"',
     '-f "$SCRIPT_DIR/single-ready-pinned-pod.jq"',
     'specContainers:[.spec.containers[]?|{name,image}]',
@@ -97,6 +104,8 @@ checks = (
     'Grid-generated Praxis ConfigMap failed overlay, reload, endpoint, or credential-field validation',
     'if [[ -n "$PRAXIS_CONFIG_FILE" && "$PRAXIS_CONFIG_MAP_EXTERNAL" == false ]]',
     'Rendered Gateway Deployment does not mount the configured task Grid overlay ConfigMap',
+    'validate_grid_gateway_chart_render.py',
+    'chart-resource-ownership.json',
     'mountPath: "/etc/praxis/routing"',
     'Grid operator-generated consumer config',
     'RUNTIME_READY_TIMEOUT_SECONDS="${GRID_GATEWAY_RUNTIME_TIMEOUT_SECONDS:-300}"',
@@ -121,6 +130,14 @@ checks = (
     'destination_identity_json="$(oc get secret',
     'destination-identity-before-metadata.json',
     'destination-ca-before-metadata.json',
+    'jq --arg ns "$NAMESPACE" --arg name "$TLS_SECRET_NAME" --arg run "$RUN_LABEL"',
+    'jq --arg ns "$NAMESPACE" --arg name "$GATEWAY_CA_SECRET_NAME" --arg run "$RUN_LABEL"',
+    'source-identity-before.json',
+    'source-ca-before.json',
+    'cmp -s "$tmpdir/source-identity-before.json" "$tmpdir/source-identity-after.json"',
+    'cmp -s "$tmpdir/source-ca-before.json" "$tmpdir/source-ca-after.json"',
+    'Grid-owned source site-identity Secret changed during Gateway Secret preparation',
+    'Grid-owned source CA Secret changed during Gateway Secret preparation',
     'gatewayNs "$NAMESPACE"',
     '.spec.tls.siteSecretRef.namespace==$gatewayNs',
     '.spec.tls.caSecretRef.namespace==$gatewayNs',
@@ -132,6 +149,10 @@ missing = [value for value in checks if value not in source]
 if missing:
     print("Grid Gateway path config contract is missing: " + repr(missing), file=sys.stderr)
     raise SystemExit(1)
+if 'caSecretName: $SOURCE_CA_SECRET' in source:
+    raise SystemExit("Gateway values must mount the Gateway-owned CA copy, not the Grid operator source Secret")
+if "grep -Eq '^(kind: Gateway|kind: HTTPRoute|kind: Secret)$'" in source:
+    raise SystemExit("Gateway chart ownership gate must allow only its validated metrics ServiceAccount token Secret")
 select_slot = source.index('praxis_config_map_name="$(python3 "$SCRIPT_DIR/select-grid-gateway-configmap.py"')
 render_values = source.index('cat >"$EVIDENCE_DIR/gateway-values.yaml"')
 if select_slot > render_values:
@@ -169,6 +190,34 @@ if render_annotation("kind", "kind", "other/gateway-controller").returncode == 0
     raise SystemExit("Kind Gateway annotation must reject unsupported controllers")
 if render_annotation("openshift", "ephemeral-dev", "openshift.io/gateway-controller").stdout:
     raise SystemExit("OpenShift Gateway rendering must not receive the Kind-only annotation")
+
+secret_guard_start = source.index('if [[ "$SOURCE_SECRET_NAMESPACE" == "$NAMESPACE" ]]')
+secret_guard_end = source.index("\nfi", secret_guard_start) + len("\nfi")
+secret_guard = source[secret_guard_start:secret_guard_end]
+
+def check_secret_names(source_ns, gateway_ns, source_site, gateway_site, source_ca, gateway_ca):
+    return subprocess.run(
+        ["bash", "-c", 'CURRENT_FAILURE=""\n' + secret_guard + "\nprintf ok"],
+        env={
+            **os.environ,
+            "SOURCE_SECRET_NAMESPACE": source_ns,
+            "NAMESPACE": gateway_ns,
+            "SOURCE_IDENTITY_SECRET": source_site,
+            "TLS_SECRET_NAME": gateway_site,
+            "SOURCE_CA_SECRET": source_ca,
+            "GATEWAY_CA_SECRET_NAME": gateway_ca,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+if check_secret_names("grid-run", "grid-run", "grid-site-identity", "grid-site-identity", "grid-ca", "grid-ca").returncode == 0:
+    raise SystemExit("co-located Gateway copies must not overwrite Grid-owned source Secrets")
+if check_secret_names("grid-run", "grid-run", "grid-site-identity", "grid-gateway-site-identity", "grid-ca", "grid-gateway-ca").returncode != 0:
+    raise SystemExit("co-located Gateway must accept distinct run-owned Secret copies")
+if check_secret_names("operator", "task", "grid-site-identity", "grid-site-identity", "grid-ca", "grid-ca").returncode != 0:
+    raise SystemExit("separate-namespace default Secret names must remain supported")
 
 site_declaration = source.index('GRID_SITE_NAME="${GRID_SITE_NAME:-grid-llmd-site}"')
 hostname_declaration = source.index('HOSTNAME="${GRID_GATEWAY_HOSTNAME:-${GRID_SITE_NAME}.grid.internal}"')
@@ -295,6 +344,7 @@ if 'destination-identity-before.json' in source or 'destination-ca-before.json' 
 for raw_capture in (
     'oc get secret "$TLS_SECRET_NAME" -n "$NAMESPACE" -o json >',
     'oc get secret "$SOURCE_CA_SECRET" -n "$NAMESPACE" -o json >',
+    'oc get secret "$GATEWAY_CA_SECRET_NAME" -n "$NAMESPACE" -o json >',
 ):
     if raw_capture in source:
         print("raw Secret JSON must not be redirected into the evidence directory", file=sys.stderr)

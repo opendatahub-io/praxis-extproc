@@ -18,6 +18,7 @@ SERVICE_NAME="${GRID_EXTPROC_SERVICE_NAME:-praxis-extproc}"
 CONFIGMAP_NAME="${GRID_EXTPROC_CONFIGMAP_NAME:-praxis-extproc-config}"
 DEPLOYMENT_NAME="${GRID_EXTPROC_DEPLOYMENT_NAME:-praxis-extproc}"
 ENVOYFILTER_NAME="${GRID_EXTPROC_ENVOYFILTER_NAME:-praxis-grid-llmd-extproc}"
+SERVICE_ACCOUNT_NAME="${GRID_EXTPROC_SERVICE_ACCOUNT_NAME:-praxis-extproc}"
 IMAGE="${GRID_EXTPROC_IMAGE:-}"
 SOURCE_REVISION="${GRID_EXTPROC_SOURCE_REVISION:-}"
 SOURCE_LOCKS_FILE="${SOURCE_LOCKS_FILE:-}"
@@ -34,8 +35,8 @@ if [[ "$MODE" == plan ]]; then
   cat <<'PLAN'
 Task-owned Praxis ExtProc plan (plan mode makes no cluster calls):
   1. Verify the source lock, image provenance, API target, run-owned namespace, and task-owned Gateway.
-  2. Render a single ExtProc Deployment/Service/ConfigMap and a Gateway-specific EnvoyFilter.
-  3. Server-side dry-run all four objects before any write.
+  2. Render the ExtProc Deployment, Service, ConfigMap, least-privilege metrics-auth identity/RBAC, and a Gateway-specific EnvoyFilter.
+  3. Server-side dry-run all seven resources before any write.
   4. Install only the task-owned resources and wait for the exact image digest.
   5. Read the selected Envoy proxy config dump and require both the ext_proc HTTP filter and its gRPC cluster.
 
@@ -88,6 +89,7 @@ jq -e --arg sha "$SOURCE_REVISION" --arg image "$IMAGE" \
   printf 'GRID_RUN_LABEL is not a Kubernetes label value\n' >&2
   exit 2
 }
+METRICS_AUTH_CLUSTER_ROLE="${GRID_EXTPROC_METRICS_AUTH_CLUSTER_ROLE_NAME:-praxis-extproc-metrics-auth-$(printf '%s' "$RUN_LABEL" | sha256sum | cut -c1-12)}"
 [[ -n "$EVIDENCE_DIR" ]] || EVIDENCE_DIR="$REPO_ROOT/evidence/grid-extproc-$(date -u +%Y%m%dT%H%M%SZ)"
 [[ ! -e "$EVIDENCE_DIR" ]] || { printf 'evidence path already exists: %s\n' "$EVIDENCE_DIR" >&2; exit 2; }
 mkdir -p "$EVIDENCE_DIR"
@@ -99,9 +101,52 @@ log() {
   printf '%s\n' "$line" | tee -a "$EVIDENCE_DIR/RUN-LOG.md" "$REPO_ROOT/RUN-LOG.md"
 }
 
+capture_runtime_diagnostics() {
+  local dir="$EVIDENCE_DIR/failure-diagnostics" pod
+  local -a pods=()
+  mkdir -p "$dir"
+  chmod 0700 "$dir"
+  set +e
+  oc get deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -o json 2>/dev/null |
+    jq '{metadata:{name:.metadata.name,uid:.metadata.uid,generation:.metadata.generation,labels:.metadata.labels},
+      spec:{replicas:.spec.replicas,selector:.spec.selector,serviceAccountName:.spec.template.spec.serviceAccountName,
+        automountServiceAccountToken:.spec.template.spec.automountServiceAccountToken,
+        containers:[.spec.template.spec.containers[]?|{name,image,imagePullPolicy,resources,ports,readinessProbe,livenessProbe,volumeMounts}]},
+      status:{observedGeneration:.status.observedGeneration,replicas:.status.replicas,readyReplicas:.status.readyReplicas,
+        availableReplicas:.status.availableReplicas,conditions:.status.conditions}}' >"$dir/deployment.json"
+  oc get pods -n "$NAMESPACE" -l "praxis.fast/qualification-run=$RUN_LABEL,app.kubernetes.io/name=praxis-extproc" -o json 2>/dev/null |
+    jq '[.items[]|{metadata:{name:.metadata.name,uid:.metadata.uid,creationTimestamp:.metadata.creationTimestamp,
+        deletionTimestamp:.metadata.deletionTimestamp,labels:.metadata.labels},
+      spec:{nodeName:.spec.nodeName,serviceAccountName:.spec.serviceAccountName,
+        automountServiceAccountToken:.spec.automountServiceAccountToken,volumes:.spec.volumes,
+        containers:[.spec.containers[]?|{name,image,imagePullPolicy,resources,ports,readinessProbe,livenessProbe,volumeMounts}]},
+      status:{phase:.status.phase,conditions:.status.conditions,
+        containers:[.status.containerStatuses[]?|{name,image,imageID,ready,restartCount,state,lastState}]}}]' \
+      >"$dir/pods.raw.json"
+  python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$dir/pods.raw.json" >"$dir/pods.json" 2>/dev/null
+  mapfile -t pods < <(jq -r '.[].metadata.name' "$dir/pods.raw.json" 2>/dev/null)
+  for pod in "${pods[@]}"; do
+    oc get pod "$pod" -n "$NAMESPACE" -o json 2>/dev/null |
+      jq '{metadata:{name:.metadata.name,uid:.metadata.uid,labels:.metadata.labels},status:{phase:.status.phase,conditions:.status.conditions}}' \
+        >"$dir/pod-$pod-status.json"
+    oc logs "$pod" -n "$NAMESPACE" -c praxis-extproc --timestamps 2>/dev/null |
+      python3 "$SCRIPT_DIR/sanitize_diagnostics.py" >"$dir/pod-$pod-current.log" 2>/dev/null
+    oc logs "$pod" -n "$NAMESPACE" -c praxis-extproc --previous --timestamps 2>/dev/null |
+      python3 "$SCRIPT_DIR/sanitize_diagnostics.py" >"$dir/pod-$pod-previous.log" 2>/dev/null
+  done
+  oc get events -n "$NAMESPACE" --sort-by=.lastTimestamp -o json 2>/dev/null |
+    jq --arg run "$RUN_LABEL" '[.items[]|select(.involvedObject.name as $name|($name|startswith("praxis-extproc")))|
+      {lastTimestamp:.lastTimestamp,type,reason,message,involvedObject:{kind:.involvedObject.kind,name:.involvedObject.name}}]' \
+      >"$dir/events.raw.json"
+  python3 "$SCRIPT_DIR/sanitize_diagnostics.py" <"$dir/events.raw.json" >"$dir/events.json" 2>/dev/null
+  set -e
+  find "$dir" -type f -exec chmod 0600 {} +
+}
+
 capture_failure() {
   local code="$1"
   trap - ERR
+  capture_runtime_diagnostics || true
   {
     printf '# Praxis ExtProc deployment attempt\n\n'
     printf -- '- Failed phase: `%s`\n' "${CURRENT_PHASE:-initialization}"
@@ -215,12 +260,24 @@ else
   }
 fi
 
-for resource in "configmap/$CONFIGMAP_NAME" "deployment/$DEPLOYMENT_NAME" "service/$SERVICE_NAME" "envoyfilter.networking.istio.io/$ENVOYFILTER_NAME"; do
+for resource in "configmap/$CONFIGMAP_NAME" "serviceaccount/$SERVICE_ACCOUNT_NAME" "deployment/$DEPLOYMENT_NAME" "service/$SERVICE_NAME" "envoyfilter.networking.istio.io/$ENVOYFILTER_NAME"; do
   kind="${resource%%/*}"
   name="${resource#*/}"
   if oc get "$kind" "$name" -n "$NAMESPACE" -o json >"$EVIDENCE_DIR/existing-${kind//\//-}-$name.json" 2>/dev/null; then
     jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' \
       "$EVIDENCE_DIR/existing-${kind//\//-}-$name.json" >/dev/null || {
+      CURRENT_FAILURE="$resource exists without matching task-run ownership"
+      printf '%s exists outside this run ownership\n' "$resource" >&2
+      exit 1
+    }
+  fi
+done
+for resource in "clusterrole/$METRICS_AUTH_CLUSTER_ROLE" "clusterrolebinding/$METRICS_AUTH_CLUSTER_ROLE"; do
+  kind="${resource%%/*}"
+  name="${resource#*/}"
+  if oc get "$kind" "$name" -o json >"$EVIDENCE_DIR/existing-$kind-$name.json" 2>/dev/null; then
+    jq -e --arg run "$RUN_LABEL" '.metadata.labels["praxis.fast/qualification-run"]==$run' \
+      "$EVIDENCE_DIR/existing-$kind-$name.json" >/dev/null || {
       CURRENT_FAILURE="$resource exists without matching task-run ownership"
       printf '%s exists outside this run ownership\n' "$resource" >&2
       exit 1
@@ -250,6 +307,8 @@ data:
       metrics_address: "0.0.0.0:9090"
       tls:
         mode: none
+      metrics_auth:
+        enabled: true
     filter_chains:
       - name: grid-llmd-smoke
         filters:
@@ -258,6 +317,59 @@ data:
               - name: X-Praxis-ExtProc-Response
                 value: "$RUN_LABEL"
           - filter: e2e_body_oracle
+YAML
+cat >>"$EVIDENCE_DIR/extproc-resources.yaml" <<YAML
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: $SERVICE_ACCOUNT_NAME
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+    app.kubernetes.io/part-of: grid-llmd-e2e
+    app.kubernetes.io/managed-by: grid-llmd-e2e-run
+    praxis.fast/qualification-run: "$RUN_LABEL"
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: $METRICS_AUTH_CLUSTER_ROLE
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+    app.kubernetes.io/part-of: grid-llmd-e2e
+    app.kubernetes.io/managed-by: grid-llmd-e2e-run
+    praxis.fast/qualification-run: "$RUN_LABEL"
+  annotations:
+    e2e.praxis.fast/source-revision: "$SOURCE_REVISION"
+rules:
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: $METRICS_AUTH_CLUSTER_ROLE
+  labels:
+    app.kubernetes.io/name: praxis-extproc
+    app.kubernetes.io/part-of: grid-llmd-e2e
+    app.kubernetes.io/managed-by: grid-llmd-e2e-run
+    praxis.fast/qualification-run: "$RUN_LABEL"
+  annotations:
+    e2e.praxis.fast/source-revision: "$SOURCE_REVISION"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: $METRICS_AUTH_CLUSTER_ROLE
+subjects:
+  - kind: ServiceAccount
+    name: $SERVICE_ACCOUNT_NAME
+    namespace: $NAMESPACE
 YAML
 cat >>"$EVIDENCE_DIR/extproc-resources.yaml" <<YAML
 ---
@@ -286,7 +398,8 @@ spec:
         app.kubernetes.io/part-of: grid-llmd-e2e
         praxis.fast/qualification-run: "$RUN_LABEL"
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: $SERVICE_ACCOUNT_NAME
+      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

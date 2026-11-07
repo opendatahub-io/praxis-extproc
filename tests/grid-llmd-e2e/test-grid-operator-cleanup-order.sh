@@ -20,6 +20,10 @@ namespace_delete = source.find('delete_resource_with_uid "/api/v1/namespaces/$RE
 positions = [ready, network_delete, network_wait, watch_loop, withdrawal, site_delete, release_delete, namespace_delete]
 if any(position < 0 for position in positions) or positions != sorted(positions):
     raise SystemExit("Grid cleanup must await operator-confirmed network withdrawal before deleting the site, Helm release, or namespace")
+defer_namespace = source.find('if [[ "$RELEASE_NAMESPACE" == "$RESOURCE_NAMESPACE" ]]')
+deferred_result = source.find('operatorNamespaceRemovalDeferredToTaskCleanup')
+if defer_namespace < release_delete or deferred_result < 0:
+    raise SystemExit("co-located Kind operator/task cleanup must leave the namespace for ordered task cleanup")
 
 required = (
     'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
@@ -42,6 +46,8 @@ required = (
     '"$EVIDENCE_DIR/gridnetwork-delete-options.json"',
     '"$EVIDENCE_DIR/gridsite-delete-options.json"',
     '"$EVIDENCE_DIR/operator-namespace-delete-options.json"',
+    'same run-owned task/operator namespace; defer namespace removal to task cleanup',
+    'operatorNamespaceRemovalDeferredToTaskCleanup:($operatorNamespaceRemoved|not)',
     'prior_delete_options="$EVIDENCE_DIR/prior-attempt/gridnetwork-delete-options.json"',
     'prior_delete_options="$EVIDENCE_DIR/prior-attempt/delete-options.json"',
 )

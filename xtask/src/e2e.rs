@@ -225,8 +225,10 @@ struct GridLlmdArgs {
     #[arg(long, env = "ALLOW_INSECURE_DEV_API", default_value_t = false)]
     allow_insecure_dev_api: bool,
 
-    /// Resource/capacity profile. Strict is the default. Reduced-dev is only
-    /// accepted when CLUSTER_ENV=ephemeral-dev and remains fully functional-gated.
+    /// Resource/capacity profile. Strict is the default. Reduced-dev is
+    /// accepted for disposable Kind (`CLUSTER_ENV=kind`) or ephemeral-dev
+    /// OpenShift, and remains fully functional-gated. API TLS bypass is still
+    /// separately restricted to `CLUSTER_ENV=ephemeral-dev`.
     #[arg(long, env = "RESOURCE_PROFILE", value_enum, default_value_t = ResourceProfile::Strict)]
     resource_profile: ResourceProfile,
 
@@ -277,7 +279,7 @@ struct GridLlmdArgs {
     #[arg(long, env = "GRID_LLMD_GATEWAY_PATH", default_value = "")]
     gateway_path: String,
 
-    /// Model sent in the deterministic llm-d-sim request body.
+    /// Short Grid model identity sent in the model header and used for provider selection.
     #[arg(long, env = "GRID_LLMD_MODEL", default_value = "")]
     model: String,
 
@@ -786,6 +788,26 @@ fn resource_profile_authorized(profile: ResourceProfile, cluster_env: Option<&st
     profile == ResourceProfile::Strict || cluster_env == Some("ephemeral-dev")
 }
 
+fn grid_llmd_resource_profile_authorized(
+    profile: ResourceProfile,
+    cluster_platform: ClusterPlatform,
+    cluster_env: Option<&str>,
+) -> bool {
+    profile == ResourceProfile::Strict
+        || match cluster_platform {
+            ClusterPlatform::OpenShift => cluster_env == Some("ephemeral-dev"),
+            ClusterPlatform::Kind => cluster_env == Some("kind"),
+        }
+}
+
+fn capacity_baseline_disposition(profile: ResourceProfile, cluster_platform: ClusterPlatform) -> &'static str {
+    match (profile, cluster_platform) {
+        (ResourceProfile::Strict, _) => "REQUIRED",
+        (ResourceProfile::ReducedDev, ClusterPlatform::OpenShift) => "WAIVED_FOR_EPHEMERAL_DEV_SMOKE",
+        (ResourceProfile::ReducedDev, ClusterPlatform::Kind) => "WAIVED_FOR_KIND_REDUCED_DEV_SMOKE",
+    }
+}
+
 fn capacity_preflight_allowed(
     under_baseline_mode: bool,
     ready_workers: usize,
@@ -1286,11 +1308,7 @@ impl Report {
             cluster_platform: args.cluster_platform,
             qualification_scope: args.qualification_scope,
             enrollment_qualification: args.qualification_scope.enrollment_qualification().to_owned(),
-            capacity_baseline: if args.resource_profile.is_reduced_dev() {
-                "WAIVED_FOR_EPHEMERAL_DEV_SMOKE".to_owned()
-            } else {
-                "REQUIRED".to_owned()
-            },
+            capacity_baseline: capacity_baseline_disposition(args.resource_profile, args.cluster_platform).to_owned(),
             under_baseline_dev_smoke: args.resource_profile.is_reduced_dev(),
             resource_profile: args.resource_profile,
             result_label: if args.resource_profile.is_reduced_dev() {
@@ -1634,8 +1652,15 @@ fn run_grid_maas(args: &GridMaasArgs) -> Result<(), String> {
 }
 
 fn run_grid_llmd(args: &GridLlmdArgs) -> Result<(), String> {
-    if !resource_profile_authorized(args.resource_profile, args.cluster_env.as_deref()) {
-        return Err("RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=ephemeral-dev".to_owned());
+    if !grid_llmd_resource_profile_authorized(
+        args.resource_profile,
+        args.cluster_platform,
+        args.cluster_env.as_deref(),
+    ) {
+        return Err(
+            "RESOURCE_PROFILE=reduced-dev requires CLUSTER_ENV=kind for Kind or CLUSTER_ENV=ephemeral-dev for OpenShift"
+                .to_owned(),
+        );
     }
     let started_epoch_seconds = epoch_seconds();
     let evidence_dir = resolve_evidence_dir(args.evidence_dir.as_deref(), started_epoch_seconds);
@@ -2572,6 +2597,10 @@ fn gateway_request_path(args: &GridLlmdArgs) -> String {
 
 fn default_gateway_request_path(namespace: &str, model: &str) -> String {
     format!("/publishers/{namespace}/models/{model}/v1/chat/completions")
+}
+
+fn default_publisher_model(namespace: &str, model: &str) -> String {
+    format!("publishers/{namespace}/models/{model}")
 }
 
 fn validate_ipp_inputs(args: &GridLlmdArgs, missing: &mut Vec<&'static str>) {
@@ -4717,11 +4746,7 @@ fn check_cluster_capacity(
         pending_count,
         control_plane_nodes_no_schedule_tainted,
     );
-    let disposition = if args.resource_profile.is_reduced_dev() {
-        "WAIVED_FOR_EPHEMERAL_DEV_SMOKE"
-    } else {
-        "REQUIRED"
-    };
+    let disposition = capacity_baseline_disposition(args.resource_profile, args.cluster_platform);
     write_json_private(
         &evidence_dir.join("capacity-snapshot.json"),
         &serde_json::json!({
@@ -4750,7 +4775,7 @@ fn check_cluster_capacity(
         name: if args.resource_profile.is_reduced_dev() { "capacity-readiness" } else { "capacity-baseline" }.to_owned(),
         status: if accepted { "pass" } else { "blocked" }.to_owned(),
         detail: if args.resource_profile.is_reduced_dev() {
-            format!("DEV-SMOKE / REDUCED-CAPACITY; capacity-baseline=WAIVED_FOR_EPHEMERAL_DEV_SMOKE; {qualified_workers}/2 workers meet the strict per-node baseline; {total_allocatable_worker_cpu_milli}m aggregate allocatable worker CPU; {ready_workers} Ready workers; {pending_count} Pending Pods; control-plane NoSchedule taints verified={control_plane_nodes_no_schedule_tainted}; pending and worker readiness gates remain enforced")
+            format!("DEV-SMOKE / REDUCED-CAPACITY; capacity-baseline={disposition}; {qualified_workers}/2 workers meet the strict per-node baseline; {total_allocatable_worker_cpu_milli}m aggregate allocatable worker CPU; {ready_workers} Ready workers; {pending_count} Pending Pods; control-plane NoSchedule taints verified={control_plane_nodes_no_schedule_tainted}; pending and worker readiness gates remain enforced")
         } else {
             format!("full baseline requires at least 2 Ready workers, at least 2 workers with 8 CPU/32GiB allocatable each, and at least 20000m aggregate allocatable worker CPU; {qualified_workers}/2 meet per-node baseline, {total_allocatable_worker_cpu_milli}m aggregate CPU, {ready_workers} workers Ready, {pending_count} Pending Pods, control-plane NoSchedule taints verified={control_plane_nodes_no_schedule_tainted}")
         },
@@ -8818,7 +8843,8 @@ fn run_probe(args: &GridLlmdArgs, report: &mut Report, evidence_dir: &Path, phas
         report.started_epoch_seconds,
         std::process::id()
     );
-    let body = render_request_body(&args.model, &args.prompt);
+    let request_body_model = default_publisher_model(&args.namespace, &args.model);
+    let body = render_request_body(&request_body_model, &args.prompt);
     let (request_file, request_body_sha256) = create_serialized_request_file(&body)?;
     write_json_private(&request_path, &redacted_request_body(&body))?;
     let auth_value = request_auth_header_value(args.auth_token.as_deref(), args.no_auth, &args.auth_header)?;
@@ -10520,6 +10546,14 @@ mod tests {
     }
 
     #[test]
+    fn default_request_body_model_uses_the_canonical_publisher_identity() {
+        assert_eq!(
+            default_publisher_model("grid-task", "grid-test-model"),
+            "publishers/grid-task/models/grid-test-model"
+        );
+    }
+
+    #[test]
     fn kubeconfig_tls_verification_rejects_only_explicit_insecure_mode() {
         let ca_bearing = serde_json::json!({
             "clusters":[{"cluster":{"certificate-authority-data":"REDACTED"}}]
@@ -10551,6 +10585,51 @@ mod tests {
             ResourceProfile::ReducedDev,
             Some("ephemeral-dev")
         ));
+    }
+
+    #[test]
+    fn kind_reduced_dev_profile_requires_kind_environment_without_relaxing_openshift() {
+        assert!(grid_llmd_resource_profile_authorized(
+            ResourceProfile::Strict,
+            ClusterPlatform::Kind,
+            None,
+        ));
+        assert!(grid_llmd_resource_profile_authorized(
+            ResourceProfile::ReducedDev,
+            ClusterPlatform::Kind,
+            Some("kind"),
+        ));
+        assert!(!grid_llmd_resource_profile_authorized(
+            ResourceProfile::ReducedDev,
+            ClusterPlatform::Kind,
+            Some("ephemeral-dev"),
+        ));
+        assert!(!grid_llmd_resource_profile_authorized(
+            ResourceProfile::ReducedDev,
+            ClusterPlatform::OpenShift,
+            Some("kind"),
+        ));
+        assert!(grid_llmd_resource_profile_authorized(
+            ResourceProfile::ReducedDev,
+            ClusterPlatform::OpenShift,
+            Some("ephemeral-dev"),
+        ));
+    }
+
+    #[test]
+    fn reduced_dev_capacity_waiver_identifies_kind_without_changing_openshift_label() {
+        assert_eq!(
+            capacity_baseline_disposition(ResourceProfile::Strict, ClusterPlatform::Kind),
+            "REQUIRED"
+        );
+        assert_eq!(
+            capacity_baseline_disposition(ResourceProfile::ReducedDev, ClusterPlatform::Kind),
+            "WAIVED_FOR_KIND_REDUCED_DEV_SMOKE"
+        );
+        assert_eq!(
+            capacity_baseline_disposition(ResourceProfile::ReducedDev, ClusterPlatform::OpenShift),
+            "WAIVED_FOR_EPHEMERAL_DEV_SMOKE"
+        );
     }
 
     #[test]

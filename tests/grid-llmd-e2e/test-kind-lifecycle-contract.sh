@@ -43,6 +43,11 @@ ordered_phases = (
     'run_phase serving-pool-b',
     'run_pool_setup_probe pool-b',
     'run_phase grid-operator-bootstrap',
+    'run_phase grid-provider-registration',
+    'run_phase client-identity',
+    'run_phase provider-proxies',
+    'run_phase grid-operator-praxis-config',
+    'run_phase extproc-filter',
     'run_phase native-routing-qualification',
     'phase_start natural-cleanup',
     'run-kind-lifecycle.sh" --mode cleanup',
@@ -76,6 +81,7 @@ for required in (
     'sanitize_diagnostics.py',
     'qualification_rc',
     'GRID_LLMD_AUTH_TOKEN',
+    'KIND_POOL_SETUP_PROBE_API_CA_FILE="$STATE_DIR/maas-api-root-ca.crt"',
     'natural-cleanup',
     'diskConsumedSinceFirstSampleBytes',
     'cgroupCpuUsageUsec',
@@ -85,6 +91,9 @@ for required in (
 
 if 'docker system prune' in lifecycle or 'finalizers=' in lifecycle:
     raise SystemExit("lifecycle must not prune shared Docker state or alter finalizers")
+
+if 'disable-task-gateway-retries.sh' in lifecycle:
+    raise SystemExit("lifecycle must verify per-request upstream/retry counters instead of patching the generated Gateway route")
 
 for required in (
     'workflow_dispatch:',
@@ -117,6 +126,21 @@ if len(platform_readiness) != 2 or 'SERVING_POOLS_MODE=verify SERVING_POOL_SELEC
     raise SystemExit("platform readiness must use platform-only verification before creating the task namespace")
 if 'KIND_CLEANUP_CONTEXT=qualification KIND_PRIVATE_STATE_DIR="$STATE_DIR"' not in lifecycle:
     raise SystemExit("in-run cleanup must explicitly be recorded as qualification natural cleanup")
+if 'OPERATOR_NAMESPACE="$TASK_NAMESPACE"' not in lifecycle:
+    raise SystemExit("Kind Grid operator and its GridNetwork/Gateway must share the run-owned namespace required by current TLS ownership contracts")
+bootstrap_gateway = lifecycle.split('phase_start task-gateway-bootstrap', 1)[1].split('phase_end 0', 1)[0]
+if ('GRID_GATEWAY_MOUNT_RECONCILIATION_ENABLED=true' not in bootstrap_gateway or
+        'GRID_GATEWAY_RELEASE_HELM_MOUNTS=true' not in bootstrap_gateway):
+    raise SystemExit("bootstrap Gateway must opt into Grid mount reconciliation before the operator configuration handoff")
+if ('GRID_GATEWAY_PRAXIS_CONFIG_MAP_NAME=grid-llmd-praxis-config' not in bootstrap_gateway or
+        'GRID_PRAXIS_CONFIG_MAP_NAME=grid-llmd-praxis-config' not in lifecycle or
+        lifecycle.count('GRID_GATEWAY_PRAXIS_CONFIG_MAP_NAME=grid-llmd-praxis-config') != 2):
+    raise SystemExit("bootstrap, generated Praxis config, and final Gateway must use the same ConfigMap source")
+for phase in ('phase_start task-gateway-bootstrap', 'phase_start task-gateway-grid-config'):
+    phase = lifecycle.split(phase, 1)[1].split('phase_end 0', 1)[0]
+    if ('GRID_GATEWAY_TLS_SECRET_NAME=grid-gateway-site-identity' not in phase or
+            'GRID_GATEWAY_CA_SECRET_NAME=grid-gateway-ca' not in phase):
+        raise SystemExit("co-located Kind Grid/Gateway must use separate run-owned TLS and CA copies")
 if 'naturalCleanup:$cleanupStatus' in lifecycle:
     raise SystemExit("final result must not encode the cleanup status string as the natural-cleanup value")
 if 'naturalCleanup:$naturalCleanup' not in lifecycle:
@@ -179,6 +203,48 @@ if lifecycle.count('GRID_GATEWAY_MODE=install PRAXIS_GATEWAY_CHART_FILE="$PRAXIS
     raise SystemExit("both task Gateway installs must pass the chart archive and digest under the helper's PRAXIS_GATEWAY_* inputs")
 if 'task_cleanup_mode=fresh' not in cleanup or 'if [[ "$CLEANUP_CONTEXT" == workflow-retry ]]; then' not in cleanup or 'task_cleanup_mode=resume' not in cleanup or 'KIND_TASK_CLEANUP_MODE="$task_cleanup_mode"' not in cleanup:
     raise SystemExit("workflow failure cleanup must use resume mode so an uninstalled task Gateway is safely inventoried and cleaned")
+if 'GRID_SOURCE_REVISION="$(source_value grid)"' not in lifecycle or 'export GRID_SOURCE_REVISION GRID_GATEWAY_SOURCE_REVISION' not in lifecycle:
+    raise SystemExit("provider registration must receive the exact Grid SHA from this run's source lock")
+if 'GRID_OPERATOR_IMAGE="$(image_ref grid-operator)"' not in lifecycle or not any(
+    line.startswith("export ") and "GRID_OPERATOR_SOURCE_REVISION" in line and "GRID_OPERATOR_IMAGE" in line
+    for line in lifecycle.splitlines()
+):
+    raise SystemExit("provider registration must receive the exact immutable Grid operator image from this run's image lock")
+if ('export GRID_LLMD_GRID_OPERATOR_DEPLOYMENT="$OPERATOR_NAMESPACE/grid-operator"' not in lifecycle or
+        'export GRID_LLMD_GRID_OPERATOR_DEPLOYMENT="$OPERATOR_NAMESPACE/deployment/grid-operator"' in lifecycle):
+    raise SystemExit("qualification must pass the downstream Grid operator as namespace/name, not namespace/deployment/name")
+qualification = lifecycle.split('phase_start native-routing-qualification', 1)[1].split('phase_end 0', 1)[0]
+for required_input in (
+    'export GRID_LLMD_GRID_SITE_RESOURCE="$TASK_NAMESPACE/gridsite/$GRID_SITE"',
+    'export GRID_LLMD_SITE_IDENTITY_SECRET="$TASK_NAMESPACE/grid-site-identity"',
+    'export GRID_LLMD_GRID_CA_SECRET="$TASK_NAMESPACE/grid-ca"',
+    'export GRID_LLMD_EXPECTED_SITE_SAN="$SITE_HOSTNAME"',
+    'export GRID_LLMD_IPP_STATE=absent',
+    'export GRID_LLMD_DEPLOYMENTS="maas-system/maas-controller"',
+):
+    if required_input not in qualification:
+        raise SystemExit(f"qualification is missing a required evidence input: {required_input}")
+if ('GRID_LLMD_RUNTIME_IMAGE_DIGESTS="praxis-ai-grid-operator=$(runtime_image_digest grid-operator)' not in qualification or
+        'GRID_LLMD_RUNTIME_IMAGE_DIGESTS' not in qualification.split('export GRID_LLMD_SOURCE_REVISIONS', 1)[1].split('\n', 1)[0]):
+    raise SystemExit("qualification must pass an immutable runtime manifest digest for every image pin")
+
+runtime_digest_body = lifecycle.split('runtime_image_digest() {', 1)[1].split('\n}', 1)[0]
+with tempfile.TemporaryDirectory(prefix="kind-runtime-image-digest-") as temp_dir:
+    image_dir = Path(temp_dir) / "images" / "grid-gateway"
+    image_dir.mkdir(parents=True)
+    (image_dir / "image-ref.txt").write_text("registry.invalid/grid-gateway@sha256:" + "a" * 64 + "\n", encoding="utf-8")
+    digest_harness = f'''set -Eeuo pipefail
+RUN_DIR={str(Path(temp_dir))!r}
+image_ref() {{ cat "$RUN_DIR/images/$1/image-ref.txt"; }}
+runtime_image_digest() {{{runtime_digest_body}
+}}
+[[ "$(runtime_image_digest grid-gateway)" == "sha256:{'a' * 64}" ]]
+printf 'registry.invalid/grid-gateway:latest\\n' >"$RUN_DIR/images/grid-gateway/image-ref.txt"
+if runtime_image_digest grid-gateway >/dev/null 2>&1; then exit 9; fi
+'''
+    subprocess.run(["bash"], input=digest_harness, text=True, check=True)
+if 'serving_cleanup_mode=fresh' not in cleanup or 'serving_cleanup_mode=resume' not in cleanup or 'KIND_SERVING_CLEANUP_MODE="$serving_cleanup_mode"' not in cleanup:
+    raise SystemExit("workflow failure cleanup must resume partial serving cleanup instead of requiring both pools")
 
 source_validation = builder.index('[[ "$actual_head" == "$SOURCE_SHA" && -z "$actual_branch" ]]')
 permission_fix = builder.index('make_build_context_readable "$BUILD_CONTEXT_DIR"')

@@ -29,6 +29,10 @@ required = {
     "controller rollout and pinned runtime digest": 'exactly one Ready Pod with the pinned runtime image digest',
     "bounded webhook convergence": 'webhook-convergence-polls.tsv',
     "webhook Pod and EndpointSlice contract": 'verify_kind_kserve_webhook_readiness.py',
+    "server-side webhook admission probe": 'k apply --dry-run=server -f "$EVIDENCE_DIR/rendered-runtime-configs.yaml" -o name',
+    "bounded admission probe": 'KSERVE_ADMISSION_PROBE_ATTEMPTS:-30',
+    "admission probe evidence": 'webhook-admission-probe.tsv',
+    "all rendered runtime configs passed admission": 'observed_runtime_config_count" == "$expected_runtime_config_count"',
     "live API served and stored gate": '.name=="v1alpha2" and .served==true and .storage==true',
     "webhook CA bundle gate": 'webhook CA bundle or service reference is missing',
     "automatic failure snapshots": 'failure-kserve-workloads.yaml',
@@ -60,6 +64,7 @@ ordered = [
     'k wait --for=condition=Ready certificate/llmisvc-serving-cert',
     'k rollout status deployment/llmisvc-controller-manager',
     'verify_kind_kserve_webhook_readiness.py',
+    'k apply --dry-run=server -f "$EVIDENCE_DIR/rendered-runtime-configs.yaml" -o name',
     'h upgrade --install kserve-runtime-configs',
 ]
 positions = [source.index(fragment) for fragment in ordered]
