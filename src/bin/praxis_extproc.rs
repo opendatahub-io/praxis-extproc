@@ -109,7 +109,7 @@ struct Prepared {
 /// Log invalid guardrail response-mode configuration once during startup.
 fn warn_invalid_response_mode_config(selector: &praxis_extproc::response_mode::ResponseModeSelector) {
     if let Some(reason) = selector.invalid_reason() {
-        warn!(reason = %reason, "invalid guardrail response-mode configuration; keeping buffered mode and rejecting FDS");
+        warn!(reason = %reason, "invalid guardrail response-mode configuration; keeping buffered mode");
     }
 }
 

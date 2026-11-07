@@ -19,17 +19,10 @@ use crate::adapter::header_value_str;
 pub struct ResponseModeSelector {
     /// Whether guardrail filters were found in the configuration.
     enabled: bool,
-    /// Whether an unconditional guardrail is configured.
-    ///
-    /// This is used for FDS admission separately from response-mode selection:
-    /// an unconditional input-only guardrail still cannot be enforced in FDS.
-    has_unconditional_guardrail: bool,
     /// Whether an unconditional response-phase guardrail is configured.
     has_always_on_response_guardrail: bool,
     /// Header names that identify selected conditional response-phase guardrails.
     output_headers: HashSet<String>,
-    /// Header names that identify any selected conditional guardrail phase.
-    guardrail_headers: HashSet<String>,
     /// Whether all guardrail entries had a supported shape.
     valid: bool,
     /// Why the configured guardrail selector is invalid, when applicable.
@@ -44,8 +37,6 @@ impl ResponseModeSelector {
     )]
     pub fn from_config(chains: &[FilterChainConfig]) -> Self {
         let mut output_headers = HashSet::new();
-        let mut guardrail_headers = HashSet::new();
-        let mut has_unconditional_guardrail = false;
         let mut has_always_on_response_guardrail = false;
         let mut has_guardrail = false;
         for entry in chains.iter().flat_map(|chain| &chain.filters) {
@@ -54,11 +45,7 @@ impl ResponseModeSelector {
             }
             has_guardrail = true;
             let Some((request_phase, response_phase)) = guardrail_phases(entry) else {
-                return invalid_selector(
-                    output_headers,
-                    guardrail_headers,
-                    "invalid guardrail phase configuration",
-                );
+                return invalid_selector(output_headers, "invalid guardrail phase configuration");
             };
             if !request_phase && !response_phase {
                 continue;
@@ -66,17 +53,11 @@ impl ResponseModeSelector {
 
             let Some(header) = selected_guardrail_header(entry) else {
                 if entry.conditions.is_empty() && entry.response_conditions.is_empty() {
-                    has_unconditional_guardrail = true;
                     has_always_on_response_guardrail |= response_phase;
                     continue;
                 }
-                return invalid_selector(
-                    output_headers,
-                    guardrail_headers,
-                    "unsupported guardrail selection condition",
-                );
+                return invalid_selector(output_headers, "unsupported guardrail selection condition");
             };
-            guardrail_headers.insert(header.clone());
             if response_phase {
                 output_headers.insert(header);
             }
@@ -88,10 +69,8 @@ impl ResponseModeSelector {
 
         Self {
             enabled: true,
-            has_unconditional_guardrail,
             has_always_on_response_guardrail,
             output_headers,
-            guardrail_headers,
             valid: true,
             invalid_reason: None,
         }
@@ -112,36 +91,14 @@ impl ResponseModeSelector {
                 .iter()
                 .any(|name| header_may_be_selected(headers, name))
     }
-
-    /// True when a configured guardrail cannot be safely enforced in FDS mode.
-    ///
-    /// Invalid guardrail configuration is treated as selected here so
-    /// FDS fails closed rather than allowing an unverified body through.
-    pub(crate) fn has_selected_guardrail(&self, headers: &[HeaderValue]) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        if !self.valid || self.has_unconditional_guardrail {
-            return true;
-        }
-        self.guardrail_headers
-            .iter()
-            .any(|name| header_may_be_selected(headers, name))
-    }
 }
 
-/// Build a selector that preserves buffering and rejects FDS when the config is invalid.
-fn invalid_selector(
-    output_headers: HashSet<String>,
-    guardrail_headers: HashSet<String>,
-    invalid_reason: &'static str,
-) -> ResponseModeSelector {
+/// Build a selector that preserves buffering when the config is invalid.
+fn invalid_selector(output_headers: HashSet<String>, invalid_reason: &'static str) -> ResponseModeSelector {
     ResponseModeSelector {
         enabled: true,
-        has_unconditional_guardrail: false,
         has_always_on_response_guardrail: false,
         output_headers,
-        guardrail_headers,
         valid: false,
         invalid_reason: Some(invalid_reason),
     }
@@ -387,7 +344,6 @@ filter_chains:
         );
         let headers = [raw_header("x-aigateway-guardrail-output", "", b"false")];
         assert!(selector.should_stream(&headers));
-        assert!(!selector.has_selected_guardrail(&headers));
     }
 
     #[test]
@@ -406,7 +362,6 @@ filter_chains:
         );
         let headers = [raw_header("x-aigateway-guardrail-output", "", b"true")];
         assert!(!selector.should_stream(&headers));
-        assert!(selector.has_selected_guardrail(&headers));
     }
 
     #[test]
@@ -425,46 +380,10 @@ filter_chains:
         );
         let headers = [raw_header("x-aigateway-guardrail-output", "false", &[0xFF])];
         assert!(selector.should_stream(&headers));
-        assert!(!selector.has_selected_guardrail(&headers));
     }
 
     #[test]
-    fn selected_guardrail_is_not_allowed_in_fds() {
-        let selector = selector(
-            r#"
-filter_chains:
-  - name: ipp
-    filters:
-      - filter: ai_guardrails
-        conditions:
-          - when:
-              headers: { x-aigateway-guardrail-input: "true" }
-        phase: { request: true, response: false }
-"#,
-        );
-        assert!(selector.has_selected_guardrail(&[header("x-aigateway-guardrail-input", "true")]));
-        assert!(!selector.has_selected_guardrail(&[]));
-    }
-
-    #[test]
-    fn unconditional_guardrail_is_not_allowed_in_fds() {
-        let selector = selector(
-            "
-filter_chains:
-  - name: ipp
-    filters:
-      - filter: ai_guardrails
-        phase:
-          request: true
-          response: false
-",
-        );
-        assert!(selector.should_stream(&[]));
-        assert!(selector.has_selected_guardrail(&[]));
-    }
-
-    #[test]
-    fn malformed_guardrail_phase_fails_closed_for_fds() {
+    fn malformed_guardrail_phase_keeps_buffered_mode() {
         let selector = selector(
             "
 filter_chains:
@@ -475,7 +394,6 @@ filter_chains:
           request: invalid
 ",
         );
-        assert!(selector.has_selected_guardrail(&[]));
         assert!(!selector.should_stream(&[]));
         assert_eq!(selector.invalid_reason(), Some("invalid guardrail phase configuration"));
     }
@@ -500,7 +418,6 @@ filter_chains:
             Some("unsupported guardrail selection condition")
         );
         assert!(!selector.should_stream(&[]));
-        assert!(selector.has_selected_guardrail(&[]));
     }
 
     #[test]
@@ -523,7 +440,6 @@ filter_chains:
             Some("unsupported guardrail selection condition")
         );
         assert!(!selector.should_stream(&[]));
-        assert!(selector.has_selected_guardrail(&[]));
     }
 
     #[test]
@@ -537,6 +453,5 @@ filter_chains:
 ",
         );
         assert!(!selector.should_stream(&[]));
-        assert!(!selector.has_selected_guardrail(&[]));
     }
 }
