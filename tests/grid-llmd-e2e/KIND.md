@@ -122,6 +122,8 @@ bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode run
 
 The four-CPU profile is reserved for `ubuntu-24.04` Actions, where the runner VM constrains both the Docker workloads and the Kind node. Lowering an admission threshold on an unconstrained shared host is not a four-CPU experiment. The workflow records runner-visible CPUs, Docker capacity, cgroup CPU and memory data, disk usage, phase durations, scheduling failures, and OOM events.
 
+The `gha-standard-4cpu` profile changes only selected CPU scheduling requests after measured `Insufficient cpu` events: tenant MaaS APIs and provider proxies request 10m each, and Istiod requests 400m instead of the Istio 1.28.0 default 500m. The Istiod change is Kind-only; its 2048Mi memory request, unset CPU limit, Gateway API inference flags, and readiness checks remain intact. The full profile retains all upstream defaults, including Istiod at 500m. These are scheduling adaptations for the bounded functional smoke, not throughput settings; the routing, TLS, authorization, score, receipt, failure-closed, and cleanup assertions are identical.
+
 The run evidence tree contains the run ID and context/API identity, source/image locks, phase results, request-correlated traffic evidence, resource samples, and diagnostics. The kubeconfig, client token, and other private state stay under the separate private-state directory and are never uploaded.
 
 The final report must show these proofs from the same source and image freeze:

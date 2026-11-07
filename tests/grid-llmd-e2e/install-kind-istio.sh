@@ -8,6 +8,14 @@ KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 KUBECONFIG_PATH="${KUBECONFIG:-}"
 ISTIOCTL="${ISTIOCTL:-}"
 EVIDENCE_DIR="${KIND_ISTIO_EVIDENCE_DIR:-}"
+CAPACITY_PROFILE="${KIND_CAPACITY_PROFILE:-full}"
+ISTIOD_CPU_REQUEST=""
+
+case "$CAPACITY_PROFILE" in
+  full) ;;
+  gha-standard-4cpu) ISTIOD_CPU_REQUEST=400m ;;
+  *) printf 'KIND_CAPACITY_PROFILE must be full or gha-standard-4cpu\n' >&2; exit 2 ;;
+esac
 
 for name in KUBE_CONTEXT KUBECONFIG_PATH ISTIOCTL EVIDENCE_DIR; do
   [[ -n "${!name}" ]] || { printf '%s is required\n' "$name" >&2; exit 2; }
@@ -54,20 +62,33 @@ kubectl --context "$KUBE_CONTEXT" get gatewayclass istio -o json \
 "$ISTIOCTL" version --remote=false >"$EVIDENCE_DIR/istioctl-version.txt" 2>&1
 sha256sum "$ISTIOCTL" >"$EVIDENCE_DIR/istioctl-sha256.txt"
 
-# MaaS main's local deployment path enables both flags. KServe-created
-# InferencePool HTTPRoutes otherwise fail Gateway API ResolvedRefs in Istio.
-cat >"$EVIDENCE_DIR/istio-install-command.txt" <<EOF
-istioctl install --context $KUBE_CONTEXT --set profile=minimal --set components.ingressGateways[0].name=istio-ingressgateway --set components.ingressGateways[0].enabled=true --set values.gateways.istio-ingressgateway.autoscaleEnabled=false --set values.gateways.istio-ingressgateway.replicaCount=1 --set values.pilot.env.SUPPORT_GATEWAY_API_INFERENCE_EXTENSION=true --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true -y
-EOF
-"$ISTIOCTL" install --context "$KUBE_CONTEXT" \
-  --set profile=minimal \
+install_args=(
+  install
+  --context "$KUBE_CONTEXT"
+  --set
+  profile=minimal
   --set 'components.ingressGateways[0].name=istio-ingressgateway' \
   --set 'components.ingressGateways[0].enabled=true' \
   --set values.gateways.istio-ingressgateway.autoscaleEnabled=false \
   --set values.gateways.istio-ingressgateway.replicaCount=1 \
   --set values.pilot.env.SUPPORT_GATEWAY_API_INFERENCE_EXTENSION=true \
-  --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true \
-  -y >"$EVIDENCE_DIR/istio-install.txt" 2>&1
+  --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true
+)
+if [[ -n "$ISTIOD_CPU_REQUEST" ]]; then
+  # The four-CPU runner's one-node Kind cluster reached 100% CPU requests
+  # before the second 10m provider proxy and the 50m ExtProc could schedule.
+  # Lower only Istiod's scheduling request; its memory and unbounded CPU limit
+  # remain at the pinned Istio profile defaults. Keep the full profile intact.
+  install_args+=(--set "values.pilot.resources.requests.cpu=$ISTIOD_CPU_REQUEST")
+fi
+{
+  printf 'istioctl'
+  printf ' %q' "${install_args[@]}"
+  printf ' -y\n'
+} >"$EVIDENCE_DIR/istio-install-command.txt"
+printf '%s\n' "$CAPACITY_PROFILE" >"$EVIDENCE_DIR/capacity-profile.txt"
+printf '%s\n' "${ISTIOD_CPU_REQUEST:-istio-default}" >"$EVIDENCE_DIR/istiod-cpu-request-profile.txt"
+"$ISTIOCTL" "${install_args[@]}" -y >"$EVIDENCE_DIR/istio-install.txt" 2>&1
 
 kubectl --context "$KUBE_CONTEXT" rollout status deployment/istiod -n istio-system --timeout=240s \
   >"$EVIDENCE_DIR/istiod-rollout.txt"
@@ -79,14 +100,18 @@ kubectl --context "$KUBE_CONTEXT" get pods -n istio-system -o json \
   >"$EVIDENCE_DIR/istio-pods-after.json"
 kubectl --context "$KUBE_CONTEXT" get --raw=/readyz >"$EVIDENCE_DIR/readyz-after.txt"
 grep -qx 'ok' "$EVIDENCE_DIR/readyz-after.txt" || { printf 'Kubernetes API /readyz failed after Istio rollout\n' >&2; exit 1; }
-python3 - "$EVIDENCE_DIR/istiod-after.json" "$EVIDENCE_DIR/istio-pods-after.json" <<'PY'
+python3 - "$EVIDENCE_DIR/istiod-after.json" "$EVIDENCE_DIR/istio-pods-after.json" "$ISTIOD_CPU_REQUEST" \
+  >"$EVIDENCE_DIR/istiod-install-verification.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 deployment = json.loads(Path(sys.argv[1]).read_text())
 containers = deployment["spec"]["template"]["spec"]["containers"]
-env = {item["name"]: item.get("value") for item in containers[0].get("env", [])}
+discovery = next((container for container in containers if container["name"] == "discovery"), None)
+if discovery is None:
+    raise SystemExit("istiod Deployment has no discovery container")
+env = {item["name"]: item.get("value") for item in discovery.get("env", [])}
 required = (
     "SUPPORT_GATEWAY_API_INFERENCE_EXTENSION",
     "ENABLE_GATEWAY_API_INFERENCE_EXTENSION",
@@ -94,6 +119,12 @@ required = (
 missing = [name for name in required if env.get(name) != "true"]
 if missing:
     raise SystemExit(f"istiod feature flags are not true: {', '.join(missing)}")
+actual_cpu_request = discovery.get("resources", {}).get("requests", {}).get("cpu")
+expected_cpu_request = sys.argv[3]
+if expected_cpu_request and actual_cpu_request != expected_cpu_request:
+    raise SystemExit(
+        f"istiod CPU request profile mismatch: expected {expected_cpu_request}, found {actual_cpu_request}"
+    )
 status = deployment.get("status", {})
 if status.get("observedGeneration", 0) < deployment["metadata"]["generation"]:
     raise SystemExit("istiod has not observed its current generation")
@@ -104,6 +135,16 @@ istiod_pods = [pod for pod in pods if pod["metadata"]["labels"].get("app") == "i
 ready = [pod for pod in istiod_pods if all(c.get("ready") for c in pod.get("status", {}).get("containerStatuses", []))]
 if len(ready) != deployment["spec"]["replicas"]:
     raise SystemExit(f"expected {deployment['spec']['replicas']} Ready istiod Pods, found {len(ready)}")
-print("Istio Gateway API Inference Extension flags and current rollout: PASS")
+print(json.dumps({
+    "capacityProfile": "gha-standard-4cpu" if expected_cpu_request else "full",
+    "cpuRequest": actual_cpu_request,
+    "cpuLimit": discovery.get("resources", {}).get("limits", {}).get("cpu"),
+    "memoryRequest": discovery.get("resources", {}).get("requests", {}).get("memory"),
+    "memoryLimit": discovery.get("resources", {}).get("limits", {}).get("memory"),
+    "readyReplicas": len(ready),
+    "observedGeneration": status.get("observedGeneration"),
+    "generation": deployment["metadata"]["generation"],
+}, sort_keys=True))
 PY
+printf 'Istio Gateway API Inference Extension flags and current rollout: PASS\n'
 printf 'Istio Gateway API Inference Extension enabled and verified for context %s\n' "$KUBE_CONTEXT"
