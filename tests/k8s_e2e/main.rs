@@ -50,7 +50,6 @@ mod completions;
 mod direct;
 mod errors;
 mod fd_streamed_oracle;
-mod fds_mode;
 mod filters;
 mod guardrails;
 mod oracle_helpers;

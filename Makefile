@@ -482,10 +482,7 @@ e2e-teardown:
 
 e2e-test:
 	@case "$(MODE)" in fds|buffered|streamed) ;; *) echo "MODE must be fds, buffered, or streamed (got '$(MODE)')"; exit 1;; esac
-	E2E_BODY_MODE=$(MODE) bash hack/scripts/e2e-test.sh -- \
-		$(if $(filter fds,$(MODE)),--skip guardrails::,) \
-		$(if $(filter buffered streamed,$(MODE)),--skip fds_mode::,) \
-		$(if $(V),--nocapture,)
+	E2E_BODY_MODE=$(MODE) bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
