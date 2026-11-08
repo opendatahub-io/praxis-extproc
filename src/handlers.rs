@@ -6,8 +6,9 @@
 //! Each handler owns one protocol phase (request/response headers and body):
 //! it marks end-of-stream, converts Envoy messages into filter inputs, and
 //! routes to the [`crate::pipeline`] by body mode and filter capabilities.
-//! Buffered bodies are accumulated here up to the stream's effective
-//! body-accumulation limit and run through the full pipeline at EOS.
+//! Buffered bodies are accumulated up to the stream's effective body limit.
+//! Selected-upstream body filters require Envoy's BUFFERED request mode so
+//! translation finishes before the body response is sent.
 
 use praxis_filter::FilterPipeline;
 use praxis_proto::envoy::service::{
@@ -21,8 +22,9 @@ use crate::{
     adapter, metrics,
     pipeline::{
         MutationDelivery, RequestPhase, ResponsePhase, deferred_header_response, direction_label,
-        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk, run_request_header_filters_early,
-        run_request_pipeline, run_response_header_filters_early, run_response_pipeline,
+        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk,
+        run_bodyless_selected_upstream_pipeline, run_request_header_filters_early, run_request_pipeline,
+        run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
@@ -148,8 +150,8 @@ fn handle_body_redelivery(
 ///
 /// [`Request`]: praxis_filter::Request
 #[expect(
-    clippy::large_stack_frames,
-    reason = "StreamState carries HttpFilterContext fields grown in praxis 0.7.3"
+    clippy::too_many_lines,
+    reason = "body-mode and guardrail admission checks stay together"
 )]
 pub(crate) async fn handle_request_headers(
     pipeline: &FilterPipeline,
@@ -166,23 +168,157 @@ pub(crate) async fn handle_request_headers(
     }
 
     let envoy_headers = extract_header_list(&headers);
+    if let Some(rejection) = reject_ambiguous_guardrail_selection(&envoy_headers) {
+        return Ok(vec![rejection]);
+    }
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
-    if headers.end_of_stream {
-        return run_request_pipeline(RequestPhase::Headers, pipeline, state, true).await;
+    if (state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        || state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed)
+        && state.response_mode_selector.has_selected_guardrail(&envoy_headers)
+    {
+        warn!("selected guardrails cannot be enforced in FULL_DUPLEX_STREAMED mode");
+        return Ok(vec![request_processing_rejection(
+            b"selected guardrails are not supported in FULL_DUPLEX_STREAMED mode",
+        )]);
+    }
+
+    let mut responses = if headers.end_of_stream {
+        handle_end_stream_request_headers(pipeline, state).await?
+    } else {
+        if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+            && pipeline.body_capabilities().needs_selected_upstream_request_body
+        {
+            warn!("selected-upstream request-body hook cannot run in FULL_DUPLEX_STREAMED mode");
+            return Ok(vec![request_processing_rejection(
+                b"selected-upstream request-body processing is not supported in FULL_DUPLEX_STREAMED mode",
+            )]);
+        }
+
+        handle_request_headers_with_body(pipeline, state).await?
+    };
+
+    apply_response_mode_override(pipeline, &mut responses, state, &envoy_headers);
+    Ok(responses)
+}
+
+/// Apply the request-specific response mode selected by guardrail configuration.
+fn apply_response_mode_override(
+    pipeline: &FilterPipeline,
+    responses: &mut [ProcessingResponse],
+    state: &mut StreamState,
+    envoy_headers: &[HeaderValue],
+) {
+    if state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        || state.protocol_config.response_body_mode == BodyMode::FullDuplexStreamed
+        || state.protocol_config.response_body_mode == BodyMode::None
+        || state.protocol_config.send_body_without_waiting_for_header_response
+    {
+        return;
+    }
+
+    if matches!(
+        pipeline.body_capabilities().response_body_mode,
+        praxis_filter::BodyMode::StreamBuffer { .. }
+    ) {
+        return;
+    }
+
+    if state.response_mode_selector.should_stream(envoy_headers) {
+        let mut override_applied = false;
+        for response in responses {
+            override_applied |= response::set_response_mode_streamed(response, state.protocol_config.request_body_mode);
+        }
+        if override_applied {
+            state.protocol_config.response_body_mode = BodyMode::Streamed;
+        } else {
+            debug!("response mode override skipped because no request-headers response was emitted");
+        }
+    }
+}
+
+/// Run selected-upstream body validation for a request that ended with headers.
+async fn handle_end_stream_request_headers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if pipeline.body_capabilities().needs_selected_upstream_request_body {
+        run_bodyless_selected_upstream_pipeline(pipeline, state).await
+    } else {
+        run_request_pipeline(RequestPhase::Headers, pipeline, state, true).await
+    }
+}
+
+/// Handle a request header message followed by one or more body messages.
+#[expect(
+    clippy::too_many_lines,
+    reason = "body mode cases and selected-route guard belong together"
+)]
+async fn handle_request_headers_with_body(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if has_selected_body_filter(pipeline)
+        && matches!(
+            state.protocol_config.request_body_mode,
+            BodyMode::None | BodyMode::Streamed
+        )
+    {
+        return handle_unsupported_selected_request_headers(pipeline, state).await;
     }
 
     match state.protocol_config.request_body_mode {
         BodyMode::None | BodyMode::Streamed => {
             state.header_state.request_headers_sent = true;
-            run_request_header_filters_early(pipeline, state, MutationDelivery::Send).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::Send,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
-            run_request_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::DeferSilent,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
-        _ => Ok(vec![response::request_headers(None)]),
+        _ => Ok(request_headers_without_body_filter(state)),
     }
+}
+
+/// Whether a chain contains a selected-upstream request-body participant.
+fn has_selected_body_filter(pipeline: &FilterPipeline) -> bool {
+    pipeline.body_capabilities().needs_selected_upstream_request_body
+}
+
+/// Acknowledge request headers when body processing is handled later.
+fn request_headers_without_body_filter(state: &mut StreamState) -> Vec<ProcessingResponse> {
+    state.header_state.request_headers_sent = true;
+    vec![response::request_headers(None)]
+}
+
+/// Reject unsupported body modes before forwarding, including Envoy-routed requests.
+async fn handle_unsupported_selected_request_headers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let responses = Box::pin(run_request_header_filters_early(
+        pipeline,
+        state,
+        MutationDelivery::DeferSilent,
+    ))
+    .await?;
+    if responses.first().is_some_and(response::is_immediate) {
+        return Ok(responses);
+    }
+    warn!("selected-upstream request-body hook requires BUFFERED mode");
+    Ok(vec![request_processing_rejection(
+        b"selected-upstream request-body processing requires BUFFERED mode",
+    )])
 }
 
 /// Handle request body: route by body mode and filter capabilities.
@@ -208,10 +344,87 @@ pub(crate) async fn handle_request_body(
     let needs_body = pipeline.body_capabilities().needs_request_body;
 
     match (mode, needs_body) {
-        (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => Ok(passthrough_chunk(&body, state, mode, true)),
-        (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, true).await,
+        // STREAMED / FULL_DUPLEX passthrough and streamed-filter paths never
+        // fill `state.request_body`, so enforce the accumulation ceiling with a
+        // running byte count before forwarding each chunk.
+        (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => {
+            if let Some(rejection) = reject_streamed_request_over_limit(pipeline, state, body.body.len()) {
+                return Ok(vec![rejection]);
+            }
+            Ok(passthrough_chunk(&body, state, mode, true))
+        },
+        (BodyMode::Streamed, true) => {
+            if let Some(rejection) = reject_streamed_request_over_limit(pipeline, state, body.body.len()) {
+                return Ok(vec![rejection]);
+            }
+            process_streamed_body_chunk(pipeline, body, state, true).await
+        },
         _ => accumulate_request_body(pipeline, body, state).await,
     }
+}
+
+/// Count a streamed request chunk toward `max_body_accumulation` without buffering.
+///
+/// Returns `Some(ImmediateResponse)` with status 413 when the chunk would exceed the ceiling.
+fn reject_streamed_request_over_limit(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    chunk_len: usize,
+) -> Option<ProcessingResponse> {
+    if check_body_limit(state.streamed_request_bytes, chunk_len, state.max_body_accumulation).is_err() {
+        return Some(request_body_limit_exceeded(pipeline));
+    }
+    state.streamed_request_bytes = state.streamed_request_bytes.saturating_add(chunk_len);
+    None
+}
+
+/// Refuse ambiguous gateway selection metadata before filters can disagree on it.
+fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<ProcessingResponse> {
+    let mut names = std::collections::HashSet::new();
+    for header in headers {
+        let name = header.key.to_ascii_lowercase();
+        if !is_guardrail_selection_header(&name) {
+            continue;
+        }
+        let value = if header.raw_value.is_empty() {
+            header.value.as_bytes()
+        } else {
+            &header.raw_value
+        };
+        if !names.insert(name) || !matches!(value, b"true" | b"false") {
+            let rejection = praxis_filter::Rejection::status(400)
+                .with_body(b"guardrail selection headers must be unique boolean values".to_vec());
+            return Some(response::immediate(adapter::rejection_to_immediate(&rejection)));
+        }
+    }
+    None
+}
+
+/// Recognize phase selectors and the controller's SHA-256 check identifiers.
+fn is_guardrail_selection_header(name: &str) -> bool {
+    name.strip_prefix("x-aigateway-guardrail-").is_some_and(|suffix| {
+        matches!(suffix, "input" | "output")
+            || (suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
+}
+
+/// Build a fail-closed local response for an unsupported request-processing path.
+fn request_processing_rejection(body: &'static [u8]) -> ProcessingResponse {
+    let rejection = praxis_filter::Rejection::status(500).with_body(body.to_vec());
+    response::immediate(adapter::rejection_to_immediate(&rejection))
+}
+
+/// Prefer `ImmediateResponse` 413 over gRPC `RESOURCE_EXHAUSTED` so Envoy surfaces a
+/// diagnosable client error instead of an empty HTTP 500 under
+/// `failure_mode_allow: false` (follow-up to RHOAIENG-102139).
+fn request_body_limit_exceeded(pipeline: &FilterPipeline) -> ProcessingResponse {
+    let message = if pipeline.body_capabilities().needs_selected_upstream_request_body {
+        b"request body exceeds the selected-upstream limit".as_slice()
+    } else {
+        b"request body exceeds maximum size"
+    };
+    let rejection = praxis_filter::Rejection::status(413).with_body(message.to_vec());
+    response::immediate(adapter::rejection_to_immediate(&rejection))
 }
 
 /// Accumulate request body chunks, run full pipeline on EOS.
@@ -220,14 +433,16 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation)?;
+    if let Err(_error) = check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation) {
+        return Ok(vec![request_body_limit_exceeded(pipeline)]);
+    }
     state.request_body.extend_from_slice(&body.body);
 
-    if !body.end_of_stream {
+    if !body.end_of_stream && state.protocol_config.request_body_mode != BodyMode::Buffered {
         return Ok(Vec::new());
     }
-
-    run_request_pipeline(RequestPhase::Body, pipeline, state, true).await
+    state.buffered_request_body_processed = state.protocol_config.request_body_mode == BodyMode::Buffered;
+    run_request_pipeline(RequestPhase::Body, pipeline, state, body.end_of_stream).await
 }
 
 // -----------------------------------------------------------------------------
@@ -372,11 +587,16 @@ async fn finalize_body_on_trailers(
     state.eos_tracker.mark_complete(phase);
 
     match mode {
-        BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
-        BodyMode::FullDuplexStreamed if needs_body => run_trailing_fds_body(pipeline, state, is_request).await,
+        BodyMode::Streamed if needs_body => Box::pin(flush_streamed_body_filters(pipeline, state, is_request)).await,
+        BodyMode::FullDuplexStreamed if needs_body => {
+            Box::pin(run_trailing_fds_body(pipeline, state, is_request)).await
+        },
         BodyMode::FullDuplexStreamed => Ok(flush_deferred_fds_headers(state, is_request)),
         BodyMode::Buffered => {
-            let responses = run_trailing_body_pipeline(pipeline, state, is_request).await?;
+            if is_request && state.buffered_request_body_processed {
+                return Ok(Vec::new());
+            }
+            let responses = Box::pin(run_trailing_body_pipeline(pipeline, state, is_request)).await?;
             Ok(rejection_only(responses, is_request))
         },
         _ => Ok(Vec::new()),
@@ -448,7 +668,7 @@ fn trailing_body_phase(
         (
             ProtocolPhase::RequestBody,
             state.protocol_config.request_body_mode,
-            caps.needs_request_body,
+            caps.needs_request_body || caps.needs_selected_upstream_request_body,
         )
     } else {
         (
@@ -508,11 +728,646 @@ fn check_body_limit(current: usize, incoming: usize, limit: Option<usize>) -> Re
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::indexing_slicing, reason = "tests assert the single response")]
+#[expect(clippy::too_many_lines, reason = "tests construct full protocol requests")]
 mod tests {
     use praxis_filter::{FilterAction, HttpFilterContext};
+    use praxis_proto::envoy::service::ext_proc::v3::{
+        BodySendMode as ExtProcBodySendMode, HeaderMap as ExtProcHeaderMap, HttpHeaders as ExtProcHttpHeaders,
+    };
 
     use super::*;
     use crate::test_support::counter_value;
+
+    #[tokio::test]
+    async fn request_headers_stream_response_when_no_output_guardrail_is_selected() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].mode_override.as_ref().map(|mode| mode.response_body_mode),
+            Some(ExtProcBodySendMode::Streamed.into())
+        );
+        assert_eq!(
+            responses[0].mode_override.as_ref().map(|mode| mode.request_body_mode),
+            Some(ExtProcBodySendMode::Buffered.into())
+        );
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Streamed);
+    }
+
+    #[tokio::test]
+    async fn request_headers_keep_buffered_response_when_output_guardrail_is_selected() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-output".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[test]
+    fn response_mode_override_does_not_change_state_without_a_response() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-output: "true" }
+        phase: { request: false, response: true }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let mut responses = Vec::new();
+        apply_response_mode_override(
+            &pipeline,
+            &mut responses,
+            &mut state,
+            &[HeaderValue {
+                key: "x-aigateway-guardrail-input".to_owned(),
+                value: "true".to_owned(),
+                raw_value: Vec::new(),
+            }],
+        );
+
+        assert!(responses.is_empty());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[test]
+    fn response_mode_override_preserves_none_response_mode() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(concat!(
+            "filter_chains:\n",
+            "  - name: ipp\n",
+            "    filters:\n",
+            "      - filter: ai_guardrails\n",
+            "        phase: { request: true, response: false }\n",
+        ))
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::None;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let mut responses = vec![response::request_headers(None)];
+
+        apply_response_mode_override(&pipeline, &mut responses, &mut state, &[]);
+
+        assert!(responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::None);
+    }
+
+    #[test]
+    fn response_mode_override_preserves_buffered_mode_when_envoy_does_not_wait() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(concat!(
+            "filter_chains:\n",
+            "  - name: ipp\n",
+            "    filters:\n",
+            "      - filter: ai_guardrails\n",
+            "        phase: { request: true, response: false }\n",
+        ))
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.send_body_without_waiting_for_header_response = true;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let mut responses = vec![response::request_headers(None)];
+
+        apply_response_mode_override(&pipeline, &mut responses, &mut state, &[]);
+
+        assert!(responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[tokio::test]
+    async fn request_headers_keep_buffered_response_for_other_response_body_filters() {
+        let pipeline_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "
+filter_chains:
+  - name: main
+    filters:
+      - filter: json_body
+        response_remove:
+          - /internal
+",
+        )
+        .unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        assert!(matches!(
+            pipeline.body_capabilities().response_body_mode,
+            praxis_filter::BodyMode::StreamBuffer { .. }
+        ));
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        phase: { request: true, response: false }
+",
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test exercises guardrail mode selection and buffered response mutation"
+    )]
+    #[tokio::test]
+    async fn buffered_response_filter_removes_json_field_for_input_only_guardrail() {
+        let pipeline_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "
+filter_chains:
+  - name: main
+    filters:
+      - filter: json_body
+        response_remove:
+          - /internal
+",
+        )
+        .unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        phase: { request: true, response: false }
+",
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let request_responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![
+                        HeaderValue {
+                            key: ":method".to_owned(),
+                            value: "POST".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                        HeaderValue {
+                            key: ":path".to_owned(),
+                            value: "/v1/chat/completions".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                        HeaderValue {
+                            key: "x-aigateway-guardrail-input".to_owned(),
+                            value: "true".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                    ],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(request_responses.len(), 1);
+        assert!(request_responses[0].mode_override.is_none());
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::Buffered);
+
+        let response_headers = handle_response_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![
+                        HeaderValue {
+                            key: ":status".to_owned(),
+                            value: "200".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                        HeaderValue {
+                            key: "content-type".to_owned(),
+                            value: "application/json".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                        HeaderValue {
+                            key: "content-length".to_owned(),
+                            value: "35".to_owned(),
+                            raw_value: Vec::new(),
+                        },
+                    ],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_headers.len(), 1);
+        assert!(!state.header_state.response_filters_executed);
+
+        let upstream_body = br#"{"internal":"remove","safe":"keep"}"#;
+        let body_responses = handle_response_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: upstream_body.to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        let body = body_responses
+            .iter()
+            .find_map(|response| match response.response.as_ref() {
+                Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseBody(body)) => {
+                    body.response
+                        .as_ref()
+                        .and_then(|common| common.body_mutation.as_ref())
+                        .and_then(|mutation| match mutation.mutation.as_ref() {
+                            Some(praxis_proto::envoy::service::ext_proc::v3::body_mutation::Mutation::Body(body)) => {
+                                Some(body.clone())
+                            },
+                            _ => None,
+                        })
+                },
+                _ => None,
+            });
+        assert!(body.is_some(), "buffered response filter must emit a body mutation");
+        let body = body.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json, serde_json::json!({"safe": "keep"}));
+        assert_eq!(body.len(), upstream_body.len());
+
+        let content_length = body_responses
+            .iter()
+            .find_map(|response| match response.response.as_ref() {
+                Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseBody(body)) => {
+                    body.response
+                        .as_ref()
+                        .and_then(|common| common.header_mutation.as_ref())
+                        .and_then(|mutation| {
+                            mutation.set_headers.iter().find_map(|header| {
+                                let header = header.header.as_ref()?;
+                                header
+                                    .key
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| header.value.clone())
+                            })
+                        })
+                },
+                _ => None,
+            });
+        assert!(
+            content_length.is_none(),
+            "json_body response_remove must preserve the committed content length"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_guardrail_is_rejected_before_body_processing_in_fds() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(responses.first().is_some_and(response::is_immediate));
+    }
+
+    async fn selected_guardrail_response_for_modes(
+        request_body_mode: BodyMode,
+        response_body_mode: BodyMode,
+    ) -> Vec<ProcessingResponse> {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = request_body_mode;
+        state.protocol_config.response_body_mode = response_body_mode;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "true".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn selected_guardrail_is_rejected_when_either_body_mode_is_fds() {
+        for (request_body_mode, response_body_mode) in [
+            (BodyMode::FullDuplexStreamed, BodyMode::Buffered),
+            (BodyMode::Buffered, BodyMode::FullDuplexStreamed),
+        ] {
+            let responses = selected_guardrail_response_for_modes(request_body_mode, response_body_mode).await;
+            assert!(responses.first().is_some_and(response::is_immediate));
+        }
+    }
+
+    #[tokio::test]
+    async fn unconditional_guardrail_is_rejected_before_body_processing_in_fds() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        phase:
+          request: true
+          response: false
+",
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap { headers: Vec::new() }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(responses.first().is_some_and(response::is_immediate));
+    }
+
+    #[tokio::test]
+    async fn unselected_guardrail_is_allowed_in_fds() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "false".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(!responses.iter().any(response::is_immediate));
+        assert!(responses.iter().all(|response| response.mode_override.is_none()));
+        assert_eq!(state.protocol_config.request_body_mode, BodyMode::FullDuplexStreamed);
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::FullDuplexStreamed);
+    }
+
+    #[tokio::test]
+    async fn unselected_guardrail_is_allowed_in_fds_with_end_of_stream() {
+        let pipeline_config: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: request_id\n").unwrap();
+        let pipeline =
+            crate::config::build_pipeline(&pipeline_config, &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let selector_config: crate::config::ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: ipp
+    filters:
+      - filter: ai_guardrails
+        conditions:
+          - when:
+              headers: { x-aigateway-guardrail-input: "true" }
+        phase: { request: true, response: false }
+"#,
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.request_body_mode = BodyMode::FullDuplexStreamed;
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.response_mode_selector =
+            crate::response_mode::ResponseModeSelector::from_config(&selector_config.filter_chains);
+
+        let responses = handle_request_headers(
+            &pipeline,
+            ExtProcHttpHeaders {
+                headers: Some(ExtProcHeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-aigateway-guardrail-input".to_owned(),
+                        value: "false".to_owned(),
+                        raw_value: Vec::new(),
+                    }],
+                }),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert!(!responses.iter().any(response::is_immediate));
+        assert!(responses.iter().all(|response| response.mode_override.is_none()));
+        assert_eq!(state.protocol_config.request_body_mode, BodyMode::FullDuplexStreamed);
+        assert_eq!(state.protocol_config.response_body_mode, BodyMode::FullDuplexStreamed);
+    }
 
     #[test]
     fn handle_body_redelivery_ignores_only_fds_duplicates() {
@@ -563,6 +1418,119 @@ mod tests {
         assert!(
             check_body_limit(usize::MAX, usize::MAX, None).is_ok(),
             "unbounded limit must accept any accumulation without overflow"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks both sides of the request accumulation limit"
+    )]
+    async fn request_body_accumulation_accepts_boundary_and_rejects_before_extend() {
+        let pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins())
+            .expect("empty test pipeline");
+        let mut state = StreamState::new();
+        state.max_body_accumulation = Some(4);
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+
+        let exact = accumulate_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"abcd".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("a body exactly at the configured limit must be accepted");
+        assert!(exact.is_empty(), "an incomplete body waits for its final chunk");
+        assert_eq!(state.request_body, b"abcd");
+
+        let rejected = accumulate_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"e".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("over-limit bodies return ImmediateResponse 413, not a gRPC error");
+        assert!(
+            rejected.iter().any(|response| {
+                matches!(
+                    &response.response,
+                    Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+                        immediate
+                    )) if immediate.status.as_ref().map(|status| status.code) == Some(413)
+                )
+            }),
+            "over-limit request body must be an ImmediateResponse 413, got: {rejected:?}"
+        );
+        assert_eq!(
+            state.request_body, b"abcd",
+            "the rejected chunk must not extend the buffer"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test checks both sides of the streamed passthrough limit"
+    )]
+    async fn streamed_passthrough_enforces_max_body_bytes() {
+        let pipeline = FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins())
+            .expect("empty test pipeline");
+        let mut state = StreamState::new();
+        state.max_body_accumulation = Some(4);
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+
+        let accepted = handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"abcd".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("body at the limit must be forwarded");
+        assert!(
+            !accepted.iter().any(response::is_immediate),
+            "body at the limit must not be rejected"
+        );
+        assert_eq!(state.streamed_request_bytes, 4);
+        assert!(
+            state.request_body.is_empty(),
+            "streamed passthrough must not buffer the body"
+        );
+
+        let rejected = handle_request_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"e".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .expect("over-limit streamed bodies return ImmediateResponse 413");
+        assert!(
+            rejected.iter().any(|response| {
+                matches!(
+                    &response.response,
+                    Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ImmediateResponse(
+                        immediate
+                    )) if immediate.status.as_ref().map(|status| status.code) == Some(413)
+                )
+            }),
+            "over-limit streamed request must be ImmediateResponse 413, got: {rejected:?}"
+        );
+        assert_eq!(
+            state.streamed_request_bytes, 4,
+            "the rejected chunk must not advance the streamed byte count"
         );
     }
 

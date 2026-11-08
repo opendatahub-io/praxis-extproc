@@ -2,6 +2,9 @@
   path: /metadata/name
   value: payload-pre-processing
 - op: replace
+  path: /metadata/annotations/secret.reloader.stakater.com~1reload
+  value: payload-pre-processing-tls
+- op: replace
   path: /spec/selector/matchLabels/app
   value: payload-pre-processing
 - op: replace
@@ -19,11 +22,21 @@
   path: /spec/template/spec/containers/0/resources
   value:
     requests:
-      memory: "32Mi"
-      cpu: "25m"
-    limits:
+      # BBR holds the buffered JSON body while promoting model headers. Measured
+      # peak is ~50 MiB per 10 MiB body (copies), so 8×10 MiB needs ~430 MiB;
+      # 256 MiB OOMed under that breaker budget (RHAIENG-8104). Match post-auth
+      # at 512 MiB with GRPC_MAX_RECV 11Mi (see base Deployment env).
       memory: "128Mi"
-      cpu: "200m"
+      cpu: "50m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
 - op: add
   path: /spec/template/spec/serviceAccountName
   value: payload-processing
+- op: add
+  path: /spec/template/spec/automountServiceAccountToken
+  value: true
+- op: replace
+  path: /spec/template/spec/volumes/1/secret/secretName
+  value: payload-pre-processing-tls

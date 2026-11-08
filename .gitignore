@@ -26,6 +26,8 @@ target
 # Personal notes
 .docs/**
 
-# Generated e2e-extended TLS material (hack/generate-e2e-extended-tls-certs.sh)
-deploy/overlays/e2e-extended/tls/**/certs/
-deploy/overlays/e2e-extended/tls/**/envoyfilter-upstream-tls.yaml
+# Local KIND provided-TLS experiments (see deploy/testdata/tls/README.md).
+# Never commit private keys or Secret manifests that embed them.
+deploy/testdata/tls/tls.crt
+deploy/testdata/tls/tls.key
+deploy/overlays/**/tls-secret.yaml

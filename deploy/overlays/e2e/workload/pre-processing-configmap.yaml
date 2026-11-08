@@ -8,24 +8,23 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Keep BBR above the IPP e2e 1 MiB cap so oversized-body tests still reach
+      # the fail-closed post-auth ext-proc.
+      max_body_bytes: 10485760
       tls:
         mode: self_signed
 
     filter_chains:
       - name: bbr
         filters:
-          # Promote body "model" into X-Gateway-Model-Name; `unless` trusts an
-          # existing header. For untrusted ingress, drop it and strip the header
-          # with `headers request_remove` before json_body.
+          # Mirror ODH production BBR: strip any caller-supplied routing header
+          # so routing identity always comes from the JSON body.
+          - filter: headers
+            request_remove:
+              - X-Gateway-Model-Name
           - filter: json_body
-            conditions:
-              - unless:
-                  headers_present: ["X-Gateway-Model-Name"]
             request_extract:
               - pointer: /model
                 header: X-Gateway-Model-Name
             on_invalid: continue
           - filter: e2e_body_oracle
-
-    insecure_options:
-      allow_unbounded_body: true

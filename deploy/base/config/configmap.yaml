@@ -10,19 +10,33 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Default 10 MiB body bound. Paired with Envoy ExtProc max_requests=8 and
+      # GRPC_MAX_RECV_MSG_SIZE=11Mi on the Deployment so tonic rejects oversized
+      # ExtProc messages before allocation. Measured peak is ~50 MiB per 10 MiB
+      # body (RHAIENG-8104), so ODH pre/post default to a 512 MiB limit.
+      # Operators can raise either value via ai-gateway-controller annotations;
+      # keep concurrency×body peak under the pod limit and raise
+      # GRPC_MAX_RECV_MSG_SIZE with max_body_bytes (body + ~1 MiB framing).
+      # Do not set insecure_options.allow_unbounded_body: after RHOAIENG-102139
+      # that flag would leave streamed bodies uncapped.
+      max_body_bytes: 10485760
+      metrics_auth:
+        enabled: true
       tls:
-        mode: self_signed
+        mode: provided
+        cert_path: /etc/tls/private/tls.crt
+        key_path: /etc/tls/private/tls.key
 
     filter_chains:
       - name: bbr
         filters:
-          # Promote body "model" into X-Gateway-Model-Name; `unless` trusts an
-          # existing header. For untrusted ingress, drop it and strip the header
-          # with `headers request_remove` before json_body.
+          # Strip any caller-supplied routing header before promoting body
+          # "model" so routing identity always comes from the JSON body.
+          # Pre-auth ExtProc is fail-closed; this strip remains defense in depth.
+          - filter: headers
+            request_remove:
+              - X-Gateway-Model-Name
           - filter: json_body
-            conditions:
-              - unless:
-                  headers_present: ["X-Gateway-Model-Name"]
             request_extract:
               - pointer: /model
                 header: X-Gateway-Model-Name
@@ -30,22 +44,68 @@ data:
           - filter: llmisvc_model_provider_resolver
             header: X-Gateway-Model-Name
 
-    insecure_options:
-      allow_unbounded_body: true
-
   # Post-auth (IPP) Praxis chain: full processing pipeline.
   extproc.yaml: |
     server:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      # Default 10 MiB body bound. Paired with Envoy ExtProc max_requests=8 and
+      # GRPC_MAX_RECV_MSG_SIZE=11Mi on the Deployment so tonic rejects oversized
+      # ExtProc messages before allocation. Measured peak is ~50 MiB per 10 MiB
+      # body (RHAIENG-8104), so ODH pre/post default to a 512 MiB limit.
+      # Operators can raise either value via ai-gateway-controller annotations;
+      # keep concurrency×body peak under the pod limit and raise
+      # GRPC_MAX_RECV_MSG_SIZE with max_body_bytes (body + ~1 MiB framing).
+      # Do not set insecure_options.allow_unbounded_body: after RHOAIENG-102139
+      # that flag would leave streamed bodies uncapped.
+      max_body_bytes: 10485760
+      metrics_auth:
+        enabled: true
       tls:
-        mode: self_signed
+        mode: provided
+        cert_path: /etc/tls/private/tls.crt
+        key_path: /etc/tls/private/tls.key
 
     filter_chains:
       - name: ipp
         filters:
+          # Port of legacy IPP maas-headers-guard: strip caller credentials
+          # and internal MaaS headers for requests targeting non maas-api paths.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+              - unless:
+                  path: /v1/me
+            request_remove:
+              - authorization
+              - x-api-key
+              - x-origin-cluster
+              - x-maas-username
+              - x-maas-username-oc
+              - x-maas-username-token
+              - x-maas-group
+              - x-maas-group-oc
+              - x-maas-group-token
+              - x-maas-keyname
+              - x-maas-key-id
+              - x-maas-subscription
+              - x-maas-subscription-rate-limit-id
+              - x-maas-cost-center
+              - x-maas-organization-id
+              - x-maas-identity
+              - x-maas-admin-scope
+              - x-maas-tenant
+              - x-maas-invocation-mode
+              - x-maas-policy-revision
+              - x-maas-responses-owner
+              - x-maas-return-all-models
+              - x-maas-model
           - filter: request_id
-
-    insecure_options:
-      allow_unbounded_body: true

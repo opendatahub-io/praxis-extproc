@@ -1,0 +1,30 @@
+# The fds e2e scrape reads IPP /metrics. metrics_auth accepts that scrape
+# only when TokenReview authenticates the bearer and SubjectAccessReview
+# allows GET on the /metrics non-resource URL. hack/scripts/e2e-test.sh
+# mints this account's token; no pod mounts it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-metrics-reader
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: e2e-payload-processing-metrics-reader
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: e2e-payload-processing-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: e2e-metrics-reader
+    namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: e2e-payload-processing-metrics-reader

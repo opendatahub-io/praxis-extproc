@@ -19,7 +19,8 @@ use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
 
 use praxis_filter::{FilterPipeline, HttpFilterContext, Request, Response};
 use praxis_proto::envoy::service::ext_proc::v3::{
-    ProcessingRequest, ProcessingResponse, ProtocolConfiguration, external_processor_server::ExternalProcessor,
+    ProcessingRequest, ProcessingResponse, ProtocolConfiguration,
+    external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request,
 };
 use tokio::sync::{mpsc, watch};
@@ -69,6 +70,8 @@ pub struct PraxisExtProc {
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
     trust_forwarded_for: bool,
+    /// Per-request response mode selector for generated guardrail filters.
+    response_mode_selector: crate::response_mode::ResponseModeSelector,
 }
 
 impl PraxisExtProc {
@@ -76,7 +79,7 @@ impl PraxisExtProc {
     ///
     /// No drain deadline is wired: the force-shutdown latch never fires. Use
     /// [`with_force_shutdown`](Self::with_force_shutdown) to arm one. The
-    /// body-accumulation ceiling defaults to the built-in 10 MiB
+    /// body-accumulation ceiling defaults to the built-in 32 MiB
     /// (`config::DEFAULT_MAX_BODY_BYTES`); use
     /// [`with_max_body_accumulation`](Self::with_max_body_accumulation) to set
     /// the configured effective limit.
@@ -87,6 +90,7 @@ impl PraxisExtProc {
             force_shutdown: rx,
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             trust_forwarded_for: false,
+            response_mode_selector: crate::response_mode::ResponseModeSelector::default(),
         }
     }
 
@@ -116,6 +120,22 @@ impl PraxisExtProc {
         self.trust_forwarded_for = trust;
         self
     }
+
+    /// Install the configured response body mode selector.
+    #[must_use]
+    pub fn with_response_mode_selector(mut self, selector: crate::response_mode::ResponseModeSelector) -> Self {
+        self.response_mode_selector = selector;
+        self
+    }
+}
+
+/// Build the tonic ExtProc service with the production max-decoding size.
+///
+/// The binary and in-process tests share this helper so the
+/// `.max_decoding_message_size(...)` wiring cannot drift between them.
+#[must_use]
+pub fn external_processor_server(svc: PraxisExtProc, max_recv: usize) -> ExternalProcessorServer<PraxisExtProc> {
+    ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv)
 }
 
 /// Resolve only when the latch flips to `true`.
@@ -148,12 +168,13 @@ impl ExternalProcessor for PraxisExtProc {
         let force = self.force_shutdown.clone();
         let max_body = self.max_body_accumulation;
         let trust_forwarded_for = self.trust_forwarded_for;
+        let response_mode_selector = self.response_mode_selector.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
             tokio::select! {
-                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for)) => {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for, response_mode_selector)) => {
                     if let Err(e) = r {
                         error!(error = %e, "stream processing failed");
                         drop(tx.send(Err(e)).await);
@@ -183,17 +204,23 @@ impl ExternalProcessor for PraxisExtProc {
 ///
 /// Accumulates request/response body chunks and runs the Praxis filter
 /// pipeline at the appropriate phase boundaries.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream setup passes independent server options"
+)]
 async fn handle_stream(
     pipeline: &FilterPipeline,
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     max_body: Option<usize>,
     trust_forwarded_for: bool,
+    response_mode_selector: crate::response_mode::ResponseModeSelector,
 ) -> Result<(), Status> {
     let start = Instant::now();
     let mut stream_state = StreamState::new();
     stream_state.max_body_accumulation = max_body;
     stream_state.trust_forwarded_for = trust_forwarded_for;
+    stream_state.response_mode_selector = response_mode_selector;
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -234,15 +261,32 @@ async fn process_messages(
         let responses = Box::pin(dispatch_request(pipeline, req, stream_state)).await?;
         debug!(phase = req_type, count = responses.len(), "sending responses");
 
+        let stop_after_immediate = responses.iter().any(crate::response::is_immediate);
         for resp in responses {
             if tx.send(Ok(resp)).await.is_err() {
                 debug!("response channel closed, ending stream");
                 return Ok(());
             }
         }
+        // Envoy ignores further ExtProc messages after `ImmediateResponse`. Stop
+        // reading the inbound stream and drop buffered bodies so a client that
+        // keeps the gRPC stream open cannot pin large buffers here (CWE-400).
+        if stop_after_immediate {
+            release_buffers_after_immediate(stream_state);
+            return Ok(());
+        }
     }
 
     Ok(())
+}
+
+/// Drop accumulated bodies after an `ImmediateResponse` so a hung client cannot
+/// pin them for the remainder of the gRPC stream lifetime.
+fn release_buffers_after_immediate(stream_state: &mut StreamState) {
+    stream_state.request_body.clear();
+    stream_state.response_body.clear();
+    stream_state.streamed_request_bytes = 0;
+    debug!("ImmediateResponse sent; ending ExtProc stream processing");
 }
 
 // -----------------------------------------------------------------------------
@@ -331,6 +375,11 @@ async fn dispatch_request(
     reason = "independent per-direction flags, not a state machine"
 )]
 pub(crate) struct HeaderDeliveryState {
+    /// Whether request header filters already ran. A delayed streamed body
+    /// pipeline runs them before buffering starts and must not run them again
+    /// when the complete body is available.
+    pub(crate) request_filters_executed: bool,
+
     /// Whether response-phase filters already ran at header time.
     pub(crate) response_filters_executed: bool,
 
@@ -396,6 +445,9 @@ impl BodyReceiptTracker {
 #[must_use = "parked cross-phase state must be hydrated into a context"]
 #[derive(Debug, Default)]
 pub(super) struct CarriedContext {
+    /// Logical cluster selected during request headers, before Envoy routes.
+    pub(super) cluster: Option<Arc<str>>,
+
     /// Branch re-entrance counters.
     pub(super) branch_iterations: HashMap<Arc<str>, u32>,
 
@@ -407,6 +459,15 @@ pub(super) struct CarriedContext {
 
     /// Typed per-filter state.
     pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
+
+    /// Response buffering requested by filters during the headers phase.
+    pub(super) response_body_mode: Option<praxis_filter::BodyMode>,
+
+    /// Accumulated request body bytes seen across phases and streamed chunks.
+    pub(super) request_body_bytes: u64,
+
+    /// Accumulated response body bytes seen across phases and streamed chunks.
+    pub(super) response_body_bytes: u64,
 }
 
 /// A context holding hydrated cross-phase state.
@@ -431,9 +492,15 @@ impl<'a> HydratedContext<'a> {
         let carried =
             carried.ok_or_else(|| Status::internal("cross-phase context missing: a prior phase did not restore it"))?;
         ctx.branch_iterations = carried.branch_iterations;
+        ctx.cluster = carried.cluster;
         ctx.executed_filter_indices = carried.executed_filter_indices;
         ctx.filter_metadata = carried.filter_metadata;
         ctx.filter_state = carried.filter_state;
+        if let Some(mode) = carried.response_body_mode {
+            ctx.response_body_mode = mode;
+        }
+        ctx.request_body_bytes = carried.request_body_bytes;
+        ctx.response_body_bytes = carried.response_body_bytes;
         Ok(Self { ctx })
     }
 
@@ -456,10 +523,14 @@ impl<'a> HydratedContext<'a> {
             ));
         }
         *slot = Some(CarriedContext {
+            cluster: self.ctx.cluster,
             branch_iterations: self.ctx.branch_iterations,
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
+            response_body_mode: Some(self.ctx.response_body_mode),
+            request_body_bytes: self.ctx.request_body_bytes,
+            response_body_bytes: self.ctx.response_body_bytes,
         });
         Ok(())
     }
@@ -494,6 +565,11 @@ pub(crate) struct StreamState {
     /// Accumulated request body bytes.
     pub(crate) request_body: Vec<u8>,
 
+    /// Running total of streamed / full-duplex request body bytes forwarded
+    /// without buffering into [`Self::request_body`]. Used to enforce
+    /// [`Self::max_body_accumulation`] on passthrough and streamed-filter paths.
+    pub(crate) streamed_request_bytes: usize,
+
     /// Converted response from the response headers phase.
     pub(crate) response: Option<Response>,
 
@@ -524,9 +600,16 @@ pub(crate) struct StreamState {
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     pub(crate) max_body_accumulation: Option<usize>,
 
+    /// BUFFERED sends one complete body message even when trailers, rather
+    /// than that message, end the request. Track that it was already filtered.
+    pub(crate) buffered_request_body_processed: bool,
+
     /// Whether to derive the client address from `x-forwarded-for` when Envoy's
     /// trusted `x-envoy-external-address` header is absent.
     pub(crate) trust_forwarded_for: bool,
+
+    /// Response mode selection derived from the loaded filter configuration.
+    pub(crate) response_mode_selector: crate::response_mode::ResponseModeSelector,
 }
 
 impl Default for StreamState {
@@ -538,6 +621,7 @@ impl Default for StreamState {
             carried_context: Some(CarriedContext::default()),
             request: None,
             request_body: Vec::new(),
+            streamed_request_bytes: 0,
             response: None,
             response_body: Vec::new(),
             body_receipt: BodyReceiptTracker::default(),
@@ -548,7 +632,9 @@ impl Default for StreamState {
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
             max_body_accumulation: None,
+            buffered_request_body_processed: false,
             trust_forwarded_for: false,
+            response_mode_selector: crate::response_mode::ResponseModeSelector::default(),
         }
     }
 }
@@ -556,7 +642,7 @@ impl Default for StreamState {
 impl StreamState {
     /// Create a new empty stream state with default protocol configuration.
     ///
-    /// The body-accumulation ceiling defaults to the built-in 10 MiB
+    /// The body-accumulation ceiling defaults to the built-in 32 MiB
     /// ([`crate::config::DEFAULT_MAX_BODY_BYTES`]); [`handle_stream`] overrides
     /// it with the configured effective limit.
     pub(crate) fn new() -> Self {

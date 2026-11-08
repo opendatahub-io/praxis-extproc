@@ -10,3 +10,7 @@ patches:
       kind: EnvoyFilter
       name: praxis-extproc-ext-proc
     path: mode-patch.yaml
+  - target:
+      kind: EnvoyFilter
+      name: praxis-extproc-streaming
+    path: streaming-mode-patch.yaml

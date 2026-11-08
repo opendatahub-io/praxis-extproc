@@ -160,21 +160,24 @@ mod tests {
     use super::*;
 
     /// The status of a FIPS host.
-    const FIPS_HOST: Status = Status {
-        name: "openssl",
-        installed: true,
-        provider_fips: true,
-        kernel_fips: Some(true),
-    };
+    fn fips_host() -> Status {
+        Status {
+            name: "openssl",
+            installed: true,
+            provider_fips: true,
+            kernel_fips: Some(true),
+            crypto_policy: Some("FIPS".to_owned()),
+        }
+    }
 
     #[test]
     fn fips_mode_needs_both_signals() {
-        assert!(active(&FIPS_HOST), "provider and kernel both report FIPS");
-        assert!(FIPS_HOST.unmet().is_empty(), "nothing is missing on a FIPS host");
+        assert!(active(&fips_host()), "provider and kernel both report FIPS");
+        assert!(fips_host().unmet().is_empty(), "nothing is missing on a FIPS host");
         let neither = Status {
             provider_fips: false,
             kernel_fips: Some(false),
-            ..FIPS_HOST
+            ..fips_host()
         };
         assert!(!active(&neither), "no signal, no FIPS mode");
         assert_eq!(neither.unmet().len(), 2, "both missing signals are named");
@@ -187,7 +190,7 @@ mod tests {
             (
                 Status {
                     provider_fips: false,
-                    ..FIPS_HOST
+                    ..fips_host()
                 },
                 "OpenSSL provider",
             ),
@@ -195,21 +198,21 @@ mod tests {
                 Status {
                     installed: false,
                     provider_fips: false,
-                    ..FIPS_HOST
+                    ..fips_host()
                 },
                 "not the installed crypto provider",
             ),
             (
                 Status {
                     kernel_fips: Some(false),
-                    ..FIPS_HOST
+                    ..fips_host()
                 },
                 "not in FIPS mode",
             ),
             (
                 Status {
                     kernel_fips: None,
-                    ..FIPS_HOST
+                    ..fips_host()
                 },
                 "cannot be read",
             ),
@@ -217,7 +220,7 @@ mod tests {
             assert!(!active(&status), "one missing signal means no FIPS mode: {status:?}");
             let unmet = status.unmet();
             assert_eq!(unmet.len(), 1, "exactly the missing signal is named: {unmet:?}");
-            let reason = unmet.first().copied().expect("one reason");
+            let reason = unmet.first().expect("one reason");
             assert!(reason.contains(missing), "the reason names the signal: {reason}");
         }
     }
@@ -227,10 +230,10 @@ mod tests {
         let off = Status {
             provider_fips: false,
             kernel_fips: Some(false),
-            ..FIPS_HOST
+            ..fips_host()
         };
         assert!(require_if(&off, false).is_ok(), "not required: serve regardless");
-        assert!(require_if(&FIPS_HOST, true).is_ok(), "required and met: serve");
+        assert!(require_if(&fips_host(), true).is_ok(), "required and met: serve");
         let err = require_if(&off, true).expect_err("required and unmet: refuse");
         let message = err.to_string();
         assert!(

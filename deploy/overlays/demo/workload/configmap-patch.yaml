@@ -8,6 +8,7 @@ data:
       grpc_address: "0.0.0.0:9004"
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
+      max_body_bytes: 10485760
       tls:
         mode: none
 
@@ -22,6 +23,3 @@ data:
             response_set:
               - name: X-Praxis
                 value: "true"
-
-    insecure_options:
-      allow_unbounded_body: true

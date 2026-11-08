@@ -17,3 +17,7 @@ patches:
     target:
       kind: ConfigMap
       name: payload-processing-plugins
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: payload-processing

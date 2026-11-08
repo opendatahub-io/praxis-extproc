@@ -100,6 +100,11 @@ spec:
           namespace: istio-system
           condition: available
           timeout: "120s"
+        - type: wait
+          resource: deployment/payload-processing-streaming
+          namespace: istio-system
+          condition: available
+          timeout: "120s"
 
     gateway:
       description: Gateway, HTTPRoutes, EnvoyFilter, and model backends
@@ -118,7 +123,17 @@ spec:
           condition: available
           timeout: "120s"
         - type: wait
+          resource: deployment/external-model
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
           resource: deployment/nemo-mock
+          namespace: llm
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/streaming-oracle
           namespace: llm
           condition: available
           timeout: "120s"
@@ -127,3 +142,21 @@ spec:
           namespace: istio-system
           condition: Programmed
           timeout: "120s"
+        - type: wait
+          resource: gateway/e2e-streaming-gateway
+          namespace: istio-system
+          condition: Programmed
+          timeout: "120s"
+        # HTTPRoute conditions live under status.parents[].conditions, not
+        # status.conditions, so use JSONPath instead of Forge's generic wait.
+        - type: exec
+          command:
+            - kubectl
+            - wait
+            - --context
+            - kind-praxis-{{ cluster.name }}
+            - --namespace
+            - istio-system
+            - "--for=jsonpath={.status.parents[*].conditions[?(@.type==\"Accepted\")].status}=True"
+            - httproute/e2e-streaming-route
+            - --timeout=120s

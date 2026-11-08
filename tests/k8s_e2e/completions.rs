@@ -35,15 +35,6 @@ async fn response_has_valid_structure() {
     }
 }
 
-// NOTE: a plain streaming-passthrough test (expecting 200 + an SSE body) is
-// deliberately absent. The e2e overlay enables `ai_guardrails` with a response
-// phase at the gateway level, so every request flows through it. As of
-// praxis-ai 0.7.0 (praxis-proxy/ai#1604) the filter fails closed on streaming
-// while a response guardrail is active, rejecting `stream: true` with a 422
-// before the upstream is reached — SSE passthrough is therefore impossible in
-// this overlay. That fail-closed contract is covered by
-// `guardrails::streaming_request_rejected_when_response_guardrails_enabled`.
-
 #[tokio::test]
 async fn tool_call_passthrough() {
     ensure_gateway_ready().await;

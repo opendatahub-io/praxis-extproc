@@ -13,7 +13,8 @@ spec:
         app: payload-pre-processing
     spec:
       terminationGracePeriodSeconds: 30
-      automountServiceAccountToken: false
+      serviceAccountName: payload-processing
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
       containers:
@@ -40,6 +41,9 @@ spec:
             # Hop index for e2e_body_oracle: pre-IPP is the first hop.
             - name: BODY_ORACLE_HOP_INDEX
               value: "1"
+            # Match pre max_body_bytes (10 MiB) + framing; see base Deployment.
+            - name: GRPC_MAX_RECV_MSG_SIZE
+              value: "11Mi"
           ports:
             - containerPort: 9004
               name: grpc
@@ -52,10 +56,10 @@ spec:
               protocol: TCP
           resources:
             requests:
-              memory: "64Mi"
+              memory: "128Mi"
               cpu: "50m"
             limits:
-              memory: "256Mi"
+              memory: "512Mi"
               cpu: "500m"
           livenessProbe:
             tcpSocket:

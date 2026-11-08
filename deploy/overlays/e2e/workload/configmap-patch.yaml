@@ -9,8 +9,8 @@ data:
       health_address: "0.0.0.0:50052"
       metrics_address: "0.0.0.0:9090"
       # Enforce a small body cap on the fail-closed (failure_mode_allow: false)
-      # ext-proc so an oversized body deterministically yields a 5xx. The
-      # pre-processing ext-proc stays unbounded so routing still resolves.
+      # ext-proc so an oversized body deterministically yields ImmediateResponse
+      # 413. BBR keeps a higher max_body_bytes so routing still resolves.
       max_body_bytes: 1048576
       tls:
         mode: self_signed
@@ -27,10 +27,73 @@ data:
     filter_chains:
       - name: ai-filters
         filters:
-          # Request + response phases both evaluate against the mock NeMo service;
-          # a "passed" verdict forwards traffic unchanged, so the rest of the
-          # e2e suite is undisturbed.
+          # Preserve the hosted simulator's authentication contract locally.
+          - filter: static_response
+            conditions:
+              - unless:
+                  headers:
+                    authorization: "Bearer llm-katan-openai-key"
+            status: 401
+            body: "invalid test API key"
+          # Mirrors the `ipp` chain's guard filter
+          # (../../../base/config/configmap.yaml) for maas-headers-guard
+          # regression coverage. Two e2e-only additions: a `when
+          # path_prefix: /direct/internal` condition, so the strip never
+          # hits gpt-4/llm-katan's shared /v1/chat/completions (which needs
+          # its real Authorization header); and an unconditional
+          # response_add marker so tests can observe this filter's own
+          # conditions matching -- see tests/k8s_e2e/filters.rs for why a
+          # later-filter canary can't do that instead.
+          - filter: headers
+            conditions:
+              - unless:
+                  path_prefix: /maas-api
+              - unless:
+                  path_prefix: /v1/models
+              - unless:
+                  path_prefix: /v1/subscriptions
+              - unless:
+                  path_prefix: /v1/api-keys
+              - unless:
+                  path: /v1/me
+              - when:
+                  path_prefix: /direct/internal
+            request_remove:
+              - authorization
+              - x-api-key
+              - x-origin-cluster
+              - x-maas-username
+              - x-maas-username-oc
+              - x-maas-username-token
+              - x-maas-group
+              - x-maas-group-oc
+              - x-maas-group-token
+              - x-maas-keyname
+              - x-maas-key-id
+              - x-maas-subscription
+              - x-maas-subscription-rate-limit-id
+              - x-maas-cost-center
+              - x-maas-organization-id
+              - x-maas-identity
+              - x-maas-admin-scope
+              - x-maas-tenant
+              - x-maas-invocation-mode
+              - x-maas-policy-revision
+              - x-maas-responses-owner
+              - x-maas-return-all-models
+              - x-maas-model
+            response_add:
+              - name: X-Guard-Applied
+                value: "true"
+          # Request + response phases both evaluate against the mock NeMo service
+          # when the e2e selection header is present. Keeping this conditional
+          # lets the FDS suite exercise ordinary traffic without selecting a
+          # guardrail, while buffered guardrail tests opt in explicitly.
           - filter: ai_guardrails
+            conditions:
+              - when:
+                  headers:
+                    x-aigateway-guardrail-e2e: "true"
             provider:
               type: nemo
               endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
@@ -42,6 +105,19 @@ data:
             phase:
               request: true
               response: true
+          # This E2E-only validator makes malformed-body rejection observable
+          # without changing the production-like extractor below. Tests opt in
+          # with the header, so ordinary routing and guardrail cases keep their
+          # existing invalid-body behavior.
+          - filter: json_body
+            conditions:
+              - when:
+                  headers:
+                    x-e2e-validate-json: "true"
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: reject
           - filter: json_body
             request_extract:
               - pointer: /model
