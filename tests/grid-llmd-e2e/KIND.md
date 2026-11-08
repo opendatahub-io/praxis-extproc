@@ -105,7 +105,7 @@ Kind pins Kuadrant v1.4.7 for this installation. The shared source resolver's de
 
 `run-kind-lifecycle.sh` owns the full run boundary: it resolves sources once, builds and records the images, provisions the run-owned Kind environment, runs the dependency and serving gates, executes the traffic xtask, restores temporary MaaS state, and performs ordered natural cleanup. A failed run preserves the first failure and sanitized diagnostics for the workflow cleanup step. It never deletes a finalizer or prunes shared Docker resources.
 
-The manually triggered workflow is `.github/workflows/kind-native-grid-llmd-e2e.yaml`. Select an exact branch or commit from `nerdalert/praxis-extproc`; the workflow checks out that revision, locks all runtime sources, records the tested SHA, and uses the explicit `gha-standard-4cpu` profile. It does not use provider credentials or write permission. Its cleanup retry runs after failure or cancellation, evidence is sanitized before upload, and private state is removed after the artifact upload attempt.
+The manually triggered workflow is `.github/workflows/kind-native-grid-llmd-e2e.yaml`. Select an exact branch or commit from the repository hosting the workflow; the workflow checks out that revision, locks all runtime sources, records the tested SHA, and uses the explicit `gha-standard-4cpu` profile. It does not use provider credentials or write permission. Its cleanup retry runs after failure or cancellation, evidence is sanitized before upload, and private state is removed after the artifact upload attempt.
 
 For a local run with a fresh, isolated host that satisfies the full profile guard:
 
@@ -115,8 +115,8 @@ CLUSTER_ENV=kind \
 RESOURCE_PROFILE=reduced-dev \
 KIND_CAPACITY_PROFILE=full \
 KIND_RUN_ROOT="/tmp/grid-llmd-kind-$(date -u +%Y%m%dT%H%M%SZ)" \
-EXTPROC_REPOSITORY_URL=https://github.com/nerdalert/praxis-extproc.git \
-EXTPROC_REF=<exact-fork-commit> \
+EXTPROC_REPOSITORY_URL=https://github.com/<owner>/praxis-extproc.git \
+EXTPROC_REF=<exact-commit> \
 bash tests/grid-llmd-e2e/run-kind-lifecycle.sh --mode run
 ```
 

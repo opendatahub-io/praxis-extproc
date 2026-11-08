@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Exact nerdalert/praxis-extproc branch or commit to qualify
+        description: Exact branch or commit in this repository to qualify
         required: true
         type: string
 
@@ -27,16 +27,16 @@ jobs:
       CLUSTER_ENV: kind
       RESOURCE_PROFILE: reduced-dev
       KIND_CAPACITY_PROFILE: gha-standard-4cpu
-      EXTPROC_REPOSITORY_URL: https://github.com/nerdalert/praxis-extproc.git
+      EXTPROC_REPOSITORY_URL: https://github.com/${{ github.repository }}.git
       EXTPROC_REF: ${{ inputs.source_ref }}
       CARGO_BUILD_JOBS: "1"
       CONTAINER_BUILD_JOBS: "1"
 
     steps:
-      - name: Checkout requested fork source
+      - name: Checkout requested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: nerdalert/praxis-extproc
+          repository: ${{ github.repository }}
           ref: ${{ inputs.source_ref }}
           path: praxis-extproc
           persist-credentials: false
