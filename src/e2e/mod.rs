@@ -8,6 +8,7 @@
 
 pub mod body_oracle;
 pub mod header_oracle;
+pub mod sse_backend;
 
 use praxis_filter::{FilterError, FilterRegistry};
 

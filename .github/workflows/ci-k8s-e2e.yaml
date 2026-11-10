@@ -16,30 +16,11 @@ env:
 permissions: {}
 
 jobs:
-  simulator-check:
-    name: Check simulator connectivity
-    runs-on: ubuntu-24.04
-    outputs:
-      reachable: ${{ steps.check.outputs.reachable }}
-    steps:
-      - name: Check llm-katan reachability
-        id: check
-        run: |
-          if nc -z -w 5 3.147.232.199 443; then
-            echo "reachable=true" >> "$GITHUB_OUTPUT"
-            echo "llm-katan is reachable"
-          else
-            echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "llm-katan is NOT reachable — skipping e2e tests"
-          fi
-
   k8s-e2e:
     name: K8s E2E (${{ matrix.profile }}/${{ matrix.mode }})
     timeout-minutes: 30
     permissions:
       contents: read
-    needs: simulator-check
-    if: needs.simulator-check.outputs.reachable == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -47,7 +28,7 @@ jobs:
         # conformance = production-faithful chain (ai_guardrails);
         # integrity = instrumented oracle lane (identity_header_guard + oracles,
         # no guardrails, #165). Crossed with the body mode under test.
-        mode: [buffered, fds]
+        mode: [buffered, streamed, fds]
         profile: [conformance, integrity]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,6 +52,11 @@ jobs:
           kubectl --context kind-praxis-e2e get gateways,httproutes,referencegrants -A -o yaml || true
           kubectl --context kind-praxis-e2e get services -n istio-system -o wide || true
           kubectl --context kind-praxis-e2e logs -n istio-system deployment/istiod --tail=200 || true
+          kubectl --context kind-praxis-e2e describe pods -n istio-system || true
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-processing --tail=100 || true
+          kubectl --context kind-praxis-e2e logs -n istio-system \
+            -l app=payload-pre-processing --tail=100 || true
           kubectl --context kind-praxis-e2e describe pods -n praxis-extproc || true
           kubectl --context kind-praxis-e2e logs -n praxis-extproc -l app=praxis --tail=100 || true
           kubectl --context kind-praxis-e2e get events -A --sort-by='.lastTimestamp' | tail -30 || true

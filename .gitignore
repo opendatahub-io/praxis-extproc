@@ -25,3 +25,9 @@ target
 
 # Personal notes
 .docs/**
+
+# Local KIND provided-TLS experiments (see deploy/testdata/tls/README.md).
+# Never commit private keys or Secret manifests that embed them.
+deploy/testdata/tls/tls.crt
+deploy/testdata/tls/tls.key
+deploy/overlays/**/tls-secret.yaml

@@ -15,13 +15,25 @@ data:
     insecure_options:
       allow_private_upstreams: true
 
-    # This isolated test chain keeps request guardrails active while leaving
-    # the response guardrail on the primary Gateway unchanged. The ai_guardrails
-    # filter intentionally rejects stream=true when response evaluation is on.
+    # This isolated test chain keeps a request-only guardrail available while
+    # leaving it unselected by default. The primary guardrail tests opt in with
+    # the e2e selection header; ordinary streaming tests stay unguarded.
     filter_chains:
       - name: streaming-e2e
         filters:
+          # Preserve the hosted simulator's authentication contract locally.
+          - filter: static_response
+            conditions:
+              - unless:
+                  headers:
+                    authorization: "Bearer llm-katan-openai-key"
+            status: 401
+            body: "invalid test API key"
           - filter: ai_guardrails
+            conditions:
+              - when:
+                  headers:
+                    x-aigateway-guardrail-e2e: "true"
             provider:
               type: nemo
               endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"

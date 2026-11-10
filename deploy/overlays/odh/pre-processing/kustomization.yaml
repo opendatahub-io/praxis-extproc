@@ -16,6 +16,10 @@ patches:
       - op: replace
         path: /metadata/name
         value: payload-pre-processing
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.beta.openshift.io/serving-cert-secret-name: payload-pre-processing-tls
       - op: replace
         path: /spec/selector/app
         value: payload-pre-processing
@@ -32,3 +36,7 @@ patches:
       - op: replace
         path: /spec/trafficPolicy/tls/sni
         value: payload-pre-processing.openshift-ingress.svc.cluster.local
+      - op: add
+        path: /spec/trafficPolicy/tls/subjectAltNames
+        value:
+          - payload-pre-processing.openshift-ingress.svc.cluster.local

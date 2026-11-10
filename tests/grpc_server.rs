@@ -375,9 +375,7 @@ async fn grpc_compiled_max_recv_rejects_body_above_four_mib() {
 #[test]
 fn grpc_max_recv_invalid_fails_validate() {
     let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
-    let output = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
-        .args(["-t", "-c"])
-        .arg(&config)
+    let output = validate_command(&config)
         .env(GRPC_MAX_RECV_MSG_SIZE_ENV, "not-a-size")
         .output()
         .expect("run praxis-extproc -t");
@@ -395,6 +393,44 @@ fn grpc_max_recv_invalid_fails_validate() {
     assert!(
         combined.contains(GRPC_MAX_RECV_MSG_SIZE_ENV) || combined.contains("config:"),
         "validate refusal should name the bad override, got: {combined}"
+    );
+}
+
+#[test]
+fn invalid_listener_addresses_fail_validate() {
+    let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
+
+    for flag in ["--grpc-address", "--health-address", "--metrics-address"] {
+        let output = validate_command(&config)
+            .args([flag, "not-an-address"])
+            .output()
+            .expect("run praxis-extproc -t");
+        let combined = command_output(&output);
+
+        assert!(
+            !output.status.success(),
+            "invalid {flag} must fail validate, got: {combined}"
+        );
+        assert!(
+            combined.contains("invalid socket address"),
+            "validate refusal should identify the invalid address, got: {combined}"
+        );
+    }
+}
+
+#[test]
+fn unusable_tls_files_fail_validate() {
+    let (_temp_dir, config) = write_invalid_tls_validate_config();
+    let output = validate_command(&config).output().expect("run praxis-extproc -t");
+    let combined = command_output(&output);
+
+    assert!(
+        !output.status.success(),
+        "unusable TLS files must fail validate, got: {combined}"
+    );
+    assert!(
+        combined.contains("certificate:"),
+        "validate refusal should identify the unusable certificate, got: {combined}"
     );
 }
 
@@ -3240,6 +3276,36 @@ filter_chains:
 type ExtProcClient =
     praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
 
+fn command_output(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn validate_command(config: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"));
+    command.args(["-t", "-c"]).arg(config);
+    command
+}
+
+fn write_invalid_tls_validate_config() -> (tempfile::TempDir, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("create temporary directory");
+    let missing = temp_dir.path().join("missing-tls");
+    let yaml = format!(
+        "server:\n  grpc_address: \"127.0.0.1:50051\"\n  health_address: \"127.0.0.1:50052\"\n  \
+         metrics_address: \"127.0.0.1:9090\"\n  tls:\n    mode: provided\n    cert_path: \"{}.crt\"\n    \
+         key_path: \"{}.key\"\nfilter_chains:\n  - name: test\n    filters:\n      - filter: request_id\n\
+         insecure_options:\n  allow_unbounded_body: true\n",
+        missing.display(),
+        missing.display()
+    );
+    let path = temp_dir.path().join("config.yaml");
+    std::fs::write(&path, yaml).expect("write invalid TLS config");
+    (temp_dir, path)
+}
+
 async fn start_server(config_yaml: &str) -> (ExtProcClient, tokio::sync::oneshot::Sender<()>) {
     start_server_with_registry(config_yaml, praxis_ai_filters::build_ai_registry()).await
 }
@@ -3348,11 +3414,15 @@ async fn connect_extproc_client(port: u16) -> ExtProcClient {
 }
 
 /// Minimal serving config on free ports for the binary max-recv regression.
+///
+/// `metrics_auth` is off: this process has no kubeconfig, and the default
+/// `enabled: true` exits before the gRPC listener starts.
 fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -> PathBuf {
     let yaml = format!(
         "server:\n  grpc_address: \"127.0.0.1:{grpc}\"\n  health_address: \"127.0.0.1:{health}\"\n  \
-         metrics_address: \"127.0.0.1:{metrics}\"\n  tls:\n    mode: none\nfilter_chains:\n  - name: test\n    \
-         filters:\n      - filter: request_id\ninsecure_options:\n  allow_unbounded_body: true\n"
+         metrics_address: \"127.0.0.1:{metrics}\"\n  metrics_auth:\n    enabled: false\n  tls:\n    mode: none\n\
+         filter_chains:\n  - name: test\n    filters:\n      - filter: request_id\n\
+         insecure_options:\n  allow_unbounded_body: true\n"
     );
     let path = std::env::temp_dir().join(format!(
         "praxis-extproc-grpc-max-recv-{}-{grpc}.yaml",

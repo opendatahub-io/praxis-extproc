@@ -47,11 +47,53 @@ async fn ensure_gateway_ready_at(ready: &'static tokio::sync::OnceCell<bool>, ur
 
 /// Send a chat completion request with the given model and content.
 pub(crate) async fn chat_completion(model: &str, content: &str) -> reqwest::Response {
+    chat_completion_with_headers(model, content, &[]).await
+}
+
+/// Chat completion with extra request headers (e.g. a conflicting routing header).
+pub(crate) async fn chat_completion_with_headers(
+    model: &str,
+    content: &str,
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let client = http_client();
+    let url = format!("{}/v1/chat/completions", gateway_url());
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": content}]
+    }));
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.send().await.expect("request failed")
+}
+
+/// Send a chat completion request with the e2e guardrail selection header.
+pub(crate) async fn guardrail_chat_completion(model: &str, content: &str) -> reqwest::Response {
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
 
     client
         .post(&url)
+        .header("x-aigateway-guardrail-e2e", "true")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .send()
+        .await
+        .expect("request failed")
+}
+
+/// Send a chat completion with the e2e guardrail selection header through the
+/// isolated streaming Gateway.
+pub(crate) async fn guardrail_streaming_chat_completion(model: &str, content: &str) -> reqwest::Response {
+    let client = http_client();
+    let url = format!("{}/v1/chat/completions", streaming_gateway_url());
+
+    client
+        .post(&url)
+        .header("x-aigateway-guardrail-e2e", "true")
         .json(&serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": content}]
@@ -72,25 +114,23 @@ pub(crate) fn assert_praxis_mutations(resp: &reqwest::Response) {
     );
 }
 
-/// `X-Praxis-Version` is only set by the IPP response-phase `headers` filter,
-/// which only runs once a real upstream response comes back. Its absence
-/// means the request was rejected before the backend was ever dialed, not
-/// just that the backend itself happened to fail.
+/// Assert that the IPP response-phase marker is absent.
 ///
-/// Only meaningful for BUFFERED rejection fixtures: streamed passthrough can
-/// already have forwarded earlier chunks before ExtProc trips its body cap.
-pub(crate) fn assert_not_forwarded_to_backend(resp: &reqwest::Response) {
+/// The marker proves that the IPP response filter ran, but it does not prove
+/// that an upstream backend was contacted: Envoy local replies can traverse
+/// the response filter too. Use an upstream request counter when that stronger
+/// property matters.
+pub(crate) fn assert_no_ipp_response_marker(resp: &reqwest::Response) {
     assert!(
         resp.headers().get("X-Praxis-Version").is_none(),
-        "X-Praxis-Version present — request reached the backend instead of being rejected"
+        "X-Praxis-Version present - IPP response filter ran"
     );
 }
 
-/// Whether this e2e run was set up with BUFFERED ExtProc body modes.
-pub(crate) fn is_buffered_body_mode() -> bool {
+/// Whether the request direction uses BUFFERED transport in this E2E mode.
+pub(crate) fn request_body_is_buffered() -> bool {
     std::env::var("E2E_BODY_MODE")
-        .map(|mode| mode.eq_ignore_ascii_case("buffered"))
-        .unwrap_or(false)
+        .is_ok_and(|mode| mode.eq_ignore_ascii_case("buffered") || mode.eq_ignore_ascii_case("streamed"))
 }
 
 /// Prometheus scrape URL for the fail-closed IPP ExtProc metrics port.
@@ -100,15 +140,28 @@ pub(crate) fn ipp_metrics_url() -> String {
 
 /// Current value of `praxis_extproc_body_size_rejections_total` from IPP metrics.
 ///
+/// Sends [`ipp_metrics_token`] as a bearer token. A scrape without a token
+/// that passes `TokenReview` and `SubjectAccessReview` is rejected.
+///
 /// Missing samples count as `0`: Prometheus exporters often omit a counter until
 /// it has been incremented at least once.
 pub(crate) async fn body_size_rejections_total() -> u64 {
+    metric_counter("praxis_extproc_body_size_rejections_total").await
+}
+
+/// Current value of `praxis_extproc_immediate_responses_total` from IPP metrics.
+pub(crate) async fn immediate_responses_total() -> u64 {
+    metric_counter("praxis_extproc_immediate_responses_total").await
+}
+
+async fn metric_counter(name: &str) -> u64 {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build metrics HTTP client");
     let text = client
         .get(ipp_metrics_url())
+        .bearer_auth(ipp_metrics_token())
         .send()
         .await
         .expect("scrape IPP metrics")
@@ -117,7 +170,12 @@ pub(crate) async fn body_size_rejections_total() -> u64 {
         .text()
         .await
         .expect("read IPP metrics body");
-    parse_prometheus_counter(&text, "praxis_extproc_body_size_rejections_total").unwrap_or(0)
+    parse_prometheus_counter(&text, name).unwrap_or(0)
+}
+
+/// Bearer token for the IPP metrics scrape, minted by `hack/scripts/e2e-test.sh`.
+fn ipp_metrics_token() -> String {
+    std::env::var("IPP_METRICS_TOKEN").expect("IPP_METRICS_TOKEN is unset; hack/scripts/e2e-test.sh mints it")
 }
 
 /// Parse an unlabeled (or any-label) counter sample from Prometheus text.
@@ -129,29 +187,6 @@ fn parse_prometheus_counter(text: &str, name: &str) -> Option<u64> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_prometheus_counter;
-
-    #[test]
-    fn parse_prometheus_counter_reads_sample_and_missing() {
-        let text = "\
-# HELP praxis_extproc_body_size_rejections_total Total requests rejected
-# TYPE praxis_extproc_body_size_rejections_total counter
-praxis_extproc_body_size_rejections_total 3
-praxis_extproc_requests_total 9
-";
-        assert_eq!(
-            parse_prometheus_counter(text, "praxis_extproc_body_size_rejections_total"),
-            Some(3)
-        );
-        assert_eq!(parse_prometheus_counter(text, "does_not_exist"), None);
-        assert_eq!(
-            parse_prometheus_counter("# only comments\n", "praxis_extproc_body_size_rejections_total"),
-            None
-        );
-    }
-}
 
 pub(crate) fn gateway_url() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_owned())
@@ -176,4 +211,28 @@ pub(crate) fn http_client() -> reqwest::Client {
         .default_headers(headers)
         .build()
         .expect("failed to build HTTP client")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_prometheus_counter;
+
+    #[test]
+    fn parse_prometheus_counter_reads_sample_and_missing() {
+        let text = "\
+# HELP praxis_extproc_body_size_rejections_total Total requests rejected
+# TYPE praxis_extproc_body_size_rejections_total counter
+praxis_extproc_body_size_rejections_total 3
+praxis_extproc_requests_total 9
+";
+        assert_eq!(
+            parse_prometheus_counter(text, "praxis_extproc_body_size_rejections_total"),
+            Some(3)
+        );
+        assert_eq!(parse_prometheus_counter(text, "does_not_exist"), None);
+        assert_eq!(
+            parse_prometheus_counter("# only comments\n", "praxis_extproc_body_size_rejections_total"),
+            None
+        );
+    }
 }

@@ -6,15 +6,20 @@
 //! Tests the full BBR + IPP ext-proc topology with header-based model routing:
 //!
 //! ```text
-//! Client → Gateway → [ipp-pre: json_body → X-Gateway-Model-Name]
+//! Client → Gateway → [ipp-pre: strip X-Gateway-Model-Name → json_body]
 //!                   → [ipp: response headers]
 //!                   → HTTPRoute (header match) → llm-katan
 //! ```
 //!
-//! If FDS deferral is broken, ipp-pre's header mutation is silently dropped
-//! by Envoy. Without `X-Gateway-Model-Name`, no route matches → 404.
+//! BBR strips any caller-supplied routing header before promoting body
+//! `model`, so routing identity is body-authoritative. If FDS deferral is
+//! broken, ipp-pre's header mutation is silently dropped by Envoy and no
+//! route matches → 404.
 //!
-//! Run: `make e2e-test` or `cargo test --features k8s-e2e --test k8s_e2e -- --nocapture`
+//! Run one mode at a time through the Makefile, which skips tests that are
+//! incompatible with the selected Envoy body mode:
+//! `make e2e-test MODE=buffered V=1`
+//! `make e2e-test MODE=fds V=1`
 
 #![cfg(feature = "k8s-e2e")]
 #![allow(

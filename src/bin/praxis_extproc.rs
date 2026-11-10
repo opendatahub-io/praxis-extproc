@@ -33,6 +33,11 @@ struct Cli {
     #[arg(short, long, default_value = "praxis-extproc.yaml")]
     config: String,
 
+    /// Run the gated SSE backend used by Kubernetes qualification tests.
+    #[cfg(feature = "k8s-e2e")]
+    #[arg(long)]
+    e2e_sse_backend: bool,
+
     /// Override the gRPC listen address.
     #[arg(long)]
     grpc_address: Option<String>,
@@ -59,10 +64,19 @@ async fn main() {
     init_tracing();
     let cli = Cli::parse();
 
-    if let Err(e) = Box::pin(run(cli)).await {
+    if let Err(e) = Box::pin(run_command(cli)).await {
         error!(error = %e, "fatal");
         process::exit(1);
     }
+}
+
+/// Dispatch the qualification fixture or the ExtProc server.
+async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "k8s-e2e")]
+    if cli.e2e_sse_backend {
+        return Ok(praxis_extproc::e2e::sse_backend::serve().await?);
+    }
+    Box::pin(run(cli)).await
 }
 
 // -----------------------------------------------------------------------------
@@ -78,54 +92,111 @@ struct BodyLimits {
     max_recv: usize,
 }
 
-/// Top-level application logic.
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Before anything that builds a filter registry, a subrequest client or a
-    // TLS configuration: the provider installed here is the only one there is.
-    let fips = praxis_extproc::fips::install()?;
+/// Config, registry, pipeline, and limits resolved before validate-or-serve.
+struct Prepared {
+    /// Installed crypto provider and the host FIPS signals.
+    fips: praxis_extproc::fips::Status,
+    /// Loaded ExtProc configuration.
+    cfg: ExtProcConfig,
+    /// Filter registry the pipeline was built from.
+    registry: praxis_filter::FilterRegistry,
+    /// Built pipeline, or the error from building it.
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+    /// Body ceilings resolved from config and the gRPC receive override.
+    limits: BodyLimits,
+}
 
+/// Log invalid guardrail response-mode configuration once during startup.
+fn warn_invalid_response_mode_config(selector: &praxis_extproc::response_mode::ResponseModeSelector) {
+    if let Some(reason) = selector.invalid_reason() {
+        warn!(reason = %reason, "invalid guardrail response-mode configuration; keeping buffered mode and rejecting FDS");
+    }
+}
+
+
+/// Install the crypto provider, load config, and build the pipeline.
+///
+/// The provider is installed before the registry, a subrequest client, or a
+/// TLS configuration: rustls has no fallback provider in this build, so a
+/// provider that is not installed here is not installed at all.
+fn prepare(config_path: &str) -> Result<Prepared, Box<dyn std::error::Error + Send + Sync>> {
+    let fips = praxis_extproc::fips::install()?;
     // Fail closed on a bad `GRPC_MAX_RECV_MSG_SIZE` before validate/sidecars so
     // `praxis-extproc -t` matches serve-time behaviour for this override.
     let max_recv = grpc_limits::resolve_grpc_max_recv_msg_size()?;
-
-    let cfg = load_config(&cli.config)?;
+    let cfg = load_config(config_path)?;
     let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
     let limits = BodyLimits {
         max_body: cfg.max_body_accumulation(),
         max_recv,
     };
+    Ok(Prepared {
+        fips,
+        cfg,
+        registry,
+        pipeline,
+        limits,
+    })
+}
+
+/// Top-level application logic.
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let prepared = prepare(&cli.config)?;
+    let response_mode_selector =
+        praxis_extproc::response_mode::ResponseModeSelector::from_config(&prepared.cfg.filter_chains);
+    warn_invalid_response_mode_config(&response_mode_selector);
 
     if cli.validate {
-        return validate_config(&fips, &registry, pipeline, limits);
+        return validate_prepared(&cli, prepared);
     }
 
-    let addrs = resolve_addresses(&cli, &cfg)?;
+    let addrs = resolve_addresses(&cli, &prepared.cfg)?;
 
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
     // inspectable (health NotServing) but serves no traffic.
-    if let Some(reason) = fips_refusal(&fips, &registry) {
+    if let Some(reason) = fips_refusal(&prepared.fips, &prepared.registry) {
         error!(error = %reason, "refusing to serve");
-        return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
+        return Box::pin(serve_unready(
+            addrs,
+            praxis_extproc::fips::active(&prepared.fips),
+            prepared.cfg.server.metrics_auth.clone(),
+        ))
+        .await;
     }
 
     Box::pin(serve_pipeline(
         addrs,
-        pipeline,
-        &cfg.server,
-        limits,
-        praxis_extproc::fips::active(&fips),
+        prepared.pipeline,
+        &prepared.cfg.server,
+        prepared.limits,
+        response_mode_selector,
+        praxis_extproc::fips::active(&prepared.fips),
     ))
     .await
 }
 
-/// `--validate` path: FIPS refusal, pipeline build, and already-resolved limits.
+/// `--validate` path: resolve listeners, then [`validate_config`].
+fn validate_prepared(cli: &Cli, prepared: Prepared) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    resolve_addresses(cli, &prepared.cfg)?;
+    validate_config(
+        &prepared.cfg.server,
+        &prepared.fips,
+        &prepared.registry,
+        prepared.pipeline,
+        prepared.limits,
+    )
+}
+
+/// `--validate` path after listener resolution: FIPS refusal, pipeline build,
+/// TLS, and already-resolved limits.
 ///
 /// Soft-warns when [`BodyLimits::max_recv`] cannot carry a BUFFERED body at the
 /// accumulation ceiling, but still exits successfully (`0`) so operators can
 /// catch the misconfig without blocking startup scripts.
 fn validate_config(
+    server_cfg: &config::ServerConfig,
     fips: &praxis_extproc::fips::Status,
     registry: &praxis_filter::FilterRegistry,
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
@@ -135,6 +206,7 @@ fn validate_config(
         return Err(reason.into());
     }
     pipeline?;
+    drop(tls::build_tls_config(&server_cfg.tls)?);
     warn_if_buffered_body_cannot_fit_recv(limits);
     info!(
         max_body_bytes = ?limits.max_body,
@@ -171,7 +243,6 @@ fn warn_if_buffered_body_cannot_fit_recv(limits: BodyLimits) {
     );
 }
 
-
 /// Build the AI filter registry, plus the k8s e2e body-oracle when
 /// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
 /// never enables that feature).
@@ -207,11 +278,13 @@ fn fips_refusal(fips: &praxis_extproc::fips::Status, registry: &praxis_filter::F
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -221,26 +294,40 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, server_cfg, limits, fips_active)).await
+            Box::pin(start_services(
+                addrs,
+                pipeline,
+                server_cfg,
+                limits,
+                response_mode_selector,
+                fips_active,
+            ))
+            .await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
-            Box::pin(serve_unready(addrs, fips_active)).await
+            Box::pin(serve_unready(addrs, fips_active, server_cfg.metrics_auth.clone())).await
         },
     }
 }
 
 /// Start gRPC, health (`Serving`), and metrics servers concurrently.
+#[expect(clippy::too_many_arguments, reason = "startup passes independent server options")]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, true, fips_active, move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, limits, drain_rx)
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        true,
+        fips_active,
+        server_cfg.metrics_auth.clone(),
+        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, limits, response_mode_selector, drain_rx),
+    ))
     .await
 }
 
@@ -250,11 +337,18 @@ async fn start_services(
 async fn serve_unready(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, fips_active, |drain_rx| async move {
-        wait_drain(drain_rx).await;
-        Ok(())
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        false,
+        fips_active,
+        metrics_auth,
+        |drain_rx| async move {
+            wait_drain(drain_rx).await;
+            Ok(())
+        },
+    ))
     .await
 }
 
@@ -279,10 +373,15 @@ enum Selected {
 /// sidecar's bind failure) is returned as the originating error.
 ///
 /// [`watch::Receiver`]: tokio::sync::watch::Receiver
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential sidecar supervision; extraction would split related logic"
+)]
 async fn run_with_sidecars<F, Fut>(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     serving: bool,
     fips_active: bool,
+    metrics_auth: config::MetricsAuthConfig,
     foreground: F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -299,8 +398,14 @@ where
     });
 
     let metrics_rx = shutdown_tx.subscribe();
-    let mut metrics =
-        tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
+    let (metrics_ready_tx, metrics_ready_rx) = tokio::sync::oneshot::channel();
+    let mut metrics = tokio::spawn(async move {
+        praxis_extproc::metrics::serve(addrs.2, &metrics_auth, metrics_ready_tx, wait_broadcast(metrics_rx)).await
+    });
+
+    if metrics_ready_rx.await.is_err() {
+        return task_outcome(metrics.await);
+    }
 
     let foreground = foreground(drain_rx);
     tokio::pin!(foreground);
@@ -352,11 +457,13 @@ where
 }
 
 /// Start the main gRPC ExtProc server.
+#[expect(clippy::too_many_arguments, reason = "gRPC setup passes independent server options")]
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     server_cfg: &config::ServerConfig,
     limits: BodyLimits,
+    response_mode_selector: praxis_extproc::response_mode::ResponseModeSelector,
     drain_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Per-message tonic limit only (RHOAIENG-102139 / RHAI-13005). Does not
@@ -376,6 +483,7 @@ async fn serve_grpc(
         PraxisExtProc::new(pipeline)
             .with_max_body_accumulation(limits.max_body)
             .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
+            .with_response_mode_selector(response_mode_selector)
             .with_force_shutdown(force_rx.clone()),
         limits.max_recv,
     );

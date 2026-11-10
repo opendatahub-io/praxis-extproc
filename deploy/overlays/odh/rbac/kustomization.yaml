@@ -3,5 +3,7 @@ kind: Kustomization
 
 resources:
   - serviceaccount.yaml
-  - clusterrole.yaml
-  - clusterrolebinding.yaml
+  # Keep metrics TokenReview/SAR + Prometheus /metrics GET (from #57).
+  # Do not restore payload-processing-reader (cluster-scoped secrets get).
+  - metrics-auth-clusterrole.yaml
+  - metrics-reader-clusterrole.yaml

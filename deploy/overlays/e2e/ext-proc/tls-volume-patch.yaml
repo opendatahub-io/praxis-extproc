@@ -1,0 +1,8 @@
+# E2e uses tls.mode: self_signed. Drop the base provided-TLS volume/mount and
+# OpenShift Reloader annotation so KIND does not need a serving-cert Secret.
+- op: remove
+  path: /metadata/annotations/secret.reloader.stakater.com~1reload
+- op: remove
+  path: /spec/template/spec/containers/0/volumeMounts/1
+- op: remove
+  path: /spec/template/spec/volumes/1

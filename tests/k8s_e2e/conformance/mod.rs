@@ -5,7 +5,9 @@
 mod completions;
 mod direct;
 mod errors;
+mod fds_mode;
 mod filters;
 mod guardrails;
 mod malformed_json;
+mod pre_processing;
 mod routing;

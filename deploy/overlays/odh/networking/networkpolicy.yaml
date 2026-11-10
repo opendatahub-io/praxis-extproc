@@ -2,7 +2,8 @@
 #
 # Required on OCP 4.22+ where openshift-ingress has a default deny-all
 # NetworkPolicy. Without this, payload-processing pods cannot receive
-# ext_proc traffic from the gateway or reach the Kubernetes API server.
+# ext_proc traffic from the gateway or reach the Kubernetes API server
+# (needed for metrics TokenReview / SubjectAccessReview).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -34,7 +35,8 @@ spec:
       ports:
         - protocol: TCP
           port: 9004
-    # Monitoring scrape
+    # Monitoring scrape — allow Prometheus / OTel Collector from all
+    # monitoring namespaces (platform, user-workload, and RHOAI).
     - from:
         - namespaceSelector:
             matchLabels:
@@ -42,6 +44,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openshift-user-workload-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redhat-ods-monitoring
       ports:
         - protocol: TCP
           port: 9090
@@ -56,7 +61,7 @@ spec:
           port: 5353
         - protocol: TCP
           port: 5353
-    # Kubernetes API server
+    # Kubernetes API server (metrics auth TokenReview / SubjectAccessReview)
     - ports:
         - protocol: TCP
           port: 443

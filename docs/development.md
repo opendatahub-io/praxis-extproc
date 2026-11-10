@@ -73,17 +73,20 @@ examples/
   branch-chains.yaml   # Branch chain example
 deploy/
   base/                # Shared Kustomize base
-    instance/          # Deployment + Service (hardened, non-root)
-    config/            # ConfigMap with BBR + IPP filter chains
+    instance/          # Deployment + Service (TLS volume; no OpenShift serving-cert)
+    config/            # ConfigMap with BBR + IPP filter chains (provided TLS)
+  testdata/tls/        # Optional local PEMs for provided-TLS experiments (gitignored keys)
   overlays/
     demo/              # Local KIND development overlay
-      workload/        # Namespace, TLS-disabled config patch
+      workload/        # Namespace, tls.mode none; strips base TLS volume
       test/            # Echo backend, Gateway, HTTPRoute, EnvoyFilter
     odh/               # OpenDataHub production overlay
-      rbac/            # ServiceAccount, ClusterRole, ClusterRoleBinding
+      rbac/            # ServiceAccount only (no ClusterRole / secret reader)
       networking/      # NetworkPolicy (ingress/egress restrictions)
-      pre-processing/  # Second Deployment for pre-auth model extraction
-      after/           # Post-auth Deployment + DestinationRule (TLS)
+      monitoring/      # Optional ServiceMonitor for ExtProc metrics
+      pre-processing/  # Second Deployment + OpenShift serving-cert annotation
+      after/           # Post-auth Deployment + DestinationRule + serving-cert
+    e2e/workload/      # KIND e2e; self_signed TLS; strips base TLS volume
 hack/
   kind-config.yaml     # KIND cluster configuration
   setup-kind.sh        # KIND cluster setup script
@@ -162,6 +165,39 @@ lifecycle: request headers, request body, response
 headers, response body, trailers, and rejection
 scenarios.
 
+### Guardrail transport contracts
+
+`make test` includes `tests/guardrails_transport.rs`, using the real AI filter
+registry and a recording local NeMo peer. It covers selected Input/Output
+combinations, translation filters present/absent, buffered/streamed/full-duplex
+response transport, complete-body enforcement, failure handling, limits,
+cancellation, and request isolation. No hosted model is needed.
+
+`make test-envoy` additionally runs the compiled product executable with the
+container's feature set behind real Envoy. The backend holds its final chunk
+until the test client has received the first one, proving progressive SSE
+delivery. Output-check tests prove the opposite contract: no partial unchecked
+output reaches the client. Logs and generated configurations are retained under
+`target/envoy-tests/`. The pinned Envoy download supports Linux x86_64.
+
+The generated test chain follows the controller's selection-header and filter
+ordering contract. This does not exercise Kubernetes reconciliation, MaaS
+authentication, AIGuardrail status, or an actual release container. Those still
+need controller/release qualification. ExtProc has no runtime pipeline reload;
+configuration changes take effect by replacing the process.
+
+Guardrail enforcement cases use OpenAI Chat Completions payloads. The Anthropic
+round-trip test checks translation compatibility; it does not prove guardrail
+coverage of Anthropic system prompts or content blocks before translation.
+
+Request-specific response-mode selection remains the subject of PR #172.
+These tests distinguish ordinary STREAMED transport from FULL_DUPLEX_STREAMED.
+A BUFFERED Envoy configuration still holds an SSE response until completion.
+Selecting an Output guardrail for a `stream: true` request remains unsupported
+and returns 422; unexpected SSE output returns 502. Buffered response checks
+terminated by trailers fail closed because a trailers acknowledgement cannot
+carry the replacement body.
+
 ### Service Tests
 
 `tests/services.rs` tests the health and metrics
@@ -225,6 +261,16 @@ runs on every push and pull request:
 - Tests (`cargo test`)
 - Doc build (`RUSTDOCFLAGS="-D warnings" cargo doc`)
 - Audit (`cargo audit`, `cargo deny check`)
+- Line coverage (`make coverage-check`, at least 93%, from a 93.19% measured baseline)
+- Minimal-feature tests and product-feature HTTP contracts through Envoy
+
+The Kubernetes suite runs BUFFERED, STREAMED, and FULL_DUPLEX_STREAMED response
+transport. Both model peers run in the test cluster; loss of a public model
+endpoint cannot silently skip the suite. The test chain preserves the old
+simulator's API-key rejection behavior with a local conditional response.
+STREAMED uses BUFFERED requests, as the controller does for translation. A
+passing line percentage is additional evidence, not a substitute for these
+behavioral contracts.
 
 The FIPS workflow (`.github/workflows/fips.yaml`) runs
 the checks below on every push and pull request: the
@@ -246,22 +292,47 @@ binary; the non-production `e2e_body_oracle` filter in `src/e2e/` is compiled
 and registered only under that feature), and `make e2e-test PROFILE=integrity`
 exercises it through `tests/k8s_e2e/integrity/chained_oracle.rs` and
 `tests/k8s_e2e/integrity/fd_streamed_oracle.rs`.
+The streaming oracle uses a backend compiled only with `k8s-e2e`. In streamed
+response modes the client must receive the first SSE event before releasing
+the backend's terminal event. BUFFERED mode must withhold SSE bytes after the
+backend has yielded its first frame. All modes require the exact complete
+response after release and propagate transport errors.
 TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
 in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 
 ### Profiles (conformance / integrity)
 
 `make e2e-setup` takes `PROFILE=conformance` (default) or `PROFILE=integrity`,
-orthogonal to `MODE=fds|buffered`. `conformance` runs the production-faithful
-chain (`ai_guardrails` + routing); `integrity` is an instrumented, non-production
-lane (`identity_header_guard` + `e2e_header_oracle` + `e2e_body_oracle`, no
-guardrails) for header trust-boundary and streaming coverage
-(issue [#165](https://github.com/opendatahub-io/praxis-extproc/issues/165)).
+orthogonal to `MODE=fds|buffered|streamed`. `conformance` runs the
+production-faithful chain (`ai_guardrails` + routing); `integrity` is an
+instrumented, non-production lane (`identity_header_guard` + `e2e_header_oracle`
++ `e2e_body_oracle`, no guardrails) for header trust-boundary and streaming
+coverage (issue [#165](https://github.com/opendatahub-io/praxis-extproc/issues/165)).
 Every test lives in the `conformance::` or `integrity::` test module and the
 runner selects a lane by name filter (`cargo test --test k8s_e2e <profile>`), so
 a test's module is its profile gate. See
 [`deploy/overlays/e2e/ext-proc/profiles/README.md`](../deploy/overlays/e2e/ext-proc/profiles/README.md)
 for the chains and the response-guardrails-vs-streaming invariant.
+
+Port-forward logs are retained in `target/e2e-logs/<mode>/`. On rootless Podman,
+an expected connection reset in a failure-path test can terminate the entire
+`kubectl port-forward` tunnel. Run the same suite directly in Podman's network
+namespace to keep that tunnel failure from obscuring the HTTP result:
+
+```bash
+umask 077
+kubectl config view --raw --minify --context kind-praxis-e2e > target/e2e-netns.kubeconfig
+E2E_NODE_IP=$(podman inspect praxis-e2e-control-plane --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+kubectl --kubeconfig target/e2e-netns.kubeconfig config set-cluster kind-praxis-e2e --server="https://${E2E_NODE_IP}:6443"
+KUBECONFIG="$PWD/target/e2e-netns.kubeconfig" podman unshare --rootless-netns make e2e-test MODE=streamed
+```
+
+KIND 0.29's `load docker-image` command also needs a Docker CLI even when its
+cluster uses Podman. If setup stops at image loading, export the image with
+`podman save --format docker-archive`, load that archive with
+`KIND_EXPERIMENTAL_PROVIDER=podman kind load image-archive <archive> --name praxis-e2e`,
+then resume `praxis-forge --config forge.yaml --runtime podman stack apply e2e`
+and apply the selected `deploy/overlays/e2e/environment/modes/<mode>` overlay.
 
 ## FIPS Tooling
 

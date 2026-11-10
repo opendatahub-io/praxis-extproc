@@ -22,9 +22,11 @@ EXTPROC_NS="${E2E_EXTPROC_NS:-$NS}"
 IPP_DEPLOY="${E2E_IPP_DEPLOY:-payload-processing}"
 METRICS_PORT="${E2E_METRICS_PORT:-19090}"
 
-# Body mode under test (fds|buffered). Prefer an explicit export from `make
+# Body mode under test (fds|buffered|streamed). Prefer an explicit export from `make
 # e2e-test MODE=...`; otherwise default to fds to match Makefile.
 export E2E_BODY_MODE="${E2E_BODY_MODE:-${MODE:-fds}}"
+LOG_DIR="${E2E_LOG_DIR:-target/e2e-logs/${E2E_BODY_MODE}}"
+mkdir -p "$LOG_DIR"
 
 # Profile under test (conformance | integrity). Exported so the test binary can
 # skip tests that do not belong to the active lane.
@@ -60,7 +62,7 @@ if [[ -n "$LB_IP" ]] && reachable "http://${LB_IP}/"; then
   echo "e2e: using LoadBalancer IP ${GATEWAY_URL}"
 else
   echo "e2e: LoadBalancer IP unreachable (rootless podman?); port-forwarding ${SVC} -> 127.0.0.1:${PORT}"
-  kubectl --context "$CTX" -n "$NS" port-forward "svc/${SVC}" "${PORT}:80" >/dev/null 2>&1 &
+  kubectl --context "$CTX" -n "$NS" port-forward "svc/${SVC}" "${PORT}:80" >"$LOG_DIR/gateway-port-forward.log" 2>&1 &
   PF_PID=$!
   for _ in $(seq 1 20); do
     reachable "http://127.0.0.1:${PORT}/" && break
@@ -79,7 +81,7 @@ if [[ -n "$STREAMING_LB_IP" ]] && reachable "http://${STREAMING_LB_IP}/"; then
   echo "e2e: using streaming LoadBalancer IP ${STREAMING_GATEWAY_URL}"
 else
   echo "e2e: streaming LoadBalancer IP unreachable; port-forwarding ${STREAMING_SVC} -> 127.0.0.1:${STREAMING_PORT}"
-  kubectl --context "$CTX" -n "$NS" port-forward "svc/${STREAMING_SVC}" "${STREAMING_PORT}:80" >/dev/null 2>&1 &
+  kubectl --context "$CTX" -n "$NS" port-forward "svc/${STREAMING_SVC}" "${STREAMING_PORT}:80" >"$LOG_DIR/streaming-port-forward.log" 2>&1 &
   STREAMING_PF_PID=$!
   for _ in $(seq 1 20); do
     reachable "http://127.0.0.1:${STREAMING_PORT}/" && break
@@ -91,7 +93,7 @@ else
 fi
 
 echo "e2e: port-forwarding ${EXTPROC_NS}/deploy/${IPP_DEPLOY} metrics -> 127.0.0.1:${METRICS_PORT}"
-kubectl --context "$CTX" -n "$EXTPROC_NS" port-forward "deploy/${IPP_DEPLOY}" "${METRICS_PORT}:9090" >/dev/null 2>&1 &
+kubectl --context "$CTX" -n "$EXTPROC_NS" port-forward "deploy/${IPP_DEPLOY}" "${METRICS_PORT}:9090" >"$LOG_DIR/metrics-port-forward.log" 2>&1 &
 METRICS_PF_PID=$!
 for _ in $(seq 1 40); do
   reachable "http://127.0.0.1:${METRICS_PORT}/metrics" && break
@@ -103,7 +105,13 @@ reachable "http://127.0.0.1:${METRICS_PORT}/metrics" || {
   exit 1
 }
 export IPP_METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
-echo "e2e: using ${IPP_METRICS_URL} (E2E_BODY_MODE=${E2E_BODY_MODE})"
+# Audience stays unset: TokenReview in the extproc process checks the
+# apiserver audience. This account is the scraper, not the extproc identity.
+METRICS_READER_SA="${E2E_METRICS_READER_SA:-e2e-metrics-reader}"
+IPP_METRICS_TOKEN="$(kubectl --context "$CTX" -n "$EXTPROC_NS" create token "${METRICS_READER_SA}")"
+[[ -n "${IPP_METRICS_TOKEN}" ]] || { echo "e2e: empty metrics reader token for ${METRICS_READER_SA}" >&2; exit 1; }
+export IPP_METRICS_TOKEN
+echo "e2e: using ${IPP_METRICS_URL} (E2E_BODY_MODE=${E2E_BODY_MODE}, reader ${EXTPROC_NS}/${METRICS_READER_SA})"
 
 if [[ -n "$PF_PID" || -n "$STREAMING_PF_PID" || -n "$METRICS_PF_PID" ]]; then
   # Port-forward tunnels can collapse when concurrent tests flood them. Keep

@@ -28,6 +28,12 @@ pub(crate) struct ProtocolConfig {
 
     /// Response body processing mode.
     pub(crate) response_body_mode: BodyMode,
+
+    /// Whether Envoy can forward a body before receiving a header response.
+    ///
+    /// When enabled, Envoy cannot apply a processing-mode override returned
+    /// with the request headers response.
+    pub(crate) send_body_without_waiting_for_header_response: bool,
 }
 
 impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
@@ -39,6 +45,7 @@ impl TryFrom<ProtocolConfiguration> for ProtocolConfig {
                 .map_err(|e| format!("request_body_mode: {e}"))?,
             response_body_mode: BodyMode::try_from(proto_cfg.response_body_mode)
                 .map_err(|e| format!("response_body_mode: {e}"))?,
+            send_body_without_waiting_for_header_response: proto_cfg.send_body_without_waiting_for_header_response,
         })
     }
 }
@@ -342,6 +349,17 @@ pub(crate) fn request_type_label(req: &processing_request::Request) -> &'static 
 mod tests {
     use super::*;
     use crate::test_support::invalid_arg_count;
+
+    #[test]
+    fn protocol_config_preserves_header_waiting_mode() {
+        let config = ProtocolConfig::try_from(ProtocolConfiguration {
+            send_body_without_waiting_for_header_response: true,
+            ..ProtocolConfiguration::default()
+        })
+        .unwrap();
+
+        assert!(config.send_body_without_waiting_for_header_response);
+    }
 
     #[test]
     fn phase_state_default_is_active() {

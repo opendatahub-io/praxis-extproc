@@ -1,0 +1,22 @@
+# Dedicated Service for Prometheus metrics scraping.
+#
+# Separated from the main gRPC Service (port 9004) so the
+# ServiceMonitor can target the metrics port independently.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payload-processing-metrics
+  labels:
+    app: payload-processing
+    app.opendatahub.io/modelsasservice: "true"
+    app.kubernetes.io/part-of: maas
+    app.kubernetes.io/component: monitoring
+spec:
+  selector:
+    app: payload-processing
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  type: ClusterIP
