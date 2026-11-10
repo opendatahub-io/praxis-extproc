@@ -3392,8 +3392,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.10.0#f96d0114a995765793b1fb33f86f94ecc298eb08"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3432,8 +3432,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.10.0#f96d0114a995765793b1fb33f86f94ecc298eb08"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3442,6 +3442,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "futures",
  "http",
  "metrics",
  "notify",
@@ -3464,8 +3465,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store"
-version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.10.0#f96d0114a995765793b1fb33f86f94ecc298eb08"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3478,8 +3479,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-backends"
-version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.10.0#f96d0114a995765793b1fb33f86f94ecc298eb08"
 dependencies = [
  "async-trait",
  "futures",
@@ -3497,8 +3498,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-lifecycle"
-version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.9.0#e88829542814df6f4496c2cc5e30f0d5072b313e"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.10.0#f96d0114a995765793b1fb33f86f94ecc298eb08"
 dependencies = [
  "dashmap",
  "praxis-ai-store",
@@ -4457,9 +4458,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.4.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4467,9 +4468,11 @@ dependencies = [
  "futures",
  "http",
  "indexmap 2.14.2",
+ "libc",
  "pin-project-lite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sse-stream",
  "thiserror 2.0.21",
  "tokio",
@@ -4740,7 +4743,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
