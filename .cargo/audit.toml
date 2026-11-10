@@ -1,0 +1,11 @@
+# Advisory ignores for `cargo audit` (the deny.toml ignore list only applies to
+# `cargo deny`). Keep this in sync with deny.toml's [advisories] ignore list.
+[advisories]
+ignore = [
+    # libsqlite3-sys 0.37.0 (C SQLite CVE-2026-119375), via sqlx-sqlite ->
+    # praxis-ai-store-backends. The fix is libsqlite3-sys >=0.39, but the pinned
+    # praxis-proxy/sqlx FIPS fork (and upstream sqlx 0.9.0) still require <0.38, so
+    # it cannot be bumped from here. Only exercised when the SQLite response-store
+    # backend is selected; production uses Postgres. Tracked for a sqlx-fork bump.
+    "RUSTSEC-2026-0459",
+]
