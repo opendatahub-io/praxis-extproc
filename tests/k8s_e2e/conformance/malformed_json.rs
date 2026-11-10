@@ -1,8 +1,11 @@
 //! Malformed-JSON rejection — conformance-only.
 //!
-//! Rejection relies on a fail-closed body-parsing filter (`ai_guardrails`),
-//! which only the conformance chain has; the integrity chain tolerates bad JSON
-//! (`json_body on_invalid: continue`), so this contract is conformance-specific.
+//! `ai_guardrails` must parse the request body to evaluate it, so a fail-closed
+//! guardrail rejects an unparseable body before it ever reaches the backend. The
+//! e2e chain gates `ai_guardrails` behind `x-aigateway-guardrail-e2e`, so the
+//! test opts in explicitly. The integrity chain omits response guardrails and
+//! tolerates bad JSON (`json_body on_invalid: continue`), so this contract is
+//! conformance-specific.
 
 use crate::fixtures::{ensure_gateway_ready, gateway_url, http_client};
 
@@ -17,7 +20,7 @@ fn assert_not_forwarded(resp: &reqwest::Response) {
 }
 
 #[tokio::test]
-async fn malformed_json_rejected() {
+async fn malformed_json_rejected_under_guardrails() {
     ensure_gateway_ready().await;
     let client = http_client();
     let url = format!("{}/v1/chat/completions", gateway_url());
@@ -25,6 +28,7 @@ async fn malformed_json_rejected() {
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
+        .header("x-aigateway-guardrail-e2e", "true")
         .body("this is not json")
         .send()
         .await
