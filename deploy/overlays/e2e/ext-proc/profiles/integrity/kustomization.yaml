@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Integrity (oracle) profile for issue #165. Layered on top of the forge
+# baseline by `make e2e-setup PROFILE=integrity`: it replaces the two ext-proc
+# ConfigMaps with the guardrail-free, instrumented chains (identity_header_guard
+# + e2e_header_oracle + e2e_body_oracle), after which the Makefile restarts the
+# two Deployments so they pick up the new config.
+namespace: istio-system
+
+resources:
+  - pre-processing-configmap.yaml
+  - processing-configmap.yaml

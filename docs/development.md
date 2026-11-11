@@ -286,11 +286,12 @@ warnings fatal.
 The two-hop request-body SHA-256 oracle from
 [proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
 (issue [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27))
-lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
-`praxis-extproc` image with `--features k8s-e2e` (same product binary; the
-non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
-registered only under that feature), and `make e2e-test` exercises it through
-`tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
+lives in the `integrity` profile: `make e2e-setup PROFILE=integrity` builds and
+deploys the `praxis-extproc` image with `--features k8s-e2e` (same product
+binary; the non-production `e2e_body_oracle` filter in `src/e2e/` is compiled
+and registered only under that feature), and `make e2e-test PROFILE=integrity`
+exercises it through `tests/k8s_e2e/integrity/chained_oracle.rs` and
+`tests/k8s_e2e/integrity/fd_streamed_oracle.rs`.
 The streaming oracle uses a backend compiled only with `k8s-e2e`. In streamed
 response modes the client must receive the first SSE event before releasing
 the backend's terminal event. BUFFERED mode must withhold SSE bytes after the
@@ -298,6 +299,20 @@ backend has yielded its first frame. All modes require the exact complete
 response after release and propagate transport errors.
 TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
 in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
+
+### Profiles (conformance / integrity)
+
+`make e2e-setup` takes `PROFILE=conformance` (default) or `PROFILE=integrity`,
+orthogonal to `MODE=fds|buffered|streamed`. `conformance` runs the
+production-faithful chain (`ai_guardrails` + routing); `integrity` is an
+instrumented, non-production lane (`identity_header_guard` + `e2e_header_oracle`
++ `e2e_body_oracle`, no guardrails) for header trust-boundary and streaming
+coverage (issue [#165](https://github.com/opendatahub-io/praxis-extproc/issues/165)).
+Every test lives in the `conformance::` or `integrity::` test module and the
+runner selects a lane by name filter (`cargo test --test k8s_e2e <profile>`), so
+a test's module is its profile gate. See
+[`deploy/overlays/e2e/ext-proc/profiles/README.md`](../deploy/overlays/e2e/ext-proc/profiles/README.md)
+for the chains and the response-guardrails-vs-streaming invariant.
 
 Port-forward logs are retained in `target/e2e-logs/<mode>/`. On rootless Podman,
 an expected connection reset in a failure-path test can terminate the entire
@@ -317,7 +332,7 @@ cluster uses Podman. If setup stops at image loading, export the image with
 `podman save --format docker-archive`, load that archive with
 `KIND_EXPERIMENTAL_PROVIDER=podman kind load image-archive <archive> --name praxis-e2e`,
 then resume `praxis-forge --config forge.yaml --runtime podman stack apply e2e`
-and apply the selected `deploy/overlays/e2e/test/modes/<mode>` overlay.
+and apply the selected `deploy/overlays/e2e/environment/modes/<mode>` overlay.
 
 ## FIPS Tooling
 

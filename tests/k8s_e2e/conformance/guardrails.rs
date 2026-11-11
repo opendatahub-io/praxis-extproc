@@ -7,8 +7,8 @@
 //! praxis-ai repo.
 //!
 //! The in-cluster mock `NeMo` service (`WireMock`, see
-//! `deploy/overlays/e2e/test/nemo-mock.yaml`) is content-keyword driven and
-//! defaults to a "passed" verdict, so unmarked traffic is not evaluated or
+//! `deploy/overlays/e2e/environment/nemo-mock.yaml`) is content-keyword driven
+//! and defaults to a "passed" verdict, so unmarked traffic is not evaluated or
 //! blocked by the guardrail.
 
 use crate::fixtures::{
