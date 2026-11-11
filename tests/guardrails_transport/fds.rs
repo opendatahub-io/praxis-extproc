@@ -416,3 +416,65 @@ async fn fds_empty_eos_and_redelivery_do_not_repeat_guardrail_checks() {
     assert_eq!(harness.calls()[0]["messages"][0]["content"], "complete prompt");
     assert_eq!(harness.calls()[1]["messages"][0]["content"], "complete answer");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interleaved_fds_response_preserves_request_header_filter_state() {
+    for no_header_wait in [false, true] {
+        let harness = Harness::new(NemoReply::Pass, false).await;
+        let mut session = harness.open().await;
+        let protocol = ProtocolConfiguration {
+            request_body_mode: BodySendMode::FullDuplexStreamed.into(),
+            response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+            send_body_without_waiting_for_header_response: no_header_wait,
+        };
+        let mut message = support::request_headers(protocol, (false, false), false);
+        let Some(RequestMessage::RequestHeaders(headers)) = message.request.as_mut() else {
+            unreachable!()
+        };
+        headers
+            .headers
+            .as_mut()
+            .unwrap()
+            .headers
+            .push(support::header("x-request-id", "client-correlation-id"));
+        session.send(message).await;
+        session
+            .send(request_chunk(br#"{"messages":[{"role":"user","content":"#, false))
+            .await;
+        session.send(response_headers("application/json")).await;
+        session.send(request_chunk(br#""hello"}]}"#, true)).await;
+        let request_replies = collect_fds(&mut session, false).await;
+        let Some(ResponseMessage::RequestHeaders(headers)) = request_replies[0].response.as_ref() else {
+            panic!("request header mutation before body")
+        };
+        let mutations = headers.response.as_ref().unwrap().header_mutation.as_ref().unwrap();
+        assert!(
+            mutations
+                .remove_headers
+                .iter()
+                .any(|name| name == "x-aigateway-guardrail-output"),
+            "deferred request header mutations survive early execution"
+        );
+        session.send(response_body(b"unselected output", true)).await;
+        let replies = collect_fds(&mut session, false).await;
+        let Some(ResponseMessage::ResponseHeaders(headers)) = replies[0].response.as_ref() else {
+            panic!("response headers before body")
+        };
+        assert!(
+            headers
+                .response
+                .as_ref()
+                .unwrap()
+                .header_mutation
+                .as_ref()
+                .is_some_and(|mutation| mutation
+                    .set_headers
+                    .iter()
+                    .filter_map(|entry| entry.header.as_ref())
+                    .any(|header| header.key == "x-request-id" && header.raw_value == b"client-correlation-id")),
+            "response hook must see state from the request header hook"
+        );
+        assert_eq!(body_bytes(&replies), b"unselected output");
+        assert!(harness.calls().is_empty());
+    }
+}

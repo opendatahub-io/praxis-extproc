@@ -145,8 +145,8 @@ fn handle_body_redelivery(
 ///
 /// For `BUFFERED`, sends an empty `HeadersResponse` — pipeline runs at body EOS.
 /// For `STREAMED`, runs filters early and sends mutations in `HeadersResponse`.
-/// For `FDS` with body filters, returns no response — full pipeline at body EOS.
-/// For `FDS` passthrough, runs header filters early, defers mutations to first chunk.
+/// For `FDS`, runs header filters early and defers mutations until body
+/// processing can forward the first chunk (at EOS for buffered body filters).
 ///
 /// [`Request`]: praxis_filter::Request
 pub(crate) async fn handle_request_headers(
@@ -246,10 +246,6 @@ async fn handle_end_stream_request_headers(
 }
 
 /// Handle a request header message followed by one or more body messages.
-#[expect(
-    clippy::too_many_lines,
-    reason = "body mode cases and selected-route guard belong together"
-)]
 async fn handle_request_headers_with_body(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -273,7 +269,7 @@ async fn handle_request_headers_with_body(
             ))
             .await
         },
-        BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
+        BodyMode::FullDuplexStreamed => {
             Box::pin(run_request_header_filters_early(
                 pipeline,
                 state,
@@ -281,7 +277,6 @@ async fn handle_request_headers_with_body(
             ))
             .await
         },
-        BodyMode::FullDuplexStreamed => Ok(Vec::new()),
         _ => Ok(request_headers_without_body_filter(state)),
     }
 }

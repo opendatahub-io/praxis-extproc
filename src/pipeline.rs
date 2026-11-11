@@ -114,7 +114,10 @@ async fn run_request_pipeline_inner(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_request_header_mutations(&ctx);
+    let mutation = merge_mutations(
+        state.deferred_request_header_mutation.take(),
+        adapter::collect_request_header_mutations(&ctx),
+    );
 
     ctx.dehydrate(&mut state.carried_context)?;
 
