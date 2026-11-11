@@ -30,6 +30,9 @@ use super::*;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+// Serialize allocation through readiness so another world's backend cannot
+// claim a port released just before a child process binds it.
+static WORLD_STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn envoy_releases_sse_before_the_backend_is_allowed_to_finish() {
@@ -190,6 +193,7 @@ impl World {
         reply: NemoReply,
         hold_json: bool,
     ) -> Self {
+        let _startup = WORLD_STARTUP.lock().await;
         let envoy = std::env::var_os("ENVOY_BIN").expect("set ENVOY_BIN to the Envoy executable; use make test-envoy");
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/envoy-tests")
@@ -216,12 +220,16 @@ impl World {
             Arc::clone(&requests),
             hold_json,
         );
-        let grpc = unused_address();
-        let frontend = unused_address();
+        let reserved_grpc = reserve_address();
+        let reserved_frontend = reserve_address();
+        let reserved_health = reserve_address();
+        let reserved_metrics = reserve_address();
+        let grpc = reserved_grpc.local_addr().unwrap();
+        let frontend = reserved_frontend.local_addr().unwrap();
         let mut cfg = support::configuration(&nemo.endpoint, translation, 2_097_152);
         cfg.server.grpc_address = grpc.to_string();
-        cfg.server.health_address = unused_address().to_string();
-        cfg.server.metrics_address = unused_address().to_string();
+        cfg.server.health_address = reserved_health.local_addr().unwrap().to_string();
+        cfg.server.metrics_address = reserved_metrics.local_addr().unwrap().to_string();
         let config_path = directory.join("extproc.yaml");
         // metrics_auth defaults to enabled and exits when this process has no kubeconfig.
         let config = serde_yaml::to_value(serde_json::json!({
@@ -238,6 +246,7 @@ impl World {
         .unwrap();
         std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
         let extproc_log = std::fs::File::create(directory.join("extproc.log")).unwrap();
+        drop((reserved_grpc, reserved_health, reserved_metrics));
         let extproc = Process(
             Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
                 .arg("-c")
@@ -254,6 +263,7 @@ impl World {
         )
         .unwrap();
         let envoy_log = std::fs::File::create(directory.join("envoy.log")).unwrap();
+        drop(reserved_frontend);
         let proxy = Process(
             Command::new(envoy)
                 .args(["--concurrency", "1", "--disable-hot-restart", "-c"])
@@ -263,7 +273,7 @@ impl World {
                 .spawn()
                 .unwrap(),
         );
-        let world = Self {
+        let mut world = Self {
             children: vec![extproc, proxy],
             finish,
             first_frame,
@@ -275,6 +285,13 @@ impl World {
         for address in [grpc, frontend] {
             tokio::time::timeout(DEADLINE, async {
                 loop {
+                    for child in &mut world.children {
+                        assert!(
+                            child.0.try_wait().unwrap().is_none(),
+                            "child exited before readiness; logs: {}",
+                            directory.display()
+                        );
+                    }
                     if tokio::net::TcpStream::connect(address).await.is_ok() {
                         break;
                     }
@@ -314,11 +331,8 @@ impl World {
     }
 }
 
-fn unused_address() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+fn reserve_address() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
 fn spawn_backend(
