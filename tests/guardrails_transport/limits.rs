@@ -29,7 +29,6 @@ async fn selected_fds_checks_reject_response_headers_before_request_completion()
                     .send(request_chunk(br#"{"messages":[{"role":"user","content":"#, false))
                     .await;
                 session.send(response_headers("application/json")).await;
-                session.send(request_chunk(br#""hello"}]}"#, true)).await;
                 let response = session.next().await.unwrap();
                 assert_eq!(
                     immediate_status(std::slice::from_ref(&response)),
