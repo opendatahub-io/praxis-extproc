@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::{
     adapter, metrics,
     response::{self, BodyMode},
-    server::{HydratedContext, StreamState},
+    server::{HydratedContext, PendingRequestMutations, StreamState},
 };
 
 // -----------------------------------------------------------------------------
@@ -86,6 +86,11 @@ async fn run_request_pipeline_inner(
     };
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    if let Some(pending) = state.pending_request_mutations.take() {
+        pending.restore(&mut ctx);
+        // The restored queues are authoritative; collect them once after body hooks.
+        state.deferred_request_header_mutation = None;
+    }
 
     if let Some(immediate) =
         execute_request_filters_if_needed(pipeline, &mut ctx, &mut state.header_state.request_filters_executed).await?
@@ -711,6 +716,12 @@ pub(crate) async fn run_request_header_filters_early(
     state.header_state.request_filters_executed = true;
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
+    if matches!(delivery, MutationDelivery::DeferSilent)
+        && state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        && pipeline.body_capabilities().needs_request_body
+    {
+        state.pending_request_mutations = Some(PendingRequestMutations::take_from(&mut ctx));
+    }
     ctx.dehydrate(&mut state.carried_context)?;
 
     Ok(delivery.deliver_request(mutation, state))
@@ -3031,3 +3042,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline/regressions.rs"]
+mod regressions;

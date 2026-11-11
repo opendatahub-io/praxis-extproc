@@ -563,6 +563,39 @@ pub(crate) enum RequestBodyRequirement {
     CompleteBeforeResponse,
 }
 
+/// Typed request mutations waiting for FDS body hooks and header delivery.
+#[derive(Debug)]
+pub(crate) struct PendingRequestMutations {
+    /// Appended values retain their original pending-queue semantics.
+    extra: Vec<(std::borrow::Cow<'static, str>, String)>,
+    /// Replacements preserve raw header bytes and operation order.
+    set: Vec<(http::HeaderName, http::HeaderValue)>,
+    /// Header removals collected by request filters.
+    remove: Vec<http::HeaderName>,
+    /// Routing path selected before the body phase.
+    path: Option<String>,
+}
+
+impl PendingRequestMutations {
+    /// Move pending operations out of the early context without serializing them.
+    pub(crate) fn take_from(ctx: &mut HttpFilterContext<'_>) -> Self {
+        Self {
+            extra: std::mem::take(&mut ctx.extra_request_headers),
+            set: std::mem::take(&mut ctx.request_headers_to_set),
+            remove: std::mem::take(&mut ctx.request_headers_to_remove),
+            path: ctx.rewritten_path.take(),
+        }
+    }
+
+    /// Restore the exact queues before request body filters inspect or extend them.
+    pub(crate) fn restore(self, ctx: &mut HttpFilterContext<'_>) {
+        ctx.extra_request_headers = self.extra;
+        ctx.request_headers_to_set = self.set;
+        ctx.request_headers_to_remove = self.remove;
+        ctx.rewritten_path = self.path;
+    }
+}
+
 /// Per-stream state accumulated across ExtProc phases.
 #[derive(Debug)]
 pub(crate) struct StreamState {
@@ -607,6 +640,9 @@ pub(crate) struct StreamState {
     /// Protocol configuration parsed from Envoy's first message.
     pub(crate) protocol_config: ProtocolConfig,
 
+    /// Typed deferred FDS request mutations, isolated from response hydration.
+    pub(crate) pending_request_mutations: Option<PendingRequestMutations>,
+
     /// Deferred request header mutation for FDS passthrough mode.
     pub(crate) deferred_request_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 
@@ -649,6 +685,7 @@ impl Default for StreamState {
             header_state: HeaderDeliveryState::default(),
             eos_tracker: EosTracker::default(),
             protocol_config: ProtocolConfig::default(),
+            pending_request_mutations: None,
             deferred_request_header_mutation: None,
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
