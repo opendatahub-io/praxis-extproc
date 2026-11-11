@@ -34,6 +34,17 @@ pub struct ResponseModeSelector {
 }
 
 impl ResponseModeSelector {
+    /// Conservatively require complete requests when an embedded pipeline has guardrails.
+    ///
+    /// A pipeline does not expose the original phase config. Until an explicit
+    /// selector is supplied, avoid guessing which requests or phases are selected.
+    pub(crate) fn for_pipeline(pipeline: &praxis_filter::FilterPipeline) -> Self {
+        Self {
+            enabled: pipeline.contains_filter("ai_guardrails"),
+            ..Self::default()
+        }
+    }
+
     /// Build a selector for unconditional filters and the exact header condition emitted by AIGC.
     pub fn from_config(chains: &[FilterChainConfig]) -> Self {
         let mut selector = Self {

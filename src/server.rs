@@ -82,15 +82,19 @@ impl PraxisExtProc {
     /// body-accumulation ceiling defaults to the built-in 32 MiB
     /// (`config::DEFAULT_MAX_BODY_BYTES`); use
     /// [`with_max_body_accumulation`](Self::with_max_body_accumulation) to set
-    /// the configured effective limit.
+    /// the configured effective limit. Pipelines containing guardrails require
+    /// complete request bodies conservatively; install
+    /// [`with_response_mode_selector`](Self::with_response_mode_selector) to
+    /// derive selection from the original filter configuration.
     pub fn new(pipeline: Arc<FilterPipeline>) -> Self {
         let (_tx, rx) = watch::channel(false); // `_tx` dropped => latch never fires
+        let response_mode_selector = crate::response_mode::ResponseModeSelector::for_pipeline(&pipeline);
         Self {
             pipeline,
             force_shutdown: rx,
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             trust_forwarded_for: false,
-            response_mode_selector: crate::response_mode::ResponseModeSelector::default(),
+            response_mode_selector,
         }
     }
 

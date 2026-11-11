@@ -255,3 +255,36 @@ fn headers(selections: Vec<HeaderValue>) -> praxis_proto::envoy::service::ext_pr
     });
     request
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_guardrail_services_require_complete_request_modes_without_a_selector() {
+    let harness = Harness::embedded(NemoReply::Pass).await;
+    for request_mode in [BodySendMode::None, BodySendMode::Streamed] {
+        for selected in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut session = harness.open().await;
+            let protocol = ProtocolConfiguration {
+                request_body_mode: request_mode.into(),
+                response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                send_body_without_waiting_for_header_response: true,
+            };
+            let reply = session
+                .exchange(support::request_headers(protocol, selected, false))
+                .await;
+            assert_eq!(immediate_status(&[reply]), Some(500));
+            assert!(session.next().await.is_none());
+        }
+    }
+    assert!(harness.calls().is_empty());
+    for mode in [BodySendMode::Buffered, BodySendMode::FullDuplexStreamed] {
+        let replies = harness
+            .complete(mode, (true, true), "embedded prompt", "embedded answer")
+            .await;
+        assert_eq!(immediate_status(&replies), None);
+        assert!(
+            String::from_utf8(body_bytes(&replies))
+                .unwrap()
+                .contains("embedded answer")
+        );
+    }
+    assert_eq!(harness.calls().len(), 4);
+}

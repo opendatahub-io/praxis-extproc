@@ -95,6 +95,20 @@ impl Harness {
         limit: usize,
         configure: impl FnOnce(&mut ExtProcConfig),
     ) -> Self {
+        Self::configured_service(reply, translation, limit, configure, true).await
+    }
+
+    pub(crate) async fn embedded(reply: NemoReply) -> Self {
+        Self::configured_service(reply, false, 2_097_152, |_| {}, false).await
+    }
+
+    async fn configured_service(
+        reply: NemoReply,
+        translation: bool,
+        limit: usize,
+        configure: impl FnOnce(&mut ExtProcConfig),
+        install_selector: bool,
+    ) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/checks", listener.local_addr().unwrap());
@@ -122,11 +136,11 @@ impl Harness {
         let pipeline = build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let service = ExternalProcessorServer::new(
-            PraxisExtProc::new(pipeline)
-                .with_max_body_accumulation(cfg.max_body_accumulation())
-                .with_response_mode_selector(ResponseModeSelector::from_config(&cfg.filter_chains)),
-        );
+        let mut service = PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation());
+        if install_selector {
+            service = service.with_response_mode_selector(ResponseModeSelector::from_config(&cfg.filter_chains));
+        }
+        let service = ExternalProcessorServer::new(service);
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(service)
