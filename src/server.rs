@@ -550,6 +550,15 @@ impl std::ops::DerefMut for HydratedContext<'_> {
     }
 }
 
+/// Whether response processing may overlap an incomplete request body.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RequestBodyRequirement {
+    /// Filters permit response processing before request completion.
+    MayInterleave,
+    /// Selected guardrails must inspect the complete request first.
+    CompleteBeforeResponse,
+}
+
 /// Per-stream state accumulated across ExtProc phases.
 #[derive(Debug)]
 pub(crate) struct StreamState {
@@ -561,6 +570,9 @@ pub(crate) struct StreamState {
 
     /// Converted request from the headers phase.
     pub(crate) request: Option<Request>,
+
+    /// Whether selected guardrails require the request body before a response.
+    pub(crate) request_body_requirement: RequestBodyRequirement,
 
     /// Accumulated request body bytes.
     pub(crate) request_body: Vec<u8>,
@@ -620,6 +632,7 @@ impl Default for StreamState {
         Self {
             carried_context: Some(CarriedContext::default()),
             request: None,
+            request_body_requirement: RequestBodyRequirement::MayInterleave,
             request_body: Vec::new(),
             streamed_request_bytes: 0,
             response: None,

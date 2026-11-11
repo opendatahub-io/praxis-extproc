@@ -21,14 +21,14 @@ use tracing::{debug, trace, warn};
 use crate::{
     adapter, metrics,
     pipeline::{
-        MutationDelivery, RequestPhase, ResponsePhase, deferred_header_response, direction_label,
+        MutationDelivery, RequestPhase, ResponsePhase, body_buffer_limit, deferred_header_response, direction_label,
         flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk,
         run_bodyless_selected_upstream_pipeline, run_request_header_filters_early, run_request_pipeline,
         run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
-    server::StreamState,
+    server::{RequestBodyRequirement, StreamState},
 };
 
 // -----------------------------------------------------------------------------
@@ -167,7 +167,7 @@ pub(crate) async fn handle_request_headers(
     if let Some(rejection) = reject_invalid_guardrail_request(state, &envoy_headers, headers.end_of_stream) {
         return Ok(vec![rejection]);
     }
-    state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
+    record_request_headers(state, &envoy_headers);
 
     let mut responses = if headers.end_of_stream {
         handle_end_stream_request_headers(pipeline, state).await?
@@ -186,6 +186,16 @@ pub(crate) async fn handle_request_headers(
 
     apply_response_mode_override(pipeline, &mut responses, state, &envoy_headers);
     Ok(responses)
+}
+
+/// Keep the selection decision with the original request metadata.
+fn record_request_headers(state: &mut StreamState, headers: &[HeaderValue]) {
+    state.request_body_requirement = if state.response_mode_selector.requires_complete_request(headers) {
+        RequestBodyRequirement::CompleteBeforeResponse
+    } else {
+        RequestBodyRequirement::MayInterleave
+    };
+    state.request = Some(adapter::envoy_headers_to_request(headers));
 }
 
 /// Apply the request-specific response mode selected by guardrail configuration.
@@ -439,7 +449,8 @@ async fn accumulate_request_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if let Err(_error) = check_body_limit(state.request_body.len(), body.body.len(), state.max_body_accumulation) {
+    let limit = accumulation_limit(pipeline, state, true);
+    if let Err(_error) = check_body_limit(state.request_body.len(), body.body.len(), limit) {
         return Ok(vec![request_body_limit_exceeded(pipeline)]);
     }
     state.request_body.extend_from_slice(&body.body);
@@ -466,8 +477,8 @@ async fn accumulate_request_body(
 /// response body message is delivered.
 /// For `STREAMED`, runs filters early and sends mutations immediately
 /// (Envoy ignores header mutations on body responses for non-`BUFFERED`).
-/// For `FDS` with body filters, returns no response — full pipeline at body EOS.
-/// For `FDS` passthrough, runs filters early, defers mutations to first chunk.
+/// For `FDS`, runs header filters early to establish body limits while deferring
+/// mutations until the checked body or passthrough chunk is ready.
 #[expect(
     clippy::large_stack_frames,
     reason = "StreamState carries HttpFilterContext fields grown in praxis 0.5.4"
@@ -477,17 +488,12 @@ pub(crate) async fn handle_response_headers(
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    if state
-        .eos_tracker
-        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?
-        == PhaseState::Completed
-    {
-        // Envoy does not re-deliver headers; a duplicate is a protocol violation.
-        return Err(duplicate_after_eos(ProtocolPhase::ResponseHeaders));
+    record_response_headers(state, &headers)?;
+    if state.request_body_requirement == RequestBodyRequirement::CompleteBeforeResponse && state.body_open(true) {
+        return Ok(vec![request_processing_rejection(
+            b"selected guardrails require the complete request body before response processing",
+        )]);
     }
-
-    let envoy_headers = extract_header_list(&headers);
-    state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
     if headers.end_of_stream {
         return run_response_pipeline(ResponsePhase::Headers, pipeline, state, true).await;
@@ -498,13 +504,28 @@ pub(crate) async fn handle_response_headers(
             state.header_state.response_headers_sent = true;
             run_response_header_filters_early(pipeline, state, MutationDelivery::Send).await
         },
-        BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_response_body => {
+        BodyMode::FullDuplexStreamed => {
             run_response_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
-        BodyMode::FullDuplexStreamed => Ok(Vec::new()),
         _ if pipeline.body_capabilities().needs_response_body => Ok(vec![response::response_headers(None)]),
         _ => run_response_header_filters_early(pipeline, state, MutationDelivery::DeferWithResponse).await,
     }
+}
+
+/// Validate response-header sequencing and store the upstream metadata.
+fn record_response_headers(
+    state: &mut StreamState,
+    headers: &praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
+) -> Result<(), Status> {
+    if state
+        .eos_tracker
+        .check_and_mark(ProtocolPhase::ResponseHeaders, headers.end_of_stream)?
+        == PhaseState::Completed
+    {
+        return Err(duplicate_after_eos(ProtocolPhase::ResponseHeaders));
+    }
+    state.response = Some(adapter::envoy_headers_to_response(&extract_header_list(headers)));
+    Ok(())
 }
 
 /// Handle response body: route by body mode and filter capabilities.
@@ -542,7 +563,11 @@ async fn accumulate_response_body(
     body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    check_body_limit(state.response_body.len(), body.body.len(), state.max_body_accumulation)?;
+    check_body_limit(
+        state.response_body.len(),
+        body.body.len(),
+        accumulation_limit(pipeline, state, false),
+    )?;
     state.response_body.extend_from_slice(&body.body);
 
     if !body.end_of_stream {
@@ -714,10 +739,33 @@ fn extract_header_list(headers: &praxis_proto::envoy::service::ext_proc::v3::Htt
         .unwrap_or_default()
 }
 
+/// Combine configured and filter bounds, treating an absent limit as unbounded.
+fn accumulation_limit(pipeline: &FilterPipeline, state: &StreamState, is_request: bool) -> Option<usize> {
+    let caps = pipeline.body_capabilities();
+    let mode = if is_request {
+        caps.request_body_mode
+    } else {
+        caps.response_body_mode
+    };
+    let response_limit = (!is_request)
+        .then(|| {
+            state
+                .carried_context
+                .as_ref()
+                .and_then(|ctx| ctx.response_body_mode)
+                .and_then(body_buffer_limit)
+        })
+        .flatten();
+    [state.max_body_accumulation, body_buffer_limit(mode), response_limit]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
 /// Reject body accumulation exceeding the effective limit.
 ///
-/// `limit` is `None` when bounding is disabled via
-/// `insecure_options.allow_unbounded_body`, in which case any size is accepted.
+/// `limit` is `None` only when neither the server nor the applicable filters
+/// impose a bound. Disabling the server bound preserves filter-specific limits.
 fn check_body_limit(current: usize, incoming: usize, limit: Option<usize>) -> Result<(), Status> {
     if let Some(max) = limit
         && current.saturating_add(incoming) > max
@@ -744,6 +792,63 @@ mod tests {
 
     use super::*;
     use crate::test_support::counter_value;
+
+    #[tokio::test]
+    async fn fds_static_response_limit_applies_without_a_runtime_buffer_mode() {
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: response_body_probe\n")
+                .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "response_body_probe",
+                praxis_filter::http_builtin(ResponseBodyProbeFilter::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        for server_limit in [None, Some(32)] {
+            let mut state = StreamState::new();
+            state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+            state.max_body_accumulation = server_limit;
+            state.request = Some(adapter::envoy_headers_to_request(&[]));
+            let responses = handle_response_headers(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(responses.is_empty());
+            assert_eq!(
+                state.carried_context.as_ref().unwrap().response_body_mode,
+                Some(praxis_filter::BodyMode::Stream),
+                "the bound must come from static filter capabilities"
+            );
+            let responses = handle_response_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"12345678".to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(responses.is_empty(), "the exact limit remains buffered");
+            let error = handle_response_body(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                    body: b"9".to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(state.response_body, b"12345678", "reject before growing the buffer");
+        }
+    }
 
     #[tokio::test]
     async fn request_headers_stream_response_when_no_output_guardrail_is_selected() {
@@ -1447,6 +1552,10 @@ filter_chains:
 
         fn response_body_access(&self) -> praxis_filter::BodyAccess {
             praxis_filter::BodyAccess::ReadOnly
+        }
+
+        fn response_body_mode(&self) -> praxis_filter::BodyMode {
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(8) }
         }
 
         fn on_response_body(

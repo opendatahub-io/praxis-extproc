@@ -66,6 +66,15 @@ impl Harness {
     }
 
     pub(crate) async fn with_limit(reply: NemoReply, translation: bool, limit: usize) -> Self {
+        Self::configured(reply, translation, limit, |_| {}).await
+    }
+
+    pub(crate) async fn configured(
+        reply: NemoReply,
+        translation: bool,
+        limit: usize,
+        configure: impl FnOnce(&mut ExtProcConfig),
+    ) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/checks", listener.local_addr().unwrap());
@@ -84,7 +93,8 @@ impl Harness {
                 });
             }
         });
-        let cfg = configuration(&endpoint, translation, limit);
+        let mut cfg = configuration(&endpoint, translation, limit);
+        configure(&mut cfg);
         let pipeline = build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

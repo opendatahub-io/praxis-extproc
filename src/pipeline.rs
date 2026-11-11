@@ -414,6 +414,15 @@ fn buffer_response_chunk(
     Ok(())
 }
 
+/// Return a finite filter body bound, if one was declared.
+pub(crate) fn body_buffer_limit(mode: praxis_filter::BodyMode) -> Option<usize> {
+    match mode {
+        praxis_filter::BodyMode::StreamBuffer { max_bytes } => max_bytes,
+        praxis_filter::BodyMode::SizeLimit { max_bytes } => Some(max_bytes),
+        _ => None,
+    }
+}
+
 /// Build a `HeadersResponse` carrying the deferred header-phase mutation.
 ///
 /// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
@@ -820,6 +829,11 @@ fn run_resp_body_filters(
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     if body_buf.is_empty() && !eos {
         return Ok(None);
+    }
+
+    if body_buffer_limit(ctx.response_body_mode).is_some_and(|limit| body_buf.len() > limit) {
+        metrics::record_body_size_rejection();
+        return Err(Status::resource_exhausted("buffered response exceeds maximum size"));
     }
 
     let mut body = Some(Bytes::from(mem::take(body_buf)));
