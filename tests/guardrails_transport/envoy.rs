@@ -193,6 +193,17 @@ impl World {
         reply: NemoReply,
         hold_json: bool,
     ) -> Self {
+        Self::with_trailers(request_mode, response_mode, no_header_wait, reply, hold_json, "SEND").await
+    }
+
+    async fn with_trailers(
+        request_mode: &str,
+        response_mode: &str,
+        no_header_wait: bool,
+        reply: NemoReply,
+        hold_json: bool,
+        request_trailer_mode: &str,
+    ) -> Self {
         let _startup = WORLD_STARTUP.lock().await;
         let envoy = std::env::var_os("ENVOY_BIN").expect("set ENVOY_BIN to the Envoy executable; use make test-envoy");
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -259,7 +270,16 @@ impl World {
         let envoy_path = directory.join("envoy.json");
         std::fs::write(
             &envoy_path,
-            envoy_config(request_mode, response_mode, no_header_wait, frontend, grpc, backend).to_string(),
+            envoy_config(
+                request_mode,
+                response_mode,
+                no_header_wait,
+                frontend,
+                grpc,
+                backend,
+                request_trailer_mode,
+            )
+            .to_string(),
         )
         .unwrap();
         let envoy_log = std::fs::File::create(directory.join("envoy.log")).unwrap();
@@ -440,6 +460,7 @@ fn envoy_config(
     frontend: SocketAddr,
     grpc: SocketAddr,
     backend: SocketAddr,
+    request_trailer_mode: &str,
 ) -> serde_json::Value {
     let address = |port| json!({"socket_address":{"address":"127.0.0.1","port_value":port}});
     let cluster = |name: &str, endpoint: SocketAddr| json!({"name":name,"type":"STATIC","connect_timeout":"2s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":address(endpoint.port())}}]}]}});
@@ -447,8 +468,8 @@ fn envoy_config(
     processor["http2_protocol_options"] = json!({});
     json!({"static_resources":{
         "listeners":[{"name":"http","address":address(frontend.port()),"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{
-            "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
-            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor","grpc_service":{"envoy_grpc":{"cluster_name":"extproc"},"timeout":"10s"},"failure_mode_allow":false,"allow_mode_override":true,"message_timeout":"10s","send_body_without_waiting_for_header_response":no_header_wait,"processing_mode":{"request_header_mode":"SEND","response_header_mode":"SEND","request_body_mode":request_mode,"response_body_mode":response_mode,"request_trailer_mode":"SEND","response_trailer_mode":"SEND"}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
+            "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","http_protocol_options":{"enable_trailers":true},"route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
+            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor","grpc_service":{"envoy_grpc":{"cluster_name":"extproc"},"timeout":"10s"},"failure_mode_allow":false,"allow_mode_override":true,"message_timeout":"10s","send_body_without_waiting_for_header_response":no_header_wait,"processing_mode":{"request_header_mode":"SEND","response_header_mode":"SEND","request_body_mode":request_mode,"response_body_mode":response_mode,"request_trailer_mode":request_trailer_mode,"response_trailer_mode":"SEND"}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
         }}]}]}],"clusters":[processor,cluster("backend", backend)]}})
 }
 
@@ -622,5 +643,41 @@ async fn envoy_fds_releases_sse_before_backend_completion() {
             assert!(String::from_utf8_lossy(&rest).contains("[DONE]"));
             world.assert_selection_headers_removed();
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_checks_buffered_requests_with_skipped_http_trailers() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    for response_mode in ["BUFFERED", "STREAMED", "FULL_DUPLEX_STREAMED"] {
+        let world = World::with_trailers("BUFFERED", response_mode, false, NemoReply::Pass, false, "SKIP").await;
+        let uri: http::Uri = world.url.parse().unwrap();
+        let mut socket = tokio::net::TcpStream::connect(uri.authority().unwrap().as_str())
+            .await
+            .unwrap();
+        let body = json!({"model":"test","messages":[{"role":"user","content":"trailer prompt"}]}).to_string();
+        let message = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: x-test-trailer\r\nConnection: close\r\nx-aigateway-guardrail-input: true\r\nx-aigateway-guardrail-output: true\r\n\r\n{:x}\r\n{}\r\n0\r\nx-test-trailer: finished\r\n\r\n",
+            uri.path(),
+            uri.authority().unwrap(),
+            body.len(),
+            body,
+        );
+        socket.write_all(message.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(DEADLINE, socket.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response_mode}: {response}");
+        assert!(response.contains("private answer"), "{response}");
+        let calls = world.nemo.calls();
+        assert_eq!(calls.len(), 2, "input and output must each run once");
+        assert_eq!(calls[0]["messages"][0]["content"], "trailer prompt");
+        assert_eq!(calls[1]["messages"][0]["content"], "private answer");
+        assert_eq!(world.requests.lock().unwrap().len(), 1);
+        world.assert_selection_headers_removed();
     }
 }

@@ -484,7 +484,11 @@ pub(crate) async fn handle_response_headers(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     record_response_headers(state, &headers)?;
-    if state.request_body_requirement == RequestBodyRequirement::CompleteBeforeResponse && state.body_open(true) {
+    // BUFFERED delivers the complete body even when skipped HTTP trailers own EOS.
+    if state.request_body_requirement == RequestBodyRequirement::CompleteBeforeResponse
+        && state.body_open(true)
+        && !state.buffered_request_body_processed
+    {
         return Ok(vec![request_processing_rejection(
             b"selected guardrails require the complete request body before response processing",
         )]);

@@ -278,3 +278,110 @@ pub(super) async fn collect_fds(session: &mut support::Session, trailers: bool) 
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_checked_requests_allow_skipped_or_delivered_trailers() {
+    for response_mode in [
+        BodySendMode::Buffered,
+        BodySendMode::Streamed,
+        BodySendMode::FullDuplexStreamed,
+    ] {
+        for selected in [(true, false), (false, true), (true, true)] {
+            for no_header_wait in [false, true] {
+                for send_trailers in [false, true] {
+                    let harness = Harness::new(NemoReply::Pass, false).await;
+                    let mut session = harness.open().await;
+                    let reply = session
+                        .exchange(support::request_headers(
+                            ProtocolConfiguration {
+                                request_body_mode: BodySendMode::Buffered.into(),
+                                response_body_mode: response_mode.into(),
+                                send_body_without_waiting_for_header_response: no_header_wait,
+                            },
+                            selected,
+                            false,
+                        ))
+                        .await;
+                    assert!(matches!(reply.response, Some(ResponseMessage::RequestHeaders(_))));
+                    let mut body = request("checked before trailers", false);
+                    let Some(RequestMessage::RequestBody(chunk)) = body.request.as_mut() else {
+                        unreachable!()
+                    };
+                    chunk.end_of_stream = false;
+                    let reply = session.exchange(body).await;
+                    assert!(matches!(reply.response, Some(ResponseMessage::RequestBody(_))));
+                    assert_eq!(harness.calls().len(), usize::from(selected.0));
+                    if send_trailers {
+                        let reply = session
+                            .exchange(support::wrap(RequestMessage::RequestTrailers(HttpTrailers::default())))
+                            .await;
+                        assert!(matches!(reply.response, Some(ResponseMessage::RequestTrailers(_))));
+                        assert_eq!(
+                            harness.calls().len(),
+                            usize::from(selected.0),
+                            "trailers must not rerun input checks"
+                        );
+                    }
+                    session.send(response_headers("application/json")).await;
+                    if response_mode != BodySendMode::FullDuplexStreamed {
+                        let reply = session.next().await.unwrap();
+                        assert!(
+                            matches!(reply.response, Some(ResponseMessage::ResponseHeaders(_))),
+                            "{reply:?}"
+                        );
+                    }
+                    let document = serde_json::to_vec(
+                        &json!({"choices":[{"message":{"role":"assistant","content":"checked answer"}}]}),
+                    )
+                    .unwrap();
+                    session.send(response_body(&document, true)).await;
+                    let replies = if response_mode == BodySendMode::FullDuplexStreamed {
+                        collect_fds(&mut session, false).await
+                    } else {
+                        vec![session.next().await.unwrap()]
+                    };
+                    assert_eq!(immediate_status(&replies), None);
+                    assert_eq!(body_bytes(&replies), document);
+                    assert_eq!(harness.calls().len(), usize::from(selected.0) + usize::from(selected.1));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_trailer_allowance_never_admits_missing_or_oversized_bodies() {
+    for oversized in [false, true] {
+        for selected in [(true, false), (false, true), (true, true)] {
+            let harness = Harness::configured(NemoReply::Pass, false, 4, |_| {}).await;
+            let mut session = harness.open().await;
+            session
+                .exchange(support::request_headers(
+                    ProtocolConfiguration {
+                        request_body_mode: BodySendMode::Buffered.into(),
+                        response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                        send_body_without_waiting_for_header_response: true,
+                    },
+                    selected,
+                    false,
+                ))
+                .await;
+            let reply = if oversized {
+                session
+                    .exchange(support::wrap(RequestMessage::RequestBody(HttpBody {
+                        body: b"12345".to_vec(),
+                        end_of_stream: false,
+                    })))
+                    .await
+            } else {
+                session.exchange(response_headers("application/json")).await
+            };
+            assert_eq!(immediate_status(&[reply]), Some(if oversized { 413 } else { 500 }));
+            assert!(session.next().await.is_none());
+            assert!(
+                harness.calls().is_empty(),
+                "unavailable or over-limit bodies cannot reach the provider"
+            );
+        }
+    }
+}
