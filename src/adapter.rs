@@ -469,7 +469,8 @@ fn header_option(key: &str, value: &[u8], append_action: HeaderAppendAction) -> 
             raw_value: value.to_vec(),
         }),
         append_action: append_action.into(),
-        append: None,
+        // Envoy 1.37 ExtProc reads the legacy flag instead of append_action.
+        append: Some(append_action == HeaderAppendAction::AppendIfExistsOrAdd),
     }
 }
 
@@ -1174,6 +1175,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "assert both modern and legacy wire append semantics"
+    )]
     fn response_diff_reemits_changed_multi_valued_header_in_order() {
         let req = envoy_headers_to_request(&[make_header(":method", "GET"), make_header(":path", "/")]);
         let mut ctx = build_filter_context(test_pipeline(), &req, false);
@@ -1203,6 +1208,15 @@ mod tests {
                 ("b=2".to_owned(), i32::from(HeaderAppendAction::AppendIfExistsOrAdd)),
             ],
             "first value overwrites, later values append, preserving order"
+        );
+        assert_eq!(
+            mutation
+                .set_headers
+                .iter()
+                .map(|entry| entry.append)
+                .collect::<Vec<_>>(),
+            [Some(false), Some(true)],
+            "legacy ExtProc consumers need the same overwrite/append behavior"
         );
         assert!(mutation.remove_headers.is_empty(), "nothing to remove");
     }

@@ -204,6 +204,27 @@ impl World {
         hold_json: bool,
         request_trailer_mode: &str,
     ) -> Self {
+        Self::configured(
+            request_mode,
+            response_mode,
+            no_header_wait,
+            reply,
+            hold_json,
+            request_trailer_mode,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn configured(
+        request_mode: &str,
+        response_mode: &str,
+        no_header_wait: bool,
+        reply: NemoReply,
+        hold_json: bool,
+        request_trailer_mode: &str,
+        configure: impl FnOnce(&mut praxis_extproc::config::ExtProcConfig),
+    ) -> Self {
         let _startup = WORLD_STARTUP.lock().await;
         let envoy = std::env::var_os("ENVOY_BIN").expect("set ENVOY_BIN to the Envoy executable; use make test-envoy");
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -238,6 +259,7 @@ impl World {
         let grpc = reserved_grpc.local_addr().unwrap();
         let frontend = reserved_frontend.local_addr().unwrap();
         let mut cfg = support::configuration(&nemo.endpoint, translation, 2_097_152);
+        configure(&mut cfg);
         cfg.server.grpc_address = grpc.to_string();
         cfg.server.health_address = reserved_health.local_addr().unwrap().to_string();
         cfg.server.metrics_address = reserved_metrics.local_addr().unwrap().to_string();
@@ -679,5 +701,41 @@ async fn envoy_checks_buffered_requests_with_skipped_http_trailers() {
         assert_eq!(calls[1]["messages"][0]["content"], "private answer");
         assert_eq!(world.requests.lock().unwrap().len(), 1);
         world.assert_selection_headers_removed();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_preserves_appended_request_headers_and_response_cookies() {
+    for request_mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        for response_mode in ["BUFFERED", "STREAMED", "FULL_DUPLEX_STREAMED"] {
+            let world = World::configured(request_mode, response_mode, false, NemoReply::Pass, false, "SEND", |cfg| {
+            cfg.filter_chains[0].filters.push(serde_yaml::from_str(
+                "filter: headers\nrequest_add:\n  - {name: x-values, value: first}\n  - {name: x-values, value: second}\nresponse_add:\n  - {name: set-cookie, value: session=first}\n  - {name: set-cookie, value: theme=second}\n"
+            ).unwrap());
+        }).await;
+            let response = world.send((false, false), false).await;
+            assert_eq!(response.status(), 200);
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                cookies,
+                ["session=first", "theme=second"],
+                "{response_mode}: Envoy must append both cookies"
+            );
+            assert!(response.text().await.unwrap().contains("private answer"));
+            let requests = world.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let values: Vec<_> = requests[0]
+                .get_all("x-values")
+                .iter()
+                .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
+                .collect();
+            assert_eq!(values, ["first", "second"], "request additions must append on the wire");
+            assert!(world.nemo.calls().is_empty());
+        }
     }
 }
