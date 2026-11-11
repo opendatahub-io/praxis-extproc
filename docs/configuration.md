@@ -171,7 +171,7 @@ server:
 | `health_address`               | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`              | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
 | `shutdown_drain_timeout_secs`  | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
-| `max_body_bytes`               | integer | `33554432`      | Maximum accumulated request/response body size in bytes before a request stream is rejected with an `ImmediateResponse` **413**. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely. Keep the gRPC receive ceiling (`GRPC_MAX_RECV_MSG_SIZE`) **above** this value by enough framing headroom so an exactly-at-limit BUFFERED body reaches this check instead of failing at tonic decode |
+| `max_body_bytes`               | integer | `33554432`      | Maximum accumulated request/response body size in bytes before a request stream is rejected with an `ImmediateResponse` **413**. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which removes this server cap while preserving filter buffer limits. Keep the gRPC receive ceiling (`GRPC_MAX_RECV_MSG_SIZE`) **above** this value by enough framing headroom so an exactly-at-limit BUFFERED body reaches this check instead of failing at tonic decode |
 | `metrics_auth`                 | object  | `enabled: true` | Metrics endpoint authentication                                                                                                                                                                                   |
 | `tls`                          | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
@@ -357,7 +357,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes`. Prefer an explicit `server.max_body_bytes` in production; with a raised gRPC receive limit this flag removes the only remaining DoS backstop on streamed chunks |
+| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes`. Prefer an explicit `server.max_body_bytes` in production; filter buffer limits still apply, but unfiltered bodies lose their accumulation bound |
 
 ```yaml
 insecure_options:
@@ -464,12 +464,28 @@ At runtime:
   client sees a diagnosable error instead of an
   empty 500. Response-body accumulation over the
   same limit still fails the stream with gRPC
-  `RESOURCE_EXHAUSTED`. The limit is lifted
-  entirely when `insecure_options.allow_unbounded_body`
-  is set.
+  `RESOURCE_EXHAUSTED`. Setting
+  `insecure_options.allow_unbounded_body` removes the server limit;
+  static and runtime filter buffer limits still apply.
 - **Filter rejection**: a `FilterAction::Reject`
   returns an `ImmediateResponse` to Envoy, which
   sends the rejection directly to the client.
+
+### AI guardrail body modes
+
+Selected input or output guardrails require a complete request body. Use
+`BUFFERED` or `FULL_DUPLEX_STREAMED` requests; bodyful `NONE` and `STREAMED`
+requests are rejected before forwarding. A selected request must finish
+before response processing begins. Requests that end with headers remain
+supported without a body callout.
+
+In `FULL_DUPLEX_STREAMED`, selected output checks hold response bytes until
+body EOS or trailers complete the document. Unselected and input-only checks
+can release response chunks immediately when no other filter requires
+buffering. Both values of `send_body_without_waiting_for_header_response`
+are supported. The effective accumulation limit is the smallest present
+server, static pipeline, or runtime filter bound. Filter pipelines combine
+static filter buffer requirements according to their own capability rules.
 
 ### Selected-upstream request-body filters
 

@@ -592,6 +592,9 @@ pub(crate) struct StreamState {
     /// Accumulated response body bytes.
     pub(crate) response_body: Vec<u8>,
 
+    /// FDS response filters that returned `BodyDone`, isolated from request hooks.
+    pub(crate) response_body_done_indices: Vec<bool>,
+
     /// Whether a body message has been received, per direction.
     pub(crate) body_receipt: BodyReceiptTracker,
 
@@ -641,6 +644,7 @@ impl Default for StreamState {
             streamed_request_bytes: 0,
             response: None,
             response_body: Vec::new(),
+            response_body_done_indices: Vec::new(),
             body_receipt: BodyReceiptTracker::default(),
             header_state: HeaderDeliveryState::default(),
             eos_tracker: EosTracker::default(),

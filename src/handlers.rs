@@ -22,7 +22,7 @@ use crate::{
     adapter, metrics,
     pipeline::{
         MutationDelivery, RequestPhase, ResponsePhase, body_buffer_limit, deferred_header_response, direction_label,
-        flush_streamed_body_filters, passthrough_chunk, process_streamed_body_chunk,
+        flush_streamed_body_filters, passthrough_chunk, process_fds_response_body, process_streamed_body_chunk,
         run_bodyless_selected_upstream_pipeline, run_request_header_filters_early, run_request_pipeline,
         run_response_header_filters_early, run_response_pipeline,
     },
@@ -548,8 +548,22 @@ pub(crate) async fn handle_response_body(
     match (mode, needs_body) {
         (BodyMode::Streamed | BodyMode::FullDuplexStreamed, false) => Ok(passthrough_chunk(&body, state, mode, false)),
         (BodyMode::Streamed, true) => process_streamed_body_chunk(pipeline, body, state, false).await,
+        (BodyMode::FullDuplexStreamed, true) if fds_response_can_stream(pipeline, state) => {
+            process_fds_response_body(pipeline, state, body.body, body.end_of_stream, body.end_of_stream)
+        },
         _ => accumulate_response_body(pipeline, body, state).await,
     }
+}
+
+/// Stream only when neither static filters nor this response require buffering.
+fn fds_response_can_stream(pipeline: &FilterPipeline, state: &StreamState) -> bool {
+    matches!(
+        pipeline.body_capabilities().response_body_mode,
+        praxis_filter::BodyMode::Stream
+    ) && matches!(
+        state.carried_context.as_ref().and_then(|ctx| ctx.response_body_mode),
+        Some(praxis_filter::BodyMode::Stream)
+    )
 }
 
 /// Accumulate response body chunks, run full pipeline on EOS.
@@ -614,6 +628,9 @@ async fn finalize_body_on_trailers(
 
     match mode {
         BodyMode::Streamed if needs_body => Box::pin(flush_streamed_body_filters(pipeline, state, is_request)).await,
+        BodyMode::FullDuplexStreamed if !is_request && needs_body && fds_response_can_stream(pipeline, state) => {
+            process_fds_response_body(pipeline, state, Vec::new(), true, false)
+        },
         BodyMode::FullDuplexStreamed if needs_body => {
             Box::pin(run_trailing_fds_body(pipeline, state, is_request)).await
         },
@@ -1518,6 +1535,310 @@ filter_chains:
             _: &serde_yaml::Value,
         ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
             Ok(Box::new(Self))
+        }
+    }
+
+    /// Mutates streaming chunks and emits a final suffix, including at trailers.
+    struct StreamingResponseProbe;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for StreamingResponseProbe {
+        fn name(&self) -> &'static str {
+            "streaming_response_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            let response = ctx.response_header.as_mut().unwrap();
+            response.headers.insert("x-header-probe", "sent".parse().unwrap());
+            response.headers.insert("content-length", "999".parse().unwrap());
+            Ok(FilterAction::Continue)
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request_body(
+            &self,
+            _: &mut HttpFilterContext<'_>,
+            _: &mut Option<bytes::Bytes>,
+            _: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::BodyDone)
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn on_response_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<bytes::Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if body.as_deref() == Some(b"reject") {
+                return Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)));
+            }
+            if body.as_deref() == Some(b"error") {
+                return Err("stream probe failure".into());
+            }
+            let done = body.as_deref() == Some(b"done");
+            let mut output = body.take().unwrap_or_default().to_ascii_uppercase();
+            if end_of_stream {
+                output.extend_from_slice(b"END");
+            }
+            ctx.response_header
+                .as_mut()
+                .unwrap()
+                .headers
+                .insert("x-body-probe", "sent".parse().unwrap());
+            *body = Some(bytes::Bytes::from(output));
+            Ok(if done {
+                FilterAction::BodyDone
+            } else {
+                FilterAction::Continue
+            })
+        }
+    }
+
+    impl StreamingResponseProbe {
+        /// Registry factory for streaming FDS behavior assertions.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Prepare the streaming probe with response headers deferred as on the wire.
+    async fn streaming_response_probe() -> (std::sync::Arc<FilterPipeline>, StreamState) {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: streaming_response_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "streaming_response_probe",
+                praxis_filter::http_builtin(StreamingResponseProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::FullDuplexStreamed;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        assert!(
+            handle_response_headers(
+                &pipeline,
+                praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+                &mut state
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        (pipeline, state)
+    }
+
+    #[tokio::test]
+    async fn fds_streaming_hooks_mutate_chunks_and_flush_trailer_bytes_without_duplicate_headers() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, body_mutation, processing_response::Response as R};
+        for trailers in [false, true] {
+            for has_chunk in [false, true] {
+                let (pipeline, mut state) = streaming_response_probe().await;
+                let mut replies = Vec::new();
+                if has_chunk {
+                    replies.extend(
+                        handle_response_body(
+                            &pipeline,
+                            HttpBody {
+                                body: b"hi".to_vec(),
+                                end_of_stream: false,
+                            },
+                            &mut state,
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(replies.len(), 2, "first chunk must carry headers then transformed body");
+                    assert!(state.response_body.is_empty(), "streaming must not accumulate the body");
+                }
+                if trailers {
+                    replies.extend(handle_trailers(&pipeline, &mut state, false).await.unwrap());
+                    assert!(matches!(replies.last().unwrap().response, Some(R::ResponseTrailers(_))));
+                } else {
+                    replies.extend(
+                        handle_response_body(
+                            &pipeline,
+                            HttpBody {
+                                body: Vec::new(),
+                                end_of_stream: true,
+                            },
+                            &mut state,
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                }
+                let header_replies: Vec<_> = replies
+                    .iter()
+                    .filter_map(|reply| match &reply.response {
+                        Some(R::ResponseHeaders(headers)) => Some(headers),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(header_replies.len(), 1);
+                assert!(matches!(replies[0].response, Some(R::ResponseHeaders(_))));
+                let mutations = header_replies[0]
+                    .response
+                    .as_ref()
+                    .unwrap()
+                    .header_mutation
+                    .as_ref()
+                    .unwrap();
+                assert!(mutations.remove_headers.iter().any(|name| name == "content-length"));
+                for name in ["x-header-probe", "x-body-probe"] {
+                    assert!(
+                        mutations
+                            .set_headers
+                            .iter()
+                            .filter_map(|entry| entry.header.as_ref())
+                            .any(|header| header.key == name)
+                    );
+                }
+                assert!(
+                    !mutations
+                        .set_headers
+                        .iter()
+                        .filter_map(|entry| entry.header.as_ref())
+                        .any(|header| header.key == "content-length")
+                );
+                let bodies: Vec<_> = replies
+                    .iter()
+                    .filter_map(|reply| match &reply.response {
+                        Some(R::ResponseBody(body)) => {
+                            body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()
+                        },
+                        _ => None,
+                    })
+                    .filter_map(|mutation| match mutation {
+                        body_mutation::Mutation::StreamedResponse(body) => Some(body),
+                        _ => None,
+                    })
+                    .collect();
+                let output: Vec<u8> = bodies.iter().flat_map(|body| body.body.iter().copied()).collect();
+                assert_eq!(
+                    output,
+                    if has_chunk {
+                        b"HIEND".as_slice()
+                    } else {
+                        b"END".as_slice()
+                    }
+                );
+                assert_eq!(
+                    bodies.iter().filter(|body| body.end_of_stream).count(),
+                    usize::from(!trailers)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fds_streaming_hook_rejection_and_errors_emit_no_unchecked_chunk() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, processing_response::Response as R};
+        let (pipeline, mut state) = streaming_response_probe().await;
+        let replies = handle_response_body(
+            &pipeline,
+            HttpBody {
+                body: b"reject".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert!(matches!(replies[0].response, Some(R::ImmediateResponse(_))));
+        let (pipeline, mut state) = streaming_response_probe().await;
+        let error = handle_response_body(
+            &pipeline,
+            HttpBody {
+                body: b"error".to_vec(),
+                end_of_stream: false,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("stream probe failure"));
+    }
+
+    #[tokio::test]
+    async fn fds_streaming_body_done_survives_chunks_trailers_and_interleaved_request_hooks() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, body_mutation, processing_response::Response as R};
+        for response_done in [false, true] {
+            let (pipeline, mut state) = streaming_response_probe().await;
+            if response_done {
+                let first = handle_response_body(
+                    &pipeline,
+                    HttpBody {
+                        body: b"done".to_vec(),
+                        end_of_stream: false,
+                    },
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                assert_eq!(first.len(), 2);
+            }
+            // A request BodyDone must neither suppress the first response hook
+            // nor clear an already-completed response hook's state.
+            handle_request_body(
+                &pipeline,
+                HttpBody {
+                    body: b"request".to_vec(),
+                    end_of_stream: true,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            let replies = handle_response_body(
+                &pipeline,
+                HttpBody {
+                    body: b"later".to_vec(),
+                    end_of_stream: false,
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+            let body = replies
+                .iter()
+                .find_map(|reply| match &reply.response {
+                    Some(R::ResponseBody(body)) => body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref(),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                matches!(body, body_mutation::Mutation::StreamedResponse(body) if body.body == if response_done { b"later".to_vec() } else { b"LATER".to_vec() })
+            );
+            let trailers = handle_trailers(&pipeline, &mut state, false).await.unwrap();
+            assert_eq!(trailers.len(), if response_done { 1 } else { 2 });
+            assert!(matches!(
+                trailers.last().unwrap().response,
+                Some(R::ResponseTrailers(_))
+            ));
         }
     }
 

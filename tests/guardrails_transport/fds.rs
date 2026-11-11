@@ -478,3 +478,63 @@ async fn interleaved_fds_response_preserves_request_header_filter_state() {
         assert!(harness.calls().is_empty());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_only_and_unselected_fds_output_streams_before_body_eos_or_trailers() {
+    for input in [false, true] {
+        for no_header_wait in [false, true] {
+            for trailers in [false, true] {
+                let harness = Harness::new(NemoReply::Pass, false).await;
+                let mut session = harness.open().await;
+                let protocol = ProtocolConfiguration {
+                    request_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                    response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                    send_body_without_waiting_for_header_response: no_header_wait,
+                };
+                session
+                    .send(support::request_headers(protocol, (input, false), false))
+                    .await;
+                session.send(request("streaming prompt", true)).await;
+                collect_fds(&mut session, false).await;
+                session.send(response_headers("text/event-stream")).await;
+                session.send(response_body(b"data: first\n\n", false)).await;
+                let first = tokio::time::timeout(std::time::Duration::from_secs(2), session.responses.message())
+                    .await
+                    .expect("first FDS response must arrive before the next upstream chunk exists")
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(first.response, Some(ResponseMessage::ResponseHeaders(_))));
+                let body = session.next().await.unwrap();
+                assert_eq!(body_bytes(&[body]), b"data: first\n\n");
+                session.send(response_body(b"data: second\n\n", false)).await;
+                let second = session.next().await.unwrap();
+                assert!(
+                    matches!(second.response, Some(ResponseMessage::ResponseBody(_))),
+                    "headers must be emitted only once"
+                );
+                assert_eq!(body_bytes(&[second]), b"data: second\n\n");
+                if trailers {
+                    session
+                        .send(support::wrap(RequestMessage::ResponseTrailers(HttpTrailers::default())))
+                        .await;
+                    assert!(
+                        matches!(
+                            session.next().await.unwrap().response,
+                            Some(ResponseMessage::ResponseTrailers(_))
+                        ),
+                        "trailer closure must not duplicate headers or an empty body"
+                    );
+                } else {
+                    session.send(response_body(b"data: [DONE]\n\n", true)).await;
+                    let final_responses = collect_fds(&mut session, false).await;
+                    assert_eq!(final_responses.len(), 1);
+                    assert_eq!(body_bytes(&final_responses), b"data: [DONE]\n\n");
+                }
+                assert_eq!(harness.calls().len(), usize::from(input));
+                if input {
+                    assert_eq!(harness.calls()[0]["guardrails"]["rail_types"], json!(["input"]));
+                }
+            }
+        }
+    }
+}

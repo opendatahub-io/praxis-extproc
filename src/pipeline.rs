@@ -532,6 +532,71 @@ pub(crate) async fn process_streamed_body_chunk(
     Ok(responses)
 }
 
+/// Run a streaming FDS response hook without holding later upstream chunks.
+///
+/// `filter_eos` also marks trailer closure; `wire_eos` is true only when an
+/// incoming body message itself ended the stream.
+pub(crate) fn process_fds_response_body(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    mut body: Vec<u8>,
+    filter_eos: bool,
+    wire_eos: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state
+        .request
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
+    let response = state
+        .response
+        .as_mut()
+        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+    let original_headers = capture_original_headers(response);
+    ctx.response_header = Some(response);
+    ctx.upstream_reached = true;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    ctx.body_done_indices = mem::take(&mut state.response_body_done_indices);
+    if let Some(immediate) = run_resp_body_filters(pipeline, &mut ctx, &mut body, filter_eos)? {
+        return Ok(vec![response::immediate(immediate)]);
+    }
+    state.response_body_done_indices = mem::take(&mut ctx.body_done_indices);
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    ctx.dehydrate(&mut state.carried_context)?;
+    let mut replies = streaming_fds_response_headers(state, mutation);
+    if !body.is_empty() || !filter_eos || wire_eos {
+        replies.extend(response::response_body(
+            Some(&body),
+            None,
+            BodyMode::FullDuplexStreamed,
+            wire_eos,
+        ));
+    }
+    Ok(replies)
+}
+
+/// Release streaming FDS response headers once, before the first body mutation.
+fn streaming_fds_response_headers(
+    state: &mut StreamState,
+    mutation: Option<HeaderMutation>,
+) -> Vec<ProcessingResponse> {
+    if !state.header_state.take_first_chunk(false) {
+        warn_unapplied_header_mutations(false, mutation.as_ref());
+        return Vec::new();
+    }
+    let mut mutation = merge_mutations(state.deferred_response_header_mutation.take(), mutation).unwrap_or_default();
+    // Streaming body hooks can change each chunk's length; the final length is
+    // unknown when these headers are released, even if upstream supplied one.
+    mutation.set_headers.retain(|entry| {
+        entry
+            .header
+            .as_ref()
+            .is_none_or(|header| !header.key.eq_ignore_ascii_case("content-length"))
+    });
+    mutation.remove_headers.push("content-length".to_owned());
+    vec![response::response_headers(Some(mutation))]
+}
+
 /// Once-per-process warning: `STREAMED` body filters produced header mutations.
 static STREAMED_HEADER_MUTATIONS: OnceWarning = OnceWarning::new();
 

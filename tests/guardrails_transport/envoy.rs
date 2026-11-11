@@ -577,3 +577,36 @@ async fn envoy_rejects_unchecked_request_modes_before_backend_dispatch() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_fds_releases_sse_before_backend_completion() {
+    for no_header_wait in [false, true] {
+        for input in [false, true] {
+            let world = World::with_modes(
+                "FULL_DUPLEX_STREAMED",
+                "FULL_DUPLEX_STREAMED",
+                no_header_wait,
+                NemoReply::Pass,
+                false,
+            )
+            .await;
+            let response = world.send((input, false), true).await;
+            assert_eq!(response.status(), 200);
+            let mut stream = response.bytes_stream();
+            let first = tokio::time::timeout(DEADLINE, stream.next())
+                .await
+                .expect("FDS first token must arrive while backend completion is blocked")
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&first).contains("first"));
+            assert_eq!(world.nemo.calls().len(), usize::from(input));
+            world.finish.notify_one();
+            let mut rest = Vec::new();
+            while let Some(chunk) = tokio::time::timeout(DEADLINE, stream.next()).await.unwrap() {
+                rest.extend_from_slice(&chunk.unwrap());
+            }
+            assert!(String::from_utf8_lossy(&rest).contains("[DONE]"));
+            world.assert_selection_headers_removed();
+        }
+    }
+}
