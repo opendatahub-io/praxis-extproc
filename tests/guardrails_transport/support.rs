@@ -24,7 +24,11 @@ use praxis_proto::envoy::service::{
     },
 };
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{
     Streaming,
@@ -42,12 +46,28 @@ pub(crate) enum NemoReply {
     Malformed,
     Unknown,
     Timeout,
+    HoldFirst,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingCall {
+    pub(crate) started: Notify,
+    pub(crate) finished: Notify,
+}
+
+struct AwaitingProvider(Arc<PendingCall>);
+
+impl Drop for AwaitingProvider {
+    fn drop(&mut self) {
+        self.0.finished.notify_one();
+    }
 }
 
 pub(crate) struct Harness {
     pub(crate) client: ExternalProcessorClient<Channel>,
     #[cfg(feature = "integration")]
     pub(crate) endpoint: String,
+    pub(crate) pending_call: Arc<PendingCall>,
     calls: Arc<Mutex<Vec<Value>>>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -79,12 +99,16 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/checks", listener.local_addr().unwrap());
         let records = Arc::clone(&calls);
+        let pending_call = Arc::new(PendingCall::default());
+        let pending = Arc::clone(&pending_call);
         let nemo = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             while let Ok((socket, _)) = listener.accept().await {
                 let records = Arc::clone(&records);
+                let pending = Arc::clone(&pending);
                 connections.spawn(async move {
-                    let service = service_fn(move |req| nemo_response(req, reply, Arc::clone(&records)));
+                    let service =
+                        service_fn(move |req| nemo_response(req, reply, Arc::clone(&records), Arc::clone(&pending)));
                     drop(
                         hyper::server::conn::http1::Builder::new()
                             .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
@@ -117,6 +141,7 @@ impl Harness {
             client,
             #[cfg(feature = "integration")]
             endpoint,
+            pending_call,
             calls,
             tasks: vec![nemo, server],
         }
@@ -295,12 +320,22 @@ async fn nemo_response(
     request: Request<Incoming>,
     reply: NemoReply,
     records: Arc<Mutex<Vec<Value>>>,
+    pending: Arc<PendingCall>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     assert_eq!(request.uri().path(), "/v1/checks");
     let body = request.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&body).unwrap();
     let input = value["guardrails"]["rail_types"][0] == "input";
-    records.lock().unwrap().push(value);
+    let call_number = {
+        let mut calls = records.lock().unwrap();
+        calls.push(value);
+        calls.len()
+    };
+    if matches!(reply, NemoReply::HoldFirst) && call_number == 1 {
+        let _cleanup = AwaitingProvider(Arc::clone(&pending));
+        pending.started.notify_one();
+        std::future::pending::<()>().await;
+    }
     let blocked = matches!(
         (reply, input),
         (NemoReply::BlockInput, true) | (NemoReply::BlockOutput, false)

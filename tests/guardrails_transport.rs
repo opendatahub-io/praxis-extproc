@@ -23,6 +23,9 @@ mod support;
 #[path = "guardrails_transport/boundaries.rs"]
 mod boundaries;
 
+#[path = "guardrails_transport/fds.rs"]
+mod fds;
+
 #[path = "guardrails_transport/limits.rs"]
 mod limits;
 

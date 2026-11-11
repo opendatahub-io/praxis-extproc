@@ -180,6 +180,16 @@ impl Drop for World {
 
 impl World {
     async fn new(mode: &str, reply: NemoReply, hold_json: bool) -> Self {
+        Self::with_modes("BUFFERED", mode, false, reply, hold_json).await
+    }
+
+    async fn with_modes(
+        request_mode: &str,
+        response_mode: &str,
+        no_header_wait: bool,
+        reply: NemoReply,
+        hold_json: bool,
+    ) -> Self {
         let envoy = std::env::var_os("ENVOY_BIN").expect("set ENVOY_BIN to the Envoy executable; use make test-envoy");
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/envoy-tests")
@@ -189,7 +199,11 @@ impl World {
                 NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&directory).unwrap();
-        let nemo = Box::pin(Harness::new(reply, true)).await;
+        // The translator requires selected-upstream body processing, which is
+        // independently restricted to BUFFERED requests. FDS worlds exercise
+        // guardrails without that incompatible filter.
+        let translation = request_mode == "BUFFERED";
+        let nemo = Box::pin(Harness::new(reply, translation)).await;
         let finish = Arc::new(Notify::new());
         let first_frame = Arc::new(Notify::new());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -204,7 +218,7 @@ impl World {
         );
         let grpc = unused_address();
         let frontend = unused_address();
-        let mut cfg = support::configuration(&nemo.endpoint, true, 2_097_152);
+        let mut cfg = support::configuration(&nemo.endpoint, translation, 2_097_152);
         cfg.server.grpc_address = grpc.to_string();
         cfg.server.health_address = unused_address().to_string();
         cfg.server.metrics_address = unused_address().to_string();
@@ -234,7 +248,11 @@ impl World {
                 .unwrap(),
         );
         let envoy_path = directory.join("envoy.json");
-        std::fs::write(&envoy_path, envoy_config(mode, frontend, grpc, backend).to_string()).unwrap();
+        std::fs::write(
+            &envoy_path,
+            envoy_config(request_mode, response_mode, no_header_wait, frontend, grpc, backend).to_string(),
+        )
+        .unwrap();
         let envoy_log = std::fs::File::create(directory.join("envoy.log")).unwrap();
         let proxy = Process(
             Command::new(envoy)
@@ -270,6 +288,10 @@ impl World {
     }
 
     async fn send(&self, selected: (bool, bool), stream: bool) -> reqwest::Response {
+        self.request(selected, stream).send().await.unwrap()
+    }
+
+    fn request(&self, selected: (bool, bool), stream: bool) -> reqwest::RequestBuilder {
         reqwest::Client::builder()
             .timeout(DEADLINE)
             .no_proxy()
@@ -282,9 +304,6 @@ impl World {
                 if selected.1 { "true" } else { "false" },
             )
             .json(&json!({"model":"test","messages":[{"role":"user","content":"hello"}],"stream":stream}))
-            .send()
-            .await
-            .unwrap()
     }
 
     fn assert_selection_headers_removed(&self) {
@@ -400,7 +419,14 @@ async fn backend_response(
         .unwrap())
 }
 
-fn envoy_config(mode: &str, frontend: SocketAddr, grpc: SocketAddr, backend: SocketAddr) -> serde_json::Value {
+fn envoy_config(
+    request_mode: &str,
+    response_mode: &str,
+    no_header_wait: bool,
+    frontend: SocketAddr,
+    grpc: SocketAddr,
+    backend: SocketAddr,
+) -> serde_json::Value {
     let address = |port| json!({"socket_address":{"address":"127.0.0.1","port_value":port}});
     let cluster = |name: &str, endpoint: SocketAddr| json!({"name":name,"type":"STATIC","connect_timeout":"2s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":address(endpoint.port())}}]}]}});
     let mut processor = cluster("extproc", grpc);
@@ -408,6 +434,146 @@ fn envoy_config(mode: &str, frontend: SocketAddr, grpc: SocketAddr, backend: Soc
     json!({"static_resources":{
         "listeners":[{"name":"http","address":address(frontend.port()),"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{
             "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
-            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor","grpc_service":{"envoy_grpc":{"cluster_name":"extproc"},"timeout":"10s"},"failure_mode_allow":false,"allow_mode_override":true,"message_timeout":"10s","processing_mode":{"request_header_mode":"SEND","response_header_mode":"SEND","request_body_mode":"BUFFERED","response_body_mode":mode}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
+            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor","grpc_service":{"envoy_grpc":{"cluster_name":"extproc"},"timeout":"10s"},"failure_mode_allow":false,"allow_mode_override":true,"message_timeout":"10s","send_body_without_waiting_for_header_response":no_header_wait,"processing_mode":{"request_header_mode":"SEND","response_header_mode":"SEND","request_body_mode":request_mode,"response_body_mode":response_mode,"request_trailer_mode":"SEND","response_trailer_mode":"SEND"}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
         }}]}]}],"clusters":[processor,cluster("backend", backend)]}})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_fds_withholds_all_output_until_the_complete_guardrail_verdict() {
+    for no_header_wait in [false, true] {
+        for reply in [NemoReply::BlockOutput, NemoReply::Unavailable, NemoReply::Timeout] {
+            let world = World::with_modes(
+                "FULL_DUPLEX_STREAMED",
+                "FULL_DUPLEX_STREAMED",
+                no_header_wait,
+                reply,
+                true,
+            )
+            .await;
+            let request = world.request((false, true), false);
+            let (first_bytes, mut bytes_seen) = tokio::sync::mpsc::channel(1);
+            let client = tokio::spawn(async move {
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                let mut stream = response.bytes_stream();
+                let mut output = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.unwrap();
+                    if !chunk.is_empty() {
+                        let _sent = first_bytes.try_send(());
+                        output.extend_from_slice(&chunk);
+                    }
+                }
+                (status, output)
+            });
+            tokio::time::timeout(DEADLINE, world.first_frame.notified())
+                .await
+                .expect("backend must emit its first frame before checking privacy");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), bytes_seen.recv())
+                    .await
+                    .is_err(),
+                "FDS must release no client bytes before the complete verdict"
+            );
+            assert!(
+                world.nemo.calls().is_empty(),
+                "FDS must not submit a partial document to NeMo"
+            );
+            world.finish.notify_one();
+            let (status, output) = tokio::time::timeout(DEADLINE, client)
+                .await
+                .expect("replacement must terminate at EOS")
+                .unwrap();
+            assert_eq!(status, 200);
+            let body: serde_json::Value =
+                serde_json::from_slice(&output).expect("one complete replacement document with no leaked prefix");
+            let code = if matches!(reply, NemoReply::BlockOutput) {
+                "content_blocked"
+            } else {
+                "evaluation_failed"
+            };
+            assert_eq!(body["error"]["code"], code, "no_header_wait={no_header_wait}");
+            assert_eq!(body.as_object().unwrap().len(), 1);
+            assert!(!String::from_utf8_lossy(&output).contains("private answer"));
+            let calls = world.nemo.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["guardrails"]["rail_types"][0], "output");
+            assert_eq!(calls[0]["messages"][0]["content"], "private answer");
+            world.assert_selection_headers_removed();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_fds_input_verdict_controls_backend_dispatch() {
+    for no_header_wait in [false, true] {
+        for reply in [
+            NemoReply::Pass,
+            NemoReply::BlockInput,
+            NemoReply::Unavailable,
+            NemoReply::Timeout,
+        ] {
+            let world = World::with_modes(
+                "FULL_DUPLEX_STREAMED",
+                "FULL_DUPLEX_STREAMED",
+                no_header_wait,
+                reply,
+                false,
+            )
+            .await;
+            let response = world.send((true, false), false).await;
+            let expected = match reply {
+                NemoReply::Pass => 200,
+                NemoReply::BlockInput => 403,
+                _ => 500,
+            };
+            assert_eq!(
+                response.status(),
+                expected,
+                "{reply:?}, no_header_wait={no_header_wait}"
+            );
+            let body = response.text().await.unwrap();
+            if matches!(reply, NemoReply::Pass) {
+                assert!(body.contains("private answer"));
+                world.assert_selection_headers_removed();
+            } else {
+                assert!(
+                    world.requests.lock().unwrap().is_empty(),
+                    "a rejected prompt must never reach the model"
+                );
+                assert!(!body.contains("private answer"));
+            }
+            let calls = world.nemo.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["guardrails"]["rail_types"][0], "input");
+            assert_eq!(calls[0]["messages"][0]["content"], "hello");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn envoy_rejects_unchecked_request_modes_before_backend_dispatch() {
+    for request_mode in ["NONE", "STREAMED"] {
+        for no_header_wait in [false, true] {
+            let world = World::with_modes(
+                request_mode,
+                "FULL_DUPLEX_STREAMED",
+                no_header_wait,
+                NemoReply::Pass,
+                false,
+            )
+            .await;
+            let response = world.send((false, true), false).await;
+            assert_eq!(response.status(), 500);
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("require BUFFERED or FULL_DUPLEX_STREAMED request bodies")
+            );
+            assert!(world.requests.lock().unwrap().is_empty());
+            assert!(world.nemo.calls().is_empty());
+        }
+    }
 }
