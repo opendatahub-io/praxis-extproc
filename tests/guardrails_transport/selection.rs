@@ -8,6 +8,76 @@ use praxis_proto::envoy::service::{
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_selector_shapes_require_complete_requests_without_streaming_overrides() {
+    for (conditions, response_conditions) in [
+        ("[]", "[{when: {status: [200]}}]"),
+        (
+            "[{when: {headers: {x-aigateway-guardrail-output: 'true'}}}, {when: {path: /selected}}]",
+            "[]",
+        ),
+        (
+            "[{when: {headers: {x-aigateway-guardrail-output: 'true'}, path: /selected}}]",
+            "[]",
+        ),
+        ("[{unless: {headers: {x-aigateway-guardrail-output: 'false'}}}]", "[]"),
+    ] {
+        let harness = Harness::configured(NemoReply::Pass, false, 1_048_576, |cfg| {
+            let output = cfg.filter_chains[0]
+                .filters
+                .iter_mut()
+                .find(|entry| {
+                    entry
+                        .config
+                        .get("phase")
+                        .and_then(|phase| phase.get("response"))
+                        .and_then(serde_yaml::Value::as_bool)
+                        == Some(true)
+                })
+                .unwrap();
+            output.conditions = serde_yaml::from_str(conditions).unwrap();
+            output.response_conditions = serde_yaml::from_str(response_conditions).unwrap();
+            let selector = praxis_extproc::response_mode::ResponseModeSelector::from_config(&cfg.filter_chains);
+            assert_eq!(
+                selector.invalid_reason(),
+                Some("unsupported guardrail selection condition")
+            );
+        })
+        .await;
+        for request_mode in [BodySendMode::None, BodySendMode::Streamed, BodySendMode::Buffered] {
+            let mut session = harness.open().await;
+            let reply = session
+                .exchange(support::request_headers(
+                    ProtocolConfiguration {
+                        request_body_mode: request_mode.into(),
+                        response_body_mode: BodySendMode::Buffered.into(),
+                        send_body_without_waiting_for_header_response: false,
+                    },
+                    (false, false),
+                    false,
+                ))
+                .await;
+            assert!(
+                reply.mode_override.is_none(),
+                "unknown selection must not enable response streaming"
+            );
+            if request_mode == BodySendMode::Buffered {
+                assert!(matches!(
+                    reply.response,
+                    Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
+                ));
+            } else {
+                assert_eq!(immediate_status(&[reply]), Some(500));
+                assert!(session.next().await.is_none());
+            }
+        }
+        assert!(
+            harness.calls().is_empty(),
+            "admission must not call the guardrail provider"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_selector_preserves_request_mode_and_header_wait_contract() {
     let harness = Harness::new(NemoReply::Pass, false).await;
     for response_mode in [

@@ -202,6 +202,90 @@ async fn large_body_request_succeeds() {
     assert!(!responses.is_empty(), "should produce responses for large body");
 }
 
+#[tokio::test]
+async fn empty_processing_messages_do_not_poison_the_next_request() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, mut inbound) = open_stream(&mut client).await;
+    tx.send(ProcessingRequest::default()).await.unwrap();
+    tx.send(make_request_headers("GET", "/after-empty", true))
+        .await
+        .unwrap();
+    tx.send(ProcessingRequest::default()).await.unwrap();
+    drop(tx);
+    let responses = collect_responses(&mut inbound).await;
+    assert_eq!(
+        responses.len(),
+        1,
+        "empty messages must not produce responses or end the stream"
+    );
+    assert!(matches!(responses[0].response, Some(RespVariant::RequestHeaders(_))));
+}
+
+#[tokio::test]
+async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook() {
+    let yaml = format!(
+        "server:\n  max_body_bytes: 4\n{}",
+        GUARDRAILS_CONFIG.replace("allow_unbounded_body: true", "allow_unbounded_body: false")
+    );
+    let (mut client, _shutdown) = start_server(&yaml).await;
+    for overflow in [false, true] {
+        let (tx, mut inbound) = open_stream(&mut client).await;
+        let mut headers = make_request_headers("POST", "/limited", false);
+        headers.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+            request_body_mode: BodySendMode::Streamed.into(),
+            response_body_mode: BodySendMode::Buffered.into(),
+            send_body_without_waiting_for_header_response: false,
+        });
+        tx.send(headers).await.unwrap();
+        assert!(matches!(
+            inbound.message().await.unwrap().unwrap().response,
+            Some(RespVariant::RequestHeaders(_))
+        ));
+        for bytes in [b"ab".as_slice(), b"cd"] {
+            tx.send(ProcessingRequest {
+                request: Some(ReqVariant::RequestBody(HttpBody {
+                    body: bytes.to_vec(),
+                    end_of_stream: false,
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    inbound.message().await.unwrap().unwrap().response,
+                    Some(RespVariant::RequestBody(_))
+                ),
+                "body filters must accept chunks up to the cumulative boundary"
+            );
+        }
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: if overflow { b"DROP TABLE".to_vec() } else { Vec::new() },
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let replies = collect_responses(&mut inbound).await;
+        assert_eq!(replies.len(), 1);
+        if overflow {
+            assert!(
+                matches!(&replies[0].response, Some(RespVariant::ImmediateResponse(reply))
+                if reply.status.as_ref().unwrap().code == 413),
+                "the cumulative cap must reject before the guardrail can return its own 403"
+            );
+        } else {
+            assert!(
+                matches!(replies[0].response, Some(RespVariant::RequestBody(_))),
+                "an empty EOS at the exact limit remains valid"
+            );
+        }
+    }
+}
+
 /// Request bodies over `server.max_body_bytes` must be `ImmediateResponse` 413,
 /// not a gRPC `RESOURCE_EXHAUSTED` that Envoy turns into an empty HTTP 500.
 #[tokio::test]
@@ -325,20 +409,21 @@ async fn grpc_max_recv_binary_accepts_body_above_four_mib() {
     let (grpc, health, metrics) = (free_port(), free_port(), free_port());
     let config_path = write_grpc_max_recv_config(grpc, health, metrics);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
-        .arg("-c")
-        .arg(&config_path)
-        .env_remove(GRPC_MAX_RECV_MSG_SIZE_ENV)
-        .spawn()
-        .expect("spawn praxis-extproc");
+    let mut child = BinaryChild(
+        Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+            .arg("-c")
+            .arg(&config_path)
+            .env_remove(GRPC_MAX_RECV_MSG_SIZE_ENV)
+            .spawn()
+            .expect("spawn praxis-extproc"),
+    );
 
     let mut client = connect_extproc_client(grpc).await;
     let responses = send_full_request(&mut client, "POST", "/large-over-4mib", &payload).await;
 
-    let kill = child.kill();
+    drop(client);
+    stop_binary(&mut child).await;
     drop(std::fs::remove_file(&config_path));
-    kill.expect("kill praxis-extproc");
-    child.wait().expect("reap praxis-extproc");
 
     assert!(
         responses
@@ -3437,6 +3522,42 @@ fn free_port() -> u16 {
         .and_then(|listener| listener.local_addr())
         .map(|addr| addr.port())
         .expect("find a free port")
+}
+
+/// Reap the test process even if an assertion or graceful shutdown fails.
+struct BinaryChild(std::process::Child);
+
+impl Drop for BinaryChild {
+    fn drop(&mut self) {
+        drop(self.0.kill());
+        drop(self.0.wait());
+    }
+}
+
+#[cfg(unix)]
+async fn stop_binary(child: &mut BinaryChild) {
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .expect("signal the test server");
+    assert!(signal.success(), "SIGTERM must reach the server");
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().expect("poll server exit") {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server must drain within ten seconds after its client closes");
+    assert!(status.success(), "graceful shutdown must succeed: {status}");
+}
+
+#[cfg(not(unix))]
+async fn stop_binary(child: &mut BinaryChild) {
+    child.0.kill().expect("kill test server");
+    child.0.wait().expect("reap test server");
 }
 
 async fn send_headers_only(client: &mut ExtProcClient, method: &str, path: &str) -> Vec<ProcessingResponse> {

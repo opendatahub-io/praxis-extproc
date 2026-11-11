@@ -62,7 +62,7 @@ jobs:
       - run: make test-fips test-envoy
 
   coverage:
-    name: Line coverage (93%)
+    name: Line coverage (95%)
     permissions:
       contents: read
     runs-on: ubuntu-24.04

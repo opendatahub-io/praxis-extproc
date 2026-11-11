@@ -88,7 +88,7 @@ audit:
 	cargo deny check
 
 coverage-check:
-	cargo llvm-cov --fail-under-lines 93
+	cargo llvm-cov --fail-under-lines 95
 
 # ---------------------------------------------------------------------------
 # Container
@@ -582,7 +582,7 @@ help:
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
-	@echo "  coverage-check   fail if line coverage < 93%%"
+	@echo "  coverage-check   fail if line coverage < 95%%"
 	@echo ""
 	@echo "Container (the product image is the FIPS build on UBI 9):"
 	@echo "  container         debug image (in-container cargo)"
