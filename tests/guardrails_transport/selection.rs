@@ -345,16 +345,59 @@ async fn embedded_guardrail_services_require_complete_request_modes_without_a_se
         }
     }
     assert!(harness.calls().is_empty());
-    for mode in [BodySendMode::Buffered, BodySendMode::FullDuplexStreamed] {
-        let replies = harness
-            .complete(mode, (true, true), "embedded prompt", "embedded answer")
-            .await;
-        assert_eq!(immediate_status(&replies), None);
-        assert!(
-            String::from_utf8(body_bytes(&replies))
-                .unwrap()
-                .contains("embedded answer")
-        );
+    for request_mode in [BodySendMode::Buffered, BodySendMode::FullDuplexStreamed] {
+        for response_mode in [BodySendMode::Buffered, BodySendMode::FullDuplexStreamed] {
+            use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as Reply;
+            let mut session = harness.open().await;
+            session
+                .send(support::request_headers(
+                    ProtocolConfiguration {
+                        request_body_mode: request_mode.into(),
+                        response_body_mode: response_mode.into(),
+                        send_body_without_waiting_for_header_response: false,
+                    },
+                    (true, true),
+                    false,
+                ))
+                .await;
+            if request_mode == BodySendMode::Buffered {
+                assert!(matches!(
+                    session.next().await.unwrap().response,
+                    Some(Reply::RequestHeaders(_))
+                ));
+            }
+            session.send(request("embedded prompt", false)).await;
+            if request_mode == BodySendMode::FullDuplexStreamed {
+                assert!(matches!(
+                    session.next().await.unwrap().response,
+                    Some(Reply::RequestHeaders(_))
+                ));
+            }
+            assert!(matches!(
+                session.next().await.unwrap().response,
+                Some(Reply::RequestBody(_))
+            ));
+            session.send(response_headers("application/json")).await;
+            if response_mode == BodySendMode::Buffered {
+                assert!(matches!(
+                    session.next().await.unwrap().response,
+                    Some(Reply::ResponseHeaders(_))
+                ));
+            }
+            let document =
+                serde_json::to_vec(&json!({"choices":[{"message":{"role":"assistant","content":"embedded answer"}}]}))
+                    .unwrap();
+            session.send(response_body(&document, true)).await;
+            if response_mode == BodySendMode::FullDuplexStreamed {
+                assert!(matches!(
+                    session.next().await.unwrap().response,
+                    Some(Reply::ResponseHeaders(_))
+                ));
+            }
+            let reply = session.next().await.unwrap();
+            assert!(matches!(reply.response, Some(Reply::ResponseBody(_))));
+            assert_eq!(body_bytes(&[reply]), document);
+        }
     }
-    assert_eq!(harness.calls().len(), 4);
+    assert_eq!(harness.calls().len(), 8);
 }
