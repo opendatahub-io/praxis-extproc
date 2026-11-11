@@ -8,6 +8,112 @@ use praxis_proto::envoy::service::{
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_selector_preserves_request_mode_and_header_wait_contract() {
+    let harness = Harness::new(NemoReply::Pass, false).await;
+    for response_mode in [
+        BodySendMode::None,
+        BodySendMode::Buffered,
+        BodySendMode::Streamed,
+        BodySendMode::FullDuplexStreamed,
+    ] {
+        for selected in [(false, false), (true, false), (false, true), (true, true)] {
+            for no_header_wait in [false, true] {
+                let mut session = harness.open().await;
+                let protocol = ProtocolConfiguration {
+                    request_body_mode: BodySendMode::Buffered.into(),
+                    response_body_mode: response_mode.into(),
+                    send_body_without_waiting_for_header_response: no_header_wait,
+                };
+                let reply = session
+                    .exchange(support::request_headers(protocol, selected, false))
+                    .await;
+                let should_override = !selected.1
+                    && !no_header_wait
+                    && matches!(response_mode, BodySendMode::Buffered | BodySendMode::Streamed);
+                assert_eq!(
+                    reply.mode_override.is_some(),
+                    should_override,
+                    "{response_mode:?}, {selected:?}, no_header_wait={no_header_wait}"
+                );
+                if let Some(mode) = reply.mode_override {
+                    assert_eq!(mode.request_body_mode, i32::from(BodySendMode::Buffered));
+                    assert_eq!(mode.response_body_mode, i32::from(BodySendMode::Streamed));
+                    assert_eq!(
+                        mode.response_header_mode,
+                        i32::from(praxis_proto::envoy::service::ext_proc::v3::processing_mode::HeaderSendMode::Send)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_guardrails_reject_incomplete_request_modes_before_forwarding() {
+    let harness = Harness::new(NemoReply::Pass, false).await;
+    for request_mode in [BodySendMode::None, BodySendMode::Streamed] {
+        for response_mode in [
+            BodySendMode::None,
+            BodySendMode::Buffered,
+            BodySendMode::Streamed,
+            BodySendMode::FullDuplexStreamed,
+        ] {
+            for selected in [(true, false), (false, true), (true, true)] {
+                for no_header_wait in [false, true] {
+                    let mut session = harness.open().await;
+                    let protocol = ProtocolConfiguration {
+                        request_body_mode: request_mode.into(),
+                        response_body_mode: response_mode.into(),
+                        send_body_without_waiting_for_header_response: no_header_wait,
+                    };
+                    let reply = session
+                        .exchange(support::request_headers(protocol, selected, false))
+                        .await;
+                    assert_eq!(
+                        immediate_status(std::slice::from_ref(&reply)),
+                        Some(500),
+                        "{request_mode:?}/{response_mode:?}, {selected:?}"
+                    );
+                    assert!(support::immediate_body(&reply).contains("require BUFFERED or FULL_DUPLEX_STREAMED"));
+                    assert!(
+                        session.next().await.is_none(),
+                        "rejection must close the stream before body dispatch"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        harness.calls().is_empty(),
+        "unsupported transport must fail before provider calls"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_modes_allow_unselected_and_truly_bodyless_requests() {
+    let harness = Harness::new(NemoReply::Pass, false).await;
+    for request_mode in [BodySendMode::None, BodySendMode::Streamed] {
+        for (selected, eos) in [((false, false), false), ((false, true), true), ((true, true), true)] {
+            let mut session = harness.open().await;
+            let protocol = ProtocolConfiguration {
+                request_body_mode: request_mode.into(),
+                response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                ..Default::default()
+            };
+            let reply = session
+                .exchange(support::request_headers(protocol, selected, eos))
+                .await;
+            assert_eq!(
+                immediate_status(&[reply]),
+                None,
+                "{request_mode:?}, {selected:?}, eos={eos}"
+            );
+        }
+    }
+    assert!(harness.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_header_values_are_authoritative_for_actual_guardrail_execution() {
     for (raw, text, selected) in [
         ("true", "false", true),

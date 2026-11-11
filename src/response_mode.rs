@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use praxis_core::config::{Condition, FilterChainConfig};
+use praxis_core::config::{Condition, FilterChainConfig, FilterEntry};
 use praxis_proto::envoy::service::common::v3::HeaderValue;
 
 use crate::adapter::header_value_str;
@@ -19,8 +19,12 @@ use crate::adapter::header_value_str;
 pub struct ResponseModeSelector {
     /// Whether guardrail filters were found in the configuration.
     enabled: bool,
+    /// Header names that select a guardrail requiring a complete request body.
+    guardrail_headers: HashSet<String>,
     /// Whether an unconditional response-phase guardrail is configured.
     has_always_on_response_guardrail: bool,
+    /// Whether any active guardrail has no selection condition.
+    has_unconditional_guardrail: bool,
     /// Header names that identify selected conditional response-phase guardrails.
     output_headers: HashSet<String>,
     /// Whether all guardrail entries had a supported shape.
@@ -31,54 +35,43 @@ pub struct ResponseModeSelector {
 
 impl ResponseModeSelector {
     /// Build a selector for unconditional filters and the exact header condition emitted by AIGC.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "guardrail entries are validated conservatively in one pass"
-    )]
     pub fn from_config(chains: &[FilterChainConfig]) -> Self {
-        let mut output_headers = HashSet::new();
-        let mut has_always_on_response_guardrail = false;
-        let mut has_guardrail = false;
-        for entry in chains.iter().flat_map(|chain| &chain.filters) {
-            if entry.filter_type != "ai_guardrails" {
-                continue;
-            }
-            has_guardrail = true;
-            let Some((request_phase, response_phase)) = guardrail_phases(entry) else {
-                return invalid_selector(output_headers, "invalid guardrail phase configuration");
-            };
-            if !request_phase && !response_phase {
-                continue;
-            }
-
-            let Some(header) = selected_guardrail_header(entry) else {
-                if entry.conditions.is_empty() && entry.response_conditions.is_empty() {
-                    has_always_on_response_guardrail |= response_phase;
-                    continue;
-                }
-                return invalid_selector(output_headers, "unsupported guardrail selection condition");
-            };
-            if response_phase {
-                output_headers.insert(header);
-            }
-        }
-
-        if !has_guardrail {
-            return Self::default();
-        }
-
-        Self {
-            enabled: true,
-            has_always_on_response_guardrail,
-            output_headers,
+        let mut selector = Self {
             valid: true,
-            invalid_reason: None,
+            ..Self::default()
+        };
+        for entry in chains
+            .iter()
+            .flat_map(|chain| &chain.filters)
+            .filter(|entry| entry.filter_type == "ai_guardrails")
+        {
+            selector.enabled = true;
+            if let Err(reason) = selector.add_guardrail(entry) {
+                selector.valid = false;
+                selector.invalid_reason = Some(reason);
+                break;
+            }
         }
+        selector
     }
 
     /// Return the startup diagnostic for an invalid guardrail selector.
     pub fn invalid_reason(&self) -> Option<&'static str> {
         self.invalid_reason
+    }
+
+    /// Whether a selected guardrail needs complete request-body delivery.
+    ///
+    /// Unknown selection shapes are conservative because output screening also
+    /// depends on the request-body hook, even without an input check.
+    pub(crate) fn requires_complete_request(&self, headers: &[HeaderValue]) -> bool {
+        self.enabled
+            && (!self.valid
+                || self.has_unconditional_guardrail
+                || self
+                    .guardrail_headers
+                    .iter()
+                    .any(|name| header_may_be_selected(headers, name)))
     }
 
     /// True when no selected output guardrail is present in the trusted headers.
@@ -91,16 +84,24 @@ impl ResponseModeSelector {
                 .iter()
                 .any(|name| header_may_be_selected(headers, name))
     }
-}
 
-/// Build a selector that preserves buffering when the config is invalid.
-fn invalid_selector(output_headers: HashSet<String>, invalid_reason: &'static str) -> ResponseModeSelector {
-    ResponseModeSelector {
-        enabled: true,
-        has_always_on_response_guardrail: false,
-        output_headers,
-        valid: false,
-        invalid_reason: Some(invalid_reason),
+    /// Add the supported phase and selection facts for one guardrail entry.
+    fn add_guardrail(&mut self, entry: &FilterEntry) -> Result<(), &'static str> {
+        let (request_phase, response_phase) = guardrail_phases(entry).ok_or("invalid guardrail phase configuration")?;
+        if !request_phase && !response_phase {
+            return Ok(());
+        }
+        if entry.conditions.is_empty() && entry.response_conditions.is_empty() {
+            self.has_unconditional_guardrail = true;
+            self.has_always_on_response_guardrail |= response_phase;
+            return Ok(());
+        }
+        let header = selected_guardrail_header(entry).ok_or("unsupported guardrail selection condition")?;
+        self.guardrail_headers.insert(header.clone());
+        if response_phase {
+            self.output_headers.insert(header);
+        }
+        Ok(())
     }
 }
 
@@ -109,7 +110,7 @@ fn invalid_selector(output_headers: HashSet<String>, invalid_reason: &'static st
 /// `PhaseConfig` defaults to request=true and response=false. The response-mode
 /// selector mirrors those defaults because it receives the untyped filter entry
 /// rather than the provider filter's deserialized configuration.
-fn guardrail_phases(entry: &praxis_core::config::FilterEntry) -> Option<(bool, bool)> {
+fn guardrail_phases(entry: &FilterEntry) -> Option<(bool, bool)> {
     let Some(phase) = entry.config.get("phase") else {
         return Some((true, false));
     };
@@ -124,7 +125,7 @@ fn guardrail_phases(entry: &praxis_core::config::FilterEntry) -> Option<(bool, b
 }
 
 /// Extract the exact conditional selection header from a guardrail entry.
-fn selected_guardrail_header(entry: &praxis_core::config::FilterEntry) -> Option<String> {
+fn selected_guardrail_header(entry: &FilterEntry) -> Option<String> {
     if !entry.response_conditions.is_empty() {
         return None;
     }
@@ -162,6 +163,57 @@ fn header_may_be_selected(headers: &[HeaderValue], expected_name: &str) -> bool 
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_request_requirement_tracks_active_and_unknown_guardrails() {
+        for (entry, required) in [
+            ("filter: request_id", false),
+            ("filter: ai_guardrails", true),
+            (
+                "filter: ai_guardrails\n        phase: { request: false, response: true }",
+                true,
+            ),
+            (
+                "filter: ai_guardrails\n        phase: { request: false, response: false }",
+                false,
+            ),
+            ("filter: ai_guardrails\n        phase: invalid", true),
+            (
+                "filter: ai_guardrails\n        conditions:\n          - when:\n              headers: { host: model.test }",
+                true,
+            ),
+        ] {
+            let selector = selector(&format!(
+                "filter_chains:\n  - name: main\n    filters:\n      - {entry}\n"
+            ));
+            assert_eq!(selector.requires_complete_request(&[]), required, "{entry}");
+        }
+        assert!(!ResponseModeSelector::default().requires_complete_request(&[]));
+    }
+
+    #[test]
+    fn complete_request_selection_honors_raw_values_and_missing_headers() {
+        let selector = selector(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: ai_guardrails\n        conditions:\n          - when:\n              headers: { x-aigateway-guardrail-input: 'true' }\n",
+        );
+        assert!(!selector.requires_complete_request(&[]));
+        for (text, raw, selected) in [
+            ("true", "false", false),
+            ("false", "true", true),
+            ("false", "", false),
+            ("true", "", true),
+        ] {
+            assert_eq!(
+                selector.requires_complete_request(&[raw_header("x-aigateway-guardrail-input", text, raw.as_bytes())]),
+                selected,
+                "text={text}, raw={raw}"
+            );
+        }
+        assert!(selector.requires_complete_request(&[
+            header("x-aigateway-guardrail-input", "false"),
+            header("x-aigateway-guardrail-input", "true")
+        ]));
+    }
 
     fn header(key: &str, value: &str) -> HeaderValue {
         HeaderValue {

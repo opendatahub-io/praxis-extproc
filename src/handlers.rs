@@ -164,7 +164,7 @@ pub(crate) async fn handle_request_headers(
     }
 
     let envoy_headers = extract_header_list(&headers);
-    if let Some(rejection) = reject_ambiguous_guardrail_selection(&envoy_headers) {
+    if let Some(rejection) = reject_invalid_guardrail_request(state, &envoy_headers, headers.end_of_stream) {
         return Ok(vec![rejection]);
     }
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
@@ -384,6 +384,26 @@ fn reject_ambiguous_guardrail_selection(headers: &[HeaderValue]) -> Option<Proce
         }
     }
     None
+}
+
+/// Reject ambiguous selection or modes unable to provide a selected check's body.
+fn reject_invalid_guardrail_request(
+    state: &StreamState,
+    headers: &[HeaderValue],
+    end_of_stream: bool,
+) -> Option<ProcessingResponse> {
+    if let Some(rejection) = reject_ambiguous_guardrail_selection(headers) {
+        return Some(rejection);
+    }
+    (!end_of_stream
+        && matches!(
+            state.protocol_config.request_body_mode,
+            BodyMode::None | BodyMode::Streamed
+        )
+        && state.response_mode_selector.requires_complete_request(headers))
+    .then(|| {
+        request_processing_rejection(b"selected guardrails require BUFFERED or FULL_DUPLEX_STREAMED request bodies")
+    })
 }
 
 /// Recognize phase selectors and the controller's SHA-256 check identifiers.

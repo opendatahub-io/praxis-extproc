@@ -11,6 +11,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use praxis_extproc::{
     config::{ExtProcConfig, build_pipeline},
+    response_mode::ResponseModeSelector,
     server::PraxisExtProc,
 };
 use praxis_proto::envoy::service::{
@@ -88,7 +89,9 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let service = ExternalProcessorServer::new(
-            PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
+            PraxisExtProc::new(pipeline)
+                .with_max_body_accumulation(cfg.max_body_accumulation())
+                .with_response_mode_selector(ResponseModeSelector::from_config(&cfg.filter_chains)),
         );
         let server = tokio::spawn(async move {
             Server::builder()
@@ -115,23 +118,14 @@ impl Harness {
 
     pub(crate) async fn session(&self, mode: BodySendMode, input: bool, output: bool) -> Session {
         let mut session = self.open().await;
-        let headers = vec![
-            header(":method", "POST"),
-            header(":path", "/v1/chat/completions"),
-            header("content-type", "application/json"),
-            header("x-aigateway-guardrail-input", if input { "true" } else { "false" }),
-            header("x-aigateway-guardrail-output", if output { "true" } else { "false" }),
-        ];
-        let mut message = wrap(RequestMessage::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap { headers }),
-            ..Default::default()
-        }));
-        message.protocol_config = Some(ProtocolConfiguration {
+        let protocol = ProtocolConfiguration {
             request_body_mode: BodySendMode::Buffered.into(),
             response_body_mode: mode.into(),
             ..Default::default()
-        });
-        let response = session.exchange(message).await;
+        };
+        let response = session
+            .exchange(request_headers(protocol, (input, output), false))
+            .await;
         assert!(matches!(response.response, Some(ResponseMessage::RequestHeaders(_))));
         session
     }
@@ -220,6 +214,29 @@ pub(crate) fn request(prompt: &str, stream: bool) -> ProcessingRequest {
         end_of_stream: true,
     }))
 }
+pub(crate) fn request_headers(
+    protocol: ProtocolConfiguration,
+    selected: (bool, bool),
+    end_of_stream: bool,
+) -> ProcessingRequest {
+    let headers = vec![
+        header(":method", "POST"),
+        header(":path", "/v1/chat/completions"),
+        header("content-type", "application/json"),
+        header("x-aigateway-guardrail-input", if selected.0 { "true" } else { "false" }),
+        header(
+            "x-aigateway-guardrail-output",
+            if selected.1 { "true" } else { "false" },
+        ),
+    ];
+    let mut message = wrap(RequestMessage::RequestHeaders(HttpHeaders {
+        headers: Some(HeaderMap { headers }),
+        end_of_stream,
+    }));
+    message.protocol_config = Some(protocol);
+    message
+}
+
 pub(crate) fn response_headers(content_type: &str) -> ProcessingRequest {
     wrap(RequestMessage::ResponseHeaders(HttpHeaders {
         headers: Some(HeaderMap {
