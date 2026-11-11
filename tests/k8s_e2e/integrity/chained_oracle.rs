@@ -1,9 +1,9 @@
 //! Per-hop body integrity on the pre-IPP → IPP two-hop chain.
 
-use super::oracle_helpers::{
-    HOP_DIGEST_HEADER_1, HOP_DIGEST_HEADER_2, assert_hop_digests, chat_completion_with_digest,
+use crate::{
+    fixtures::{assert_praxis_mutations, ensure_gateway_ready},
+    oracle_helpers::{HOP_DIGEST_HEADER_1, HOP_DIGEST_HEADER_2, assert_hop_digests, chat_completion_with_digest},
 };
-use crate::fixtures::{assert_praxis_mutations, ensure_gateway_ready};
 
 #[tokio::test]
 async fn chained_two_hop_oracle_matches_client_digest() {

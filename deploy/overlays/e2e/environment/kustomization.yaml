@@ -7,5 +7,6 @@ resources:
   - streaming-oracle.yaml
   - envoyfilter.yaml
   - internal-model.yaml
+  - echo.yaml
   - nemo-mock.yaml
   - local-reply-policy.yaml
