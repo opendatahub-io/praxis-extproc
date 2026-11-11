@@ -257,7 +257,7 @@ pub(crate) async fn run_response_pipeline(
         ResponsePhase::Headers => current_mutation,
         ResponsePhase::Body => {
             let deferred = state.deferred_response_header_mutation.take();
-            merge_mutations(deferred, current_mutation)
+            compose_response_mutations(deferred, current_mutation)
         },
     };
 
@@ -589,7 +589,8 @@ fn streaming_fds_response_headers(
         warn_unapplied_header_mutations(false, mutation.as_ref());
         return Vec::new();
     }
-    let mut mutation = merge_mutations(state.deferred_response_header_mutation.take(), mutation).unwrap_or_default();
+    let mut mutation =
+        compose_response_mutations(state.deferred_response_header_mutation.take(), mutation).unwrap_or_default();
     // Streaming body hooks can change each chunk's length; the final length is
     // unknown when these headers are released, even if upstream supplied one.
     mutation.set_headers.retain(|entry| {
@@ -1016,6 +1017,41 @@ pub(crate) const fn direction_label(is_request: bool) -> &'static str {
 /// Return a body slice reference if the buffer is non-empty.
 fn body_data_if_present(buf: &[u8]) -> Option<&[u8]> {
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Compose successive response-map diffs before their first wire delivery.
+///
+/// Each changed name contains its complete final value list. Its current diff
+/// supersedes all earlier operations for that name; otherwise Envoy's remove-
+/// before-set order could resurrect an earlier value after a body hook removed it.
+fn compose_response_mutations(
+    mut deferred: Option<HeaderMutation>,
+    current: Option<HeaderMutation>,
+) -> Option<HeaderMutation> {
+    if let (Some(prior), Some(next)) = (&mut deferred, &current) {
+        prior.set_headers.retain(|entry| {
+            entry
+                .header
+                .as_ref()
+                .is_none_or(|header| !mutation_touches(next, &header.key))
+        });
+        prior.remove_headers.retain(|name| !mutation_touches(next, name));
+    }
+    merge_mutations(deferred, current)
+}
+
+/// Whether a response diff replaces or removes this case-insensitive name.
+fn mutation_touches(mutation: &HeaderMutation, name: &str) -> bool {
+    mutation
+        .remove_headers
+        .iter()
+        .any(|removed| removed.eq_ignore_ascii_case(name))
+        || mutation.set_headers.iter().any(|entry| {
+            entry
+                .header
+                .as_ref()
+                .is_some_and(|header| header.key.eq_ignore_ascii_case(name))
+        })
 }
 
 /// Merge deferred header mutations with current mutations.
@@ -3046,3 +3082,7 @@ mod tests {
 #[cfg(test)]
 #[path = "pipeline/regressions.rs"]
 mod regressions;
+
+#[cfg(test)]
+#[path = "pipeline/response_regressions.rs"]
+mod response_regressions;
