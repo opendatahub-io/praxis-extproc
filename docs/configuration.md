@@ -171,7 +171,7 @@ server:
 | `health_address`               | string  | `0.0.0.0:50052` | gRPC health check address                                                                                                                                                                                         |
 | `metrics_address`              | string  | `0.0.0.0:9090`  | Prometheus metrics address                                                                                                                                                                                        |
 | `shutdown_drain_timeout_secs`  | integer | `20`            | Graceful-drain deadline in seconds; in-flight streams still running after it are force-cancelled. Must be **less than** the pod's `terminationGracePeriodSeconds` (leave headroom for a preStop lameduck and final cleanup); the `20` default fits inside the common `30`s k8s grace period |
-| `max_body_bytes`               | integer | `33554432`      | Maximum accumulated request/response body size in bytes before a request stream is rejected with an `ImmediateResponse` **413**. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which lifts the cap entirely. Keep the gRPC receive ceiling (`GRPC_MAX_RECV_MSG_SIZE`) **above** this value by enough framing headroom so an exactly-at-limit BUFFERED body reaches this check instead of failing at tonic decode |
+| `max_body_bytes`               | integer | `33554432`      | Maximum accumulated request/response body size in bytes before a request stream is rejected with an `ImmediateResponse` **413**. Must be greater than zero. Ignored when `insecure_options.allow_unbounded_body` is set, which removes this server cap while preserving filter buffer limits. Keep the gRPC receive ceiling (`GRPC_MAX_RECV_MSG_SIZE`) **above** this value by enough framing headroom so an exactly-at-limit BUFFERED body reaches this check instead of failing at tonic decode |
 | `metrics_auth`                 | object  | `enabled: true` | Metrics endpoint authentication                                                                                                                                                                                   |
 | `tls`                          | object  | `mode: none`    | TLS configuration                                                                                                                                                                                                 |
 
@@ -357,7 +357,7 @@ startup.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes`. Prefer an explicit `server.max_body_bytes` in production; with a raised gRPC receive limit this flag removes the only remaining DoS backstop on streamed chunks |
+| `allow_unbounded_body` | bool | `false` | Allow unlimited body accumulation, overriding `server.max_body_bytes`. Prefer an explicit `server.max_body_bytes` in production; filter buffer limits still apply, but unfiltered bodies lose their accumulation bound |
 
 ```yaml
 insecure_options:
@@ -408,6 +408,13 @@ RUST_LOG=praxis_extproc::server=trace praxis-extproc -c praxis-extproc.yaml
 | --- | --- |
 | `RUST_LOG` | Tracing filter (e.g. `info`, `debug`, `praxis_extproc=trace`) |
 | `GRPC_MAX_RECV_MSG_SIZE` | Per-gRPC-message receive limit for the ExtProc tonic server (bytes or a Kubernetes quantity such as `64Mi`). Default **33 MiB** (32 MiB body ceiling plus 1 MiB framing headroom, above tonic's compiled 4 MiB default) so multimodal / agent chat bodies do not fail with an empty HTTP 500 (`decoded message length too large`) and an exactly-at-`max_body_bytes` BUFFERED body still reaches the accumulation check. Invalid values fail closed at startup. This is independent of `server.max_body_bytes`: gRPC limits each message, while `max_body_bytes` limits cumulative accumulation across streamed chunks. For BUFFERED bodies Envoy typically sends one message, so the effective ceiling is `min(GRPC_MAX_RECV_MSG_SIZE, max_body_bytes)` unless `allow_unbounded_body` is set. |
+
+`server.max_body_bytes` bounds response accumulation when a filter or Envoy
+mode requires buffering. It does not cap total bytes transferred by
+unbuffered `STREAMED` or `FULL_DUPLEX_STREAMED` responses. Per-message gRPC
+and applicable filter limits still apply. The server limit counts request
+body bytes cumulatively, including streaming, unless `allow_unbounded_body`
+is enabled.
 
 ## Example Configs
 
@@ -464,12 +471,51 @@ At runtime:
   client sees a diagnosable error instead of an
   empty 500. Response-body accumulation over the
   same limit still fails the stream with gRPC
-  `RESOURCE_EXHAUSTED`. The limit is lifted
-  entirely when `insecure_options.allow_unbounded_body`
-  is set.
+  `RESOURCE_EXHAUSTED`. Setting
+  `insecure_options.allow_unbounded_body` removes the server limit;
+  static and runtime filter buffer limits still apply.
 - **Filter rejection**: a `FilterAction::Reject`
-  returns an `ImmediateResponse` to Envoy, which
-  sends the rejection directly to the client.
+  returns an `ImmediateResponse` to Envoy. Before the downstream response
+  starts, Envoy can send the rejection as a local response. Once streaming
+  has started, the behavior below applies.
+
+### Rejection after streaming starts
+
+`STREAMED` and `FULL_DUPLEX_STREAMED` can release accepted response chunks
+before later chunks reach a filter. A rejection on a later chunk cannot
+retract bytes the client already received or replace a status already sent.
+ExtProc sends the rejection and ends its processing stream without emitting
+the rejected chunk or any queued later body chunks.
+
+The [ExtProc protocol] allows Envoy to send a local reply to the downstream
+codec or reset a response that has already started. Clients must therefore
+handle an interrupted response; they cannot rely on receiving the filter's
+rejection status after response headers were committed.
+The Envoy 1.37 HTTP/1 integration test observes a body-stream error after
+the accepted prefix, with no rejected bytes delivered.
+
+Selected output guardrails hold body bytes until the complete verdict, so
+this per-chunk limitation does not permit an unchecked output prefix. In
+`STREAMED` mode, headers may already be committed even while the body is
+held, so a later rejection still cannot guarantee a replacement status.
+
+[ExtProc protocol]: ../proto/proto/ext_proc.proto
+
+### AI guardrail body modes
+
+Selected input or output guardrails require a complete request body. Use
+`BUFFERED` or `FULL_DUPLEX_STREAMED` requests; bodyful `NONE` and `STREAMED`
+requests are rejected before forwarding. A selected request must finish
+before response processing begins. Requests that end with headers remain
+supported without a body callout.
+
+In `FULL_DUPLEX_STREAMED`, selected output checks hold response bytes until
+body EOS or trailers complete the document. Unselected and input-only checks
+can release response chunks immediately when no other filter requires
+buffering. Both values of `send_body_without_waiting_for_header_response`
+are supported. The effective accumulation limit is the smallest present
+server, static pipeline, or runtime filter bound. Filter pipelines combine
+static filter buffer requirements according to their own capability rules.
 
 ### Selected-upstream request-body filters
 

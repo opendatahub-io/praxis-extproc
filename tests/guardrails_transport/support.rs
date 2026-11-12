@@ -11,6 +11,7 @@ use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use praxis_extproc::{
     config::{ExtProcConfig, build_pipeline},
+    response_mode::ResponseModeSelector,
     server::PraxisExtProc,
 };
 use praxis_proto::envoy::service::{
@@ -23,7 +24,11 @@ use praxis_proto::envoy::service::{
     },
 };
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{
     Streaming,
@@ -41,12 +46,28 @@ pub(crate) enum NemoReply {
     Malformed,
     Unknown,
     Timeout,
+    HoldFirst,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingCall {
+    pub(crate) started: Notify,
+    pub(crate) finished: Notify,
+}
+
+struct AwaitingProvider(Arc<PendingCall>);
+
+impl Drop for AwaitingProvider {
+    fn drop(&mut self) {
+        self.0.finished.notify_one();
+    }
 }
 
 pub(crate) struct Harness {
     pub(crate) client: ExternalProcessorClient<Channel>,
     #[cfg(feature = "integration")]
     pub(crate) endpoint: String,
+    pub(crate) pending_call: Arc<PendingCall>,
     calls: Arc<Mutex<Vec<Value>>>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -65,16 +86,43 @@ impl Harness {
     }
 
     pub(crate) async fn with_limit(reply: NemoReply, translation: bool, limit: usize) -> Self {
+        Self::configured(reply, translation, limit, |_| {}).await
+    }
+
+    pub(crate) async fn configured(
+        reply: NemoReply,
+        translation: bool,
+        limit: usize,
+        configure: impl FnOnce(&mut ExtProcConfig),
+    ) -> Self {
+        Self::configured_service(reply, translation, limit, configure, true).await
+    }
+
+    pub(crate) async fn embedded(reply: NemoReply) -> Self {
+        Self::configured_service(reply, false, 2_097_152, |_| {}, false).await
+    }
+
+    async fn configured_service(
+        reply: NemoReply,
+        translation: bool,
+        limit: usize,
+        configure: impl FnOnce(&mut ExtProcConfig),
+        install_selector: bool,
+    ) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v1/checks", listener.local_addr().unwrap());
         let records = Arc::clone(&calls);
+        let pending_call = Arc::new(PendingCall::default());
+        let pending = Arc::clone(&pending_call);
         let nemo = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             while let Ok((socket, _)) = listener.accept().await {
                 let records = Arc::clone(&records);
+                let pending = Arc::clone(&pending);
                 connections.spawn(async move {
-                    let service = service_fn(move |req| nemo_response(req, reply, Arc::clone(&records)));
+                    let service =
+                        service_fn(move |req| nemo_response(req, reply, Arc::clone(&records), Arc::clone(&pending)));
                     drop(
                         hyper::server::conn::http1::Builder::new()
                             .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
@@ -83,13 +131,16 @@ impl Harness {
                 });
             }
         });
-        let cfg = configuration(&endpoint, translation, limit);
+        let mut cfg = configuration(&endpoint, translation, limit);
+        configure(&mut cfg);
         let pipeline = build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let service = ExternalProcessorServer::new(
-            PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation()),
-        );
+        let mut service = PraxisExtProc::new(pipeline).with_max_body_accumulation(cfg.max_body_accumulation());
+        if install_selector {
+            service = service.with_response_mode_selector(ResponseModeSelector::from_config(&cfg.filter_chains));
+        }
+        let service = ExternalProcessorServer::new(service);
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(service)
@@ -104,6 +155,7 @@ impl Harness {
             client,
             #[cfg(feature = "integration")]
             endpoint,
+            pending_call,
             calls,
             tasks: vec![nemo, server],
         }
@@ -115,23 +167,14 @@ impl Harness {
 
     pub(crate) async fn session(&self, mode: BodySendMode, input: bool, output: bool) -> Session {
         let mut session = self.open().await;
-        let headers = vec![
-            header(":method", "POST"),
-            header(":path", "/v1/chat/completions"),
-            header("content-type", "application/json"),
-            header("x-aigateway-guardrail-input", if input { "true" } else { "false" }),
-            header("x-aigateway-guardrail-output", if output { "true" } else { "false" }),
-        ];
-        let mut message = wrap(RequestMessage::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap { headers }),
-            ..Default::default()
-        }));
-        message.protocol_config = Some(ProtocolConfiguration {
+        let protocol = ProtocolConfiguration {
             request_body_mode: BodySendMode::Buffered.into(),
             response_body_mode: mode.into(),
             ..Default::default()
-        });
-        let response = session.exchange(message).await;
+        };
+        let response = session
+            .exchange(request_headers(protocol, (input, output), false))
+            .await;
         assert!(matches!(response.response, Some(ResponseMessage::RequestHeaders(_))));
         session
     }
@@ -220,6 +263,29 @@ pub(crate) fn request(prompt: &str, stream: bool) -> ProcessingRequest {
         end_of_stream: true,
     }))
 }
+pub(crate) fn request_headers(
+    protocol: ProtocolConfiguration,
+    selected: (bool, bool),
+    end_of_stream: bool,
+) -> ProcessingRequest {
+    let headers = vec![
+        header(":method", "POST"),
+        header(":path", "/v1/chat/completions"),
+        header("content-type", "application/json"),
+        header("x-aigateway-guardrail-input", if selected.0 { "true" } else { "false" }),
+        header(
+            "x-aigateway-guardrail-output",
+            if selected.1 { "true" } else { "false" },
+        ),
+    ];
+    let mut message = wrap(RequestMessage::RequestHeaders(HttpHeaders {
+        headers: Some(HeaderMap { headers }),
+        end_of_stream,
+    }));
+    message.protocol_config = Some(protocol);
+    message
+}
+
 pub(crate) fn response_headers(content_type: &str) -> ProcessingRequest {
     wrap(RequestMessage::ResponseHeaders(HttpHeaders {
         headers: Some(HeaderMap {
@@ -268,12 +334,22 @@ async fn nemo_response(
     request: Request<Incoming>,
     reply: NemoReply,
     records: Arc<Mutex<Vec<Value>>>,
+    pending: Arc<PendingCall>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     assert_eq!(request.uri().path(), "/v1/checks");
     let body = request.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&body).unwrap();
     let input = value["guardrails"]["rail_types"][0] == "input";
-    records.lock().unwrap().push(value);
+    let call_number = {
+        let mut calls = records.lock().unwrap();
+        calls.push(value);
+        calls.len()
+    };
+    if matches!(reply, NemoReply::HoldFirst) && call_number == 1 {
+        let _cleanup = AwaitingProvider(Arc::clone(&pending));
+        pending.started.notify_one();
+        std::future::pending::<()>().await;
+    }
     let blocked = matches!(
         (reply, input),
         (NemoReply::BlockInput, true) | (NemoReply::BlockOutput, false)

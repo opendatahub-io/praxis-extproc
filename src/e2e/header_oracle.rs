@@ -128,8 +128,8 @@ impl HeaderOracleFilter {
 
 /// Effective forwarded state of `name` at this hop, encoded as a header value.
 ///
-/// `fwd:<value>` when the header reaches upstream, [`STATE_STRIPPED`] when an
-/// earlier filter removed it, [`STATE_ABSENT`] when it is neither present nor
+/// `fwd:<value>` when the header reaches upstream, `stripped` when an
+/// earlier filter removed it, `absent` when it is neither present nor
 /// added, and [`STATE_AMBIGUOUS`] when the value is non-text or contested.
 fn forwarded_state(ctx: &HttpFilterContext<'_>, name: &str) -> ForwardedState {
     let Ok(header) = http::HeaderName::try_from(name) else {
@@ -212,7 +212,7 @@ impl HttpFilter for HeaderOracleFilter {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
+#[expect(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -261,5 +261,35 @@ mod tests {
     #[test]
     fn filter_reports_its_name() {
         assert_eq!(filter("watch: [x-maas-tenant]").name(), "e2e_header_oracle");
+    }
+    #[tokio::test]
+    async fn repeated_sets_in_one_context_report_the_last_value() {
+        let pipeline =
+            praxis_filter::FilterPipeline::build(&mut [], &praxis_filter::FilterRegistry::with_builtins()).unwrap();
+        let request = crate::adapter::envoy_headers_to_request(&[]);
+        for last in ["first", "last"] {
+            let mut ctx = crate::adapter::build_filter_context(&pipeline, &request, false);
+            ctx.current_filter_id = Some(0);
+            let oracle = filter("watch: [x-test]");
+            ctx.request_headers_to_set
+                .push(("x-test".parse().unwrap(), "first".parse().unwrap()));
+            assert!(matches!(
+                oracle.on_request(&mut ctx).await.unwrap(),
+                FilterAction::Continue
+            ));
+            ctx.request_headers_to_set
+                .push(("x-test".parse().unwrap(), last.parse().unwrap()));
+            assert!(matches!(
+                oracle
+                    .on_request_body(&mut ctx, &mut Some(Bytes::new()), true)
+                    .await
+                    .unwrap(),
+                FilterAction::Continue
+            ));
+            assert_eq!(
+                ctx.get_metadata("e2e_header_oracle.x-test"),
+                Some(format!("fwd:{last}").as_str())
+            );
+        }
     }
 }

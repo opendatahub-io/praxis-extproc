@@ -23,8 +23,17 @@ mod support;
 #[path = "guardrails_transport/boundaries.rs"]
 mod boundaries;
 
+#[path = "guardrails_transport/fds.rs"]
+mod fds;
+
+#[path = "guardrails_transport/limits.rs"]
+mod limits;
+
 #[path = "guardrails_transport/selection.rs"]
 mod selection;
+
+#[path = "guardrails_transport/stream_rejection.rs"]
+mod stream_rejection;
 
 #[cfg(feature = "integration")]
 #[path = "guardrails_transport/envoy.rs"]

@@ -106,10 +106,10 @@ struct Prepared {
     limits: BodyLimits,
 }
 
-/// Log invalid guardrail response-mode configuration once during startup.
-fn warn_invalid_response_mode_config(selector: &praxis_extproc::response_mode::ResponseModeSelector) {
+/// Log why guardrail selection inference is unavailable during startup.
+fn warn_unknown_guardrail_selection(selector: &praxis_extproc::response_mode::ResponseModeSelector) {
     if let Some(reason) = selector.invalid_reason() {
-        warn!(reason = %reason, "invalid guardrail response-mode configuration; keeping buffered mode and rejecting FDS");
+        warn!(reason = %reason, "cannot infer guardrail selection from configuration; requiring complete request bodies and disabling response mode overrides");
     }
 }
 
@@ -145,7 +145,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prepared = prepare(&cli.config)?;
     let response_mode_selector =
         praxis_extproc::response_mode::ResponseModeSelector::from_config(&prepared.cfg.filter_chains);
-    warn_invalid_response_mode_config(&response_mode_selector);
+    warn_unknown_guardrail_selection(&response_mode_selector);
 
     if cli.validate {
         return validate_prepared(&cli, prepared);

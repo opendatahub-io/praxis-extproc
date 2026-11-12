@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::{
     adapter, metrics,
     response::{self, BodyMode},
-    server::{HydratedContext, StreamState},
+    server::{HydratedContext, PendingRequestMutations, StreamState},
 };
 
 // -----------------------------------------------------------------------------
@@ -86,6 +86,11 @@ async fn run_request_pipeline_inner(
     };
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    if let Some(pending) = state.pending_request_mutations.take() {
+        pending.restore(&mut ctx);
+        // The restored queues are authoritative; collect them once after body hooks.
+        state.deferred_request_header_mutation = None;
+    }
 
     if let Some(immediate) =
         execute_request_filters_if_needed(pipeline, &mut ctx, &mut state.header_state.request_filters_executed).await?
@@ -114,7 +119,10 @@ async fn run_request_pipeline_inner(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let mutation = adapter::collect_request_header_mutations(&ctx);
+    let mutation = merge_mutations(
+        state.deferred_request_header_mutation.take(),
+        adapter::collect_request_header_mutations(&ctx),
+    );
 
     ctx.dehydrate(&mut state.carried_context)?;
 
@@ -249,7 +257,7 @@ pub(crate) async fn run_response_pipeline(
         ResponsePhase::Headers => current_mutation,
         ResponsePhase::Body => {
             let deferred = state.deferred_response_header_mutation.take();
-            merge_mutations(deferred, current_mutation)
+            compose_response_mutations(deferred, current_mutation)
         },
     };
 
@@ -414,6 +422,15 @@ fn buffer_response_chunk(
     Ok(())
 }
 
+/// Return a finite filter body bound, if one was declared.
+pub(crate) fn body_buffer_limit(mode: praxis_filter::BodyMode) -> Option<usize> {
+    match mode {
+        praxis_filter::BodyMode::StreamBuffer { max_bytes } => max_bytes,
+        praxis_filter::BodyMode::SizeLimit { max_bytes } => Some(max_bytes),
+        _ => None,
+    }
+}
+
 /// Build a `HeadersResponse` carrying the deferred header-phase mutation.
 ///
 /// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
@@ -518,6 +535,72 @@ pub(crate) async fn process_streamed_body_chunk(
         response::response_body(body_data, None, body_mode, eos)
     };
     Ok(responses)
+}
+
+/// Run a streaming FDS response hook without holding later upstream chunks.
+///
+/// `filter_eos` also marks trailer closure; `wire_eos` is true only when an
+/// incoming body message itself ended the stream.
+pub(crate) fn process_fds_response_body(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    mut body: Vec<u8>,
+    filter_eos: bool,
+    wire_eos: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state
+        .request
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
+    let response = state
+        .response
+        .as_mut()
+        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+    let original_headers = capture_original_headers(response);
+    ctx.response_header = Some(response);
+    ctx.upstream_reached = true;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    ctx.body_done_indices = mem::take(&mut state.response_body_done_indices);
+    if let Some(immediate) = run_resp_body_filters(pipeline, &mut ctx, &mut body, filter_eos)? {
+        return Ok(vec![response::immediate(immediate)]);
+    }
+    state.response_body_done_indices = mem::take(&mut ctx.body_done_indices);
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    ctx.dehydrate(&mut state.carried_context)?;
+    let mut replies = streaming_fds_response_headers(state, mutation);
+    if !body.is_empty() || !filter_eos || wire_eos {
+        replies.extend(response::response_body(
+            Some(&body),
+            None,
+            BodyMode::FullDuplexStreamed,
+            wire_eos,
+        ));
+    }
+    Ok(replies)
+}
+
+/// Release streaming FDS response headers once, before the first body mutation.
+fn streaming_fds_response_headers(
+    state: &mut StreamState,
+    mutation: Option<HeaderMutation>,
+) -> Vec<ProcessingResponse> {
+    if !state.header_state.take_first_chunk(false) {
+        warn_unapplied_header_mutations(false, mutation.as_ref());
+        return Vec::new();
+    }
+    let mut mutation =
+        compose_response_mutations(state.deferred_response_header_mutation.take(), mutation).unwrap_or_default();
+    // Streaming body hooks can change each chunk's length; the final length is
+    // unknown when these headers are released, even if upstream supplied one.
+    mutation.set_headers.retain(|entry| {
+        entry
+            .header
+            .as_ref()
+            .is_none_or(|header| !header.key.eq_ignore_ascii_case("content-length"))
+    });
+    mutation.remove_headers.push("content-length".to_owned());
+    vec![response::response_headers(Some(mutation))]
 }
 
 /// Once-per-process warning: `STREAMED` body filters produced header mutations.
@@ -634,6 +717,15 @@ pub(crate) async fn run_request_header_filters_early(
     state.header_state.request_filters_executed = true;
 
     let mutation = adapter::collect_request_header_mutations(&ctx);
+    if matches!(delivery, MutationDelivery::DeferSilent)
+        && state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
+        && pipeline.body_capabilities().needs_request_body
+    {
+        state
+            .pending_request_mutations
+            .try_put(PendingRequestMutations::take_from(&mut ctx))
+            .map_err(|_unparked| Status::internal("pending request mutations already present before capture"))?;
+    }
     ctx.dehydrate(&mut state.carried_context)?;
 
     Ok(delivery.deliver_request(mutation, state))
@@ -822,6 +914,11 @@ fn run_resp_body_filters(
         return Ok(None);
     }
 
+    if body_buffer_limit(ctx.response_body_mode).is_some_and(|limit| body_buf.len() > limit) {
+        metrics::record_body_size_rejection();
+        return Err(Status::resource_exhausted("buffered response exceeds maximum size"));
+    }
+
     let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
         .execute_http_response_body(ctx, &mut body, eos)
@@ -923,6 +1020,41 @@ pub(crate) const fn direction_label(is_request: bool) -> &'static str {
 /// Return a body slice reference if the buffer is non-empty.
 fn body_data_if_present(buf: &[u8]) -> Option<&[u8]> {
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Compose successive response-map diffs before their first wire delivery.
+///
+/// Each changed name contains its complete final value list. Its current diff
+/// supersedes all earlier operations for that name; otherwise Envoy's remove-
+/// before-set order could resurrect an earlier value after a body hook removed it.
+fn compose_response_mutations(
+    mut deferred: Option<HeaderMutation>,
+    current: Option<HeaderMutation>,
+) -> Option<HeaderMutation> {
+    if let (Some(prior), Some(next)) = (&mut deferred, &current) {
+        prior.set_headers.retain(|entry| {
+            entry
+                .header
+                .as_ref()
+                .is_none_or(|header| !mutation_touches(next, &header.key))
+        });
+        prior.remove_headers.retain(|name| !mutation_touches(next, name));
+    }
+    merge_mutations(deferred, current)
+}
+
+/// Whether a response diff replaces or removes this case-insensitive name.
+fn mutation_touches(mutation: &HeaderMutation, name: &str) -> bool {
+    mutation
+        .remove_headers
+        .iter()
+        .any(|removed| removed.eq_ignore_ascii_case(name))
+        || mutation.set_headers.iter().any(|entry| {
+            entry
+                .header
+                .as_ref()
+                .is_some_and(|header| header.key.eq_ignore_ascii_case(name))
+        })
 }
 
 /// Merge deferred header mutations with current mutations.
@@ -2714,7 +2846,7 @@ mod tests {
         hydrated.response_body_bytes = 202;
 
         // Capture (`dehydrate`) must move every field into the empty slot.
-        let mut slot = None;
+        let mut slot = crate::server::Parked::empty();
         hydrated.dehydrate(&mut slot).unwrap();
         let carried = slot.take().unwrap();
 
@@ -2790,12 +2922,12 @@ mod tests {
 
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let mut slot = Some(CarriedContext::default());
+        let mut slot = crate::server::Parked::new(CarriedContext::default());
 
         // First hydrate drains the slot to None.
         let first = adapter::build_filter_context(&pipeline, &request, false);
         let _hydrated = HydratedContext::hydrate(slot.take(), first).unwrap();
-        assert!(slot.is_none(), "hydrate's take must leave the slot None");
+        assert!(slot.as_ref().is_none(), "hydrate's take must leave the slot empty");
 
         // Second hydrate finds None and must error instead of carrying empty state.
         let second = adapter::build_filter_context(&pipeline, &request, false);
@@ -2819,7 +2951,7 @@ mod tests {
         let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
 
         // The slot is still occupied: a prior phase failed to drain it.
-        let mut slot = Some(CarriedContext::default());
+        let mut slot = crate::server::Parked::new(CarriedContext::default());
         slot.as_mut()
             .unwrap()
             .filter_metadata
@@ -2949,3 +3081,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline/regressions.rs"]
+mod regressions;
+
+#[cfg(test)]
+#[path = "pipeline/response_regressions.rs"]
+mod response_regressions;
