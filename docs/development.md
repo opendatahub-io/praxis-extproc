@@ -180,6 +180,13 @@ delivery. Output-check tests prove the opposite contract: no partial unchecked
 output reaches the client. Logs and generated configurations are retained under
 `target/envoy-tests/`. The pinned Envoy download supports Linux x86_64.
 
+Late-rejection tests also run the actual ExtProc service with a test-only
+streaming filter. The gRPC cases reject the first or a later chunk and check
+that queued chunks never reach the filter afterward. The real-Envoy cases
+wait for the first client-visible bytes before allowing a rejecting chunk,
+covering `STREAMED`, `FULL_DUPLEX_STREAMED`, and both header-wait settings.
+These complement the selected-output tests that require complete buffering.
+
 The generated test chain follows the controller's selection-header and filter
 ordering contract. This does not exercise Kubernetes reconciliation, MaaS
 authentication, AIGuardrail status, or an actual release container. Those still

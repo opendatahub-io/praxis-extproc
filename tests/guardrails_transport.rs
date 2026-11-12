@@ -32,6 +32,9 @@ mod limits;
 #[path = "guardrails_transport/selection.rs"]
 mod selection;
 
+#[path = "guardrails_transport/stream_rejection.rs"]
+mod stream_rejection;
+
 #[cfg(feature = "integration")]
 #[path = "guardrails_transport/envoy.rs"]
 mod envoy;

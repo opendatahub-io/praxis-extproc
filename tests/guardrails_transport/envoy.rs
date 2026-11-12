@@ -1,4 +1,4 @@
-//! HTTP contracts through real Envoy and the compiled product executable.
+//! HTTP contracts through real Envoy and the product executable or service.
 //!
 //! These use the ExtProc protocol documented in Envoy's
 //! `service/ext_proc/v3/external_processor.proto`: an absent body mutation
@@ -27,6 +27,9 @@ use hyper::{
 use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
 use super::*;
+
+#[path = "envoy/rejection.rs"]
+mod rejection;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -193,36 +196,19 @@ impl World {
         reply: NemoReply,
         hold_json: bool,
     ) -> Self {
-        Self::with_trailers(request_mode, response_mode, no_header_wait, reply, hold_json, "SEND").await
-    }
-
-    async fn with_trailers(
-        request_mode: &str,
-        response_mode: &str,
-        no_header_wait: bool,
-        reply: NemoReply,
-        hold_json: bool,
-        request_trailer_mode: &str,
-    ) -> Self {
         Self::configured(
-            request_mode,
-            response_mode,
-            no_header_wait,
+            EnvoyModes::new(request_mode, response_mode, no_header_wait),
             reply,
             hold_json,
-            request_trailer_mode,
             |_| {},
         )
         .await
     }
 
     async fn configured(
-        request_mode: &str,
-        response_mode: &str,
-        no_header_wait: bool,
+        modes: EnvoyModes<'_>,
         reply: NemoReply,
         hold_json: bool,
-        request_trailer_mode: &str,
         configure: impl FnOnce(&mut praxis_extproc::config::ExtProcConfig),
     ) -> Self {
         let _startup = WORLD_STARTUP.lock().await;
@@ -238,7 +224,7 @@ impl World {
         // The translator requires selected-upstream body processing, which is
         // independently restricted to BUFFERED requests. FDS worlds exercise
         // guardrails without that incompatible filter.
-        let translation = request_mode == "BUFFERED";
+        let translation = modes.request == "BUFFERED";
         let nemo = Box::pin(Harness::new(reply, translation)).await;
         let finish = Arc::new(Notify::new());
         let first_frame = Arc::new(Notify::new());
@@ -290,20 +276,7 @@ impl World {
                 .unwrap(),
         );
         let envoy_path = directory.join("envoy.json");
-        std::fs::write(
-            &envoy_path,
-            envoy_config(
-                request_mode,
-                response_mode,
-                no_header_wait,
-                frontend,
-                grpc,
-                backend,
-                request_trailer_mode,
-            )
-            .to_string(),
-        )
-        .unwrap();
+        std::fs::write(&envoy_path, envoy_config(modes, frontend, grpc, backend).to_string()).unwrap();
         let envoy_log = std::fs::File::create(directory.join("envoy.log")).unwrap();
         drop(reserved_frontend);
         let proxy = Process(
@@ -475,14 +448,49 @@ async fn backend_response(
         .unwrap())
 }
 
-fn envoy_config(
-    request_mode: &str,
-    response_mode: &str,
+#[derive(Clone, Copy)]
+struct EnvoyModes<'a> {
     no_header_wait: bool,
+    request: &'a str,
+    request_trailers: &'a str,
+    response: &'a str,
+}
+
+impl<'a> EnvoyModes<'a> {
+    fn new(request: &'a str, response: &'a str, no_header_wait: bool) -> Self {
+        Self {
+            no_header_wait,
+            request,
+            request_trailers: "SEND",
+            response,
+        }
+    }
+}
+
+fn extproc_filter_config(modes: EnvoyModes<'_>) -> serde_json::Value {
+    json!({
+        "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
+        "grpc_service": {"envoy_grpc": {"cluster_name": "extproc"}, "timeout": "10s"},
+        "failure_mode_allow": false,
+        "allow_mode_override": true,
+        "message_timeout": "10s",
+        "send_body_without_waiting_for_header_response": modes.no_header_wait,
+        "processing_mode": {
+            "request_header_mode": "SEND",
+            "response_header_mode": "SEND",
+            "request_body_mode": modes.request,
+            "response_body_mode": modes.response,
+            "request_trailer_mode": modes.request_trailers,
+            "response_trailer_mode": "SEND"
+        }
+    })
+}
+
+fn envoy_config(
+    modes: EnvoyModes<'_>,
     frontend: SocketAddr,
     grpc: SocketAddr,
     backend: SocketAddr,
-    request_trailer_mode: &str,
 ) -> serde_json::Value {
     let address = |port| json!({"socket_address":{"address":"127.0.0.1","port_value":port}});
     let cluster = |name: &str, endpoint: SocketAddr| json!({"name":name,"type":"STATIC","connect_timeout":"2s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":address(endpoint.port())}}]}]}});
@@ -491,7 +499,7 @@ fn envoy_config(
     json!({"static_resources":{
         "listeners":[{"name":"http","address":address(frontend.port()),"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{
             "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","http_protocol_options":{"enable_trailers":true},"route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
-            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor","grpc_service":{"envoy_grpc":{"cluster_name":"extproc"},"timeout":"10s"},"failure_mode_allow":false,"allow_mode_override":true,"message_timeout":"10s","send_body_without_waiting_for_header_response":no_header_wait,"processing_mode":{"request_header_mode":"SEND","response_header_mode":"SEND","request_body_mode":request_mode,"response_body_mode":response_mode,"request_trailer_mode":request_trailer_mode,"response_trailer_mode":"SEND"}}},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
+            "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":extproc_filter_config(modes)},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
         }}]}]}],"clusters":[processor,cluster("backend", backend)]}})
 }
 
@@ -673,7 +681,9 @@ async fn envoy_checks_buffered_requests_with_skipped_http_trailers() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     for response_mode in ["BUFFERED", "STREAMED", "FULL_DUPLEX_STREAMED"] {
-        let world = World::with_trailers("BUFFERED", response_mode, false, NemoReply::Pass, false, "SKIP").await;
+        let mut modes = EnvoyModes::new("BUFFERED", response_mode, false);
+        modes.request_trailers = "SKIP";
+        let world = World::configured(modes, NemoReply::Pass, false, |_| {}).await;
         let uri: http::Uri = world.url.parse().unwrap();
         let mut socket = tokio::net::TcpStream::connect(uri.authority().unwrap().as_str())
             .await
@@ -708,7 +718,7 @@ async fn envoy_checks_buffered_requests_with_skipped_http_trailers() {
 async fn envoy_preserves_appended_request_headers_and_response_cookies() {
     for request_mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
         for response_mode in ["BUFFERED", "STREAMED", "FULL_DUPLEX_STREAMED"] {
-            let world = World::configured(request_mode, response_mode, false, NemoReply::Pass, false, "SEND", |cfg| {
+            let world = World::configured(EnvoyModes::new(request_mode, response_mode, false), NemoReply::Pass, false, |cfg| {
             cfg.filter_chains[0].filters.push(serde_yaml::from_str(
                 "filter: headers\nrequest_add:\n  - {name: x-values, value: first}\n  - {name: x-values, value: second}\nresponse_add:\n  - {name: set-cookie, value: session=first}\n  - {name: set-cookie, value: theme=second}\n"
             ).unwrap());
@@ -735,6 +745,7 @@ async fn envoy_preserves_appended_request_headers_and_response_cookies() {
                 .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
                 .collect();
             assert_eq!(values, ["first", "second"], "request additions must append on the wire");
+            drop(requests);
             assert!(world.nemo.calls().is_empty());
         }
     }

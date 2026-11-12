@@ -102,9 +102,12 @@ on headers would be too late).
 
 ### 4. Response Body
 
-Same accumulation pattern as the request body. On
-`end_of_stream`, response body filters run and
-mutations are returned.
+Buffered response filters run after the body is complete. Streaming filters
+can process and release individual chunks in `STREAMED` and
+`FULL_DUPLEX_STREAMED`. A later rejection ends processing but cannot retract
+chunks already sent to the client; see [late rejection behavior].
+
+[late rejection behavior]: configuration.md#rejection-after-streaming-starts
 
 ### 5. Trailers
 

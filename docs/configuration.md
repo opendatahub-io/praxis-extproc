@@ -409,6 +409,13 @@ RUST_LOG=praxis_extproc::server=trace praxis-extproc -c praxis-extproc.yaml
 | `RUST_LOG` | Tracing filter (e.g. `info`, `debug`, `praxis_extproc=trace`) |
 | `GRPC_MAX_RECV_MSG_SIZE` | Per-gRPC-message receive limit for the ExtProc tonic server (bytes or a Kubernetes quantity such as `64Mi`). Default **33 MiB** (32 MiB body ceiling plus 1 MiB framing headroom, above tonic's compiled 4 MiB default) so multimodal / agent chat bodies do not fail with an empty HTTP 500 (`decoded message length too large`) and an exactly-at-`max_body_bytes` BUFFERED body still reaches the accumulation check. Invalid values fail closed at startup. This is independent of `server.max_body_bytes`: gRPC limits each message, while `max_body_bytes` limits cumulative accumulation across streamed chunks. For BUFFERED bodies Envoy typically sends one message, so the effective ceiling is `min(GRPC_MAX_RECV_MSG_SIZE, max_body_bytes)` unless `allow_unbounded_body` is set. |
 
+`server.max_body_bytes` bounds response accumulation when a filter or Envoy
+mode requires buffering. It does not cap total bytes transferred by
+unbuffered `STREAMED` or `FULL_DUPLEX_STREAMED` responses. Per-message gRPC
+and applicable filter limits still apply. The server limit counts request
+body bytes cumulatively, including streaming, unless `allow_unbounded_body`
+is enabled.
+
 ## Example Configs
 
 Working examples in the `examples/` directory:
@@ -468,8 +475,31 @@ At runtime:
   `insecure_options.allow_unbounded_body` removes the server limit;
   static and runtime filter buffer limits still apply.
 - **Filter rejection**: a `FilterAction::Reject`
-  returns an `ImmediateResponse` to Envoy, which
-  sends the rejection directly to the client.
+  returns an `ImmediateResponse` to Envoy. Before the downstream response
+  starts, Envoy can send the rejection as a local response. Once streaming
+  has started, the behavior below applies.
+
+### Rejection after streaming starts
+
+`STREAMED` and `FULL_DUPLEX_STREAMED` can release accepted response chunks
+before later chunks reach a filter. A rejection on a later chunk cannot
+retract bytes the client already received or replace a status already sent.
+ExtProc sends the rejection and ends its processing stream without emitting
+the rejected chunk or any queued later body chunks.
+
+The [ExtProc protocol] allows Envoy to send a local reply to the downstream
+codec or reset a response that has already started. Clients must therefore
+handle an interrupted response; they cannot rely on receiving the filter's
+rejection status after response headers were committed.
+The Envoy 1.37 HTTP/1 integration test observes a body-stream error after
+the accepted prefix, with no rejected bytes delivered.
+
+Selected output guardrails hold body bytes until the complete verdict, so
+this per-chunk limitation does not permit an unchecked output prefix. In
+`STREAMED` mode, headers may already be committed even while the body is
+held, so a later rejection still cannot guarantee a replacement status.
+
+[ExtProc protocol]: ../proto/proto/ext_proc.proto
 
 ### AI guardrail body modes
 
