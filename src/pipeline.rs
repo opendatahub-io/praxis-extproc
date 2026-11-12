@@ -721,7 +721,10 @@ pub(crate) async fn run_request_header_filters_early(
         && state.protocol_config.request_body_mode == BodyMode::FullDuplexStreamed
         && pipeline.body_capabilities().needs_request_body
     {
-        state.pending_request_mutations = Some(PendingRequestMutations::take_from(&mut ctx));
+        state
+            .pending_request_mutations
+            .try_put(PendingRequestMutations::take_from(&mut ctx))
+            .map_err(|_unparked| Status::internal("pending request mutations already present before capture"))?;
     }
     ctx.dehydrate(&mut state.carried_context)?;
 
@@ -2843,7 +2846,7 @@ mod tests {
         hydrated.response_body_bytes = 202;
 
         // Capture (`dehydrate`) must move every field into the empty slot.
-        let mut slot = None;
+        let mut slot = crate::server::Parked::empty();
         hydrated.dehydrate(&mut slot).unwrap();
         let carried = slot.take().unwrap();
 
@@ -2919,12 +2922,12 @@ mod tests {
 
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let mut slot = Some(CarriedContext::default());
+        let mut slot = crate::server::Parked::new(CarriedContext::default());
 
         // First hydrate drains the slot to None.
         let first = adapter::build_filter_context(&pipeline, &request, false);
         let _hydrated = HydratedContext::hydrate(slot.take(), first).unwrap();
-        assert!(slot.is_none(), "hydrate's take must leave the slot None");
+        assert!(slot.as_ref().is_none(), "hydrate's take must leave the slot empty");
 
         // Second hydrate finds None and must error instead of carrying empty state.
         let second = adapter::build_filter_context(&pipeline, &request, false);
@@ -2948,7 +2951,7 @@ mod tests {
         let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
 
         // The slot is still occupied: a prior phase failed to drain it.
-        let mut slot = Some(CarriedContext::default());
+        let mut slot = crate::server::Parked::new(CarriedContext::default());
         slot.as_mut()
             .unwrap()
             .filter_metadata

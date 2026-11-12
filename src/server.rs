@@ -436,14 +436,55 @@ impl BodyReceiptTracker {
     }
 }
 
+/// An ownership slot that refuses to overwrite state awaiting consumption.
+#[derive(Debug)]
+pub(super) struct Parked<T>(Option<T>);
+
+impl<T> Parked<T> {
+    /// Start with state ready for its first consumer.
+    pub(super) fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    /// Seed parked state in tests without hydrating a filter context.
+    #[cfg(test)]
+    pub(super) fn as_mut(&mut self) -> Option<&mut T> {
+        self.0.as_mut()
+    }
+
+    /// Inspect parked state without consuming it.
+    pub(super) fn as_ref(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+
+    /// Start without pending state.
+    pub(super) fn empty() -> Self {
+        Self(None)
+    }
+
+    /// Transfer ownership to a consumer, leaving the slot empty.
+    pub(super) fn take(&mut self) -> Option<T> {
+        self.0.take()
+    }
+
+    /// Park state only if the previous value was consumed.
+    pub(super) fn try_put(&mut self, value: T) -> Result<(), T> {
+        if self.0.is_some() {
+            return Err(value);
+        }
+        self.0 = Some(value);
+        Ok(())
+    }
+}
+
 /// Cross-phase filter-context state parked between ExtProc phases.
 ///
 /// A fresh [`HttpFilterContext`] is built per phase, so these fields cross the
 /// boundary as two linear moves: [`HydratedContext::hydrate`] pours the parked state
 /// into a fresh context at phase start, and [`HydratedContext::dehydrate`] captures it
-/// back out at phase end. The stream state parks this in an `Option` slot moved out
+/// back out at phase end. The stream state parks this in a checked slot moved out
 /// to hydrate each phase's context and moved back on capture: a phase that forgets to
-/// restore its state leaves the slot `None`, which the next `hydrate` reports as an
+/// restore its state leaves the slot empty, which the next `hydrate` reports as an
 /// error instead of silently carrying an empty context. `#[must_use]` flags parked
 /// state that is dropped instead of hydrated.
 #[must_use = "parked cross-phase state must be hydrated into a context"]
@@ -520,13 +561,8 @@ impl<'a> HydratedContext<'a> {
     /// available at the call site.
     ///
     /// [`hydrate`]: HydratedContext::hydrate
-    pub(super) fn dehydrate(self, slot: &mut Option<CarriedContext>) -> Result<(), Status> {
-        if slot.is_some() {
-            return Err(Status::internal(
-                "cross-phase context already present: this phase did not drain it before capture",
-            ));
-        }
-        *slot = Some(CarriedContext {
+    pub(super) fn dehydrate(self, slot: &mut Parked<CarriedContext>) -> Result<(), Status> {
+        slot.try_put(CarriedContext {
             cluster: self.ctx.cluster,
             branch_iterations: self.ctx.branch_iterations,
             executed_filter_indices: self.ctx.executed_filter_indices,
@@ -535,8 +571,10 @@ impl<'a> HydratedContext<'a> {
             response_body_mode: Some(self.ctx.response_body_mode),
             request_body_bytes: self.ctx.request_body_bytes,
             response_body_bytes: self.ctx.response_body_bytes,
-        });
-        Ok(())
+        })
+        .map_err(|_unparked| {
+            Status::internal("cross-phase context already present: this phase did not drain it before capture")
+        })
     }
 }
 
@@ -601,9 +639,9 @@ impl PendingRequestMutations {
 pub(crate) struct StreamState {
     /// Filter-context state carried across phase boundaries.
     ///
-    /// Moved out to hydrate each phase's context and refilled on capture; a `None`
-    /// between phases means a phase failed to restore its state.
-    pub(crate) carried_context: Option<CarriedContext>,
+    /// Moved out to hydrate each phase's context and refilled on capture; an empty
+    /// slot between phases means a phase failed to restore its state.
+    pub(crate) carried_context: Parked<CarriedContext>,
 
     /// Converted request from the headers phase.
     pub(crate) request: Option<Request>,
@@ -641,7 +679,7 @@ pub(crate) struct StreamState {
     pub(crate) protocol_config: ProtocolConfig,
 
     /// Typed deferred FDS request mutations, isolated from response hydration.
-    pub(crate) pending_request_mutations: Option<PendingRequestMutations>,
+    pub(crate) pending_request_mutations: Parked<PendingRequestMutations>,
 
     /// Deferred request header mutation for FDS passthrough mode.
     pub(crate) deferred_request_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
@@ -668,12 +706,11 @@ pub(crate) struct StreamState {
 }
 
 impl Default for StreamState {
-    /// The carried-context slot is seeded present, not `None`: `None` is reserved
-    /// for a slot a phase drained without restoring, so both constructors must start
-    /// it as `Some` to keep that signal meaningful.
+    /// Seed the first phase with carried state; an empty slot between phases
+    /// indicates that a prior phase failed to restore it.
     fn default() -> Self {
         Self {
-            carried_context: Some(CarriedContext::default()),
+            carried_context: Parked::new(CarriedContext::default()),
             request: None,
             request_body_requirement: RequestBodyRequirement::MayInterleave,
             request_body: Vec::new(),
@@ -685,7 +722,7 @@ impl Default for StreamState {
             header_state: HeaderDeliveryState::default(),
             eos_tracker: EosTracker::default(),
             protocol_config: ProtocolConfig::default(),
-            pending_request_mutations: None,
+            pending_request_mutations: Parked::empty(),
             deferred_request_header_mutation: None,
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
