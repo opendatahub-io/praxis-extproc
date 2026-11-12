@@ -71,6 +71,11 @@ impl ResponseModeSelector {
         self.invalid_reason
     }
 
+    /// Whether guardrails exist but their selection cannot be inferred safely.
+    pub(crate) fn selection_unknown(&self) -> bool {
+        self.enabled && !self.valid
+    }
+
     /// Whether a selected guardrail needs complete request-body delivery.
     ///
     /// Unknown selection shapes are conservative because output screening also

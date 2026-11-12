@@ -35,7 +35,10 @@ async fn selected_fds_checks_reject_response_headers_before_request_completion()
                     Some(500),
                     "{mode:?}, no_header_wait={no_header_wait}"
                 );
-                assert!(support::immediate_body(&response).contains("complete request body before response"));
+                assert_eq!(
+                    support::immediate_body(&response),
+                    "selected guardrails require the complete request body before response processing"
+                );
                 assert!(
                     harness.calls().is_empty(),
                     "reject interleaving before partial screening or forwarding"

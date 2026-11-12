@@ -66,6 +66,8 @@ async fn unsupported_selector_shapes_require_complete_requests_without_streaming
                     Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
                 ));
             } else {
+                assert!(support::immediate_body(&reply).contains("guardrail selection cannot be determined"));
+                assert!(support::immediate_body(&reply).contains("BUFFERED or FULL_DUPLEX_STREAMED"));
                 assert_eq!(immediate_status(&[reply]), Some(500));
                 assert!(session.next().await.is_none());
             }
@@ -340,6 +342,7 @@ async fn embedded_guardrail_services_require_complete_request_modes_without_a_se
             let reply = session
                 .exchange(support::request_headers(protocol, selected, false))
                 .await;
+            assert!(support::immediate_body(&reply).contains("guardrail selection cannot be determined"));
             assert_eq!(immediate_status(&[reply]), Some(500));
             assert!(session.next().await.is_none());
         }
@@ -400,4 +403,72 @@ async fn embedded_guardrail_services_require_complete_request_modes_without_a_se
         }
     }
     assert_eq!(harness.calls().len(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_guardrail_selection_explains_premature_response_rejection() {
+    for embedded in [false, true] {
+        let harness = if embedded {
+            Harness::embedded(NemoReply::Pass).await
+        } else {
+            Harness::configured(NemoReply::Pass, false, 1_048_576, |cfg| {
+                let guardrail = cfg.filter_chains[0]
+                    .filters
+                    .iter_mut()
+                    .find(|entry| entry.filter_type == "ai_guardrails")
+                    .unwrap();
+                guardrail.conditions =
+                    serde_yaml::from_str("[{when: {headers: {x-aigateway-guardrail-input: 'true'}, path: /selected}}]")
+                        .unwrap();
+            })
+            .await
+        };
+        for no_header_wait in [false, true] {
+            let mut session = harness.open().await;
+            session
+                .send(support::request_headers(
+                    ProtocolConfiguration {
+                        request_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                        response_body_mode: BodySendMode::FullDuplexStreamed.into(),
+                        send_body_without_waiting_for_header_response: no_header_wait,
+                    },
+                    (false, false),
+                    false,
+                ))
+                .await;
+            session
+                .send(support::wrap(RequestMessage::RequestBody(
+                    praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                        body: br#"{"messages":["#.to_vec(),
+                        end_of_stream: false,
+                    },
+                )))
+                .await;
+            let reply = session.exchange(response_headers("application/json")).await;
+            assert_eq!(immediate_status(std::slice::from_ref(&reply)), Some(500));
+            assert!(reply.mode_override.is_none());
+            assert!(
+                support::immediate_body(&reply).contains("guardrail selection cannot be determined"),
+                "{reply:?}"
+            );
+            assert!(session.next().await.is_none());
+            assert!(harness.calls().is_empty());
+        }
+    }
+}
+
+#[test]
+fn invalid_guardrail_phase_fails_pipeline_construction() {
+    let mut cfg = support::configuration("http://127.0.0.1:1/v1/checks", false, 1_048_576);
+    let guardrail = cfg.filter_chains[0]
+        .filters
+        .iter_mut()
+        .find(|entry| entry.filter_type == "ai_guardrails")
+        .unwrap();
+    guardrail.config["phase"] = serde_yaml::Value::String("invalid".into());
+    let error = praxis_extproc::config::build_pipeline(&cfg, &praxis_ai_filters::build_ai_registry())
+        .err()
+        .expect("invalid phase must prevent serving")
+        .to_string();
+    assert!(error.to_ascii_lowercase().contains("phase"), "{error}");
 }

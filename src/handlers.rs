@@ -407,7 +407,10 @@ fn reject_invalid_guardrail_request(
         )
         && state.response_mode_selector.requires_complete_request(headers))
     .then(|| {
-        request_processing_rejection(b"selected guardrails require BUFFERED or FULL_DUPLEX_STREAMED request bodies")
+        guardrail_request_rejection(
+            state,
+            b"selected guardrails require BUFFERED or FULL_DUPLEX_STREAMED request bodies",
+        )
     })
 }
 
@@ -417,6 +420,16 @@ fn is_guardrail_selection_header(name: &str) -> bool {
         matches!(suffix, "input" | "output")
             || (suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
     })
+}
+
+/// Distinguish conservative admission from a guardrail known to be selected.
+fn guardrail_request_rejection(state: &StreamState, selected_reason: &'static [u8]) -> ProcessingResponse {
+    let reason = if state.response_mode_selector.selection_unknown() {
+        b"guardrail selection cannot be determined; complete request body delivery in BUFFERED or FULL_DUPLEX_STREAMED mode is required".as_slice()
+    } else {
+        selected_reason
+    };
+    request_processing_rejection(reason)
 }
 
 /// Build a fail-closed local response for an unsupported request-processing path.
@@ -489,7 +502,8 @@ pub(crate) async fn handle_response_headers(
         && state.body_open(true)
         && !state.buffered_request_body_processed
     {
-        return Ok(vec![request_processing_rejection(
+        return Ok(vec![guardrail_request_rejection(
+            state,
             b"selected guardrails require the complete request body before response processing",
         )]);
     }
