@@ -7,3 +7,6 @@
 Makefile linguist-detectable=false
 Containerfile linguist-detectable=false
 Dockerfile linguist-detectable=false
+
+# Preserve patch context whitespace when checking the packaged compatibility patch.
+tests/grid-llmd-e2e/patches/*.patch whitespace=-trailing-space,-space-before-tab
