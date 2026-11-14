@@ -376,6 +376,9 @@ async fn nemo_response(
 pub(crate) fn configuration(endpoint: &str, translation: bool, limit: usize) -> ExtProcConfig {
     let mut filters = Vec::new();
     filters.push(json!({"filter":"request_id"}));
+    // Current Praxis AI guardrails require the trusted operation classifier to
+    // publish an AiOperationMatch before extracting request messages.
+    filters.push(json!({"filter":"ai_operation"}));
     for (name, input, output) in [("input", true, false), ("output", false, true)] {
         filters.push(json!({"filter":"ai_guardrails", "conditions":[{"when":{"headers":{format!("x-aigateway-guardrail-{name}"):"true"}}}],
             "phase":{"request":input,"response":output}, "provider":{"type":"nemo", "endpoint":endpoint, "timeout_ms":500, "guardrails":{"config_ids":[name]}}}));
