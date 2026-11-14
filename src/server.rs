@@ -17,7 +17,7 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
 
-use praxis_filter::{FilterPipeline, HttpFilterContext, Request, Response};
+use praxis_filter::{FilterPipeline, HttpFilterContext, Request, RequestExtensions, Response};
 use praxis_proto::envoy::service::ext_proc::v3::{
     ProcessingRequest, ProcessingResponse, ProtocolConfiguration,
     external_processor_server::{ExternalProcessor, ExternalProcessorServer},
@@ -488,7 +488,7 @@ impl<T> Parked<T> {
 /// error instead of silently carrying an empty context. `#[must_use]` flags parked
 /// state that is dropped instead of hydrated.
 #[must_use = "parked cross-phase state must be hydrated into a context"]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct CarriedContext {
     /// Logical cluster selected during request headers, before Envoy routes.
     pub(super) cluster: Option<Arc<str>>,
@@ -505,6 +505,11 @@ pub(super) struct CarriedContext {
     /// Typed per-filter state.
     pub(super) filter_state: HashMap<usize, Box<dyn std::any::Any + Send + Sync>>,
 
+    /// Pipeline-prepared and filter-populated request extensions. `None` is
+    /// used only before the first phase, so the first hydration can prepare
+    /// pipeline resources exactly once for this request.
+    pub(super) extensions: Option<Box<RequestExtensions>>,
+
     /// Response buffering requested by filters during the headers phase.
     pub(super) response_body_mode: Option<praxis_filter::BodyMode>,
 
@@ -513,6 +518,22 @@ pub(super) struct CarriedContext {
 
     /// Accumulated response body bytes seen across phases and streamed chunks.
     pub(super) response_body_bytes: u64,
+}
+
+impl std::fmt::Debug for CarriedContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarriedContext")
+            .field("cluster", &self.cluster)
+            .field("branch_iterations", &self.branch_iterations)
+            .field("executed_filter_indices", &self.executed_filter_indices)
+            .field("filter_metadata", &self.filter_metadata)
+            .field("filter_state_len", &self.filter_state.len())
+            .field("has_extensions", &self.extensions.is_some())
+            .field("response_body_mode", &self.response_body_mode)
+            .field("request_body_bytes", &self.request_body_bytes)
+            .field("response_body_bytes", &self.response_body_bytes)
+            .finish()
+    }
 }
 
 /// A context holding hydrated cross-phase state.
@@ -533,9 +554,18 @@ impl<'a> HydratedContext<'a> {
     /// means a prior phase never restored its state, so it surfaces as an error
     /// rather than silently hydrating an empty context. Owning the context by value
     /// means the bare context is consumed, so it cannot be hydrated a second time.
-    pub(super) fn hydrate(carried: Option<CarriedContext>, mut ctx: HttpFilterContext<'a>) -> Result<Self, Status> {
+    pub(super) fn hydrate(
+        carried: Option<CarriedContext>,
+        mut ctx: HttpFilterContext<'a>,
+        pipeline: &FilterPipeline,
+    ) -> Result<Self, Status> {
         let carried =
             carried.ok_or_else(|| Status::internal("cross-phase context missing: a prior phase did not restore it"))?;
+        if let Some(extensions) = carried.extensions {
+            ctx.extensions = *extensions;
+        } else {
+            pipeline.prepare_extensions(&mut ctx.extensions);
+        }
         ctx.branch_iterations = carried.branch_iterations;
         ctx.cluster = carried.cluster;
         ctx.executed_filter_indices = carried.executed_filter_indices;
@@ -568,6 +598,7 @@ impl<'a> HydratedContext<'a> {
             executed_filter_indices: self.ctx.executed_filter_indices,
             filter_metadata: self.ctx.filter_metadata,
             filter_state: self.ctx.filter_state,
+            extensions: Some(Box::new(self.ctx.extensions)),
             response_body_mode: Some(self.ctx.response_body_mode),
             request_body_bytes: self.ctx.request_body_bytes,
             response_body_bytes: self.ctx.response_body_bytes,

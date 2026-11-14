@@ -85,7 +85,7 @@ async fn run_request_pipeline_inner(
         return Err(Status::invalid_argument("request headers not received"));
     };
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     if let Some(pending) = state.pending_request_mutations.take() {
         pending.restore(&mut ctx);
         // The restored queues are authoritative; collect them once after body hooks.
@@ -151,12 +151,30 @@ async fn execute_request_filters_if_needed(
     if *request_filters_executed {
         return Ok(None);
     }
+    let action = execute_request_head(pipeline, ctx).await?;
+    if let Some(immediate) = immediate_from_action(action) {
+        return Ok(Some(immediate));
+    }
     let action = execute_request(pipeline, ctx).await?;
     let immediate = immediate_from_action(action);
     if immediate.is_none() {
         *request_filters_executed = true;
     }
     Ok(immediate)
+}
+
+/// Run request-head participants before request filters and any body pre-read.
+async fn execute_request_head(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<FilterAction, Status> {
+    if !pipeline.has_request_head_phase() {
+        return Ok(FilterAction::Continue);
+    }
+    pipeline
+        .execute_http_request_head(ctx)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
 }
 
 /// Assemble the request response after request and selected-provider hooks finish.
@@ -232,7 +250,7 @@ pub(crate) async fn run_response_pipeline(
     })?;
 
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
     ctx.upstream_reached = true;
@@ -483,7 +501,7 @@ pub(crate) async fn process_streamed_body_chunk(
         ctx.upstream_reached = true;
         Some(original)
     };
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     let eos = body.end_of_stream;
     let mut chunk = body.body;
     let original_chunk_had_bytes = !chunk.is_empty();
@@ -560,7 +578,7 @@ pub(crate) fn process_fds_response_body(
     let original_headers = capture_original_headers(response);
     ctx.response_header = Some(response);
     ctx.upstream_reached = true;
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     ctx.body_done_indices = mem::take(&mut state.response_body_done_indices);
     if let Some(immediate) = run_resp_body_filters(pipeline, &mut ctx, &mut body, filter_eos)? {
         return Ok(vec![response::immediate(immediate)]);
@@ -708,7 +726,12 @@ pub(crate) async fn run_request_header_filters_early(
         return Ok(delivery.deliver_request(None, state));
     };
     let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
+
+    let action = execute_request_head(pipeline, &mut ctx).await?;
+    if let Some(imm) = immediate_from_action(action) {
+        return Ok(vec![response::immediate(imm)]);
+    }
 
     let action = execute_request(pipeline, &mut ctx).await?;
     if let Some(imm) = immediate_from_action(action) {
@@ -747,7 +770,7 @@ pub(crate) async fn run_response_header_filters_early(
     };
 
     // Hydrate only after the guard so an early return does not lose parked state.
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     let original_headers = capture_original_headers(resp);
     ctx.response_header = Some(resp);
     ctx.upstream_reached = true;
@@ -971,7 +994,7 @@ pub(crate) async fn flush_streamed_body_filters(
         ctx.response_header = Some(resp);
         ctx.upstream_reached = true;
     }
-    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx, pipeline)?;
     let action = run_trailing_body(pipeline, &mut ctx, is_request).await?;
     ctx.dehydrate(&mut state.carried_context)?;
     Ok(immediate_from_action(action)
@@ -1237,10 +1260,27 @@ mod tests {
             "state_probe"
         }
 
+        fn runs_request_head(&self) -> bool {
+            true
+        }
+
+        async fn on_request_head(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            let count = ctx.extensions.get::<Probe>().map_or(0, |probe| probe.0);
+            ctx.extensions.insert(Probe(count + 1));
+            Ok(FilterAction::Continue)
+        }
+
         async fn on_request(
             &self,
             ctx: &mut HttpFilterContext<'_>,
         ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.filter_metadata.insert(
+                "head_seen".to_owned(),
+                ctx.extensions.get::<Probe>().map_or(0, |probe| probe.0).to_string(),
+            );
             ctx.insert_filter_state(Probe(PROBE_VALUE));
             PROBE_UPSTREAM_ON_REQUEST.store(ctx.upstream_reached, std::sync::atomic::Ordering::SeqCst);
             Ok(FilterAction::Continue)
@@ -2833,7 +2873,7 @@ mod tests {
         // Seed every carried field on a hydrated context, the way a filter would
         // (through DerefMut), so `hydrate` stays the only way to build one.
         let ctx = adapter::build_filter_context(&pipeline, &request, false);
-        let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
+        let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx, &pipeline).unwrap();
         hydrated.cluster = Some(Arc::from("selected-cluster"));
         hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
         hydrated.executed_filter_indices = vec![true, false, true];
@@ -2841,6 +2881,7 @@ mod tests {
             .filter_metadata
             .insert("carry.meta".to_owned(), "kept".to_owned());
         hydrated.filter_state.insert(7, Box::new(Probe(PROBE_VALUE)));
+        hydrated.extensions.insert(Probe(PROBE_VALUE));
         hydrated.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1234) };
         hydrated.request_body_bytes = 101;
         hydrated.response_body_bytes = 202;
@@ -2858,6 +2899,7 @@ mod tests {
             executed_filter_indices,
             filter_metadata,
             filter_state,
+            extensions,
             response_body_mode,
             request_body_bytes,
             response_body_bytes,
@@ -2874,13 +2916,18 @@ mod tests {
         assert_eq!(executed_filter_indices, &vec![true, false, true]);
         assert_eq!(filter_metadata.get("carry.meta").map(String::as_str), Some("kept"));
         assert!(filter_state.contains_key(&7));
+        assert_eq!(
+            extensions.as_ref().and_then(|value| value.get::<Probe>()),
+            Some(&Probe(PROBE_VALUE))
+        );
         assert_eq!(*request_body_bytes, 101);
         assert_eq!(*response_body_bytes, 202);
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
         let fresh = adapter::build_filter_context(&pipeline, &request, false);
-        let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
+        let hydrated = HydratedContext::hydrate(Some(carried), fresh, &pipeline).unwrap();
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
         assert_eq!(hydrated.cluster.as_deref(), Some("selected-cluster"));
         assert!(matches!(
             hydrated.response_body_mode,
@@ -2898,6 +2945,64 @@ mod tests {
         assert_eq!(restored, Some(&Probe(PROBE_VALUE)), "hydrate must restore filter_state");
     }
 
+    /// Header processing runs head participants first and does not repeat them at body time.
+    #[tokio::test]
+    async fn request_head_runs_before_request_filters_exactly_once() {
+        let pipeline = state_probe_pipeline();
+        let request = adapter::envoy_headers_to_request(&[]);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let mut ctx = HydratedContext::hydrate(Some(crate::server::CarriedContext::default()), ctx, &pipeline).unwrap();
+        let mut executed = false;
+        assert!(
+            execute_request_filters_if_needed(&pipeline, &mut ctx, &mut executed)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(executed);
+        assert_eq!(ctx.filter_metadata.get("head_seen").map(String::as_str), Some("1"));
+        let mut slot = crate::server::Parked::empty();
+        ctx.dehydrate(&mut slot).unwrap();
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let mut ctx = HydratedContext::hydrate(slot.take(), ctx, &pipeline).unwrap();
+        assert!(
+            execute_request_filters_if_needed(&pipeline, &mut ctx, &mut executed)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ctx.extensions.get::<Probe>(), Some(&Probe(1)));
+    }
+
+    /// Request resources are prepared once and retained through later phases.
+    #[test]
+    fn request_extensions_are_prepared_once_across_phases() {
+        struct PrepareProbe(Arc<std::sync::atomic::AtomicUsize>);
+        impl praxis_filter::PipelineExtension for PrepareProbe {
+            fn prepare(&self, extensions: &mut praxis_filter::RequestExtensions) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                extensions.insert(Probe(PROBE_VALUE));
+            }
+        }
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pipeline = carry_probe_pipeline();
+        Arc::get_mut(&mut pipeline)
+            .unwrap()
+            .add_pipeline_extension(Box::new(PrepareProbe(Arc::clone(&count))));
+        let request = adapter::envoy_headers_to_request(&[]);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let mut hydrated =
+            HydratedContext::hydrate(Some(crate::server::CarriedContext::default()), ctx, &pipeline).unwrap();
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE)));
+        hydrated.extensions.insert(Probe(PROBE_VALUE + 1));
+        let mut slot = crate::server::Parked::empty();
+        hydrated.dehydrate(&mut slot).unwrap();
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
+        let hydrated = HydratedContext::hydrate(slot.take(), ctx, &pipeline).unwrap();
+        assert_eq!(hydrated.extensions.get::<Probe>(), Some(&Probe(PROBE_VALUE + 1)));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// A missing parked context (`None`) means a prior phase never restored its
     /// state: hydrate must surface it as an error instead of silently carrying an
     /// empty context.
@@ -2907,7 +3012,7 @@ mod tests {
         let request = adapter::envoy_headers_to_request(&[]);
         let fresh = adapter::build_filter_context(&pipeline, &request, false);
 
-        let result = HydratedContext::hydrate(None, fresh);
+        let result = HydratedContext::hydrate(None, fresh, &pipeline);
         assert!(
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
             "hydrate with no parked context must report an internal error"
@@ -2926,12 +3031,12 @@ mod tests {
 
         // First hydrate drains the slot to None.
         let first = adapter::build_filter_context(&pipeline, &request, false);
-        let _hydrated = HydratedContext::hydrate(slot.take(), first).unwrap();
+        let _hydrated = HydratedContext::hydrate(slot.take(), first, &pipeline).unwrap();
         assert!(slot.as_ref().is_none(), "hydrate's take must leave the slot empty");
 
         // Second hydrate finds None and must error instead of carrying empty state.
         let second = adapter::build_filter_context(&pipeline, &request, false);
-        let result = HydratedContext::hydrate(slot.take(), second);
+        let result = HydratedContext::hydrate(slot.take(), second, &pipeline);
         assert!(
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
             "a second hydrate from a drained slot must report an internal error"
@@ -2948,7 +3053,7 @@ mod tests {
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
         let fresh = adapter::build_filter_context(&pipeline, &request, false);
-        let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
+        let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh, &pipeline).unwrap();
 
         // The slot is still occupied: a prior phase failed to drain it.
         let mut slot = crate::server::Parked::new(CarriedContext::default());

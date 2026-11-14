@@ -291,13 +291,19 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
 
     let mut entries = flatten_chains(&config.filter_chains);
 
-    let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
-        .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
+    let mut pipeline =
+        FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options, &[])
+            .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
 
+    let max_body_bytes = config.max_body_accumulation();
     pipeline
-        .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
+        .apply_body_limits(
+            max_body_bytes,
+            max_body_bytes,
+            config.insecure_options.allow_unbounded_body,
+        )
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
@@ -544,6 +550,22 @@ insecure_options:
         assert!(pipeline.allow_private_upstreams());
     }
 
+    /// The runtime accepts field-free translation config and rejects the removed flag.
+    #[test]
+    fn anthropic_translator_uses_flag_free_config_contract() {
+        let registry = praxis_ai_filters::build_ai_registry();
+        let config =
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: openai_chat_completions_to_anthropic\n";
+        let cfg: ExtProcConfig = serde_yaml::from_str(config).unwrap();
+        assert!(build_pipeline(&cfg, &registry).is_ok());
+        let legacy = format!("{config}        api_translation_enabled: true\n");
+        let cfg: ExtProcConfig = serde_yaml::from_str(&legacy).unwrap();
+        let error = build_pipeline(&cfg, &registry)
+            .err()
+            .expect("removed field must be rejected");
+        assert!(error.to_string().contains("api_translation_enabled"));
+    }
+
     #[test]
     fn build_pipeline_with_ai_filter() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
@@ -561,6 +583,16 @@ filter_chains:
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 1, "pipeline should have one AI filter");
+        assert_eq!(
+            pipeline.request_body_ceiling(),
+            Some(cfg.server.max_body_bytes.get()),
+            "server accumulation limit must bound request buffering requested by AI filters"
+        );
+        assert_eq!(
+            pipeline.response_body_ceiling(),
+            Some(cfg.server.max_body_bytes.get()),
+            "server accumulation limit must bound response buffering requested by AI filters"
+        );
     }
 
     #[test]
