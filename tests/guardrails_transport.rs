@@ -13,6 +13,7 @@
     clippy::missing_panics_doc,
     clippy::future_not_send,
     clippy::large_futures,
+    dead_code,
     missing_docs,
     reason = "integration test utilities and assertions"
 )]
