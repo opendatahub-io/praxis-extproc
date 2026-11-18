@@ -85,7 +85,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY proto proto
 COPY src src
 COPY xtask xtask
-COPY testsupport testsupport
 
 ARG CARGO_FEATURES
 ARG CARGO_PROFILE
