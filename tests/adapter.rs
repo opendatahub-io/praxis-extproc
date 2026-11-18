@@ -28,7 +28,10 @@
     reason = "tests"
 )]
 #![allow(missing_docs, reason = "test module")]
+#![allow(dead_code, reason = "shared transport toolbox; each binary uses a subset")]
 
+
+mod common;
 
 #[path = "adapter/support.rs"]
 mod support;

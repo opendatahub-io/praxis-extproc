@@ -28,6 +28,8 @@
     reason = "Tier-2 smoke harness reusing the shared Tier-1 support module"
 )]
 
+mod common;
+
 #[path = "guardrails_transport/support.rs"]
 mod support;
 

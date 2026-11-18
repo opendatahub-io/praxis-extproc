@@ -18,6 +18,8 @@
     reason = "integration test utilities and assertions"
 )]
 
+mod common;
+
 #[path = "guardrails_transport/support.rs"]
 mod support;
 
