@@ -13,7 +13,10 @@ publish = false
 # crate carries would force docs on every helper for no benefit.
 
 [dependencies]
-praxis-extproc = { path = ".." }
+# No default features: the harness only uses config/server/response_mode, which
+# are feature-independent. Forcing defaults here would drag the non-FIPS feature
+# set (and its `sha2`) into the FIPS dependency graph.
+praxis-extproc = { path = "..", default-features = false }
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.9.0", default-features = false }
 praxis-filter = { version = "0.7.4", package = "praxis-proxy-filter", default-features = false }
 praxis-proto = { path = "../proto", package = "praxis-proxy-proto" }
