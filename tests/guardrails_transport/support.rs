@@ -22,9 +22,8 @@ use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
         BodySendMode, HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProcessingResponse, ProtocolConfiguration,
-        body_mutation, external_processor_client::ExternalProcessorClient,
-        external_processor_server::ExternalProcessorServer, processing_request::Request as RequestMessage,
-        processing_response::Response as ResponseMessage,
+        external_processor_client::ExternalProcessorClient, external_processor_server::ExternalProcessorServer,
+        processing_request::Request as RequestMessage, processing_response::Response as ResponseMessage,
     },
 };
 use serde_json::{Value, json};
@@ -38,6 +37,11 @@ use tonic::{
     Streaming,
     transport::{Channel, Server},
 };
+
+// Generic transport helpers (`wrap`, `immediate_status`, `immediate_body`,
+// `body_bytes`, ...) live in the shared toolbox; re-export so guardrail tests
+// reach them as `support::*` alongside the harness below.
+pub(crate) use crate::common::*;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -245,12 +249,6 @@ impl Session {
     }
 }
 
-pub(crate) fn wrap(request: RequestMessage) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(request),
-        ..Default::default()
-    }
-}
 pub(crate) fn header(key: &str, value: &str) -> HeaderValue {
     HeaderValue {
         key: key.to_owned(),
@@ -339,36 +337,6 @@ pub(crate) fn response_body(body: &[u8], eos: bool) -> ProcessingRequest {
         end_of_stream: eos,
     }))
 }
-pub(crate) fn immediate_status(responses: &[ProcessingResponse]) -> Option<i32> {
-    responses.iter().find_map(|response| match &response.response {
-        Some(ResponseMessage::ImmediateResponse(immediate)) => immediate.status.as_ref().map(|status| status.code),
-        _ => None,
-    })
-}
-pub(crate) fn immediate_body(response: &ProcessingResponse) -> String {
-    match &response.response {
-        Some(ResponseMessage::ImmediateResponse(immediate)) => immediate.body.clone(),
-        _ => String::new(),
-    }
-}
-
-pub(crate) fn body_bytes(responses: &[ProcessingResponse]) -> Vec<u8> {
-    responses
-        .iter()
-        .filter_map(|response| match &response.response {
-            Some(ResponseMessage::ResponseBody(body)) => {
-                body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()
-            },
-            _ => None,
-        })
-        .flat_map(|mutation| match mutation {
-            body_mutation::Mutation::Body(body) => body.clone(),
-            body_mutation::Mutation::StreamedResponse(body) => body.body.clone(),
-            body_mutation::Mutation::ClearBody(_) => Vec::new(),
-        })
-        .collect()
-}
-
 async fn nemo_response(
     request: Request<Incoming>,
     reply: NemoReply,

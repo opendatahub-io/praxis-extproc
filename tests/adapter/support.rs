@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Red Hat, Inc.
 
-//! Shared harness, stub filters, config, and helpers for the adapter tests.
+//! Adapter-tier harness: stub filters, config strings, in-process and spawned
+//! server starters, and request senders. Generic transport helpers (message /
+//! header builders, response inspectors, client, port allocation) come from
+//! [`crate::common`] and are re-exported so tests reach them as `support::*`.
 
 pub(crate) use std::{path::PathBuf, process::Command};
 
@@ -26,30 +29,7 @@ pub(crate) use tokio::net::TcpListener;
 pub(crate) use tokio_stream::wrappers::ReceiverStream;
 pub(crate) use tonic::transport::{Channel, Server};
 
-pub(crate) const TIMEOUT_MILLIS: u64 = 500;
-
-
-/// Extract `end_of_stream` from a streamed request-body response, if present.
-pub(crate) fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
-    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
-    match msg.response.as_ref()? {
-        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
-            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-
-/// Pull the next response from a `FULL_DUPLEX` stream with the shared timeout.
-pub(crate) async fn next_full_duplex_msg(stream: &mut tonic::Streaming<ProcessingResponse>) -> ProcessingResponse {
-    tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
-        .await
-        .expect("timed out waiting for response")
-        .expect("response stream error")
-        .expect("stream closed before response")
-}
+pub(crate) use crate::common::*;
 
 
 pub(crate) struct WireSelectedBodyFilter;
@@ -319,10 +299,6 @@ filter_chains:
 "#;
 
 
-pub(crate) type ExtProcClient =
-    praxis_proto::envoy::service::ext_proc::v3::external_processor_client::ExternalProcessorClient<Channel>;
-
-
 pub(crate) fn command_output(output: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -433,20 +409,6 @@ pub(crate) async fn start_server_with_tonic_compiled_max_recv(
 }
 
 
-pub(crate) async fn extproc_client_for_addr(addr: std::net::SocketAddr) -> ExtProcClient {
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .expect("uri")
-        .connect()
-        .await
-        .expect("connect");
-    // Client send/recv limits stay at the raised default so tests can deliver
-    // bodies that only the *server* max_recv under test should reject.
-    ExtProcClient::new(channel)
-        .max_decoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
-        .max_encoding_message_size(DEFAULT_GRPC_MAX_RECV_MSG_SIZE)
-}
-
-
 /// Connect to a spawned `praxis-extproc` gRPC listener, retrying until ready.
 pub(crate) async fn connect_extproc_client(port: u16) -> ExtProcClient {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -486,14 +448,6 @@ pub(crate) fn write_grpc_max_recv_config(grpc: u16, health: u16, metrics: u16) -
     ));
     std::fs::write(&path, yaml).expect("write server config");
     path
-}
-
-
-pub(crate) fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .expect("find a free port")
 }
 
 
@@ -631,192 +585,4 @@ pub(crate) async fn send_full_roundtrip(
 
     drop(tx);
     collect_responses(&mut inbound).await
-}
-
-
-pub(crate) fn make_request_headers(method: &str, path: &str, end_of_stream: bool) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![
-                    make_header(":method", method),
-                    make_header(":path", path),
-                    make_header(":authority", "localhost"),
-                    make_header(":scheme", "http"),
-                ],
-            }),
-            end_of_stream,
-        })),
-        ..Default::default()
-    }
-}
-
-
-pub(crate) fn make_response_headers(status: u32, end_of_stream: bool) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![make_header(":status", &status.to_string())],
-            }),
-            end_of_stream,
-        })),
-        ..Default::default()
-    }
-}
-
-
-pub(crate) fn make_response_body(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(ReqVariant::ResponseBody(HttpBody {
-            body: body.to_vec(),
-            end_of_stream,
-        })),
-        ..Default::default()
-    }
-}
-
-
-/// Attach a first-message `protocol_config` selecting `response_body_mode`.
-pub(crate) fn with_response_body_mode(
-    mut msg: ProcessingRequest,
-    response_body_mode: BodySendMode,
-) -> ProcessingRequest {
-    msg.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
-        request_body_mode: BodySendMode::None as i32,
-        response_body_mode: response_body_mode as i32,
-        send_body_without_waiting_for_header_response: false,
-    });
-    msg
-}
-
-
-pub(crate) async fn open_stream(
-    client: &mut ExtProcClient,
-) -> (
-    tokio::sync::mpsc::Sender<ProcessingRequest>,
-    tonic::Streaming<ProcessingResponse>,
-) {
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let stream = client
-        .process(ReceiverStream::new(rx))
-        .await
-        .expect("process call failed")
-        .into_inner();
-    (tx, stream)
-}
-
-
-pub(crate) fn make_header(key: &str, value: &str) -> HeaderValue {
-    HeaderValue {
-        key: key.to_owned(),
-        value: value.to_owned(),
-        raw_value: Vec::new(),
-    }
-}
-
-
-pub(crate) async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -> Vec<ProcessingResponse> {
-    collect_responses_result(inbound).await.expect("collect responses")
-}
-
-
-pub(crate) async fn collect_responses_result(
-    inbound: &mut tonic::Streaming<ProcessingResponse>,
-) -> Result<Vec<ProcessingResponse>, tonic::Status> {
-    let mut responses = Vec::new();
-    let timeout = tokio::time::Duration::from_secs(2);
-
-    loop {
-        match tokio::time::timeout(timeout, inbound.message()).await {
-            Ok(Ok(Some(resp))) => responses.push(resp),
-            // Idle timeout (`Err`) means the stream went quiet.
-            Ok(Ok(None)) | Err(_) => break,
-            Ok(Err(status)) => return Err(status),
-        }
-    }
-
-    Ok(responses)
-}
-
-
-/// Collect streamed body chunks from a response stream.
-///
-/// Returns `(chunks, reassembled_body)` where chunks is the vector of
-/// `StreamedBodyResponse` messages and `reassembled_body` is all chunk
-/// bodies concatenated.
-///
-/// Panics if stream errors, times out, or exceeds `max_chunks` without EOS.
-pub(crate) async fn collect_streamed_chunks<F>(
-    response_stream: &mut tonic::Streaming<ProcessingResponse>,
-    extract_fn: F,
-    max_chunks: usize,
-) -> (
-    Vec<praxis_proto::envoy::service::ext_proc::v3::StreamedBodyResponse>,
-    Vec<u8>,
-)
-where
-    F: Fn(&ProcessingResponse) -> Option<&praxis_proto::envoy::service::ext_proc::v3::StreamedBodyResponse>,
-{
-    let mut chunks = Vec::new();
-    let mut received_body = Vec::new();
-
-    loop {
-        assert!(
-            chunks.len() < max_chunks,
-            "received {max_chunks} chunks without end_of_stream"
-        );
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(TIMEOUT_MILLIS),
-            response_stream.message(),
-        )
-        .await;
-
-        match outcome {
-            Ok(Ok(Some(msg))) => {
-                if let Some(s) = extract_fn(&msg) {
-                    received_body.extend_from_slice(&s.body);
-                    let is_eos = s.end_of_stream;
-                    chunks.push(s.clone());
-                    if is_eos {
-                        break;
-                    }
-                } else {
-                    panic!("expected StreamedResponse, got: {msg:?}");
-                }
-            },
-            Ok(Ok(None)) => panic!("stream closed before EOS"),
-            Ok(Err(err)) => panic!("stream error: {err}"),
-            Err(_) => panic!("timed out waiting for chunk"),
-        }
-    }
-
-    (chunks, received_body)
-}
-
-
-pub(crate) fn has_request_headers_response(responses: &[ProcessingResponse]) -> bool {
-    responses
-        .iter()
-        .any(|r| matches!(&r.response, Some(RespVariant::RequestHeaders(_))))
-}
-
-
-pub(crate) fn extract_all_set_headers(responses: &[ProcessingResponse]) -> Vec<HeaderValue> {
-    let mut headers = Vec::new();
-    for r in responses {
-        let mutation = match &r.response {
-            Some(RespVariant::RequestHeaders(h)) => h.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
-            Some(RespVariant::RequestBody(b)) => b.response.as_ref().and_then(|c| c.header_mutation.as_ref()),
-            _ => None,
-        };
-        if let Some(m) = mutation {
-            for hvo in &m.set_headers {
-                if let Some(hv) = &hvo.header {
-                    headers.push(hv.clone());
-                }
-            }
-        }
-    }
-    headers
 }
