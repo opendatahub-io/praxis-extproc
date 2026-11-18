@@ -15,7 +15,7 @@
     reason = "unit fixture around checked-in YAML"
 )]
 
-const ODH_ENVOY_FILTER: &str = include_str!("../deploy/overlays/odh/envoy-filter.yaml");
+const ODH_ENVOY_FILTER: &str = include_str!("../../deploy/overlays/odh/envoy-filter.yaml");
 
 #[test]
 fn odh_ipp_pre_anchors_are_fail_closed() {

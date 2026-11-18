@@ -35,10 +35,6 @@ mod selection;
 #[path = "guardrails_transport/stream_rejection.rs"]
 mod stream_rejection;
 
-#[cfg(feature = "integration")]
-#[path = "guardrails_transport/envoy.rs"]
-mod envoy;
-
 use praxis_proto::envoy::service::ext_proc::v3::BodySendMode;
 use serde_json::json;
 use support::{Harness, NemoReply, body_bytes, immediate_status, request, response_body, response_headers};

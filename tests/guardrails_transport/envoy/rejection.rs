@@ -1,7 +1,7 @@
 //! `ProcessingResponse.immediate_response` after downstream output has started.
 
 use super::*;
-use crate::stream_rejection::{FIRST, RejectingServer};
+use crate::support::{FIRST, RejectingServer};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn envoy_immediate_response_after_committed_chunk_resets_without_rejected_bytes() {

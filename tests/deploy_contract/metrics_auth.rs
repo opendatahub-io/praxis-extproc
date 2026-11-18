@@ -13,9 +13,9 @@
     reason = "deploy fixture around checked-in YAML"
 )]
 
-const ODH_RBAC_KUST: &str = include_str!("../deploy/overlays/odh/rbac/kustomization.yaml");
-const ODH_KUST: &str = include_str!("../deploy/overlays/odh/kustomization.yaml");
-const ODH_PRE_PATCH: &str = include_str!("../deploy/overlays/odh/pre-processing/deployment-patch.yaml");
+const ODH_RBAC_KUST: &str = include_str!("../../deploy/overlays/odh/rbac/kustomization.yaml");
+const ODH_KUST: &str = include_str!("../../deploy/overlays/odh/kustomization.yaml");
+const ODH_PRE_PATCH: &str = include_str!("../../deploy/overlays/odh/pre-processing/deployment-patch.yaml");
 
 #[test]
 fn odh_keeps_metrics_roles_and_sa_automount() {

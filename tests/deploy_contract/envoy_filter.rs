@@ -23,9 +23,9 @@ use serde_yaml::Value;
 // Constants
 // -----------------------------------------------------------------------------
 
-const ENVOY_FILTER: &str = include_str!("../deploy/overlays/odh/envoy-filter.yaml");
+const ENVOY_FILTER: &str = include_str!("../../deploy/overlays/odh/envoy-filter.yaml");
 
-const GATEWAY: &str = include_str!("fixtures/istio_gateway_http_filters.yaml");
+const GATEWAY: &str = include_str!("../fixtures/istio_gateway_http_filters.yaml");
 
 const IPP_PRE: &str = "envoy.filters.http.ext_proc.ipp-pre";
 
