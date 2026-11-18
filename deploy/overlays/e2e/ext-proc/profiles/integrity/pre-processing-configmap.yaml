@@ -1,0 +1,49 @@
+# Integrity (oracle) profile — hop 1 (BBR / pre-auth).
+#
+# Instrumented, NON-production lane for issue #165: it runs the real
+# identity_header_guard trust-boundary filter plus the e2e observability
+# oracles, and deliberately omits ai_guardrails so streaming and the oracles
+# are not blocked. Applied by `make e2e-setup PROFILE=integrity` on top of the
+# forge baseline; it is never part of the production (odh) config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-pre-processing-plugins
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      tls:
+        mode: self_signed
+
+    filter_chains:
+      - name: bbr
+        filters:
+          # Trust boundary: strip client-supplied x-maas-* identity headers so a
+          # client cannot spoof them to the backend (identity_header_guard,
+          # ai#709). Runs first, before anything reads identity from headers.
+          - filter: identity_header_guard
+            prefix: "x-maas-"
+          # Promote body "model" into X-Gateway-Model-Name for routing.
+          - filter: json_body
+            conditions:
+              - unless:
+                  headers_present: ["X-Gateway-Model-Name"]
+            request_extract:
+              - pointer: /model
+                header: X-Gateway-Model-Name
+            on_invalid: continue
+          # Observe the effective forwarded headers AFTER the guard and the
+          # routing mutation, so tests can assert stripping / injection at
+          # this hop via x-qualification-fwd-<name>-hop-1 response headers.
+          - filter: e2e_header_oracle
+            watch:
+              - x-maas-tenant
+              - x-maas-user
+              - x-gateway-model-name
+          - filter: e2e_body_oracle
+
+    insecure_options:
+      allow_unbounded_body: true

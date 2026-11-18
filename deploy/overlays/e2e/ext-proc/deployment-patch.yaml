@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-processing
+spec:
+  template:
+    spec:
+      serviceAccountName: payload-processing
+      automountServiceAccountToken: true
+      containers:
+        - name: payload-processing
+          imagePullPolicy: Never
+          env:
+            # Hop index for e2e_body_oracle: post-IPP is the second hop.
+            - name: BODY_ORACLE_HOP_INDEX
+              value: "2"
+            # Pair with e2e IPP max_body_bytes (1 MiB) + framing; overrides base 11Mi.
+            - name: GRPC_MAX_RECV_MSG_SIZE
+              value: "2Mi"
