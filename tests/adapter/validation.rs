@@ -70,3 +70,45 @@ fn unusable_tls_files_fail_validate() {
         "validate refusal should identify the unusable certificate, got: {combined}"
     );
 }
+
+/// Serving must fail fast (non-zero exit) when the gRPC port is already bound,
+/// rather than hanging or silently degrading.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_fails_when_the_grpc_port_is_already_in_use() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy a port");
+    let grpc = occupied.local_addr().expect("local addr").port();
+    let config = write_grpc_max_recv_config(grpc, free_port(), free_port());
+
+    let mut child = BinaryChild(
+        Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
+            .arg("-c")
+            .arg(&config)
+            .env_remove(GRPC_MAX_RECV_MSG_SIZE_ENV)
+            .spawn()
+            .expect("spawn praxis-extproc"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("poll child") {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    drop(std::fs::remove_file(&config));
+    drop(occupied);
+
+    if let Some(status) = status {
+        assert!(
+            !status.success(),
+            "serving on an already-bound gRPC port must exit non-zero, got {status:?}"
+        );
+    } else {
+        stop_binary(&mut child).await;
+        panic!("server did not exit despite the gRPC port being in use");
+    }
+}

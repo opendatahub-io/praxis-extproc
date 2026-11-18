@@ -1485,3 +1485,352 @@ async fn response_headers_deferred_by_default() {
         panic!("expected ResponseBody, got: {resp_body_resp:?}");
     }
 }
+
+/// A buffering passthrough filter: it declares `StreamBuffer`, so the adapter
+/// must accumulate the streamed wire chunks and hand the filter one complete
+/// body. The forwarded body then carries whatever the adapter reassembled.
+struct ReassembleFilter;
+
+#[async_trait::async_trait]
+impl HttpFilter for ReassembleFilter {
+    fn name(&self) -> &'static str {
+        "reassemble"
+    }
+
+    async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn request_body_mode(&self) -> FilterBodyMode {
+        FilterBodyMode::StreamBuffer {
+            max_bytes: Some(1 << 20),
+        }
+    }
+
+    async fn on_request_body(
+        &self,
+        _: &mut HttpFilterContext<'_>,
+        _body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+}
+
+impl ReassembleFilter {
+    #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+    fn from_config(_: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self))
+    }
+}
+
+const REASSEMBLE_CONFIG: &str = r#"
+filter_chains:
+  - name: test
+    filters:
+      - filter: reassemble
+insecure_options:
+  allow_unbounded_body: true
+"#;
+
+/// A streamed request body whose wire chunk boundaries fall in deliberately
+/// awkward places — mid multi-byte UTF-8 scalar and just after a JSON escape's
+/// backslash — must still reassemble byte-for-byte before the buffering filter
+/// (and thus the upstream) sees it.
+#[tokio::test]
+async fn request_body_reassembles_across_awkward_utf8_and_escape_splits() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let payload = "{\"content\":\"café ☕ \\\"q\\\" line\\nend\"}".as_bytes().to_vec();
+    let c3 = payload.iter().position(|&b| b == 0xC3).expect("é lead byte present");
+    let e2 = payload.iter().position(|&b| b == 0xE2).expect("☕ lead byte present");
+    let backslash = payload.iter().position(|&b| b == b'\\').expect("escape present");
+
+    for split in [
+        1,
+        c3 + 1,        // inside the 2-byte é
+        e2 + 1,        // inside the 3-byte ☕
+        e2 + 2,        // inside the 3-byte ☕, other boundary
+        backslash + 1, // between an escape's backslash and its payload byte
+        payload.len() / 2,
+        payload.len() - 1,
+    ] {
+        let mut registry = praxis_ai_filters::build_ai_registry();
+        registry
+            .register("reassemble", praxis_filter::http_builtin(ReassembleFilter::from_config))
+            .expect("register reassemble filter");
+        let (mut client, _shutdown) = start_server_with_registry(REASSEMBLE_CONFIG, registry).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut inbound = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+        let mut headers = make_request_headers("POST", "/reassemble", false);
+        headers.protocol_config = Some(ProtocolConfiguration {
+            request_body_mode: 1,
+            response_body_mode: 1,
+            send_body_without_waiting_for_header_response: true,
+        });
+        tx.send(headers).await.unwrap();
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: payload[..split].to_vec(),
+                end_of_stream: false,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: payload[split..].to_vec(),
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let responses = collect_responses(&mut inbound).await;
+        assert!(
+            !responses
+                .iter()
+                .any(|r| matches!(r.response, Some(RespVariant::ImmediateResponse(_)))),
+            "split at {split} must not be rejected"
+        );
+        let reassembled: Vec<u8> = responses
+            .iter()
+            .filter_map(|response| match response.response.as_ref()? {
+                RespVariant::RequestBody(body) => {
+                    match body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+                        body_mutation::Mutation::Body(bytes) => Some(bytes.clone()),
+                        body_mutation::Mutation::StreamedResponse(streamed) => Some(streamed.body.clone()),
+                        body_mutation::Mutation::ClearBody(_) => Some(Vec::new()),
+                    }
+                },
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(reassembled, payload, "split at byte {split} must reassemble byte-exact");
+    }
+}
+
+/// A body delivered as many realistic ~16 KiB wire chunks (what Envoy actually
+/// does for a large streamed body) must reassemble byte-for-byte.
+#[tokio::test]
+async fn request_body_reassembles_from_realistic_16kib_chunks() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    const CHUNK: usize = 16 * 1024;
+    let payload: Vec<u8> = (0_u32..(16 * 1024 * 4 + 777)).map(|i| (i % 251) as u8).collect();
+
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register("reassemble", praxis_filter::http_builtin(ReassembleFilter::from_config))
+        .expect("register reassemble filter");
+    let (mut client, _shutdown) = start_server_with_registry(REASSEMBLE_CONFIG, registry).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let mut inbound = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/chunked-16k", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1,
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: true,
+    });
+    tx.send(headers).await.unwrap();
+
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = (offset + CHUNK).min(payload.len());
+        let eos = end == payload.len();
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: payload[offset..end].to_vec(),
+                end_of_stream: eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        offset = end;
+    }
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+    let reassembled: Vec<u8> = responses
+        .iter()
+        .filter_map(|response| match response.response.as_ref()? {
+            RespVariant::RequestBody(body) => {
+                match body.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+                    body_mutation::Mutation::Body(bytes) => Some(bytes.clone()),
+                    body_mutation::Mutation::StreamedResponse(streamed) => Some(streamed.body.clone()),
+                    body_mutation::Mutation::ClearBody(_) => Some(Vec::new()),
+                }
+            },
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(reassembled, payload, "16 KiB-chunked body must reassemble byte-exact");
+}
+
+/// Full-duplex request and response bodies interleaved on one stream must both
+/// flow through the real handler — neither direction blocks the other — and each
+/// reassembles in order. Exercises live interleaving, not direction-at-a-time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_duplex_request_and_response_bodies_interleave() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let mut inbound = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/interleave", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 4,
+        send_body_without_waiting_for_header_response: true,
+    });
+    tx.send(headers).await.unwrap();
+
+    let req = b"request-alpha|request-omega";
+    let resp = b"response-alpha|response-omega";
+    let req_body = |bytes: &[u8], eos| ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: bytes.to_vec(),
+            end_of_stream: eos,
+        })),
+        ..Default::default()
+    };
+    let resp_body = |bytes: &[u8], eos| ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: bytes.to_vec(),
+            end_of_stream: eos,
+        })),
+        ..Default::default()
+    };
+
+    // Interleave the two directions on the wire.
+    tx.send(req_body(&req[..13], false)).await.unwrap();
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    tx.send(resp_body(&resp[..14], false)).await.unwrap();
+    tx.send(req_body(&req[13..], true)).await.unwrap();
+    tx.send(resp_body(&resp[14..], true)).await.unwrap();
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+    let reassemble = |want_request: bool| -> Vec<u8> {
+        responses
+            .iter()
+            .filter_map(|response| {
+                let mutation = match response.response.as_ref()? {
+                    RespVariant::RequestBody(b) if want_request => b.response.as_ref()?.body_mutation.as_ref()?,
+                    RespVariant::ResponseBody(b) if !want_request => b.response.as_ref()?.body_mutation.as_ref()?,
+                    _ => return None,
+                };
+                match mutation.mutation.as_ref()? {
+                    body_mutation::Mutation::Body(bytes) => Some(bytes.clone()),
+                    body_mutation::Mutation::StreamedResponse(streamed) => Some(streamed.body.clone()),
+                    body_mutation::Mutation::ClearBody(_) => Some(Vec::new()),
+                }
+            })
+            .flatten()
+            .collect()
+    };
+    assert_eq!(
+        reassemble(true),
+        req,
+        "request direction must reassemble across interleaving"
+    );
+    assert_eq!(
+        reassemble(false),
+        resp,
+        "response direction must reassemble across interleaving"
+    );
+}
+
+/// A streamed SSE response whose wire fragments fall at awkward points (mid
+/// event, mid `data:` line) must reassemble byte-for-byte, and its terminal
+/// `data: [DONE]` marker must survive exactly once — never dropped or doubled.
+#[tokio::test]
+async fn sse_response_fragments_reassemble_with_a_single_terminal_marker() {
+    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let mut inbound = client.process(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("GET", "/sse", true);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 1,
+        response_body_mode: 1,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+    assert!(matches!(
+        inbound.message().await.unwrap().unwrap().response,
+        Some(RespVariant::RequestHeaders(_))
+    ));
+    tx.send(make_response_headers(200, false)).await.unwrap();
+    assert!(matches!(
+        inbound.message().await.unwrap().unwrap().response,
+        Some(RespVariant::ResponseHeaders(_))
+    ));
+
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"usage\":{\"total_tokens\":7}}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .as_bytes()
+    .to_vec();
+    // Fragment at awkward points: inside the first event, mid `data:` prefix of
+    // the usage event, and right before the terminal marker.
+    let cuts = [7, 25, 44, sse.len() - 14];
+    let mut offset = 0;
+    for (i, &cut) in cuts.iter().chain(std::iter::once(&sse.len())).enumerate() {
+        let end = cut.min(sse.len());
+        if end <= offset {
+            continue;
+        }
+        let eos = i == cuts.len();
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::ResponseBody(HttpBody {
+                body: sse[offset..end].to_vec(),
+                end_of_stream: eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        offset = end;
+    }
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+    let reassembled: Vec<u8> = responses
+        .iter()
+        .filter_map(|response| match response.response.as_ref()? {
+            RespVariant::ResponseBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+                body_mutation::Mutation::Body(bytes) => Some(bytes.clone()),
+                body_mutation::Mutation::StreamedResponse(streamed) => Some(streamed.body.clone()),
+                body_mutation::Mutation::ClearBody(_) => Some(Vec::new()),
+            },
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(reassembled, sse, "SSE fragments must reassemble byte-exact");
+    let done = reassembled
+        .windows(b"data: [DONE]".len())
+        .filter(|w| *w == b"data: [DONE]")
+        .count();
+    assert_eq!(done, 1, "the terminal marker must appear exactly once");
+}
