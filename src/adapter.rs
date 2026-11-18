@@ -695,7 +695,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn invalid_header_field_is_dropped() {
         let headers = vec![
