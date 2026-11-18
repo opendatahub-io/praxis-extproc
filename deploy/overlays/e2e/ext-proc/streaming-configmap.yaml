@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-processing-streaming-plugins
+data:
+  extproc.yaml: |
+    server:
+      grpc_address: "0.0.0.0:9004"
+      health_address: "0.0.0.0:50052"
+      metrics_address: "0.0.0.0:9090"
+      max_body_bytes: 1048576
+      tls:
+        mode: self_signed
+
+    insecure_options:
+      allow_private_upstreams: true
+
+    # This isolated test chain keeps a request-only guardrail available while
+    # leaving it unselected by default. The primary guardrail tests opt in with
+    # the e2e selection header; ordinary streaming tests stay unguarded.
+    filter_chains:
+      - name: streaming-e2e
+        filters:
+          # Preserve the hosted simulator's authentication contract locally.
+          - filter: static_response
+            conditions:
+              - unless:
+                  headers:
+                    authorization: "Bearer llm-katan-openai-key"
+            status: 401
+            body: "invalid test API key"
+          - filter: ai_guardrails
+            conditions:
+              - when:
+                  headers:
+                    x-aigateway-guardrail-e2e: "true"
+            provider:
+              type: nemo
+              endpoint: "http://nemo-mock.llm.svc.cluster.local:8080/v1/checks"
+            phase:
+              request: true
+              response: false
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: continue
+          - filter: headers
+            request_add:
+              - name: X-Praxis-Processed
+                value: "true"
+            response_set:
+              - name: X-Praxis-Version
+                value: "e2e-streaming"

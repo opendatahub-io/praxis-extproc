@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - gateway.yaml
+  - streaming-gateway.yaml
+  - streaming-oracle.yaml
+  - envoyfilter.yaml
+  - internal-model.yaml
+  - echo.yaml
+  - nemo-mock.yaml
+  - local-reply-policy.yaml

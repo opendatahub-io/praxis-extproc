@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: payload-pre-processing
+spec:
+  selector:
+    app: payload-pre-processing
+  ports:
+    - protocol: TCP
+      port: 9004
+      targetPort: 9004
+      appProtocol: HTTP2
+  type: ClusterIP

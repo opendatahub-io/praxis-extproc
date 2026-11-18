@@ -1,0 +1,20 @@
+# ipp-pre (configPatches[0]): buffer the request body; no trailers in BUFFERED.
+- op: replace
+  path: /spec/configPatches/0/patch/value/typed_config/processing_mode/request_body_mode
+  value: BUFFERED
+- op: replace
+  path: /spec/configPatches/0/patch/value/typed_config/processing_mode/request_trailer_mode
+  value: SKIP
+# ipp (configPatches[1]): buffer both bodies; no trailers in BUFFERED.
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/request_body_mode
+  value: BUFFERED
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/response_body_mode
+  value: BUFFERED
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/request_trailer_mode
+  value: SKIP
+- op: replace
+  path: /spec/configPatches/1/patch/value/typed_config/processing_mode/response_trailer_mode
+  value: SKIP
