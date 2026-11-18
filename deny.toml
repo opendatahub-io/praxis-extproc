@@ -12,6 +12,15 @@ ignore = [
     # CVE-2026-119375 (medium 6.8): only exploitable when opening a
     # crafted WAL file from an untrusted source; not applicable here.
     "RUSTSEC-2026-0459",
+
+    # chrono / chrono-tz unmaintained (2026-09-14): transitive via the policy
+    # engine (cedar-policy, cel, regorus). Not under our control.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+
+    # humantime unmaintained (2026-09-14): transitive via praxis-ai's
+    # humantime-serde. Not under our control.
+    "RUSTSEC-2026-0542",
 ]
 
 [licenses]
