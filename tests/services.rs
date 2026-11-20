@@ -335,11 +335,13 @@ async fn metrics_unknown_path_returns_404() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicU16, Ordering};
-
-static PORT: AtomicU16 = AtomicU16::new(19000);
-
 fn next_addr() -> std::net::SocketAddr {
-    let port = PORT.fetch_add(1, Ordering::Relaxed);
-    format!("127.0.0.1:{port}").parse().expect("valid addr")
+    // Ask the OS for a free ephemeral port, then release it so the service can
+    // bind it. A shared in-process counter would hand out colliding ports once
+    // tests run process-per-test (e.g. under nextest). Brief TOCTOU window, same
+    // approach as the adapter suite's `free_port()`.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    addr
 }
