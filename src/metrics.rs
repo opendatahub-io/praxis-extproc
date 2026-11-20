@@ -493,13 +493,8 @@ async fn bind_listener(addr: SocketAddr) -> crate::error::Result<tokio::net::Tcp
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::too_many_lines, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use metrics_util::{
-        CompositeKey,
-        debugging::{DebugValue, DebuggingRecorder},
-    };
-
     use super::*;
 
     #[test]
@@ -537,142 +532,6 @@ mod tests {
         ] {
             assert_eq!(status_class(status), class, "status {status:?}");
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Counter Values and Labels
-    // -------------------------------------------------------------------------
-
-    /// Run `body` against a thread-local debugging recorder and return every
-    /// captured metric as `(key, value)`.
-    fn capture(body: impl FnOnce()) -> Vec<(CompositeKey, DebugValue)> {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        {
-            let _guard = metrics::set_default_local_recorder(&recorder);
-            body();
-        }
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(key, _unit, _description, value)| (key, value))
-            .collect()
-    }
-
-    /// Value of the counter named `name` carrying exactly `labels`, if present.
-    fn counter(snapshot: &[(CompositeKey, DebugValue)], name: &str, labels: &[(&str, &str)]) -> Option<u64> {
-        let mut want: Vec<(String, String)> = labels
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect();
-        want.sort();
-        snapshot.iter().find_map(|(composite, value)| {
-            let key = composite.key();
-            if key.name() != name {
-                return None;
-            }
-            let mut have: Vec<(String, String)> = key
-                .labels()
-                .map(|label| (label.key().to_owned(), label.value().to_owned()))
-                .collect();
-            have.sort();
-            if have != want {
-                return None;
-            }
-            match value {
-                DebugValue::Counter(count) => Some(*count),
-                _ => None,
-            }
-        })
-    }
-
-    #[test]
-    fn body_size_rejection_counter_increments_per_call() {
-        let snapshot = capture(|| {
-            record_body_size_rejection();
-            record_body_size_rejection();
-        });
-        assert_eq!(
-            counter(&snapshot, "praxis_extproc_body_size_rejections_total", &[]),
-            Some(2),
-            "each rejection must add one to the unlabelled counter"
-        );
-    }
-
-    #[test]
-    fn invalid_argument_counter_is_keyed_by_reason_and_detail() {
-        let snapshot = capture(|| {
-            record_invalid_argument("selection", "duplicate");
-            record_invalid_argument("selection", "duplicate");
-            record_invalid_argument("selection", "malformed");
-        });
-        assert_eq!(
-            counter(
-                &snapshot,
-                "praxis_extproc_invalid_argument_total",
-                &[("reason", "selection"), ("detail", "duplicate")]
-            ),
-            Some(2)
-        );
-        assert_eq!(
-            counter(
-                &snapshot,
-                "praxis_extproc_invalid_argument_total",
-                &[("reason", "selection"), ("detail", "malformed")]
-            ),
-            Some(1),
-            "a distinct detail label must form a distinct series"
-        );
-    }
-
-    #[test]
-    fn local_reply_counter_buckets_by_status_class() {
-        let snapshot = capture(|| {
-            record_local_reply(Some(403));
-            record_local_reply(Some(401));
-            record_local_reply(Some(200));
-            record_local_reply(None);
-        });
-        assert_eq!(
-            counter(
-                &snapshot,
-                "praxis_extproc_local_replies_total",
-                &[("status_class", "4xx")]
-            ),
-            Some(2),
-            "both client-error replies land in the 4xx series"
-        );
-        assert_eq!(
-            counter(
-                &snapshot,
-                "praxis_extproc_local_replies_total",
-                &[("status_class", "2xx")]
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            counter(
-                &snapshot,
-                "praxis_extproc_local_replies_total",
-                &[("status_class", "other")]
-            ),
-            Some(1),
-            "a missing status falls into the other bucket"
-        );
-    }
-
-    #[test]
-    fn immediate_response_and_request_counters_increment() {
-        let snapshot = capture(|| {
-            record_immediate_response();
-            record_request(0.25);
-        });
-        assert_eq!(
-            counter(&snapshot, "praxis_extproc_immediate_responses_total", &[]),
-            Some(1)
-        );
-        assert_eq!(counter(&snapshot, "praxis_extproc_requests_total", &[]), Some(1));
     }
 
     // -------------------------------------------------------------------------

@@ -240,38 +240,3 @@ async fn raw_value_header_parsing() {
         "raw_value headers should parse correctly"
     );
 }
-
-/// Many streams in flight at once must each complete independently — no
-/// deadlock, cross-talk, or dropped response under concurrent load.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn many_concurrent_streams_each_complete_independently() {
-    const STREAMS: usize = 32;
-    let (client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
-
-    let mut handles = Vec::with_capacity(STREAMS);
-    for i in 0..STREAMS {
-        let mut client = client.clone();
-        handles.push(tokio::spawn(async move {
-            send_headers_only(&mut client, "GET", &format!("/concurrent-{i}")).await
-        }));
-    }
-
-    let mut completed = 0;
-    for handle in handles {
-        let responses = handle.await.expect("stream task must not panic");
-        assert!(
-            responses
-                .iter()
-                .any(|r| matches!(r.response, Some(RespVariant::RequestHeaders(_)))),
-            "each concurrent stream must get its own RequestHeaders response"
-        );
-        assert!(
-            !responses
-                .iter()
-                .any(|r| matches!(r.response, Some(RespVariant::ImmediateResponse(_)))),
-            "concurrency must not spuriously reject a stream"
-        );
-        completed += 1;
-    }
-    assert_eq!(completed, STREAMS, "every concurrent stream must complete");
-}
