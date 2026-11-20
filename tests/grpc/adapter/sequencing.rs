@@ -898,3 +898,34 @@ filter_chains:
 
     drop(shutdown_tx);
 }
+
+/// Cancelling the RPC during the header phase — before the announced body
+/// arrives — must not wedge the server: a fresh stream afterwards still works.
+#[tokio::test]
+async fn client_cancellation_during_the_header_phase_leaves_the_server_healthy() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    {
+        let (tx, inbound) = open_stream(&mut client).await;
+        // Announce a body (end_of_stream = false), then cancel both directions
+        // before sending it.
+        tx.send(make_request_headers("POST", "/cancel-at-headers", false))
+            .await
+            .unwrap();
+        drop(inbound);
+        drop(tx);
+    }
+
+    let (tx, mut inbound) = open_stream(&mut client).await;
+    tx.send(make_request_headers("GET", "/after-cancel", true))
+        .await
+        .unwrap();
+    drop(tx);
+    let responses = collect_responses(&mut inbound).await;
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r.response, Some(RespVariant::RequestHeaders(_)))),
+        "server must stay healthy after a header-phase cancellation"
+    );
+}

@@ -243,3 +243,78 @@ async fn grpc_compiled_max_recv_rejects_body_above_four_mib() {
         "expected gRPC size rejection, got: {msg}"
     );
 }
+
+
+/// The server's outbound (encode) per-message cap must bound the response the
+/// same way the inbound (decode) cap bounds the request. A tiny request whose
+/// body a filter inflates past the cap must fail the stream, not ship an
+/// unbounded frame. Without `.max_encoding_message_size`, tonic's default leaves
+/// the outbound side unlimited and this stream would succeed.
+#[tokio::test]
+async fn grpc_max_encoding_rejects_oversized_outbound_response() {
+    const LIMIT: usize = 64 * 1024;
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    registry
+        .register(
+            "inflating_body",
+            praxis_filter::http_builtin(InflatingBodyFilter::from_config),
+        )
+        .expect("register inflating test filter");
+    let (mut client, _shutdown) = start_server_with_registry_and_max_recv(INFLATING_BODY_CONFIG, registry, LIMIT).await;
+
+    let err = send_full_request_result(&mut client, "POST", "/inflate", b"x")
+        .await
+        .expect_err("an outbound message over the encode limit must fail the stream");
+    let message = err.to_string().to_ascii_lowercase();
+    assert!(
+        [
+            "too large",
+            "message size",
+            "length",
+            "encode",
+            "out of range",
+            "outofrange",
+            "resource_exhausted"
+        ]
+        .iter()
+        .any(|needle| message.contains(needle)),
+        "expected a gRPC encode-size error, got: {err}"
+    );
+}
+
+/// Recovery: after an over-cap body is rejected with 413, the same connection
+/// must still serve the next request. (The under/at/over boundary itself is
+/// covered by `buffered_body_at_and_over_max_body_bytes` at the real default.)
+#[tokio::test]
+async fn server_recovers_on_the_same_connection_after_an_over_cap_413() {
+    let (mut client, _shutdown) = start_server(SMALL_BODY_LIMIT_CONFIG).await;
+
+    let rejected = |responses: &[ProcessingResponse]| {
+        responses.iter().any(|response| {
+            matches!(
+                response.response.as_ref(),
+                Some(RespVariant::ImmediateResponse(reply))
+                    if reply.status.as_ref().map(|status| status.code) == Some(413)
+            )
+        })
+    };
+
+    let over = send_full_request(&mut client, "POST", "/over", &vec![b'x'; 2048]).await;
+    assert!(
+        rejected(&over),
+        "over-cap body must be rejected with 413, got: {over:?}"
+    );
+
+    // The same connection serves a fresh small request after the 413.
+    let after = send_full_request(&mut client, "POST", "/after", b"ok").await;
+    assert!(
+        !rejected(&after),
+        "server must recover and serve the next request after a 413"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|r| matches!(r.response, Some(RespVariant::RequestBody(_)))),
+        "post-413 request must reach the handler"
+    );
+}

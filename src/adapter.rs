@@ -696,6 +696,30 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_request_header_keys_are_all_preserved() {
+        let headers = vec![
+            make_header(":method", "GET"),
+            make_header(":path", "/"),
+            make_header("x-forwarded-for", "203.0.113.1"),
+            make_header("x-forwarded-for", "198.51.100.7"),
+        ];
+
+        let req = envoy_headers_to_request(&headers);
+
+        let values: Vec<&[u8]> = req
+            .headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(http::header::HeaderValue::as_bytes)
+            .collect();
+        assert_eq!(
+            values,
+            [b"203.0.113.1".as_slice(), b"198.51.100.7".as_slice()],
+            "HTTP/2 repeated keys must all reach filters, in order, not collapse to one"
+        );
+    }
+
+    #[test]
     fn invalid_header_field_is_dropped() {
         let headers = vec![
             make_header(":method", "GET"),

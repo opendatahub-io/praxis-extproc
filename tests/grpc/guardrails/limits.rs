@@ -221,6 +221,98 @@ async fn fds_output_enforces_the_effective_cap_before_provider_evaluation() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_size_payloads_round_trip_with_full_content_through_the_provider() {
+    for target in [1_024, 65_536, 262_144] {
+        let request_body = support::exact_size_request(target);
+        let response_body_bytes = support::exact_size_response(target);
+        let want_request: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
+        let want_response: serde_json::Value = serde_json::from_slice(&response_body_bytes).unwrap();
+
+        let harness = Harness::new(NemoReply::Pass, false).await;
+        let mut session = harness.session(BodySendMode::Buffered, true, true).await;
+        let input_reply = session.exchange(request_chunk(&request_body, true)).await;
+        assert!(
+            matches!(input_reply.response, Some(ResponseMessage::RequestBody(_))),
+            "target={target}"
+        );
+        let header_reply = session.exchange(response_headers("application/json")).await;
+        assert!(
+            matches!(header_reply.response, Some(ResponseMessage::ResponseHeaders(_))),
+            "target={target}"
+        );
+        session.send(response_body(&response_body_bytes, true)).await;
+        let output_reply = session.next().await.unwrap();
+        assert_eq!(
+            immediate_status(std::slice::from_ref(&output_reply)),
+            None,
+            "target={target}"
+        );
+        assert_eq!(
+            body_bytes(&[output_reply]),
+            response_body_bytes,
+            "the exact-size response must round-trip byte-for-byte at target={target}"
+        );
+
+        let calls = harness.calls();
+        assert_eq!(calls.len(), 2, "both phases must call the provider at target={target}");
+        for call in calls {
+            let expected = if call["guardrails"]["rail_types"][0] == "input" {
+                &want_request["messages"][0]["content"]
+            } else {
+                &want_response["choices"][0]["message"]["content"]
+            };
+            assert_eq!(
+                &call["messages"][0]["content"], expected,
+                "provider must inspect the complete exact-size content at target={target}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_request_body_triplet_around_the_named_body_cap() {
+    // The named limit under test is ext-proc's own `max_body_bytes`. Below the
+    // 1 MiB guardrail ceiling it is the sole effective cap, so the boundary is
+    // unambiguous: a body `> cap` is rejected, `<= cap` is accepted intact.
+    const CAP: usize = 8_192;
+    for delta in [-1_isize, 0, 1] {
+        let target = CAP.checked_add_signed(delta).unwrap();
+        let request_body = support::exact_size_request(target);
+        let harness = Harness::with_limit(NemoReply::Pass, false, CAP).await;
+        let mut session = harness.session(BodySendMode::Buffered, true, false).await;
+        let reply = session.exchange(request_chunk(&request_body, true)).await;
+        if delta > 0 {
+            assert_eq!(
+                immediate_status(std::slice::from_ref(&reply)),
+                Some(413),
+                "one byte over the cap must be rejected"
+            );
+            assert!(
+                harness.calls().is_empty(),
+                "an over-cap body must never reach the provider"
+            );
+            assert!(session.next().await.is_none());
+        } else {
+            assert!(
+                matches!(reply.response, Some(ResponseMessage::RequestBody(_))),
+                "target={target} at or under the cap must be accepted"
+            );
+            let calls = harness.calls();
+            assert_eq!(
+                calls.len(),
+                1,
+                "the accepted input must run exactly one check at target={target}"
+            );
+            let want: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
+            assert_eq!(
+                calls[0]["messages"][0]["content"], want["messages"][0]["content"],
+                "provider must see the full accepted payload at target={target}"
+            );
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

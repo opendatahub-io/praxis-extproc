@@ -133,13 +133,19 @@ impl PraxisExtProc {
     }
 }
 
-/// Build the tonic ExtProc service with the production max-decoding size.
+/// Build the tonic ExtProc service with the production message-size limits.
 ///
-/// The binary and in-process tests share this helper so the
-/// `.max_decoding_message_size(...)` wiring cannot drift between them.
+/// Both the inbound (decode) and outbound (encode) per-message caps are set to
+/// `max_recv`. A mutated `ProcessingResponse` body is bounded by the same
+/// accumulation ceiling as the request it answers, so the two sides share one
+/// limit; without the encode cap tonic's default leaves outbound frames
+/// unbounded. The binary and in-process tests share this helper so the wiring
+/// cannot drift between them.
 #[must_use]
 pub fn external_processor_server(svc: PraxisExtProc, max_recv: usize) -> ExternalProcessorServer<PraxisExtProc> {
-    ExternalProcessorServer::new(svc).max_decoding_message_size(max_recv)
+    ExternalProcessorServer::new(svc)
+        .max_decoding_message_size(max_recv)
+        .max_encoding_message_size(max_recv)
 }
 
 /// Resolve only when the latch flips to `true`.
