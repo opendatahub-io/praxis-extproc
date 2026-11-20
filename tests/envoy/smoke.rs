@@ -28,7 +28,6 @@ use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
 use super::*;
 
-#[path = "envoy/rejection.rs"]
 mod rejection;
 
 const DEADLINE: Duration = Duration::from_secs(10);

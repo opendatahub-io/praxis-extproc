@@ -6,8 +6,9 @@
 //! A fidelity check that the Tier-1 contracts still hold when the wire messages
 //! come from a real Envoy rather than being hand-crafted, so drift between the
 //! two is caught. Not a coverage tier. Gated on the `integration` feature and
-//! an `ENVOY_BIN`; run via `make test-envoy`. Reuses the Tier-1 `support`
-//! module (the recording `NeMo` peer) inside its own Envoy `World` harness.
+//! an `ENVOY_BIN`; run via `make test-envoy`. Reuses the Tier-1 guardrails
+//! `support` module (the recording `NeMo` peer) inside its own Envoy `World`
+//! harness.
 
 #![cfg(feature = "integration")]
 #![allow(
@@ -30,11 +31,11 @@
 
 mod common;
 
-#[path = "guardrails_transport/support.rs"]
+#[path = "grpc/guardrails/support.rs"]
 mod support;
 
 use serde_json::json;
 use support::{Harness, NemoReply};
 
-#[path = "guardrails_transport/envoy.rs"]
-mod envoy;
+#[path = "envoy/smoke.rs"]
+mod smoke;

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Red Hat, Inc.
 
-//! Adapter / transport mechanics: the wire <-> `HttpFilterContext` <->
-//! `ProcessingResponse` path, plus gRPC framing limits, exercised with stub
-//! filters so the server machinery is tested independently of real filters.
+//! Tier 1: the ext-proc server driven directly over gRPC.
 //!
-//! Starts a tonic server on a random port, sends `ProcessingRequest`
-//! messages via a tonic client, and verifies responses.
+//! The test is the `ext_proc` client: it starts an in-process ext-proc server on
+//! a random port, sends `ProcessingRequest` messages over real HTTP/2 (tonic),
+//! and asserts on the `ProcessingResponse`. Two module groups share this tier:
+//! `adapter` exercises generic transport/adapter mechanics with stub filters;
+//! `guardrails` exercises real guardrail behaviour against a recording `NeMo` peer.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,26 +31,10 @@
 #![allow(missing_docs, reason = "test module")]
 #![allow(dead_code, reason = "shared transport toolbox; each binary uses a subset")]
 
-
 mod common;
 
-#[path = "adapter/support.rs"]
-mod support;
+#[path = "grpc/adapter/mod.rs"]
+mod adapter;
 
-#[path = "adapter/basics.rs"]
-mod basics;
-
-#[path = "adapter/body_modes.rs"]
-mod body_modes;
-
-#[path = "adapter/sequencing.rs"]
-mod sequencing;
-
-#[path = "adapter/limits.rs"]
-mod limits;
-
-#[path = "adapter/validation.rs"]
-mod validation;
-
-#[path = "adapter/routing.rs"]
-mod routing;
+#[path = "grpc/guardrails/mod.rs"]
+mod guardrails;

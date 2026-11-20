@@ -1,46 +1,18 @@
-//! Real AI guardrail contracts across the ExtProc transport and body modes.
+//! Real AI guardrail contracts across the ExtProc transport and body modes,
+//! driven by a recording `NeMo` peer.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::tests_outside_test_module,
-    clippy::too_many_lines,
-    clippy::missing_assert_message,
-    clippy::missing_docs_in_private_items,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::future_not_send,
-    clippy::large_futures,
-    dead_code,
-    missing_docs,
-    reason = "integration test utilities and assertions"
-)]
-
-mod common;
-
-#[path = "guardrails_transport/support.rs"]
 mod support;
 
-#[path = "guardrails_transport/boundaries.rs"]
 mod boundaries;
-
-#[path = "guardrails_transport/fds.rs"]
 mod fds;
-
-#[path = "guardrails_transport/limits.rs"]
 mod limits;
-
-#[path = "guardrails_transport/selection.rs"]
 mod selection;
-
-#[path = "guardrails_transport/stream_rejection.rs"]
 mod stream_rejection;
 
 use praxis_proto::envoy::service::ext_proc::v3::BodySendMode;
 use serde_json::json;
-use support::{Harness, NemoReply, body_bytes, immediate_status, request, response_body, response_headers};
+
+use self::support::{Harness, NemoReply, body_bytes, immediate_status, request, response_body, response_headers};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_phases_call_nemo_with_complete_content_in_every_response_mode() {
