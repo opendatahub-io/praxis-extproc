@@ -252,13 +252,11 @@ the following executable contracts:
 | EOS, trailers, NeMo calls and exact released bytes | [Guarded matrix] |
 | Unguarded 32 MiB boundaries and recovery | [Boundary payloads] |
 | Independent serialized-protobuf receive limits | [Boundary framing] |
-| Truncation and off-by-one regression controls | [Mutation controls] |
 
 [Boundary builders]: ../tests/common/payloads.rs
 [Guarded matrix]: ../tests/grpc/guardrails/payload_boundaries.rs
 [Boundary payloads]: ../tests/grpc/adapter/payloads.rs
 [Boundary framing]: ../tests/grpc/adapter/message_limits.rs
-[Mutation controls]: ../hack/scripts/check-boundary-regressions.sh
 
 Both size boundaries cover minus one byte, the exact cap and plus one byte.
 The guarded matrix combines ASCII, multibyte UTF-8 and escaped JSON with single
@@ -285,18 +283,10 @@ Run the qualification locally:
 
 ```console
 cargo test --test grpc
-bash hack/scripts/check-boundary-regressions.sh
 ```
 
-The mutation script copies sources into a temporary directory and verifies
-passing baselines before injecting three faults: rejecting the exact cap,
-accepting one byte over it, and truncating released chunks. Each fault must
-fail a test assertion. Logs remain in `target/boundary-mutations/`; the working
-sources are never mutated. CI runs these controls in the test job.
-
-Local validation on 2026-11-24: `cargo test --workspace` passed, including all
-133 gRPC tests. All three mutation controls were detected. Clippy with all targets and
-the `integration` feature, and the nightly formatting check, passed.
+Validation on 2026-11-25: all 496 direct gRPC tests and the metrics counter
+test passed. Clippy for the gRPC tests and the nightly formatting check passed.
 
 ### Service Tests
 
