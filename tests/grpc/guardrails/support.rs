@@ -257,47 +257,18 @@ pub(crate) fn header(key: &str, value: &str) -> HeaderValue {
     }
 }
 pub(crate) fn request(prompt: &str, stream: bool) -> ProcessingRequest {
+    request_with_eos(prompt, stream, true)
+}
+
+/// Build a chat request body with an explicit transport end-of-stream flag.
+pub(crate) fn request_with_eos(prompt: &str, stream: bool, end_of_stream: bool) -> ProcessingRequest {
     wrap(RequestMessage::RequestBody(HttpBody {
         body: serde_json::to_vec(
             &json!({"model":"test", "messages":[{"role":"user","content":prompt}],"stream":stream}),
         )
         .unwrap(),
-        end_of_stream: true,
+        end_of_stream,
     }))
-}
-/// Build a chat-completions *request* body of an exact byte length, carrying
-/// real inner text (multibyte UTF-8 and JSON escapes) instead of trailing
-/// whitespace padding.
-pub(crate) fn exact_size_request(target: usize) -> Vec<u8> {
-    exact_size_body(
-        target,
-        |content| json!({"model":"test","messages":[{"role":"user","content":content}],"stream":false}),
-    )
-}
-
-/// Build a chat-completions *response* body of an exact byte length, same idea.
-pub(crate) fn exact_size_response(target: usize) -> Vec<u8> {
-    exact_size_body(
-        target,
-        |content| json!({"choices":[{"message":{"role":"assistant","content":content}}]}),
-    )
-}
-
-/// Serialize `envelope(content)` to exactly `target` bytes. The seed carries the
-/// bytes worth exercising (2- and 3-byte UTF-8 scalars, an escaped quote, an
-/// escaped newline); ASCII padding then dials the serialized length to the
-/// target, since each padding byte serializes one-to-one.
-fn exact_size_body(target: usize, envelope: impl Fn(&str) -> Value) -> Vec<u8> {
-    const SEED: &str = "café ☕ \"q\"\n";
-    let base = serde_json::to_vec(&envelope(SEED)).unwrap().len();
-    assert!(
-        target >= base,
-        "target {target} is below the minimal envelope size {base}"
-    );
-    let content = format!("{SEED}{}", "a".repeat(target - base));
-    let bytes = serde_json::to_vec(&envelope(&content)).unwrap();
-    assert_eq!(bytes.len(), target, "exact-size payload must hit its byte target");
-    bytes
 }
 
 pub(crate) fn request_headers(
@@ -305,7 +276,17 @@ pub(crate) fn request_headers(
     selected: (bool, bool),
     end_of_stream: bool,
 ) -> ProcessingRequest {
-    let headers = vec![
+    request_headers_with(protocol, selected, end_of_stream, [])
+}
+
+/// Build guardrail request headers with extra values in the supplied order.
+pub(crate) fn request_headers_with(
+    protocol: ProtocolConfiguration,
+    selected: (bool, bool),
+    end_of_stream: bool,
+    extra_headers: impl IntoIterator<Item = HeaderValue>,
+) -> ProcessingRequest {
+    let mut headers = vec![
         header(":method", "POST"),
         header(":path", "/v1/chat/completions"),
         header("content-type", "application/json"),
@@ -315,6 +296,7 @@ pub(crate) fn request_headers(
             if selected.1 { "true" } else { "false" },
         ),
     ];
+    headers.extend(extra_headers);
     let mut message = wrap(RequestMessage::RequestHeaders(HttpHeaders {
         headers: Some(HeaderMap { headers }),
         end_of_stream,
@@ -323,14 +305,6 @@ pub(crate) fn request_headers(
     message
 }
 
-pub(crate) fn response_headers(content_type: &str) -> ProcessingRequest {
-    wrap(RequestMessage::ResponseHeaders(HttpHeaders {
-        headers: Some(HeaderMap {
-            headers: vec![header(":status", "200"), header("content-type", content_type)],
-        }),
-        ..Default::default()
-    }))
-}
 pub(crate) fn response_body(body: &[u8], eos: bool) -> ProcessingRequest {
     wrap(RequestMessage::ResponseBody(HttpBody {
         body: body.to_vec(),

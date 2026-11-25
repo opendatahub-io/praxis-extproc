@@ -6,6 +6,8 @@ mod support;
 mod boundaries;
 mod fds;
 mod limits;
+mod payload_boundaries;
+mod provider_content;
 mod selection;
 mod stream_rejection;
 

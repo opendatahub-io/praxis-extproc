@@ -3,6 +3,8 @@
 
 //! Protocol sequencing: ordering, duplicate end-of-stream, local reply, drain.
 
+use std::time::Duration;
+
 use super::support::*;
 
 #[tokio::test]
@@ -41,13 +43,10 @@ async fn duplicate_eos_in_request_headers_rejected() {
 
     tx.send(make_request_headers("GET", "/", true)).await.unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for duplicate EOS rejection")
-    .expect_err("duplicate EOS was accepted");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for duplicate EOS rejection")
+        .expect_err("duplicate EOS was accepted");
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("out-of-order") || err.message().contains("invalid"),
@@ -99,12 +98,9 @@ async fn duplicate_eos_in_request_body_rejected() {
     .await
     .unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error");
+    let result = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error");
 
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
@@ -162,12 +158,9 @@ async fn duplicate_eos_in_response_headers_rejected() {
     .await
     .unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error");
+    let result = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error");
 
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
@@ -204,13 +197,10 @@ async fn initial_request_body_rejected() {
     .await
     .unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error")
-    .expect_err("initial RequestBody should be rejected");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("initial RequestBody should be rejected");
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -242,13 +232,10 @@ async fn initial_request_trailers_rejected() {
     .await
     .unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error")
-    .expect_err("initial RequestTrailers should be rejected");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("initial RequestTrailers should be rejected");
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -285,13 +272,10 @@ async fn response_body_before_response_headers_rejected() {
     .await
     .unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error")
-    .expect_err("ResponseBody before ResponseHeaders should be rejected");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("ResponseBody before ResponseHeaders should be rejected");
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -395,7 +379,7 @@ async fn request_headers_after_local_reply_rejected() {
     let _headers = next_full_duplex_msg(&mut stream).await;
     tx.send(make_request_headers("GET", "/", true)).await.unwrap();
 
-    let err = tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), stream.message())
         .await
         .expect("timed out waiting for error")
         .expect_err("request headers after a local reply should be rejected");
@@ -427,13 +411,10 @@ async fn duplicate_non_eos_request_headers_rejected() {
     // Duplicate RequestHeaders (non-EOS) - should be rejected
     tx.send(make_request_headers("GET", "/attacker", false)).await.unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error")
-    .expect_err("duplicate non-EOS RequestHeaders should be rejected");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("duplicate non-EOS RequestHeaders should be rejected");
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -468,13 +449,10 @@ async fn duplicate_non_eos_response_headers_rejected() {
     // Duplicate ResponseHeaders (non-EOS) - should be rejected
     tx.send(make_response_headers(500, false)).await.unwrap();
 
-    let err = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error")
-    .expect_err("duplicate non-EOS ResponseHeaders should be rejected");
+    let err = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error")
+        .expect_err("duplicate non-EOS ResponseHeaders should be rejected");
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -540,12 +518,9 @@ async fn duplicate_eos_in_response_body_rejected() {
     .await
     .unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for error");
+    let result = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for error");
 
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
@@ -611,13 +586,10 @@ async fn duplicate_eos_in_fds_request_body_ignored() {
     // The duplicate is a no-op: the stream stays healthy and closes cleanly
     // (Ok) with no ImmediateResponse — never an error tearing it down.
     loop {
-        let next = tokio::time::timeout(
-            std::time::Duration::from_millis(TIMEOUT_MILLIS),
-            response_stream.message(),
-        )
-        .await
-        .expect("timed out waiting for stream to drain")
-        .expect("duplicate FDS end-of-stream chunk must not error the stream");
+        let next = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+            .await
+            .expect("timed out waiting for stream to drain")
+            .expect("duplicate FDS end-of-stream chunk must not error the stream");
 
         match next {
             None => break,
@@ -668,11 +640,7 @@ async fn repro_ap_post_eos_body() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message()).await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -712,11 +680,7 @@ async fn repro_ap_post_eos_headers() {
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message()).await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -752,11 +716,7 @@ async fn wrong_wire_mode_unsupported_buffered_partial_rejected() {
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message()).await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -799,11 +759,7 @@ async fn unsupported_response_body_mode_rejected() {
     });
     tx.send(headers).await.unwrap();
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message()).await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -856,7 +812,7 @@ filter_chains:
             .expect("server failed");
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let channel = Channel::from_shared(format!("http://{addr}"))
         .expect("uri")

@@ -1,5 +1,7 @@
 //! Guardrail selection and termination contracts in full-duplex transport.
 
+use std::time::Duration;
+
 use praxis_proto::envoy::service::ext_proc::v3::{
     HttpTrailers, ProtocolConfiguration, body_mutation, processing_request::Request as RequestMessage,
     processing_response::Response as ResponseMessage,
@@ -27,7 +29,7 @@ async fn fds_input_checks_complete_chunks_at_body_eos_and_trailers() {
             let split = document.len() / 2;
             session.send(request_chunk(&document[..split], false)).await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(25), session.responses.message())
+                tokio::time::timeout(Duration::from_millis(25), session.responses.message())
                     .await
                     .is_err(),
                 "FDS request must remain private before completion"
@@ -40,7 +42,7 @@ async fn fds_input_checks_complete_chunks_at_body_eos_and_trailers() {
                     .await;
             }
             if !matches!(reply, NemoReply::Pass | NemoReply::BlockInput) {
-                let error = tokio::time::timeout(std::time::Duration::from_secs(2), session.responses.message())
+                let error = tokio::time::timeout(Duration::from_secs(2), session.responses.message())
                     .await
                     .unwrap()
                     .unwrap_err();
@@ -92,7 +94,7 @@ async fn fds_output_trailers_release_only_the_checked_replacement_before_ack() {
                 .unwrap();
         session.send(response_body(&document, false)).await;
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), session.responses.message())
+            tokio::time::timeout(Duration::from_millis(25), session.responses.message())
                 .await
                 .is_err(),
             "FDS output must remain private until trailers close the body"
@@ -152,14 +154,15 @@ async fn unconditional_and_host_selected_fds_output_checks_are_enforced() {
             response_body_mode: BodySendMode::FullDuplexStreamed.into(),
             send_body_without_waiting_for_header_response: true,
         };
-        let mut message = support::request_headers(protocol, (false, false), false);
-        let Some(RequestMessage::RequestHeaders(headers)) = message.request.as_mut() else {
-            unreachable!()
-        };
-        headers.headers.as_mut().unwrap().headers.push(support::header(
-            ":authority",
-            if selected { "model.test" } else { "other.test" },
-        ));
+        let message = support::request_headers_with(
+            protocol,
+            (false, false),
+            false,
+            [support::header(
+                ":authority",
+                if selected { "model.test" } else { "other.test" },
+            )],
+        );
         session.send(message).await;
         session.send(request("hello", false)).await;
         collect_fds(&mut session, false).await;
@@ -300,22 +303,16 @@ async fn cancelled_fds_provider_calls_release_resources_and_next_stream_state_is
                 ))
                 .await;
         }
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            harness.pending_call.started.notified(),
-        )
-        .await
-        .expect("the first provider call must be pending before cancellation");
+        tokio::time::timeout(Duration::from_secs(2), harness.pending_call.started.notified())
+            .await
+            .expect("the first provider call must be pending before cancellation");
         assert_eq!(harness.calls().len(), 1);
         drop(session);
         // The output hook bridges through block_in_place; the configured 500ms
         // provider timeout bounds cancellation even while that hook is synchronous.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            harness.pending_call.finished.notified(),
-        )
-        .await
-        .expect("cancellation or the provider deadline must release the pending HTTP request");
+        tokio::time::timeout(Duration::from_secs(2), harness.pending_call.finished.notified())
+            .await
+            .expect("cancellation or the provider deadline must release the pending HTTP request");
         let mut fresh = start_fds(&harness, selected).await;
         fresh.send(request("fresh prompt", false)).await;
         let request_replies = collect_fds(&mut fresh, false).await;
@@ -363,17 +360,13 @@ async fn headers_only_requests_and_responses_complete_without_body_callouts() {
                 .exchange(support::request_headers(protocol, (true, true), true))
                 .await;
             assert!(matches!(headers.response, Some(ResponseMessage::RequestHeaders(_))));
-            let mut response = response_headers("application/json");
-            let Some(RequestMessage::ResponseHeaders(headers)) = response.request.as_mut() else {
-                unreachable!()
-            };
-            headers.end_of_stream = true;
+            let response = support::response_headers_with_eos("application/json", true);
             let reply = session.exchange(response).await;
             assert!(matches!(reply.response, Some(ResponseMessage::ResponseHeaders(_))));
             assert!(harness.calls().is_empty());
             drop(session.sender);
             assert!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), session.responses.message())
+                tokio::time::timeout(Duration::from_secs(2), session.responses.message())
                     .await
                     .unwrap()
                     .unwrap()
@@ -387,11 +380,7 @@ async fn headers_only_requests_and_responses_complete_without_body_callouts() {
 async fn fds_empty_eos_and_redelivery_do_not_repeat_guardrail_checks() {
     let harness = Harness::new(NemoReply::Pass, false).await;
     let mut session = start_fds(&harness, (true, true)).await;
-    let mut document = request("complete prompt", false);
-    let Some(RequestMessage::RequestBody(body)) = document.request.as_mut() else {
-        unreachable!()
-    };
-    body.end_of_stream = false;
+    let document = support::request_with_eos("complete prompt", false, false);
     session.send(document).await;
     session.send(request_chunk(b"", true)).await;
     collect_fds(&mut session, false).await;
@@ -406,7 +395,7 @@ async fn fds_empty_eos_and_redelivery_do_not_repeat_guardrail_checks() {
     session.send(response_body(b"ignored duplicate", true)).await;
     drop(session.sender);
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), session.responses.message())
+        tokio::time::timeout(Duration::from_secs(2), session.responses.message())
             .await
             .unwrap()
             .unwrap()
@@ -427,16 +416,12 @@ async fn interleaved_fds_response_preserves_request_header_filter_state() {
             response_body_mode: BodySendMode::FullDuplexStreamed.into(),
             send_body_without_waiting_for_header_response: no_header_wait,
         };
-        let mut message = support::request_headers(protocol, (false, false), false);
-        let Some(RequestMessage::RequestHeaders(headers)) = message.request.as_mut() else {
-            unreachable!()
-        };
-        headers
-            .headers
-            .as_mut()
-            .unwrap()
-            .headers
-            .push(support::header("x-request-id", "client-correlation-id"));
+        let message = support::request_headers_with(
+            protocol,
+            (false, false),
+            false,
+            [support::header("x-request-id", "client-correlation-id")],
+        );
         session.send(message).await;
         session
             .send(request_chunk(br#"{"messages":[{"role":"user","content":"#, false))
@@ -498,7 +483,7 @@ async fn input_only_and_unselected_fds_output_streams_before_body_eos_or_trailer
                 collect_fds(&mut session, false).await;
                 session.send(response_headers("text/event-stream")).await;
                 session.send(response_body(b"data: first\n\n", false)).await;
-                let first = tokio::time::timeout(std::time::Duration::from_secs(2), session.responses.message())
+                let first = tokio::time::timeout(Duration::from_secs(2), session.responses.message())
                     .await
                     .expect("first FDS response must arrive before the next upstream chunk exists")
                     .unwrap()

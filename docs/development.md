@@ -63,7 +63,9 @@ xtask/
   src/fips/            # cargo xtask fips: report, host-check, runtime-probe
   assets/fips/         # FIPS provider config, certified modules, OpenSSL symbol list
 tests/
-  grpc_server.rs       # In-process gRPC server tests
+  grpc.rs              # Direct gRPC integration tests (no Envoy)
+  grpc/adapter/        # Protocol, transport, and stub-filter contracts
+  grpc/guardrails/     # Real guardrail filters with a recording NeMo peer
   services.rs          # Health and metrics service tests
   integration.rs       # Kubernetes integration tests
   k8s_e2e/             # Black-box e2e tests (feature k8s-e2e), incl. body-oracle
@@ -159,19 +161,52 @@ building, body chunking, and TLS configuration.
 
 ### gRPC Server Tests
 
-`tests/grpc_server.rs` starts the ExtProc server
+`tests/grpc.rs` starts the ExtProc server
 in-process and exercises the full gRPC stream
 lifecycle: request headers, request body, response
 headers, response body, trailers, and rejection
 scenarios.
 
+Run this tier without Envoy, containers, or Kubernetes:
+
+```console
+cargo test --test grpc
+```
+
+The protocol and transport coverage includes:
+
+| Area | Tests |
+| --- | --- |
+| Exact-size JSON, chunk splits, body caps and recovery | [Payloads] |
+| Duplicate headers and cumulative header/body mutations | [Headers] |
+| Concurrency, header cancellation and occupied-port startup | [Lifecycle] |
+| SSE fragments, one `[DONE]` and full-duplex interleaving | [Streaming] |
+| Server encode limit independent of the client receive limit | [Encoding] |
+
+[Payloads]: ../tests/grpc/adapter/payloads.rs
+[Headers]: ../tests/grpc/adapter/headers.rs
+[Lifecycle]: ../tests/grpc/adapter/lifecycle.rs
+[Streaming]: ../tests/grpc/adapter/streaming.rs
+[Encoding]: ../tests/grpc/adapter/message_limits.rs
+
+Fragmented request tests use `FULL_DUPLEX_STREAMED`; `BUFFERED` delivers a
+complete body message. Startup failure coverage launches the product executable
+while holding its configured gRPC port open. Counter values, labels and duration
+observations are checked with an isolated recorder in
+[services.rs](../tests/services.rs).
+
 ### Guardrail transport contracts
 
-`make test` includes `tests/guardrails_transport.rs`, using the real AI filter
+`make test` includes `tests/grpc/guardrails/`, using the real AI filter
 registry and a recording local NeMo peer. It covers selected Input/Output
 combinations, translation filters present/absent, buffered/streamed/full-duplex
 response transport, complete-body enforcement, failure handling, limits,
 cancellation, and request isolation. No hosted model is needed.
+
+[Provider content](../tests/grpc/guardrails/provider_content.rs) verifies that
+selected input and output checks send the complete decoded messages to NeMo.
+Generic payload sizes, byte reassembly and body-cap recovery use a recording
+stub filter in the adapter tests.
 
 `make test-envoy` additionally runs the compiled product executable with the
 container's feature set behind real Envoy. The backend holds its final chunk
@@ -204,6 +239,64 @@ Selecting an Output guardrail for a `stream: true` request remains unsupported
 and returns 422; unexpected SSE output returns 502. Buffered response checks
 terminated by trailers fail closed because a trailers acknowledgement cannot
 carry the replacement body.
+
+### Payload boundary qualification (RHAIGW-656)
+
+The [boundary story](https://redhat.atlassian.net/browse/RHAIGW-656) maps to
+the following executable contracts:
+
+| Acceptance area | Tests |
+| --- | --- |
+| Exact-size encodings and fragmentation | [Boundary builders], [Guarded matrix] |
+| Guarded 1 MiB input/output boundaries | [Guarded matrix] |
+| EOS, trailers, NeMo calls and exact released bytes | [Guarded matrix] |
+| Unguarded 32 MiB boundaries and recovery | [Boundary payloads] |
+| Independent serialized-protobuf receive limits | [Boundary framing] |
+| Truncation and off-by-one regression controls | [Mutation controls] |
+
+[Boundary builders]: ../tests/common/payloads.rs
+[Guarded matrix]: ../tests/grpc/guardrails/payload_boundaries.rs
+[Boundary payloads]: ../tests/grpc/adapter/payloads.rs
+[Boundary framing]: ../tests/grpc/adapter/message_limits.rs
+[Mutation controls]: ../hack/scripts/check-boundary-regressions.sh
+
+Both size boundaries cover minus one byte, the exact cap and plus one byte.
+The guarded matrix combines ASCII, multibyte UTF-8 and escaped JSON with single
+frames, 16 KiB chunks, deliberate scalar/escape splits, body EOS, empty EOS and
+trailers. Accepted cases assert one NeMo call per selected phase and complete
+decoded content. Oversized cases assert zero provider calls, input HTTP 413 or
+output gRPC ResourceExhausted, and no unchecked body release.
+
+The guarded gRPC matrix runs 162 cases. Input filter-limit cases use an
+input-only guardrail chain, matching the existing effective-cap tests; output
+cases retain both phase filters. This distinguishes the filter's 1 MiB cap
+from the server's 2 MiB cap. Mixed pipelines can negotiate a different request
+body limit; these tests do not establish a universal 1 MiB input limit for
+every chain.
+
+Accepted documents are compared byte-for-byte after release, and decoded
+message content is compared directly at the recording NeMo peer. Oversized
+output produces gRPC ResourceExhausted, with no unchecked payload released.
+A protobuf receive overflow currently surfaces as
+gRPC Internal containing tonic's decoded-message-size diagnostic; the
+independent outbound encoding-limit test expects OutOfRange.
+
+Run the qualification locally:
+
+```console
+cargo test --test grpc
+bash hack/scripts/check-boundary-regressions.sh
+```
+
+The mutation script copies sources into a temporary directory and verifies
+passing baselines before injecting three faults: rejecting the exact cap,
+accepting one byte over it, and truncating released chunks. Each fault must
+fail a test assertion. Logs remain in `target/boundary-mutations/`; the working
+sources are never mutated. CI runs these controls in the test job.
+
+Local validation on 2026-11-24: `cargo test --workspace` passed, including all
+133 gRPC tests. All three mutation controls were detected. Clippy with all targets and
+the `integration` feature, and the nightly formatting check, passed.
 
 ### Service Tests
 

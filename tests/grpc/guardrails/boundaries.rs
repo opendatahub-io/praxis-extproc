@@ -1,5 +1,7 @@
 //! Selection, isolation, response limits, and unsupported stream termination.
 
+use std::time::Duration;
+
 use praxis_proto::envoy::service::ext_proc::v3::{
     HttpTrailers, body_mutation, processing_request::Request as RequestMessage,
     processing_response::Response as ResponseMessage,
@@ -51,11 +53,10 @@ async fn empty_final_body_frame_checks_and_releases_the_buffered_document() {
             session.send(response_body(b"", true)).await;
             drop(session.sender);
             let mut responses = Vec::new();
-            while let Some(response) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), session.responses.message())
-                    .await
-                    .unwrap()
-                    .unwrap()
+            while let Some(response) = tokio::time::timeout(Duration::from_secs(10), session.responses.message())
+                .await
+                .unwrap()
+                .unwrap()
             {
                 responses.push(response);
             }
@@ -114,7 +115,7 @@ async fn server_and_filter_response_limits_fail_closed_before_provider_evaluatio
         let first = session.exchange(response_body(&vec![b' '; accepted], false)).await;
         assert_eq!(body_bytes(&[first]), b"", "at-limit buffered bytes must remain private");
         session.send(response_body(b"x", true)).await;
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), session.responses.message())
+        let status = tokio::time::timeout(Duration::from_secs(10), session.responses.message())
             .await
             .unwrap()
             .unwrap_err();

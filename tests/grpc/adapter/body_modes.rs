@@ -3,12 +3,14 @@
 
 //! Body-mode delivery: buffered, streamed, and full-duplex.
 
+use std::time::Duration;
+
+use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
 use super::support::*;
 
 #[tokio::test]
 async fn none_body_mode_runs_pipeline_at_headers() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -39,8 +41,6 @@ async fn none_body_mode_runs_pipeline_at_headers() {
 
 #[tokio::test]
 async fn buffered_request_body_closed_by_trailers_acks() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -86,8 +86,6 @@ async fn buffered_request_body_closed_by_trailers_acks() {
 
 #[tokio::test]
 async fn buffered_response_body_closed_by_trailers_acks() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -130,7 +128,7 @@ async fn buffered_response_body_closed_by_trailers_acks() {
 
 #[tokio::test]
 async fn fds_request_body_closed_by_trailers_runs_pipeline() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
 
@@ -218,8 +216,6 @@ async fn fds_request_body_closed_by_trailers_runs_pipeline() {
 
 #[tokio::test]
 async fn fds_request_body_closed_by_trailers_rejects_blocked_content() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -272,8 +268,6 @@ async fn fds_request_body_closed_by_trailers_rejects_blocked_content() {
 
 #[tokio::test]
 async fn fds_passthrough_request_trailers_flush_deferred_headers() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -318,8 +312,6 @@ async fn fds_passthrough_request_trailers_flush_deferred_headers() {
 
 #[tokio::test]
 async fn fds_request_trailers_without_body_chunk_sends_no_body() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -418,15 +410,11 @@ async fn response_body_with_header_mutations() {
     tx.send(make_request_headers("GET", "/", true)).await.expect("send");
     drop(inbound.message().await);
 
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![make_header(":status", "200"), make_header("content-type", "text/plain")],
-            }),
-            end_of_stream: false,
-        })),
-        ..Default::default()
-    })
+    tx.send(make_response_headers_with(
+        200,
+        false,
+        [make_header("content-type", "text/plain")],
+    ))
     .await
     .expect("send response headers");
 
@@ -460,7 +448,7 @@ async fn response_body_with_header_mutations() {
 /// would pass through untransformed.
 #[tokio::test]
 async fn buffered_response_transform_metadata_survives_body_phase() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(ANTHROPIC_TRANSFORM_CONFIG).await;
 
@@ -598,17 +586,9 @@ async fn multi_chunk_response_body() {
     tx.send(make_request_headers("GET", "/", true)).await.expect("send");
     drop(inbound.message().await);
 
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![make_header(":status", "200")],
-            }),
-            end_of_stream: false,
-        })),
-        ..Default::default()
-    })
-    .await
-    .expect("send response headers");
+    tx.send(make_response_headers(200, false))
+        .await
+        .expect("send response headers");
 
     drop(inbound.message().await);
 
@@ -643,7 +623,7 @@ async fn multi_chunk_response_body() {
 
 #[tokio::test]
 async fn empty_full_duplex_emits_streamed_eos() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -671,28 +651,22 @@ async fn empty_full_duplex_emits_streamed_eos() {
     .unwrap();
 
     // First response: HeadersResponse (deferred from header phase)
-    let hdr_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let hdr_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
     assert!(
         matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
         "first response should be HeadersResponse, got: {hdr_msg:?}"
     );
 
     // Second response: StreamedBodyResponse with empty body + EOS
-    let body_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for body response")
-    .expect("body response stream error")
-    .expect("stream closed before body response");
+    let body_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for body response")
+        .expect("body response stream error")
+        .expect("stream closed before body response");
 
     if let Some(RespVariant::RequestBody(b)) = &body_msg.response
         && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
@@ -717,7 +691,7 @@ async fn empty_full_duplex_emits_streamed_eos() {
 
 #[tokio::test]
 async fn full_duplex_single_chunk_request_body() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -746,28 +720,22 @@ async fn full_duplex_single_chunk_request_body() {
     .unwrap();
 
     // First response: HeadersResponse (deferred from header phase)
-    let hdr_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let hdr_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
     assert!(
         matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
         "first response should be HeadersResponse, got: {hdr_msg:?}"
     );
 
     // Second response: StreamedBodyResponse with body data + EOS
-    let body_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for body response")
-    .expect("body response stream error")
-    .expect("stream closed before body response");
+    let body_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for body response")
+        .expect("body response stream error")
+        .expect("stream closed before body response");
 
     if let Some(RespVariant::RequestBody(b)) = &body_msg.response
         && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
@@ -787,7 +755,7 @@ async fn full_duplex_single_chunk_request_body() {
 #[tokio::test]
 async fn full_duplex_multi_chunk_request_body() {
     const MAX_CHUNKS: usize = 8;
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -816,14 +784,11 @@ async fn full_duplex_multi_chunk_request_body() {
     .unwrap();
 
     // First response: HeadersResponse (deferred from header phase)
-    let hdr_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let hdr_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
     assert!(
         matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
         "first response should be HeadersResponse, got: {hdr_msg:?}"
@@ -861,8 +826,6 @@ async fn full_duplex_multi_chunk_request_body() {
 
 #[tokio::test]
 async fn full_duplex_headers_prepended_only_to_first_chunk() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
@@ -920,7 +883,7 @@ async fn full_duplex_headers_prepended_only_to_first_chunk() {
 #[tokio::test]
 async fn full_duplex_response_body() {
     const MAX_CHUNKS: usize = 8;
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -935,14 +898,11 @@ async fn full_duplex_response_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
 
     tx.send(make_response_headers(200, false)).await.unwrap();
 
@@ -960,14 +920,11 @@ async fn full_duplex_response_body() {
     .unwrap();
 
     // First response after body EOS: ResponseHeaders (deferred)
-    let hdr_msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for response header response")
-    .expect("response header stream error")
-    .expect("stream closed before response header response");
+    let hdr_msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for response header response")
+        .expect("response header stream error")
+        .expect("stream closed before response header response");
     assert!(
         matches!(hdr_msg.response, Some(RespVariant::ResponseHeaders(_))),
         "first response should be ResponseHeaders, got: {hdr_msg:?}"
@@ -1005,7 +962,7 @@ async fn full_duplex_response_body() {
 
 #[tokio::test]
 async fn streamed_single_chunk_request_body() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1020,14 +977,11 @@ async fn streamed_single_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
 
     let body_data = b"streamed body content";
     tx.send(ProcessingRequest {
@@ -1040,14 +994,11 @@ async fn streamed_single_chunk_request_body() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out")
-    .expect("stream error")
-    .expect("stream closed");
+    let msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
 
     if let Some(RespVariant::RequestBody(b)) = &msg.response
         && let Some(body_mutation::Mutation::Body(bytes)) = b
@@ -1065,7 +1016,7 @@ async fn streamed_single_chunk_request_body() {
 
 #[tokio::test]
 async fn streamed_multi_chunk_request_body() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1080,14 +1031,11 @@ async fn streamed_multi_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out waiting for header response")
-    .expect("header response stream error")
-    .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out waiting for header response")
+        .expect("header response stream error")
+        .expect("stream closed before header response");
 
     let chunks: &[&[u8]] = &[b"chunk-1-", b"chunk-2-", b"chunk-3"];
     let mut received_body = Vec::new();
@@ -1106,14 +1054,11 @@ async fn streamed_multi_chunk_request_body() {
         .unwrap();
 
         // Half-duplex: must get a response before sending next chunk
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(TIMEOUT_MILLIS),
-            response_stream.message(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for response to chunk {i}"))
-        .unwrap_or_else(|e| panic!("stream error on chunk {i}: {e}"))
-        .unwrap_or_else(|| panic!("stream closed before response to chunk {i}"));
+        let msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for response to chunk {i}"))
+            .unwrap_or_else(|e| panic!("stream error on chunk {i}: {e}"))
+            .unwrap_or_else(|| panic!("stream closed before response to chunk {i}"));
 
         if let Some(RespVariant::RequestBody(b)) = &msg.response {
             if let Some(body_mutation::Mutation::Body(bytes)) = b
@@ -1142,7 +1087,7 @@ async fn streamed_empty_body() {
     let mut response_stream = client.process(stream).await.unwrap().into_inner();
 
     let mut headers = make_request_headers("POST", "/empty", false);
-    headers.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+    headers.protocol_config = Some(ProtocolConfiguration {
         request_body_mode: 1, // STREAMED
         response_body_mode: 2,
         send_body_without_waiting_for_header_response: false,
@@ -1161,14 +1106,11 @@ async fn streamed_empty_body() {
     .await
     .unwrap();
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out")
-    .expect("stream error")
-    .expect("stream closed");
+    let msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out")
+        .expect("stream error")
+        .expect("stream closed");
 
     assert!(
         matches!(&msg.response, Some(RespVariant::RequestBody(_))),
@@ -1179,7 +1121,7 @@ async fn streamed_empty_body() {
 
 #[tokio::test]
 async fn streamed_response_body() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1215,14 +1157,11 @@ async fn streamed_response_body() {
         .await
         .unwrap();
 
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(TIMEOUT_MILLIS),
-            response_stream.message(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for response body chunk {i}"))
-        .unwrap_or_else(|e| panic!("stream error on response body chunk {i}: {e}"))
-        .unwrap_or_else(|| panic!("stream closed before response body chunk {i}"));
+        let msg = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for response body chunk {i}"))
+            .unwrap_or_else(|e| panic!("stream error on response body chunk {i}: {e}"))
+            .unwrap_or_else(|| panic!("stream closed before response body chunk {i}"));
 
         if let Some(RespVariant::ResponseBody(b)) = &msg.response {
             if let Some(body_mutation::Mutation::Body(bytes)) = b
@@ -1245,8 +1184,6 @@ async fn streamed_response_body() {
 
 #[tokio::test]
 async fn streamed_guardrails_rejects_on_matching_chunk() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
@@ -1272,14 +1209,11 @@ async fn streamed_guardrails_rejects_on_matching_chunk() {
     .await
     .unwrap();
 
-    let msg1 = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out on chunk 1")
-    .expect("stream error on chunk 1")
-    .expect("stream closed on chunk 1");
+    let msg1 = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out on chunk 1")
+        .expect("stream error on chunk 1")
+        .expect("stream closed on chunk 1");
 
     assert!(
         matches!(&msg1.response, Some(RespVariant::RequestBody(_))),
@@ -1297,14 +1231,11 @@ async fn streamed_guardrails_rejects_on_matching_chunk() {
     .await
     .unwrap();
 
-    let msg2 = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out on chunk 2")
-    .expect("stream error on chunk 2")
-    .expect("stream closed on chunk 2");
+    let msg2 = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out on chunk 2")
+        .expect("stream error on chunk 2")
+        .expect("stream closed on chunk 2");
 
     assert!(
         matches!(&msg2.response, Some(RespVariant::ImmediateResponse(_))),
@@ -1315,8 +1246,6 @@ async fn streamed_guardrails_rejects_on_matching_chunk() {
 
 #[tokio::test]
 async fn streamed_deferred_mutation_on_first_chunk_only() {
-    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
-
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let stream = ReceiverStream::new(rx);
@@ -1357,14 +1286,11 @@ async fn streamed_deferred_mutation_on_first_chunk_only() {
     .await
     .unwrap();
 
-    let msg1 = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out on chunk 1")
-    .expect("stream error on chunk 1")
-    .expect("stream closed on chunk 1");
+    let msg1 = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out on chunk 1")
+        .expect("stream error on chunk 1")
+        .expect("stream closed on chunk 1");
 
     let first_has_mutation = matches!(
         &msg1.response,
@@ -1389,14 +1315,11 @@ async fn streamed_deferred_mutation_on_first_chunk_only() {
     .await
     .unwrap();
 
-    let msg2 = tokio::time::timeout(
-        std::time::Duration::from_millis(TIMEOUT_MILLIS),
-        response_stream.message(),
-    )
-    .await
-    .expect("timed out on chunk 2")
-    .expect("stream error on chunk 2")
-    .expect("stream closed on chunk 2");
+    let msg2 = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message())
+        .await
+        .expect("timed out on chunk 2")
+        .expect("stream error on chunk 2")
+        .expect("stream closed on chunk 2");
 
     let second_has_mutation = matches!(
         &msg2.response,

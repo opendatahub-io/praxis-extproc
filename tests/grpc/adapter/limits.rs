@@ -3,6 +3,8 @@
 
 //! gRPC message-size framing and body-accumulation limits.
 
+use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
 use super::support::*;
 
 #[tokio::test]
@@ -15,7 +17,7 @@ async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook() {
     for overflow in [false, true] {
         let (tx, mut inbound) = open_stream(&mut client).await;
         let mut headers = make_request_headers("POST", "/limited", false);
-        headers.protocol_config = Some(praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        headers.protocol_config = Some(ProtocolConfiguration {
             request_body_mode: BodySendMode::Streamed.into(),
             response_body_mode: BodySendMode::Buffered.into(),
             send_body_without_waiting_for_header_response: false,

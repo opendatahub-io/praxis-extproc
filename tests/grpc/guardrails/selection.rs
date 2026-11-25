@@ -2,7 +2,10 @@
 
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
-    ext_proc::v3::{HeaderMap, HttpHeaders, ProtocolConfiguration, processing_request::Request as RequestMessage},
+    ext_proc::v3::{
+        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProtocolConfiguration, processing_mode::HeaderSendMode,
+        processing_request::Request as RequestMessage, processing_response::Response as ResponseMessage,
+    },
 };
 
 use super::*;
@@ -61,10 +64,7 @@ async fn unsupported_selector_shapes_require_complete_requests_without_streaming
                 "unknown selection must not enable response streaming"
             );
             if request_mode == BodySendMode::Buffered {
-                assert!(matches!(
-                    reply.response,
-                    Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::RequestHeaders(_))
-                ));
+                assert!(matches!(reply.response, Some(ResponseMessage::RequestHeaders(_))));
             } else {
                 assert!(support::immediate_body(&reply).contains("guardrail selection cannot be determined"));
                 assert!(support::immediate_body(&reply).contains("BUFFERED or FULL_DUPLEX_STREAMED"));
@@ -110,10 +110,7 @@ async fn production_selector_preserves_request_mode_and_header_wait_contract() {
                 if let Some(mode) = reply.mode_override {
                     assert_eq!(mode.request_body_mode, i32::from(BodySendMode::Buffered));
                     assert_eq!(mode.response_body_mode, i32::from(BodySendMode::Streamed));
-                    assert_eq!(
-                        mode.response_header_mode,
-                        i32::from(praxis_proto::envoy::service::ext_proc::v3::processing_mode::HeaderSendMode::Send)
-                    );
+                    assert_eq!(mode.response_header_mode, i32::from(HeaderSendMode::Send));
                 }
             }
         }
@@ -310,7 +307,7 @@ async fn selected_output_cannot_be_silently_disabled_by_none_response_mode() {
     }
 }
 
-fn headers(selections: Vec<HeaderValue>) -> praxis_proto::envoy::service::ext_proc::v3::ProcessingRequest {
+fn headers(selections: Vec<HeaderValue>) -> ProcessingRequest {
     let mut headers = vec![
         support::header(":method", "POST"),
         support::header(":path", "/v1/chat/completions"),
@@ -437,12 +434,10 @@ async fn unknown_guardrail_selection_explains_premature_response_rejection() {
                 ))
                 .await;
             session
-                .send(support::wrap(RequestMessage::RequestBody(
-                    praxis_proto::envoy::service::ext_proc::v3::HttpBody {
-                        body: br#"{"messages":["#.to_vec(),
-                        end_of_stream: false,
-                    },
-                )))
+                .send(support::wrap(RequestMessage::RequestBody(HttpBody {
+                    body: br#"{"messages":["#.to_vec(),
+                    end_of_stream: false,
+                })))
                 .await;
             let reply = session.exchange(response_headers("application/json")).await;
             assert_eq!(immediate_status(std::slice::from_ref(&reply)), Some(500));

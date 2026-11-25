@@ -1,7 +1,9 @@
 //! Effective body limits for full-duplex guardrail processing.
 
+use std::time::Duration;
+
 use praxis_proto::envoy::service::ext_proc::v3::{
-    HttpBody, HttpTrailers, ProcessingResponse, ProtocolConfiguration, body_mutation,
+    HttpBody, HttpTrailers, ProcessingRequest, ProcessingResponse, ProtocolConfiguration, body_mutation,
     processing_request::Request as RequestMessage, processing_response::Response as ResponseMessage,
 };
 
@@ -105,7 +107,7 @@ async fn buffered_output_enforces_the_runtime_guardrail_cap() {
         body.resize(1_048_576 + usize::from(overflow), b' ');
         session.send(response_body(&body, true)).await;
         if overflow {
-            let error = tokio::time::timeout(std::time::Duration::from_secs(10), session.responses.message())
+            let error = tokio::time::timeout(Duration::from_secs(10), session.responses.message())
                 .await
                 .unwrap()
                 .unwrap_err();
@@ -195,7 +197,7 @@ async fn fds_output_enforces_the_effective_cap_before_provider_evaluation() {
                     .await;
                 if overflow {
                     session.send(response_body(b" ", !trailers)).await;
-                    let error = tokio::time::timeout(std::time::Duration::from_secs(10), session.responses.message())
+                    let error = tokio::time::timeout(Duration::from_secs(10), session.responses.message())
                         .await
                         .unwrap()
                         .unwrap_err();
@@ -236,10 +238,7 @@ pub(super) async fn start_fds(harness: &Harness, selected: (bool, bool)) -> supp
     session
 }
 
-pub(super) fn request_chunk(
-    body: &[u8],
-    end_of_stream: bool,
-) -> praxis_proto::envoy::service::ext_proc::v3::ProcessingRequest {
+pub(super) fn request_chunk(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
     support::wrap(RequestMessage::RequestBody(HttpBody {
         body: body.to_vec(),
         end_of_stream,
@@ -306,11 +305,7 @@ async fn buffered_checked_requests_allow_skipped_or_delivered_trailers() {
                         ))
                         .await;
                     assert!(matches!(reply.response, Some(ResponseMessage::RequestHeaders(_))));
-                    let mut body = request("checked before trailers", false);
-                    let Some(RequestMessage::RequestBody(chunk)) = body.request.as_mut() else {
-                        unreachable!()
-                    };
-                    chunk.end_of_stream = false;
+                    let body = support::request_with_eos("checked before trailers", false, false);
                     let reply = session.exchange(body).await;
                     assert!(matches!(reply.response, Some(ResponseMessage::RequestBody(_))));
                     assert_eq!(harness.calls().len(), usize::from(selected.0));
