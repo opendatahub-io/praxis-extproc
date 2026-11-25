@@ -111,6 +111,8 @@ async fn startup_fails_promptly_when_grpc_port_is_already_bound() {
         Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
             .arg("-c")
             .arg(&config_path)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
             .stdout(output_file.try_clone().unwrap())
             .stderr(output_file.try_clone().unwrap())
             .spawn()

@@ -32,40 +32,42 @@ struct BoundaryCase {
     size: usize,
 }
 
+#[rstest::rstest]
+#[case::ascii(SEEDS[0])]
+#[case::multibyte(SEEDS[1])]
+#[case::json_escapes(SEEDS[2])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guarded_json_boundary_matrix_preserves_content_and_rejects_before_nemo() {
-    for phase in [Phase::Input, Phase::Output] {
-        for seed in SEEDS {
-            for framing in [Framing::Single, Framing::Chunks, Framing::Splits] {
-                let harness = Harness::configured(NemoReply::Pass, false, 2_097_152, |cfg| {
-                    if matches!(phase, Phase::Input) {
-                        cfg.filter_chains[0].filters.retain(|entry| {
-                            entry
-                                .config
-                                .get("phase")
-                                .and_then(|phase| phase.get("response"))
-                                .and_then(serde_yaml::Value::as_bool)
-                                != Some(true)
-                        });
-                    }
-                })
-                .await;
-                for ending in [Ending::Body, Ending::EmptyEos, Ending::Trailers] {
-                    for size in [GUARDED_CAP - 1, GUARDED_CAP, GUARDED_CAP + 1] {
-                        assert_boundary(
-                            &harness,
-                            BoundaryCase {
-                                ending,
-                                framing,
-                                phase,
-                                seed,
-                                size,
-                            },
-                        )
-                        .await;
-                    }
-                }
-            }
+async fn guarded_json_boundary_matrix_preserves_content_and_rejects_before_nemo(
+    #[values(Phase::Input, Phase::Output)] phase: Phase,
+    #[case] seed: &'static str,
+    #[values(Framing::Single, Framing::Chunks, Framing::Splits)] framing: Framing,
+) {
+    let harness = Harness::configured(NemoReply::Pass, false, 2_097_152, |cfg| {
+        if matches!(phase, Phase::Input) {
+            cfg.filter_chains[0].filters.retain(|entry| {
+                entry
+                    .config
+                    .get("phase")
+                    .and_then(|phase| phase.get("response"))
+                    .and_then(serde_yaml::Value::as_bool)
+                    != Some(true)
+            });
+        }
+    })
+    .await;
+    for ending in [Ending::Body, Ending::EmptyEos, Ending::Trailers] {
+        for size in [GUARDED_CAP - 1, GUARDED_CAP, GUARDED_CAP + 1] {
+            assert_boundary(
+                &harness,
+                BoundaryCase {
+                    ending,
+                    framing,
+                    phase,
+                    seed,
+                    size,
+                },
+            )
+            .await;
         }
     }
 }

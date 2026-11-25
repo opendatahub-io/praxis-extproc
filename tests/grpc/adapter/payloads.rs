@@ -10,6 +10,7 @@ use praxis_filter::FilterFactory;
 use serde_json::json;
 
 use super::support::*;
+use crate::common::payloads::Framing;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -37,17 +38,25 @@ async fn sixteen_kib_chunks_reassemble_byte_exact_at_body_filter() {
     assert_reassembled(&mut client, &calls, &body, chunks).await;
 }
 
+#[rstest::rstest]
+#[case::scalar_first_byte("☕", 1)]
+#[case::scalar_second_byte("☕", 2)]
+#[case::escaped_quote("\\\"", 1)]
+#[case::escaped_newline("\\n", 1)]
 #[tokio::test]
-async fn splits_inside_utf8_scalars_and_json_escapes_preserve_body_filter_content() {
+async fn splits_inside_utf8_scalars_and_json_escapes_preserve_body_filter_content(
+    #[case] needle: &str,
+    #[case] offset: usize,
+) {
     let (mut client, calls, _shutdown) = recording_server(1024).await;
     let body = exact_size_body(1024);
-    let scalar = body.windows(3).position(|bytes| bytes == "☕".as_bytes()).unwrap();
-    let quote = body.windows(2).position(|bytes| bytes == br#"\""#).unwrap();
-    let newline = body.windows(2).position(|bytes| bytes == br"\n").unwrap();
-    for split in [scalar + 1, scalar + 2, quote + 1, newline + 1] {
-        let (first, last) = body.split_at(split);
-        assert_reassembled(&mut client, &calls, &body, vec![first, last]).await;
-    }
+    let split = body
+        .windows(needle.len())
+        .position(|bytes| bytes == needle.as_bytes())
+        .unwrap()
+        + offset;
+    let (first, last) = body.split_at(split);
+    assert_reassembled(&mut client, &calls, &body, vec![first, last]).await;
 }
 
 #[tokio::test]
@@ -88,39 +97,40 @@ async fn body_cap_boundaries_preserve_content_and_recover_on_the_same_channel() 
     }
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn unguarded_thirty_two_mib_json_boundaries_recover_on_fresh_streams() {
-    use crate::common::payloads::{Framing, Phase, UNGUARDED_CAP, exact_document, fragments};
+async fn unguarded_thirty_two_mib_json_boundaries_recover_on_fresh_streams(
+    #[values(Framing::Single, Framing::Chunks)] framing: Framing,
+) {
+    use crate::common::payloads::{Phase, UNGUARDED_CAP, exact_document, fragments};
 
     let (mut client, calls, _shutdown) = recording_server(UNGUARDED_CAP).await;
-    for framing in [Framing::Single, Framing::Chunks] {
-        for size in [UNGUARDED_CAP - 1, UNGUARDED_CAP, UNGUARDED_CAP + 1, 1024] {
-            let (body, _) = exact_document(Phase::Input, size, "café ☕ \"q\"\n");
-            if size <= UNGUARDED_CAP {
-                assert_reassembled(&mut client, &calls, &body, fragments(&body, framing)).await;
-                calls.lock().unwrap().clear();
-            } else {
-                let replies = tokio::time::timeout(DEADLINE, async {
-                    let (tx, mut stream) = open_stream(&mut client).await;
-                    let mut headers = make_request_headers("POST", "/oversized", false);
-                    headers.protocol_config = Some(protocol(BodySendMode::FullDuplexStreamed, BodySendMode::Buffered));
-                    tx.send(headers).await.unwrap();
-                    let chunks = fragments(&body, framing);
-                    for (index, chunk) in chunks.iter().enumerate() {
-                        tx.send(request_body(chunk, index + 1 == chunks.len())).await.unwrap();
-                    }
-                    drop(tx);
-                    finish(&mut stream).await
-                })
-                .await
-                .expect("oversized payload exchange must open, send, and finish before deadline");
-                assert_eq!(immediate_status(&replies), Some(413));
-                assert!(request_bytes(&replies).is_empty());
-                assert!(
-                    calls.lock().unwrap().is_empty(),
-                    "oversized JSON must never reach the hook"
-                );
-            }
+    for size in [UNGUARDED_CAP - 1, UNGUARDED_CAP, UNGUARDED_CAP + 1, 1024] {
+        let (body, _) = exact_document(Phase::Input, size, "café ☕ \"q\"\n");
+        if size <= UNGUARDED_CAP {
+            assert_reassembled(&mut client, &calls, &body, fragments(&body, framing)).await;
+            calls.lock().unwrap().clear();
+        } else {
+            let replies = tokio::time::timeout(DEADLINE, async {
+                let (tx, mut stream) = open_stream(&mut client).await;
+                let mut headers = make_request_headers("POST", "/oversized", false);
+                headers.protocol_config = Some(protocol(BodySendMode::FullDuplexStreamed, BodySendMode::Buffered));
+                tx.send(headers).await.unwrap();
+                let chunks = fragments(&body, framing);
+                for (index, chunk) in chunks.iter().enumerate() {
+                    tx.send(request_body(chunk, index + 1 == chunks.len())).await.unwrap();
+                }
+                drop(tx);
+                finish(&mut stream).await
+            })
+            .await
+            .expect("oversized payload exchange must open, send, and finish before deadline");
+            assert_eq!(immediate_status(&replies), Some(413));
+            assert!(request_bytes(&replies).is_empty());
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "oversized JSON must never reach the hook"
+            );
         }
     }
 }

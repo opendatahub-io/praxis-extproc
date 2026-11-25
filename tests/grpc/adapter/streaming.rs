@@ -8,50 +8,51 @@
 
 use super::support::*;
 
+#[rstest::rstest]
 #[tokio::test]
-async fn sse_fragments_reassemble_with_exactly_one_terminal_done_marker() {
+async fn sse_fragments_reassemble_with_exactly_one_terminal_done_marker(
+    #[values(BodySendMode::Streamed, BodySendMode::FullDuplexStreamed)] mode: BodySendMode,
+) {
     let sse = "data: {\"text\":\"café ☕\"}\n\ndata: [DONE]\n\n".as_bytes();
-    for mode in [BodySendMode::Streamed, BodySendMode::FullDuplexStreamed] {
-        let (mut client, _shutdown) = start_server_with_registry(PROBE_CONFIG, probe_registry()).await;
-        let (tx, mut stream) = open_stream(&mut client).await;
-        let mut headers = make_request_headers("GET", "/sse", true);
-        headers.protocol_config = Some(protocol(BodySendMode::None, mode));
-        tx.send(headers).await.unwrap();
+    let (mut client, _shutdown) = start_server_with_registry(PROBE_CONFIG, probe_registry()).await;
+    let (tx, mut stream) = open_stream(&mut client).await;
+    let mut headers = make_request_headers("GET", "/sse", true);
+    headers.protocol_config = Some(protocol(BodySendMode::None, mode));
+    tx.send(headers).await.unwrap();
+    assert!(matches!(
+        next(&mut stream).await.response,
+        Some(RespVariant::RequestHeaders(_))
+    ));
+    tx.send(response_headers("text/event-stream")).await.unwrap();
+    if mode == BodySendMode::Streamed {
         assert!(matches!(
             next(&mut stream).await.response,
-            Some(RespVariant::RequestHeaders(_))
+            Some(RespVariant::ResponseHeaders(_))
         ));
-        tx.send(response_headers("text/event-stream")).await.unwrap();
-        if mode == BodySendMode::Streamed {
-            assert!(matches!(
-                next(&mut stream).await.response,
-                Some(RespVariant::ResponseHeaders(_))
-            ));
-        }
-        let chunks: Vec<_> = sse.chunks(3).collect();
-        let mut replies = Vec::new();
-        for (index, chunk) in chunks.iter().enumerate() {
-            tx.send(make_response_body(chunk, index + 1 == chunks.len()))
-                .await
-                .unwrap();
-            let mut reply = next(&mut stream).await;
-            if matches!(reply.response, Some(RespVariant::ResponseHeaders(_))) {
-                replies.push(reply);
-                reply = next(&mut stream).await;
-            }
-            assert!(matches!(reply.response, Some(RespVariant::ResponseBody(_))));
+    }
+    let chunks: Vec<_> = sse.chunks(3).collect();
+    let mut replies = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        tx.send(make_response_body(chunk, index + 1 == chunks.len()))
+            .await
+            .unwrap();
+        let mut reply = next(&mut stream).await;
+        if matches!(reply.response, Some(RespVariant::ResponseHeaders(_))) {
             replies.push(reply);
+            reply = next(&mut stream).await;
         }
-        drop(tx);
-        assert!(finish(&mut stream).await.is_empty(), "no duplicate terminal output");
-        let bytes = body_bytes(&replies);
-        assert_eq!(bytes, sse, "{mode:?}: every fragment must survive");
-        assert_eq!(String::from_utf8(bytes).unwrap().matches("[DONE]").count(), 1);
-        if mode == BodySendMode::FullDuplexStreamed {
-            let endings: Vec<_> = replies.iter().filter_map(response_eos).collect();
-            assert_eq!(endings.iter().filter(|&&eos| eos).count(), 1);
-            assert_eq!(endings.last(), Some(&true));
-        }
+        assert!(matches!(reply.response, Some(RespVariant::ResponseBody(_))));
+        replies.push(reply);
+    }
+    drop(tx);
+    assert!(finish(&mut stream).await.is_empty(), "no duplicate terminal output");
+    let bytes = body_bytes(&replies);
+    assert_eq!(bytes, sse, "{mode:?}: every fragment must survive");
+    assert_eq!(String::from_utf8(bytes).unwrap().matches("[DONE]").count(), 1);
+    if mode == BodySendMode::FullDuplexStreamed {
+        let endings: Vec<_> = replies.iter().filter_map(response_eos).collect();
+        assert_eq!(endings.iter().filter(|&&eos| eos).count(), 1);
+        assert_eq!(endings.last(), Some(&true));
     }
 }
 

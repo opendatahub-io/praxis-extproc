@@ -32,26 +32,26 @@ fn grpc_max_recv_invalid_fails_validate() {
 }
 
 
-#[test]
-fn invalid_listener_addresses_fail_validate() {
+#[rstest::rstest]
+fn invalid_listener_addresses_fail_validate(
+    #[values("--grpc-address", "--health-address", "--metrics-address")] flag: &str,
+) {
     let config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/praxis-extproc.yaml");
 
-    for flag in ["--grpc-address", "--health-address", "--metrics-address"] {
-        let output = validate_command(&config)
-            .args([flag, "not-an-address"])
-            .output()
-            .expect("run praxis-extproc -t");
-        let combined = command_output(&output);
+    let output = validate_command(&config)
+        .args([flag, "not-an-address"])
+        .output()
+        .expect("run praxis-extproc -t");
+    let combined = command_output(&output);
 
-        assert!(
-            !output.status.success(),
-            "invalid {flag} must fail validate, got: {combined}"
-        );
-        assert!(
-            combined.contains("invalid socket address"),
-            "validate refusal should identify the invalid address, got: {combined}"
-        );
-    }
+    assert!(
+        !output.status.success(),
+        "invalid {flag} must fail validate, got: {combined}"
+    );
+    assert!(
+        combined.contains("invalid socket address"),
+        "validate refusal should identify the invalid address, got: {combined}"
+    );
 }
 
 

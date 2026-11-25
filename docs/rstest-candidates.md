@@ -1,12 +1,12 @@
-# rstest candidates
+# rstest conversion inventory
 
-Inventory of the root integration test suite, excluding the Envoy tier reserved for a separate PR. These tests can benefit from parameterization; none requires rstest for correctness. This change adds the development dependency only. Existing tests remain unchanged.
+The 40 direct gRPC matrix candidates are converted to rstest. Splitting embedded-service rejection and acceptance checks produces 41 parameterized functions. The gRPC suite reports 496 tests, previously 134. Envoy tests and deployment contracts remain outside this conversion.
 
 Use named `#[case::name(...)]` cases for related tuples and `#[values(...)]` for independent Cartesian dimensions. Keep `#[tokio::test]` for the async runtime. Default rstest features are disabled because these tests already use Tokio deadlines and do not rename the dependency.
 
-## Existing matrices
+## Converted matrices
 
-41 test functions contain suitable parameter dimensions. Each row identifies a function and the loop(s) that can become parameters.
+Each row identifies a converted function and its parameter dimensions. Ordered recovery checks and fragments remain within each case.
 
 ### [grpc/guardrails/mod.rs](../tests/grpc/guardrails/mod.rs)
 
@@ -60,9 +60,10 @@ Use named `#[case::name(...)]` cases for related tuples and `#[values(...)]` for
 | [incomplete_modes_allow_unselected_and_truly_bodyless_requests](../tests/grpc/guardrails/selection.rs) | Request mode × named selection/EOS pairs. |
 | [raw_header_values_are_authoritative_for_actual_guardrail_execution](../tests/grpc/guardrails/selection.rs) | Named raw value / text value / expected selection tuples. |
 | [duplicate_or_malformed_selection_is_rejected_before_any_callout](../tests/grpc/guardrails/selection.rs) | Named invalid selection headers. |
-| [controller_check_ids_and_output_selectors_still_reject_ambiguity](../tests/grpc/guardrails/selection.rs) | Header name × invalid selection headers. |
+| [controller_check_ids_and_output_selectors_still_reject_ambiguity](../tests/grpc/guardrails/selection.rs) | Header name × invalid value / duplicate selection. |
 | [selected_output_cannot_be_silently_disabled_by_none_response_mode](../tests/grpc/guardrails/selection.rs) | Output selection. |
-| [embedded_guardrail_services_require_complete_request_modes_without_a_selector](../tests/grpc/guardrails/selection.rs) | Split rejection and acceptance matrices into separate tests first; then parameterize each. |
+| [embedded_guardrail_services_require_complete_request_modes_without_a_selector](../tests/grpc/guardrails/selection.rs) | Incomplete request mode × selection; rejects before provider calls. |
+| [embedded_guardrail_services_accept_complete_request_modes_without_a_selector](../tests/grpc/guardrails/selection.rs) | Complete request mode × response mode; exactly two provider calls per case. |
 | [unknown_guardrail_selection_explains_premature_response_rejection](../tests/grpc/guardrails/selection.rs) | Embedded service × header wait. |
 
 ### [grpc/guardrails/stream_rejection.rs](../tests/grpc/guardrails/stream_rejection.rs)
@@ -75,7 +76,7 @@ Use named `#[case::name(...)]` cases for related tuples and `#[values(...)]` for
 
 | Test | Parameters / constraints |
 | --- | --- |
-| [guarded_json_boundary_matrix_preserves_content_and_rejects_before_nemo](../tests/grpc/guardrails/payload_boundaries.rs) | Phase × seed × framing. Retain ending/size sequences within the shared harness initially; splitting all dimensions would create 162 independently scheduled cases. |
+| [guarded_json_boundary_matrix_preserves_content_and_rejects_before_nemo](../tests/grpc/guardrails/payload_boundaries.rs) | Phase × seed × framing. Retains ending/size sequences within each harness; covers all 162 combinations in 18 reported cases. |
 
 ### [grpc/adapter/limits.rs](../tests/grpc/adapter/limits.rs)
 
@@ -107,6 +108,10 @@ Use named `#[case::name(...)]` cases for related tuples and `#[values(...)]` for
 | Test | Parameters / constraints |
 | --- | --- |
 | [invalid_listener_addresses_fail_validate](../tests/grpc/adapter/validation.rs) | gRPC / health / metrics address flag. |
+
+## Deferred deployment contract
+
+This remains part of the Envoy layer reserved for a separate PR.
 
 ### [deploy_contract/envoy_filter.rs](../tests/deploy_contract/envoy_filter.rs)
 

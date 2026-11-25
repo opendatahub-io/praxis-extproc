@@ -7,68 +7,67 @@ use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
 use super::support::*;
 
+#[rstest::rstest]
 #[tokio::test]
-async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook() {
+async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook(#[values(false, true)] overflow: bool) {
     let yaml = format!(
         "server:\n  max_body_bytes: 4\n{}",
         GUARDRAILS_CONFIG.replace("allow_unbounded_body: true", "allow_unbounded_body: false")
     );
     let (mut client, _shutdown) = start_server(&yaml).await;
-    for overflow in [false, true] {
-        let (tx, mut inbound) = open_stream(&mut client).await;
-        let mut headers = make_request_headers("POST", "/limited", false);
-        headers.protocol_config = Some(ProtocolConfiguration {
-            request_body_mode: BodySendMode::Streamed.into(),
-            response_body_mode: BodySendMode::Buffered.into(),
-            send_body_without_waiting_for_header_response: false,
-        });
-        tx.send(headers).await.unwrap();
-        assert!(matches!(
-            inbound.message().await.unwrap().unwrap().response,
-            Some(RespVariant::RequestHeaders(_))
-        ));
-        for bytes in [b"ab".as_slice(), b"cd"] {
-            tx.send(ProcessingRequest {
-                request: Some(ReqVariant::RequestBody(HttpBody {
-                    body: bytes.to_vec(),
-                    end_of_stream: false,
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-            assert!(
-                matches!(
-                    inbound.message().await.unwrap().unwrap().response,
-                    Some(RespVariant::RequestBody(_))
-                ),
-                "body filters must accept chunks up to the cumulative boundary"
-            );
-        }
+    let (tx, mut inbound) = open_stream(&mut client).await;
+    let mut headers = make_request_headers("POST", "/limited", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: BodySendMode::Streamed.into(),
+        response_body_mode: BodySendMode::Buffered.into(),
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+    assert!(matches!(
+        inbound.message().await.unwrap().unwrap().response,
+        Some(RespVariant::RequestHeaders(_))
+    ));
+    for bytes in [b"ab".as_slice(), b"cd"] {
         tx.send(ProcessingRequest {
             request: Some(ReqVariant::RequestBody(HttpBody {
-                body: if overflow { b"DROP TABLE".to_vec() } else { Vec::new() },
-                end_of_stream: true,
+                body: bytes.to_vec(),
+                end_of_stream: false,
             })),
             ..Default::default()
         })
         .await
         .unwrap();
-        drop(tx);
-        let replies = collect_responses(&mut inbound).await;
-        assert_eq!(replies.len(), 1);
-        if overflow {
-            assert!(
-                matches!(&replies[0].response, Some(RespVariant::ImmediateResponse(reply))
-                if reply.status.as_ref().unwrap().code == 413),
-                "the cumulative cap must reject before the guardrail can return its own 403"
-            );
-        } else {
-            assert!(
-                matches!(replies[0].response, Some(RespVariant::RequestBody(_))),
-                "an empty EOS at the exact limit remains valid"
-            );
-        }
+        assert!(
+            matches!(
+                inbound.message().await.unwrap().unwrap().response,
+                Some(RespVariant::RequestBody(_))
+            ),
+            "body filters must accept chunks up to the cumulative boundary"
+        );
+    }
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: if overflow { b"DROP TABLE".to_vec() } else { Vec::new() },
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let replies = collect_responses(&mut inbound).await;
+    assert_eq!(replies.len(), 1);
+    if overflow {
+        assert!(
+            matches!(&replies[0].response, Some(RespVariant::ImmediateResponse(reply))
+            if reply.status.as_ref().unwrap().code == 413),
+            "the cumulative cap must reject before the guardrail can return its own 403"
+        );
+    } else {
+        assert!(
+            matches!(replies[0].response, Some(RespVariant::RequestBody(_))),
+            "an empty EOS at the exact limit remains valid"
+        );
     }
 }
 
