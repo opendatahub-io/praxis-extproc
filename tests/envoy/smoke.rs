@@ -170,6 +170,7 @@ struct World {
     children: Vec<Process>,
     finish: Arc<Notify>,
     first_frame: Arc<Notify>,
+    metrics_address: SocketAddr,
     nemo: Harness,
     requests: Arc<Mutex<Vec<http::HeaderMap>>>,
     task: JoinHandle<()>,
@@ -243,11 +244,12 @@ impl World {
         let reserved_metrics = reserve_address();
         let grpc = reserved_grpc.local_addr().unwrap();
         let frontend = reserved_frontend.local_addr().unwrap();
+        let metrics_address = reserved_metrics.local_addr().unwrap();
         let mut cfg = support::configuration(&nemo.endpoint, translation, 2_097_152);
         configure(&mut cfg);
         cfg.server.grpc_address = grpc.to_string();
         cfg.server.health_address = reserved_health.local_addr().unwrap().to_string();
-        cfg.server.metrics_address = reserved_metrics.local_addr().unwrap().to_string();
+        cfg.server.metrics_address = metrics_address.to_string();
         let config_path = directory.join("extproc.yaml");
         // metrics_auth defaults to enabled and exits when this process has no kubeconfig.
         let config = serde_yaml::to_value(serde_json::json!({
@@ -257,7 +259,7 @@ impl World {
                 "grpc_address": cfg.server.grpc_address,
                 "health_address": cfg.server.health_address,
                 "metrics_address": cfg.server.metrics_address,
-                "max_body_bytes": 2_097_152,
+                "max_body_bytes": cfg.server.max_body_bytes.get(),
                 "metrics_auth": {"enabled": false},
             }
         }))
@@ -291,6 +293,7 @@ impl World {
             children: vec![extproc, proxy],
             finish,
             first_frame,
+            metrics_address,
             nemo,
             requests,
             task,
@@ -342,6 +345,50 @@ impl World {
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].contains_key("x-aigateway-guardrail-input"));
         assert!(!requests[0].contains_key("x-aigateway-guardrail-output"));
+    }
+
+    /// Current `praxis_extproc_body_size_rejections_total` from extproc's
+    /// metrics endpoint. Absent from the page until first incremented, so
+    /// a missing line reads as zero.
+    async fn body_size_rejections(&self) -> u64 {
+        let page = reqwest::Client::builder()
+            .timeout(DEADLINE)
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{}/metrics", self.metrics_address))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        page.lines()
+            .find_map(|line| line.strip_prefix("praxis_extproc_body_size_rejections_total "))
+            .map_or(0, |value| value.trim().parse().unwrap())
+    }
+
+    /// POST a chat-completions body padded with trailing whitespace to
+    /// `body_len` bytes, selecting the input guardrail when `guard_input` is
+    /// set. Trailing spaces keep the document valid JSON, so the guardrail
+    /// extracts the same prompt no matter how large the body is. Returns the
+    /// HTTP status.
+    async fn send_padded_body(&self, body_len: usize, guard_input: bool) -> reqwest::StatusCode {
+        let mut body =
+            serde_json::to_vec(&json!({"model":"test","messages":[{"role":"user","content":"hello"}]})).unwrap();
+        body.resize(body_len, b' ');
+        let mut request = reqwest::Client::builder()
+            .timeout(DEADLINE)
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(&self.url)
+            .header("content-type", "application/json")
+            .body(body);
+        if guard_input {
+            request = request.header("x-aigateway-guardrail-input", "true");
+        }
+        request.send().await.unwrap().status()
     }
 }
 
@@ -449,6 +496,9 @@ async fn backend_response(
 
 #[derive(Clone, Copy)]
 struct EnvoyModes<'a> {
+    /// Envoy's listener `per_connection_buffer_limit_bytes`; `None` keeps
+    /// Envoy's default.
+    buffer_limit: Option<u32>,
     no_header_wait: bool,
     request: &'a str,
     request_trailers: &'a str,
@@ -458,6 +508,7 @@ struct EnvoyModes<'a> {
 impl<'a> EnvoyModes<'a> {
     fn new(request: &'a str, response: &'a str, no_header_wait: bool) -> Self {
         Self {
+            buffer_limit: None,
             no_header_wait,
             request,
             request_trailers: "SEND",
@@ -495,11 +546,15 @@ fn envoy_config(
     let cluster = |name: &str, endpoint: SocketAddr| json!({"name":name,"type":"STATIC","connect_timeout":"2s","load_assignment":{"cluster_name":name,"endpoints":[{"lb_endpoints":[{"endpoint":{"address":address(endpoint.port())}}]}]}});
     let mut processor = cluster("extproc", grpc);
     processor["http2_protocol_options"] = json!({});
-    json!({"static_resources":{
+    let mut config = json!({"static_resources":{
         "listeners":[{"name":"http","address":address(frontend.port()),"filter_chains":[{"filters":[{"name":"envoy.filters.network.http_connection_manager","typed_config":{
             "@type":"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager","stat_prefix":"test","http_protocol_options":{"enable_trailers":true},"route_config":{"name":"test","virtual_hosts":[{"name":"all","domains":["*"],"routes":[{"match":{"prefix":"/"},"route":{"cluster":"backend","timeout":"0s"}}]}]},
             "http_filters":[{"name":"envoy.filters.http.ext_proc","typed_config":extproc_filter_config(modes)},{"name":"envoy.filters.http.router","typed_config":{"@type":"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"}}]
-        }}]}]}],"clusters":[processor,cluster("backend", backend)]}})
+        }}]}]}],"clusters":[processor,cluster("backend", backend)]}});
+    if let Some(limit) = modes.buffer_limit {
+        config["static_resources"]["listeners"][0]["per_connection_buffer_limit_bytes"] = json!(limit);
+    }
+    config
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -747,5 +802,159 @@ async fn envoy_preserves_appended_request_headers_and_response_cookies() {
             drop(requests);
             assert!(world.nemo.calls().is_empty());
         }
+    }
+}
+
+/// extproc must enforce its configured `max_body_bytes` on the unguarded
+/// route, through real Envoy, in both delivery modes. A body at or below the
+/// limit reaches the backend; one byte over is rejected with 413, counted on
+/// `praxis_extproc_body_size_rejections_total`, and never reaches the backend;
+/// and extproc keeps serving afterwards.
+///
+/// BUFFERED runs with Envoy's listener buffer raised above the body; under
+/// FULL_DUPLEX_STREAMED Envoy does not buffer the whole body, so its default
+/// is left in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extproc_enforces_the_server_body_limit_through_envoy() {
+    const MIB: usize = 1024 * 1024;
+    for (mode, envoy_buffer) in [("BUFFERED", Some(64 * 1024 * 1024)), ("FULL_DUPLEX_STREAMED", None)] {
+        for limit in [10 * MIB, 32 * MIB] {
+            let mut modes = EnvoyModes::new(mode, mode, false);
+            modes.buffer_limit = envoy_buffer;
+            let world = World::configured(modes, NemoReply::Pass, false, |cfg| {
+                cfg.server.max_body_bytes = praxis_extproc::config::MaxBodyBytes::try_from(limit).unwrap();
+            })
+            .await;
+            let context = format!("{mode}, {} MiB limit", limit / MIB);
+
+            for body_len in [limit - 1, limit] {
+                let before = world.body_size_rejections().await;
+                assert_eq!(
+                    world.send_padded_body(body_len, false).await,
+                    200,
+                    "{context}: {body_len} bytes must pass"
+                );
+                assert_eq!(
+                    world.body_size_rejections().await,
+                    before,
+                    "{context}: a within-limit body must not be counted"
+                );
+            }
+            assert_eq!(
+                world.requests.lock().unwrap().len(),
+                2,
+                "{context}: both accepted bodies must reach the backend"
+            );
+            assert!(
+                world.nemo.calls().is_empty(),
+                "{context}: the unguarded route must not call the model"
+            );
+
+            let before = world.body_size_rejections().await;
+            assert_eq!(
+                world.send_padded_body(limit + 1, false).await,
+                413,
+                "{context}: one byte over must be rejected"
+            );
+            assert_eq!(
+                world.body_size_rejections().await,
+                before + 1,
+                "{context}: the oversized body must be counted"
+            );
+            assert_eq!(
+                world.requests.lock().unwrap().len(),
+                2,
+                "{context}: a rejected body must not reach the backend"
+            );
+
+            // extproc must keep serving after a rejection.
+            assert_eq!(
+                world.send_padded_body(4096, false).await,
+                200,
+                "{context}: a small request must succeed after a 413"
+            );
+            assert_eq!(
+                world.requests.lock().unwrap().len(),
+                3,
+                "{context}: the recovery body must reach the backend"
+            );
+        }
+    }
+}
+
+/// With only the input guardrail in the chain, extproc must enforce the
+/// guarded 1 MiB input cap through real Envoy in both delivery modes: a body
+/// within the cap is evaluated by the provider and forwarded; one byte over is
+/// rejected with 413, counted, and never reaches the provider or the backend.
+///
+/// The guarded cap is the input guardrail's own 1 MiB stream buffer, well
+/// below the server's `max_body_bytes`, so a 413 at 1 MiB + 1 proves the
+/// guardrail cap and not the server limit.
+///
+/// ⚠️ The output guardrail is removed deliberately. With both an input and an
+/// output guardrail present, this cap is suspected not to hold, for reasons
+/// raised separately with the team. That is unconfirmed as of writing; when it
+/// is confirmed, add an `#[ignore]`d two-guardrail test here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extproc_enforces_the_guarded_input_cap_through_envoy() {
+    const GUARD_LIMIT: usize = 1024 * 1024;
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        let mut modes = EnvoyModes::new(mode, mode, false);
+        // Raise Envoy's listener buffer above the body so BUFFERED reaches
+        // extproc; the server limit stays at the 2 MiB test default so the
+        // 1 MiB guardrail buffer is the only cap below the body.
+        modes.buffer_limit = Some(64 * 1024 * 1024);
+        let world = World::configured(modes, NemoReply::Pass, false, |cfg| {
+            cfg.filter_chains[0].filters.retain(|entry| {
+                !(entry.filter_type == "ai_guardrails" && entry.config["phase"]["response"].as_bool() == Some(true))
+            });
+        })
+        .await;
+
+        for body_len in [GUARD_LIMIT - 1, GUARD_LIMIT] {
+            let before = world.body_size_rejections().await;
+            assert_eq!(
+                world.send_padded_body(body_len, true).await,
+                200,
+                "{mode}: {body_len} bytes within the cap must pass"
+            );
+            assert_eq!(
+                world.body_size_rejections().await,
+                before,
+                "{mode}: a within-cap body must not be counted"
+            );
+        }
+        assert_eq!(
+            world.nemo.calls().len(),
+            2,
+            "{mode}: each accepted body must be evaluated once"
+        );
+        assert_eq!(
+            world.requests.lock().unwrap().len(),
+            2,
+            "{mode}: each accepted body must reach the backend"
+        );
+
+        let before = world.body_size_rejections().await;
+        assert_eq!(
+            world.send_padded_body(GUARD_LIMIT + 1, true).await,
+            413,
+            "{mode}: one byte over the cap must be rejected"
+        );
+        assert_eq!(
+            world.body_size_rejections().await,
+            before + 1,
+            "{mode}: the oversized body must be counted"
+        );
+        assert_eq!(
+            world.nemo.calls().len(),
+            2,
+            "{mode}: an oversized body must not be evaluated"
+        );
+        assert_eq!(
+            world.requests.lock().unwrap().len(),
+            2,
+            "{mode}: an oversized body must not reach the backend"
+        );
     }
 }
