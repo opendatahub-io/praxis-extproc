@@ -891,10 +891,10 @@ async fn extproc_enforces_the_server_body_limit_through_envoy() {
 /// below the server's `max_body_bytes`, so a 413 at 1 MiB + 1 proves the
 /// guardrail cap and not the server limit.
 ///
-/// ⚠️ The output guardrail is removed deliberately. With both an input and an
-/// output guardrail present, this cap is suspected not to hold, for reasons
-/// raised separately with the team. That is unconfirmed as of writing; when it
-/// is confirmed, add an `#[ignore]`d two-guardrail test here.
+/// The output guardrail is removed deliberately: with both guardrails in the
+/// chain, the effective limit is the server's `max_body_bytes`, not 1 MiB.
+/// `extproc_applies_the_server_cap_when_an_output_guardrail_is_in_the_chain`
+/// covers that case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extproc_enforces_the_guarded_input_cap_through_envoy() {
     const GUARD_LIMIT: usize = 1024 * 1024;
@@ -956,5 +956,66 @@ async fn extproc_enforces_the_guarded_input_cap_through_envoy() {
             2,
             "{mode}: an oversized body must not reach the backend"
         );
+    }
+}
+
+/// With both the input and the output guardrail in the chain and only the
+/// input check selected, the effective request limit is the server cap, not
+/// the input guardrail's 1 MiB, through real Envoy in both delivery modes.
+///
+/// The chain's request buffer is the largest any filter declares, and the
+/// output guardrail declares 64 MiB whether or not its check is selected. The
+/// server's `max_body_bytes` (explicitly 2 MiB here) caps that, so bodies up to
+/// 2 MiB are accepted and 2 MiB + 1 byte is rejected with 413. Accepted bodies
+/// reach `NeMo` and the backend; the rejected one reaches neither and is
+/// counted on `praxis_extproc_body_size_rejections_total`.
+///
+/// Alongside `extproc_enforces_the_guarded_input_cap_through_envoy`, this
+/// documents how chain composition changes the effective limit and proves the
+/// configured server cap still holds. It pins current behaviour: whether a
+/// guarded route should keep a 1 MiB input cap regardless of an output
+/// guardrail is pending the testing-plan author.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extproc_applies_the_server_cap_when_an_output_guardrail_is_in_the_chain() {
+    const MIB: usize = 1024 * 1024;
+    const SERVER_CAP: usize = 2 * MIB;
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        let mut modes = EnvoyModes::new(mode, mode, false);
+        // Raise Envoy's listener buffer above the body so BUFFERED reaches
+        // extproc. Both guardrails stay in the chain; only the input check is
+        // selected by `send_padded_body(.., true)`.
+        modes.buffer_limit = Some(64 * 1024 * 1024);
+        let world = World::configured(modes, NemoReply::Pass, false, |cfg| {
+            cfg.server.max_body_bytes = praxis_extproc::config::MaxBodyBytes::try_from(SERVER_CAP).unwrap();
+        })
+        .await;
+
+        for (body_len, expected) in [(MIB, 200), (MIB + 1, 200), (SERVER_CAP, 200), (SERVER_CAP + 1, 413)] {
+            let accepted = expected == 200;
+            let nemo_before = world.nemo.calls().len();
+            let backend_before = world.requests.lock().unwrap().len();
+            let rejections_before = world.body_size_rejections().await;
+
+            assert_eq!(
+                world.send_padded_body(body_len, true).await,
+                expected,
+                "{mode}: {body_len} bytes"
+            );
+            assert_eq!(
+                world.nemo.calls().len(),
+                nemo_before + usize::from(accepted),
+                "{mode}: {body_len} bytes: an accepted body must reach NeMo once, a rejected one never"
+            );
+            assert_eq!(
+                world.requests.lock().unwrap().len(),
+                backend_before + usize::from(accepted),
+                "{mode}: {body_len} bytes: only an accepted body may reach the backend"
+            );
+            assert_eq!(
+                world.body_size_rejections().await,
+                rejections_before + u64::from(!accepted),
+                "{mode}: {body_len} bytes: only the rejected body may be counted"
+            );
+        }
     }
 }
