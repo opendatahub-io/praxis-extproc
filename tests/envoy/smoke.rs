@@ -167,6 +167,8 @@ impl Drop for Process {
 }
 
 struct World {
+    /// Request bodies exactly as the backend received them, in arrival order.
+    bodies: Arc<Mutex<Vec<Bytes>>>,
     children: Vec<Process>,
     finish: Arc<Notify>,
     first_frame: Arc<Notify>,
@@ -228,14 +230,14 @@ impl World {
         let nemo = Box::pin(Harness::new(reply, translation)).await;
         let finish = Arc::new(Notify::new());
         let first_frame = Arc::new(Notify::new());
-        let requests = Arc::new(Mutex::new(Vec::new()));
+        let record = BackendRecord::default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = listener.local_addr().unwrap();
         let task = spawn_backend(
             listener,
             Arc::clone(&finish),
             Arc::clone(&first_frame),
-            Arc::clone(&requests),
+            record.clone(),
             hold_json,
         );
         let reserved_grpc = reserve_address();
@@ -267,15 +269,21 @@ impl World {
         std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
         let extproc_log = std::fs::File::create(directory.join("extproc.log")).unwrap();
         drop((reserved_grpc, reserved_health, reserved_metrics));
-        let extproc = Process(
-            Command::new(env!("CARGO_BIN_EXE_praxis-extproc"))
-                .arg("-c")
-                .arg(&config_path)
-                .stdout(Stdio::from(extproc_log.try_clone().unwrap()))
-                .stderr(Stdio::from(extproc_log))
-                .spawn()
-                .unwrap(),
-        );
+        let mut extproc_command = Command::new(env!("CARGO_BIN_EXE_praxis-extproc"));
+        extproc_command
+            .arg("-c")
+            .arg(&config_path)
+            .stdout(Stdio::from(extproc_log.try_clone().unwrap()))
+            .stderr(Stdio::from(extproc_log));
+        // Set on the child only: changing this process's environment would leak
+        // into tests running in parallel.
+        if let Some(limit) = modes.grpc_max_recv {
+            extproc_command.env(
+                praxis_extproc::grpc_limits::GRPC_MAX_RECV_MSG_SIZE_ENV,
+                limit.to_string(),
+            );
+        }
+        let extproc = Process(extproc_command.spawn().unwrap());
         let envoy_path = directory.join("envoy.json");
         std::fs::write(&envoy_path, envoy_config(modes, frontend, grpc, backend).to_string()).unwrap();
         let envoy_log = std::fs::File::create(directory.join("envoy.log")).unwrap();
@@ -290,12 +298,13 @@ impl World {
                 .unwrap(),
         );
         let mut world = Self {
+            bodies: record.bodies,
             children: vec![extproc, proxy],
             finish,
             first_frame,
             metrics_address,
             nemo,
-            requests,
+            requests: record.requests,
             task,
             url: format!("http://{frontend}/v1/chat/completions"),
         };
@@ -377,6 +386,12 @@ impl World {
         let mut body =
             serde_json::to_vec(&json!({"model":"test","messages":[{"role":"user","content":"hello"}]})).unwrap();
         body.resize(body_len, b' ');
+        self.post_body(body, guard_input).await
+    }
+
+    /// POST `body` unchanged as a JSON request, selecting the input guardrail
+    /// when `guard_input` is set. Returns the HTTP status.
+    async fn post_body(&self, body: Vec<u8>, guard_input: bool) -> reqwest::StatusCode {
         let mut request = reqwest::Client::builder()
             .timeout(DEADLINE)
             .no_proxy()
@@ -396,11 +411,21 @@ fn reserve_address() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
 
+/// What the fake backend records about every request it receives. Clones
+/// share the same lists.
+#[derive(Clone, Default)]
+struct BackendRecord {
+    /// Request headers, in arrival order.
+    requests: Arc<Mutex<Vec<http::HeaderMap>>>,
+    /// Request bodies exactly as received, in arrival order.
+    bodies: Arc<Mutex<Vec<Bytes>>>,
+}
+
 fn spawn_backend(
     listener: TcpListener,
     finish: Arc<Notify>,
     first_frame: Arc<Notify>,
-    requests: Arc<Mutex<Vec<http::HeaderMap>>>,
+    record: BackendRecord,
     hold_json: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -408,14 +433,14 @@ fn spawn_backend(
         while let Ok((socket, _)) = listener.accept().await {
             let finish = Arc::clone(&finish);
             let first_frame = Arc::clone(&first_frame);
-            let requests = Arc::clone(&requests);
+            let record = record.clone();
             connections.spawn(async move {
                 let service = service_fn(move |request| {
                     backend_response(
                         request,
                         Arc::clone(&finish),
                         Arc::clone(&first_frame),
-                        Arc::clone(&requests),
+                        record.clone(),
                         hold_json,
                     )
                 });
@@ -433,11 +458,12 @@ async fn backend_response(
     request: Request<Incoming>,
     finish: Arc<Notify>,
     first_frame: Arc<Notify>,
-    requests: Arc<Mutex<Vec<http::HeaderMap>>>,
+    record: BackendRecord,
     hold_json: bool,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, Infallible> {
-    requests.lock().unwrap().push(request.headers().clone());
+    record.requests.lock().unwrap().push(request.headers().clone());
     let body = request.into_body().collect().await.unwrap().to_bytes();
+    record.bodies.lock().unwrap().push(body.clone());
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let streaming = value["stream"] == true;
     let json = serde_json::to_vec(&json!({
@@ -499,6 +525,9 @@ struct EnvoyModes<'a> {
     /// Envoy's listener `per_connection_buffer_limit_bytes`; `None` keeps
     /// Envoy's default.
     buffer_limit: Option<u32>,
+    /// extproc's (not Envoy's) gRPC receive limit, set as `GRPC_MAX_RECV_MSG_SIZE`
+    /// on the extproc process; `None` keeps the binary's default.
+    grpc_max_recv: Option<usize>,
     no_header_wait: bool,
     request: &'a str,
     request_trailers: &'a str,
@@ -509,6 +538,7 @@ impl<'a> EnvoyModes<'a> {
     fn new(request: &'a str, response: &'a str, no_header_wait: bool) -> Self {
         Self {
             buffer_limit: None,
+            grpc_max_recv: None,
             no_header_wait,
             request,
             request_trailers: "SEND",
@@ -812,7 +842,7 @@ async fn envoy_preserves_appended_request_headers_and_response_cookies() {
 /// and extproc keeps serving afterwards.
 ///
 /// BUFFERED runs with Envoy's listener buffer raised above the body; under
-/// FULL_DUPLEX_STREAMED Envoy does not buffer the whole body, so its default
+/// `FULL_DUPLEX_STREAMED` Envoy does not buffer the whole body, so its default
 /// is left in place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extproc_enforces_the_server_body_limit_through_envoy() {
@@ -1017,5 +1047,128 @@ async fn extproc_applies_the_server_cap_when_an_output_guardrail_is_in_the_chain
                 "{mode}: {body_len} bytes: only the rejected body may be counted"
             );
         }
+    }
+}
+
+/// ai-gateway-controller's default `max_body_bytes`.
+const PRODUCTION_MAX_BODY: usize = 10 * 1024 * 1024;
+
+/// Envoy listener buffer as models-as-a-service deploys it.
+const PRODUCTION_ENVOY_BUFFER: u32 = 64 * 1024 * 1024;
+
+/// ai-gateway-controller's `grpcRecvFramingHeadroomBytes`, written out so the
+/// test keeps the deployed value if extproc's own constant changes.
+const PRODUCTION_GRPC_RECV_HEADROOM: usize = 1024 * 1024;
+
+/// `NeMo` timeout from ai-gateway-controller's examples; the harness's 500 ms
+/// is too short for a 1 MiB prompt under load.
+const PRODUCTION_NEMO_TIMEOUT_MS: u64 = 5000;
+
+/// Multibyte UTF-8 and JSON escapes, so damaged chunks change the bytes.
+const INTEGRITY_SEED: &str = "café ☕ quote\"slash\\newline\n";
+
+/// Production request-body settings: response `NONE`, 64 MiB Envoy buffer,
+/// gRPC receive limit = body limit + headroom.
+fn production_modes(request_mode: &str) -> EnvoyModes<'_> {
+    let mut modes = EnvoyModes::new(request_mode, "NONE", false);
+    modes.buffer_limit = Some(PRODUCTION_ENVOY_BUFFER);
+    modes.grpc_max_recv = Some(PRODUCTION_MAX_BODY + PRODUCTION_GRPC_RECV_HEADROOM);
+    modes
+}
+
+/// Compares bodies without printing megabytes on failure.
+fn assert_identical(context: &str, sent: &[u8], received: &[u8]) {
+    if sent == received {
+        return;
+    }
+    let first_difference = sent
+        .iter()
+        .zip(received)
+        .position(|(sent, received)| sent != received)
+        .unwrap_or_else(|| sent.len().min(received.len()));
+    panic!(
+        "{context}: body changed: sent {} bytes, received {} bytes, first difference at byte {first_difference}",
+        sent.len(),
+        received.len()
+    );
+}
+
+/// A body exactly at production's `max_body_bytes` reaches the backend
+/// byte-for-byte. Under `BUFFERED` extproc only continues and Envoy forwards
+/// its own copy; under `FULL_DUPLEX_STREAMED` extproc streams the body back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extproc_forwards_large_bodies_intact_through_envoy() {
+    use crate::common::payloads::{Phase, exact_document};
+
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        let world = World::configured(production_modes(mode), NemoReply::Pass, false, |cfg| {
+            cfg.server.max_body_bytes = praxis_extproc::config::MaxBodyBytes::try_from(PRODUCTION_MAX_BODY).unwrap();
+        })
+        .await;
+        let (body, _) = exact_document(Phase::Input, PRODUCTION_MAX_BODY, INTEGRITY_SEED);
+        let rejections_before = world.body_size_rejections().await;
+
+        assert_eq!(world.post_body(body.clone(), false).await, 200, "{mode}");
+
+        let bodies = world.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "{mode}: exactly one request must reach the backend");
+        assert_identical(mode, &body, &bodies[0]);
+        assert!(
+            world.nemo.calls().is_empty(),
+            "{mode}: an unguarded request must not call the provider"
+        );
+        assert_eq!(
+            world.body_size_rejections().await,
+            rejections_before,
+            "{mode}: an accepted body must not be counted as rejected"
+        );
+    }
+}
+
+/// A guarded body exactly at the input guardrail's 1 MiB cap is evaluated
+/// whole and reaches the backend byte-for-byte (input-only chain, as for a
+/// tenant with input checks only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extproc_releases_guarded_bodies_intact_through_envoy() {
+    use crate::common::payloads::{GUARDED_CAP, Phase, exact_document};
+
+    for mode in ["BUFFERED", "FULL_DUPLEX_STREAMED"] {
+        let world = World::configured(production_modes(mode), NemoReply::Pass, false, |cfg| {
+            cfg.server.max_body_bytes = praxis_extproc::config::MaxBodyBytes::try_from(PRODUCTION_MAX_BODY).unwrap();
+            cfg.filter_chains[0].filters.retain(|entry| {
+                !(entry.filter_type == "ai_guardrails" && entry.config["phase"]["response"].as_bool() == Some(true))
+            });
+            // The whole 1 MiB prompt goes to the provider; give it a production timeout.
+            for entry in &mut cfg.filter_chains[0].filters {
+                if entry.filter_type == "ai_guardrails" {
+                    entry.config["provider"]["timeout_ms"] = serde_yaml::Value::from(PRODUCTION_NEMO_TIMEOUT_MS);
+                }
+            }
+        })
+        .await;
+        let (body, content) = exact_document(Phase::Input, GUARDED_CAP, INTEGRITY_SEED);
+        let rejections_before = world.body_size_rejections().await;
+
+        assert_eq!(world.post_body(body.clone(), true).await, 200, "{mode}");
+
+        let calls = world.nemo.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{mode}: the guarded body must be evaluated exactly once"
+        );
+        assert!(
+            calls[0]["messages"][0]["content"].as_str() == Some(content.as_str()),
+            "{mode}: the provider must receive the complete decoded prompt ({} bytes)",
+            content.len()
+        );
+        let bodies = world.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "{mode}: exactly one request must reach the backend");
+        assert_identical(mode, &body, &bodies[0]);
+        assert_eq!(
+            world.body_size_rejections().await,
+            rejections_before,
+            "{mode}: an accepted body must not be counted as rejected"
+        );
     }
 }

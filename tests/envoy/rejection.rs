@@ -86,7 +86,7 @@ impl RejectionWorld {
             listener,
             Arc::clone(&finish),
             Arc::new(Notify::new()),
-            Arc::new(Mutex::new(Vec::new())),
+            BackendRecord::default(),
             false,
         );
         let reserved_frontend = reserve_address();
