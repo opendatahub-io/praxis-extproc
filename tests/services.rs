@@ -278,11 +278,93 @@ async fn metrics_endpoint_returns_prometheus_format() {
     assert_eq!(resp.status(), 200, "metrics should return 200");
 }
 
-#[tokio::test]
-async fn metrics_record_functions_do_not_panic() {
-    praxis_extproc::metrics::register();
-    praxis_extproc::metrics::record_request(0.5);
-    praxis_extproc::metrics::record_immediate_response();
+#[test]
+fn metrics_record_functions_emit_exact_values_and_labels() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use praxis_extproc::metrics::{
+        record_body_size_rejection, record_immediate_response, record_invalid_argument, record_local_reply,
+        record_request, register,
+    };
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        register();
+        for duration in [0.25, 0.5] {
+            record_request(duration);
+        }
+        record_immediate_response();
+        record_body_size_rejection();
+        for status in [Some(200), Some(302), Some(404), Some(503), None, Some(100)] {
+            record_local_reply(status);
+        }
+        record_invalid_argument("message_order", "invalid_phase_transition");
+        record_invalid_argument("message_order", "invalid_phase_transition");
+        record_invalid_argument("body_mode", "body_message_in_none_mode");
+    });
+    let snapshot = snapshotter.snapshot().into_vec();
+    let mut seen = std::collections::BTreeSet::new();
+    for (composite, _, _, value) in snapshot {
+        let key = composite.key();
+        let mut labels: Vec<_> = key.labels().map(|label| (label.key(), label.value())).collect();
+        labels.sort_unstable();
+        assert!(
+            seen.insert((
+                key.name().to_owned(),
+                labels
+                    .clone()
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect::<Vec<_>>()
+            ))
+        );
+        match key.name() {
+            "praxis_extproc_requests_total" => {
+                assert!(labels.is_empty());
+                assert_eq!(value, DebugValue::Counter(2));
+            },
+            "praxis_extproc_immediate_responses_total" | "praxis_extproc_body_size_rejections_total" => {
+                assert!(labels.is_empty());
+                assert_eq!(value, DebugValue::Counter(1));
+            },
+            "praxis_extproc_request_duration_seconds" => {
+                assert!(labels.is_empty());
+                let DebugValue::Histogram(values) = value else {
+                    panic!("duration must be a histogram")
+                };
+                let samples: Vec<f64> = values.into_iter().map(Into::into).collect();
+                assert_eq!(samples, [0.25, 0.5]);
+            },
+            "praxis_extproc_local_replies_total" => {
+                assert_eq!(labels.len(), 1);
+                assert_eq!(labels[0].0, "status_class");
+                let expected = match labels[0].1 {
+                    "2xx" | "3xx" | "4xx" | "5xx" => 1,
+                    "other" => 2,
+                    unexpected => panic!("unexpected status class {unexpected}"),
+                };
+                assert_eq!(value, DebugValue::Counter(expected));
+            },
+            "praxis_extproc_invalid_argument_total" => {
+                let expected = if labels == [("detail", "invalid_phase_transition"), ("reason", "message_order")] {
+                    2
+                } else {
+                    assert_eq!(
+                        labels,
+                        [("detail", "body_message_in_none_mode"), ("reason", "body_mode")]
+                    );
+                    1
+                };
+                assert_eq!(value, DebugValue::Counter(expected));
+            },
+            unexpected => panic!("unexpected metric {unexpected}"),
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        11,
+        "every counter/label combination and histogram must be present"
+    );
 }
 
 #[tokio::test]

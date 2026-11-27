@@ -7,6 +7,8 @@
 //! `NeMo` peer in `guardrails_transport`) build on top of these and re-export
 //! them, so a test can reach any of these as `support::<name>`.
 
+use std::time::Duration;
+
 use praxis_extproc::grpc_limits::DEFAULT_GRPC_MAX_RECV_MSG_SIZE;
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
@@ -18,6 +20,8 @@ use praxis_proto::envoy::service::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
+
+pub(crate) mod payloads;
 
 /// Shared idle timeout (milliseconds) for single-message response waits.
 pub(crate) const TIMEOUT_MILLIS: u64 = 500;
@@ -80,32 +84,66 @@ pub(crate) fn make_header(key: &str, value: &str) -> HeaderValue {
 }
 
 pub(crate) fn make_request_headers(method: &str, path: &str, end_of_stream: bool) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![
-                    make_header(":method", method),
-                    make_header(":path", path),
-                    make_header(":authority", "localhost"),
-                    make_header(":scheme", "http"),
-                ],
-            }),
-            end_of_stream,
-        })),
-        ..Default::default()
-    }
+    make_request_headers_with(method, path, end_of_stream, [])
+}
+
+/// Build request headers with extra values appended in the supplied order.
+pub(crate) fn make_request_headers_with(
+    method: &str,
+    path: &str,
+    end_of_stream: bool,
+    extra_headers: impl IntoIterator<Item = HeaderValue>,
+) -> ProcessingRequest {
+    let mut headers = vec![
+        make_header(":method", method),
+        make_header(":path", path),
+        make_header(":authority", "localhost"),
+        make_header(":scheme", "http"),
+    ];
+    headers.extend(extra_headers);
+
+    wrap(ReqVariant::RequestHeaders(HttpHeaders {
+        headers: Some(HeaderMap { headers }),
+        end_of_stream,
+    }))
 }
 
 pub(crate) fn make_response_headers(status: u32, end_of_stream: bool) -> ProcessingRequest {
-    ProcessingRequest {
-        request: Some(ReqVariant::ResponseHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![make_header(":status", &status.to_string())],
-            }),
-            end_of_stream,
-        })),
+    make_response_headers_with(status, end_of_stream, [])
+}
+
+/// Build response headers with extra values appended in the supplied order.
+pub(crate) fn make_response_headers_with(
+    status: u32,
+    end_of_stream: bool,
+    extra_headers: impl IntoIterator<Item = HeaderValue>,
+) -> ProcessingRequest {
+    let mut headers = vec![make_header(":status", &status.to_string())];
+    headers.extend(extra_headers);
+    wrap(ReqVariant::ResponseHeaders(HttpHeaders {
+        headers: Some(HeaderMap { headers }),
+        end_of_stream,
+    }))
+}
+
+/// Build HTTP 200 response headers with a content type and a body to follow.
+pub(crate) fn response_headers(content_type: &str) -> ProcessingRequest {
+    response_headers_with_eos(content_type, false)
+}
+
+/// Build HTTP 200 response headers with a content type and explicit completion.
+pub(crate) fn response_headers_with_eos(content_type: &str, end_of_stream: bool) -> ProcessingRequest {
+    let header = |key: &str, value: &str| HeaderValue {
+        key: key.to_owned(),
+        raw_value: value.as_bytes().to_vec(),
         ..Default::default()
-    }
+    };
+    wrap(ReqVariant::ResponseHeaders(HttpHeaders {
+        headers: Some(HeaderMap {
+            headers: vec![header(":status", "200"), header("content-type", content_type)],
+        }),
+        end_of_stream,
+    }))
 }
 
 pub(crate) fn make_response_body(body: &[u8], end_of_stream: bool) -> ProcessingRequest {
@@ -144,7 +182,7 @@ pub(crate) fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
 
 /// Pull the next response from a `FULL_DUPLEX` stream with the shared timeout.
 pub(crate) async fn next_full_duplex_msg(stream: &mut tonic::Streaming<ProcessingResponse>) -> ProcessingResponse {
-    tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
+    tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), stream.message())
         .await
         .expect("timed out waiting for response")
         .expect("response stream error")
@@ -159,7 +197,7 @@ pub(crate) async fn collect_responses_result(
     inbound: &mut tonic::Streaming<ProcessingResponse>,
 ) -> Result<Vec<ProcessingResponse>, tonic::Status> {
     let mut responses = Vec::new();
-    let timeout = tokio::time::Duration::from_secs(2);
+    let timeout = Duration::from_secs(2);
 
     loop {
         match tokio::time::timeout(timeout, inbound.message()).await {
@@ -197,11 +235,7 @@ where
             "received {max_chunks} chunks without end_of_stream"
         );
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(TIMEOUT_MILLIS),
-            response_stream.message(),
-        )
-        .await;
+        let outcome = tokio::time::timeout(Duration::from_millis(TIMEOUT_MILLIS), response_stream.message()).await;
 
         match outcome {
             Ok(Ok(Some(msg))) => {
@@ -272,9 +306,10 @@ pub(crate) fn body_bytes(responses: &[ProcessingResponse]) -> Vec<u8> {
             _ => None,
         })
         .flat_map(|mutation| match mutation {
-            body_mutation::Mutation::Body(body) => body.clone(),
-            body_mutation::Mutation::StreamedResponse(body) => body.body.clone(),
-            body_mutation::Mutation::ClearBody(_) => Vec::new(),
+            body_mutation::Mutation::Body(body) => body.as_slice(),
+            body_mutation::Mutation::StreamedResponse(body) => body.body.as_slice(),
+            body_mutation::Mutation::ClearBody(_) => &[],
         })
+        .copied()
         .collect()
 }

@@ -3,6 +3,8 @@
 
 //! Envoy-routed translation, selected-body, and branch chains.
 
+use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+
 use super::support::*;
 
 #[tokio::test]
@@ -65,19 +67,12 @@ async fn conditional_terminal_branch_rejects_matching_request() {
     let response = client.process(stream).await.expect("process call failed");
     let mut inbound = response.into_inner();
 
-    tx.send(ProcessingRequest {
-        request: Some(ReqVariant::RequestHeaders(HttpHeaders {
-            headers: Some(HeaderMap {
-                headers: vec![
-                    make_header(":method", "GET"),
-                    make_header(":path", "/"),
-                    make_header("x-danger", "true"),
-                ],
-            }),
-            end_of_stream: true,
-        })),
-        ..Default::default()
-    })
+    tx.send(make_request_headers_with(
+        "GET",
+        "/",
+        true,
+        [make_header("x-danger", "true")],
+    ))
     .await
     .expect("send headers");
 
@@ -110,8 +105,6 @@ async fn conditional_terminal_branch_allows_clean_request() {
 /// Envoy-routed requests need both body translation and the late path mutation.
 #[tokio::test]
 async fn envoy_routed_anthropic_request_translates_body_and_path() {
-    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
-
     let (mut client, _shutdown) = start_server(ENVOY_ANTHROPIC_CONFIG).await;
     let input = br#"{"model":"internal-model","max_tokens":73,"system":"Be concise","messages":[{"role":"user","content":"hello"}]}"#;
     let responses = send_full_request(&mut client, "POST", "/v1/messages", input).await;
@@ -162,7 +155,7 @@ async fn envoy_routed_openai_request_preserves_body() {
     );
     for response in &responses {
         if let Some(RespVariant::RequestBody(body)) = &response.response
-            && let Some(praxis_proto::envoy::service::ext_proc::v3::body_mutation::Mutation::Body(bytes)) = body
+            && let Some(body_mutation::Mutation::Body(bytes)) = body
                 .response
                 .as_ref()
                 .and_then(|common| common.body_mutation.as_ref())
@@ -228,7 +221,7 @@ async fn streamed_selected_body_rejects_before_header_ack() {
 /// BUFFERED mode carries selected-body bytes and late header mutations in its body response.
 #[tokio::test]
 async fn buffered_selected_body_translates_and_preserves_header_mutation() {
-    use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
     let mut registry = praxis_ai_filters::build_ai_registry();
     registry
