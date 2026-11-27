@@ -11,7 +11,7 @@ use super::support::*;
 #[tokio::test]
 async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook(#[values(false, true)] overflow: bool) {
     let yaml = format!(
-        "server:\n  max_body_bytes: 4\n{}",
+        "server:\n  max_body_bytes: 10\n{}",
         GUARDRAILS_CONFIG.replace("allow_unbounded_body: true", "allow_unbounded_body: false")
     );
     let (mut client, _shutdown) = start_server(&yaml).await;
@@ -24,10 +24,10 @@ async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook(#[v
     });
     tx.send(headers).await.unwrap();
     assert!(matches!(
-        inbound.message().await.unwrap().unwrap().response,
+        next(&mut inbound).await.response,
         Some(RespVariant::RequestHeaders(_))
     ));
-    for bytes in [b"ab".as_slice(), b"cd"] {
+    for bytes in [b"abcde".as_slice(), b"fghij"] {
         tx.send(ProcessingRequest {
             request: Some(ReqVariant::RequestBody(HttpBody {
                 body: bytes.to_vec(),
@@ -38,10 +38,7 @@ async fn streamed_body_filter_enforces_cumulative_limit_before_the_next_hook(#[v
         .await
         .unwrap();
         assert!(
-            matches!(
-                inbound.message().await.unwrap().unwrap().response,
-                Some(RespVariant::RequestBody(_))
-            ),
+            matches!(next(&mut inbound).await.response, Some(RespVariant::RequestBody(_))),
             "body filters must accept chunks up to the cumulative boundary"
         );
     }

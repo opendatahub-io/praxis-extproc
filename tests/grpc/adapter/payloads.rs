@@ -17,7 +17,7 @@ use crate::common::payloads::Framing;
 // -----------------------------------------------------------------------------
 
 const CHUNK_BYTES: usize = 16_384; // 16 KiB.
-const FILTER_BODY_CAP: usize = 33_554_432; // 32 MiB.
+const FILTER_BODY_CAP: usize = 67_108_864; // 64 MiB; isolate the server body limit.
 const PAYLOAD_BYTES: usize = 65_536; // 64 KiB.
 const PAYLOAD_SEED: &str = "café ☕ \"q\"\n";
 

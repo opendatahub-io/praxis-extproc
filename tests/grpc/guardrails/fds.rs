@@ -522,6 +522,15 @@ async fn input_only_and_unselected_fds_output_streams_before_body_eos_or_trailer
         assert_eq!(final_responses.len(), 1);
         assert_eq!(body_bytes(&final_responses), b"data: [DONE]\n\n");
     }
+    drop(session.sender);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), session.responses.message())
+            .await
+            .expect("FDS output must close after client input ends")
+            .unwrap()
+            .is_none(),
+        "no extra body or trailer reply may follow the terminal response"
+    );
     assert_eq!(harness.calls().len(), usize::from(input));
     if input {
         assert_eq!(harness.calls()[0]["guardrails"]["rail_types"], json!(["input"]));

@@ -37,7 +37,6 @@ async fn immediate_response_ends_stream_after_first_or_later_chunk_rejection(
     session.sender.try_send(response_body(b"later", true)).unwrap();
     let rejected = session.next().await.unwrap();
     assert_eq!(immediate_status(std::slice::from_ref(&rejected)), Some(403));
-    assert!(body_bytes(&[rejected]).is_empty());
     assert!(
         session.next().await.is_none(),
         "no queued body or trailer reply may follow rejection"

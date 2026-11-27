@@ -119,6 +119,16 @@ async fn assert_boundary(harness: &Harness, case: BoundaryCase) {
         },
     }
     let replies = Box::pin(collect_fds(&mut session, matches!(ending, Ending::Trailers))).await;
+    if matches!(ending, Ending::Trailers) {
+        assert!(
+            matches!(
+                (phase, replies.last().and_then(|reply| reply.response.as_ref())),
+                (Phase::Input, Some(ResponseMessage::RequestTrailers(_)))
+                    | (Phase::Output, Some(ResponseMessage::ResponseTrailers(_)))
+            ),
+            "{phase:?}, {framing:?}, {ending:?}, size={size}: wrong trailer acknowledgement"
+        );
+    }
     assert_eq!(
         released_bytes(&replies, phase),
         body,
@@ -130,7 +140,11 @@ async fn assert_boundary(harness: &Harness, case: BoundaryCase) {
     drop(calls);
     drop(session.sender);
     assert!(
-        session.responses.message().await.unwrap().is_none(),
+        tokio::time::timeout(Duration::from_secs(10), session.responses.message())
+            .await
+            .unwrap_or_else(|error| panic!("{phase:?}, {framing:?}, {ending:?}, size={size}: EOF timeout: {error}"))
+            .unwrap()
+            .is_none(),
         "no duplicate release after completion"
     );
 }
@@ -156,7 +170,14 @@ async fn assert_overflow(session: &mut Session, phase: Phase, framing: Framing, 
                     released_bytes(std::slice::from_ref(&reply), phase).len()
                 );
                 if immediate_status(&[reply]) == Some(413) {
-                    assert!(session.responses.message().await.unwrap().is_none());
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(10), session.responses.message())
+                            .await
+                            .unwrap_or_else(|error| panic!("{phase:?}, {framing:?}, {ending:?}: EOF timeout: {error}"))
+                            .unwrap()
+                            .is_none(),
+                        "{phase:?}, {framing:?}, {ending:?}: no reply may follow rejection"
+                    );
                     break;
                 }
             },

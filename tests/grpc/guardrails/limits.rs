@@ -213,6 +213,15 @@ async fn fds_output_enforces_the_effective_cap_before_provider_evaluation(
         }
         let responses = collect_fds(&mut session, trailers).await;
         assert_eq!(body_bytes(&responses), body, "the exact limit must be accepted");
+        if trailers {
+            assert!(
+                matches!(
+                    responses.last().and_then(|reply| reply.response.as_ref()),
+                    Some(ResponseMessage::ResponseTrailers(_))
+                ),
+                "output must end with a response-trailers acknowledgement"
+            );
+        }
         assert_eq!(harness.calls().len(), 1);
         assert_eq!(harness.calls()[0]["messages"][0]["content"], "bounded output");
     }
